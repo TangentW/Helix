@@ -641,7 +641,7 @@ struct NativeCallback {
                 .escapingClosureValuesV1,
             ]
             if restrictCallbackToMainActor {
-                capabilities.insert(.mainActorSyncV1)
+                capabilities.insert(.mainActorIsolationV1)
             }
             if wrapsCallbackInArray {
                 capabilities.insert(.collectionsV1)

@@ -153,7 +153,7 @@ struct ReleasePipeline {
         let report = try ReleaseCompiler.Indexer().index(request)
         #expect(report.eligibleCount == 1)
         #expect(report.rejectedCount == 1)
-        #expect(report.archive.capabilities.contains(.asyncLeafEntriesV1))
+        #expect(report.archive.capabilities.contains(.sequentialAsyncV1))
         #expect(report.archive.capabilities.contains(.anyValuesV1))
         #expect(report.archive.functions.first(where: {
             $0.mangledName == leaf.mangledName
@@ -938,7 +938,7 @@ struct ReleasePipeline {
         )
         #expect(report.eligibleCount == 8)
         #expect(report.archive.capabilities.contains(.untypedThrowsV1))
-        #expect(report.archive.capabilities.contains(.mainActorSyncV1))
+        #expect(report.archive.capabilities.contains(.mainActorIsolationV1))
         #expect(report.archive.capabilities.contains(.collectionsV1))
         #expect(report.archive.capabilities.contains(.localNominalsV1))
         #expect(report.archive.capabilities.contains(.structuredErrorsV1))
@@ -1245,7 +1245,7 @@ struct ReleasePipeline {
             )
         )
         #expect(report.eligibleCount == 2)
-        #expect(report.archive.capabilities.contains(.asyncLeafEntriesV1))
+        #expect(report.archive.capabilities.contains(.sequentialAsyncV1))
 
         let roots = try report.archive.functions.map { record -> BridgeGeneration.Root in
             let entry = try #require(record.entryIndex)

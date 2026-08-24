@@ -44,10 +44,10 @@ extension CompilerCapabilities {
                 capabilities.insert(.escapingClosureValuesV1)
             }
             if function.effects.requiresMainActor {
-                capabilities.insert(.mainActorSyncV1)
+                capabilities.insert(.mainActorIsolationV1)
             }
             if function.effects.isAsync {
-                capabilities.insert(.asyncLeafEntriesV1)
+                capabilities.insert(.sequentialAsyncV1)
             }
             if function.parameterConventions.contains(.borrowed) {
                 capabilities.insert(.borrowCallsV1)
@@ -162,7 +162,7 @@ extension CompilerCapabilities {
         case let .closure(signature):
             capabilities.insert(.closureValuesV1)
             if signature.effects.requiresMainActor {
-                capabilities.insert(.mainActorSyncV1)
+                capabilities.insert(.mainActorIsolationV1)
             }
             if let thrownType = signature.thrownType {
                 collectThrownType(thrownType, into: &capabilities)

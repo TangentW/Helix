@@ -2708,9 +2708,9 @@ struct SemanticVerifier {
             .destroyValue(.init(rawValue: 3)),
             at: 2
         )
-        valid.module.capabilities.insert(.mainActorSyncV1)
-        valid.shell.capabilities.insert(.mainActorSyncV1)
-        valid.policy.acceptedCapabilities.insert(.mainActorSyncV1)
+        valid.module.capabilities.insert(.mainActorIsolationV1)
+        valid.shell.capabilities.insert(.mainActorIsolationV1)
+        valid.policy.acceptedCapabilities.insert(.mainActorIsolationV1)
         _ = try Verification.Engine().verify(
             bytes: Bytecode.Encoder.encode(valid.module),
             shell: valid.shell,
@@ -2718,9 +2718,9 @@ struct SemanticVerifier {
         )
 
         var missingCapability = valid
-        missingCapability.module.capabilities.remove(.mainActorSyncV1)
+        missingCapability.module.capabilities.remove(.mainActorIsolationV1)
         #expect(
-            throws: Verification.Error.capabilityDenied(.mainActorSyncV1)
+            throws: Verification.Error.capabilityDenied(.mainActorIsolationV1)
         ) {
             try Verification.Engine().verify(
                 bytes: Bytecode.Encoder.encode(missingCapability.module),
@@ -5059,9 +5059,9 @@ struct SemanticVerifier {
         actorMismatch.module.functions[2].registerTypes[0] = .closure(
             actorFormal
         )
-        actorMismatch.module.capabilities.insert(.mainActorSyncV1)
-        actorMismatch.shell.capabilities.insert(.mainActorSyncV1)
-        actorMismatch.policy.acceptedCapabilities.insert(.mainActorSyncV1)
+        actorMismatch.module.capabilities.insert(.mainActorIsolationV1)
+        actorMismatch.shell.capabilities.insert(.mainActorIsolationV1)
+        actorMismatch.policy.acceptedCapabilities.insert(.mainActorIsolationV1)
         #expect(
             throws: Verification.Error.invalidInstruction(
                 function: .init(rawValue: 0),
@@ -5563,10 +5563,10 @@ struct SemanticVerifier {
             ),
             .returnValue(.init(rawValue: 0)),
         ]
-        convertedUseAfterEnd.module.capabilities.insert(.mainActorSyncV1)
-        convertedUseAfterEnd.shell.capabilities.insert(.mainActorSyncV1)
+        convertedUseAfterEnd.module.capabilities.insert(.mainActorIsolationV1)
+        convertedUseAfterEnd.shell.capabilities.insert(.mainActorIsolationV1)
         convertedUseAfterEnd.policy.acceptedCapabilities.insert(
-            .mainActorSyncV1
+            .mainActorIsolationV1
         )
         #expect(
             throws: Verification.Error.invalidInstruction(
@@ -5664,14 +5664,14 @@ struct SemanticVerifier {
         }
     }
 
-    @Test("Async effects are entry-only, capability-gated, and cannot be called synchronously")
-    func verifiesAsyncLeafContract() throws {
+    @Test("Sequential async effects are capability-gated and require async callers")
+    func verifiesSequentialAsyncContract() throws {
         var accepted = try makeFixture()
         accepted.module.functions[0].effects.isAsync = true
-        accepted.module.capabilities.insert(.asyncLeafEntriesV1)
+        accepted.module.capabilities.insert(.sequentialAsyncV1)
         accepted.shell.entries[.init(rawValue: 0)]?.effects.isAsync = true
-        accepted.shell.capabilities.insert(.asyncLeafEntriesV1)
-        accepted.policy.acceptedCapabilities.insert(.asyncLeafEntriesV1)
+        accepted.shell.capabilities.insert(.sequentialAsyncV1)
+        accepted.policy.acceptedCapabilities.insert(.sequentialAsyncV1)
         _ = try Verification.Engine().verify(
             bytes: Bytecode.Encoder.encode(accepted.module),
             shell: accepted.shell,
@@ -5679,8 +5679,8 @@ struct SemanticVerifier {
         )
 
         var missingCapability = accepted
-        missingCapability.module.capabilities.remove(.asyncLeafEntriesV1)
-        #expect(throws: Verification.Error.capabilityDenied(.asyncLeafEntriesV1)) {
+        missingCapability.module.capabilities.remove(.sequentialAsyncV1)
+        #expect(throws: Verification.Error.capabilityDenied(.sequentialAsyncV1)) {
             try Verification.Engine().verify(
                 bytes: Bytecode.Encoder.encode(missingCapability.module),
                 shell: missingCapability.shell,
@@ -5717,21 +5717,47 @@ struct SemanticVerifier {
                 effects: .init(isAsync: true)
             )
         )
-        helper.module.capabilities.insert(.asyncLeafEntriesV1)
-        helper.shell.capabilities.insert(.asyncLeafEntriesV1)
-        helper.policy.acceptedCapabilities.insert(.asyncLeafEntriesV1)
+        helper.module.capabilities.insert(.sequentialAsyncV1)
+        helper.shell.capabilities.insert(.sequentialAsyncV1)
+        helper.policy.acceptedCapabilities.insert(.sequentialAsyncV1)
         #expect(
             throws: Verification.Error.invalidInstruction(
                 function: .init(rawValue: 0),
                 block: .init(rawValue: 0),
                 offset: 0,
-                reason: "hlbc_apply calls an async entry without a suspension contract"
+                reason: "hlbc_apply calls an async operation from a synchronous function"
             )
         ) {
             try Verification.Engine().verify(
                 bytes: Bytecode.Encoder.encode(helper.module),
                 shell: helper.shell,
                 policy: helper.policy
+            )
+        }
+
+        var asyncCaller = helper
+        asyncCaller.module.functions[0].effects.isAsync = true
+        asyncCaller.shell.entries[.init(rawValue: 0)]?.effects.isAsync = true
+        _ = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(asyncCaller.module),
+            shell: asyncCaller.shell,
+            policy: asyncCaller.policy
+        )
+
+        var noSuspendedFrames = asyncCaller
+        noSuspendedFrames.module.requestedResources.maxSuspendedFrames = 0
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 0,
+                reason: "hlbc_apply requires a positive suspended-frame budget"
+            )
+        ) {
+            try Verification.Engine().verify(
+                bytes: Bytecode.Encoder.encode(noSuspendedFrames.module),
+                shell: noSuspendedFrames.shell,
+                policy: noSuspendedFrames.policy
             )
         }
     }
@@ -5747,9 +5773,9 @@ struct SemanticVerifier {
                 effects: .init(isAsync: true)
             )
         )
-        fixture.module.capabilities.insert(.asyncLeafEntriesV1)
-        fixture.shell.capabilities.insert(.asyncLeafEntriesV1)
-        fixture.policy.acceptedCapabilities.insert(.asyncLeafEntriesV1)
+        fixture.module.capabilities.insert(.sequentialAsyncV1)
+        fixture.shell.capabilities.insert(.sequentialAsyncV1)
+        fixture.policy.acceptedCapabilities.insert(.sequentialAsyncV1)
 
         #expect(
             throws: Verification.Error.invalidFunction(

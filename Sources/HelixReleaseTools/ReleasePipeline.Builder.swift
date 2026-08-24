@@ -262,7 +262,7 @@ public struct Builder: Sendable {
             acceptedCapabilities: compilation.module.capabilities,
             resourceCeiling: compilation.module.requestedResources,
             allowedNativeImports: allowedImports,
-            allowMainActorSynchronousEntries: compilation.module.capabilities.contains(.mainActorSyncV1)
+            allowMainActorEntries: compilation.module.capabilities.contains(.mainActorIsolationV1)
         )
         _ = try Verification.Engine().verify(
             bytes: compilation.bytecode,

@@ -23,8 +23,25 @@ public protocol NativeInvoker: Sendable {
     ) throws -> VM.NativeInvocationResult
 }
 
-/// A synchronous import's only authority to consume work and observe deadlines.
-/// Cooperative factories must checkpoint at least once before returning.
+/// Exact async counterpart to ``NativeInvoker``. Keeping the protocols
+/// separate makes it impossible for the synchronous interpreter to block on
+/// or accidentally enter an async implementation.
+public protocol AsyncNativeInvoker: Sendable {
+    var id: Core.NativeImportID { get }
+    var key: Core.NativeImportKey { get }
+    var parameterTypes: [Bytecode.ValueType] { get }
+    var resultType: Bytecode.ValueType { get }
+    var effects: Core.Effects { get }
+    var contract: Core.NativeImportContract { get }
+    func invoke(
+        arguments: [VM.Value],
+        context: VM.NativeInvocationContext
+    ) async throws -> VM.NativeInvocationResult
+}
+
+/// One exact import invocation's authority to consume work and observe
+/// deadlines. Synchronous cooperative factories must checkpoint at least once;
+/// suspending factories retain the context only for their awaited call.
 public struct NativeInvocationContext: Sendable {
     /// The context may be handed through a generated `@Sendable` invoker. All
     /// mutable admission state is lock-protected, and every operation also
@@ -35,12 +52,14 @@ public struct NativeInvocationContext: Sendable {
         let deadlineNanoseconds: UInt64
         let requiresCooperation: Bool
         let requiresMainActor: Bool
+        let requiresAsyncMainActorEntry: Bool
         let callbackByParameter: [Int: Core.NativeImportCallback]
         let parameterTypes: [Bytecode.ValueType]
         let callbackHost: VM.NativeCallbackHost?
         let callbackEpoch: VM.NativeCallbackEpoch?
         let lock = NSLock()
         var checkpointCount: UInt32 = 0
+        var enteredRequiredMainActor = false
         var isFinished = false
 
         init(
@@ -49,6 +68,7 @@ public struct NativeInvocationContext: Sendable {
             deadlineNanoseconds: UInt64,
             requiresCooperation: Bool,
             requiresMainActor: Bool,
+            requiresAsyncMainActorEntry: Bool,
             callbacks: [Core.NativeImportCallback],
             parameterTypes: [Bytecode.ValueType],
             callbackHost: VM.NativeCallbackHost?
@@ -58,6 +78,7 @@ public struct NativeInvocationContext: Sendable {
             self.deadlineNanoseconds = deadlineNanoseconds
             self.requiresCooperation = requiresCooperation
             self.requiresMainActor = requiresMainActor
+            self.requiresAsyncMainActorEntry = requiresAsyncMainActorEntry
             callbackByParameter = callbacks.isEmpty ? [:] : Dictionary(
                 uniqueKeysWithValues: callbacks.map {
                     (Int($0.parameterIndex), $0)
@@ -79,6 +100,7 @@ public struct NativeInvocationContext: Sendable {
         deadlineNanoseconds: UInt64,
         requiresCooperation: Bool,
         requiresMainActor: Bool,
+        requiresAsyncMainActorEntry: Bool,
         callbacks: [Core.NativeImportCallback],
         parameterTypes: [Bytecode.ValueType],
         callbackHost: VM.NativeCallbackHost?
@@ -89,6 +111,7 @@ public struct NativeInvocationContext: Sendable {
             deadlineNanoseconds: deadlineNanoseconds,
             requiresCooperation: requiresCooperation,
             requiresMainActor: requiresMainActor,
+            requiresAsyncMainActorEntry: requiresAsyncMainActorEntry,
             callbacks: callbacks,
             parameterTypes: parameterTypes,
             callbackHost: callbackHost
@@ -218,21 +241,62 @@ public struct NativeInvocationContext: Sendable {
         return try MainActor.assumeIsolated(operation)
     }
 
+    /// Executes and encodes one suspending MainActor import without allowing a
+    /// non-Sendable native result to leave the actor-isolated closure. Exact
+    /// generated adapters must use this operation; `finish` rejects an async
+    /// MainActor descriptor whose implementation bypassed the actor gate.
+    public func withMainActor<Result: Sendable>(
+        _ operation: @MainActor () async throws -> Result
+    ) async throws -> Result {
+        try state.lock.withLock {
+            guard !state.isFinished else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "native invocation context escaped its call"
+                )
+            }
+            guard state.requiresMainActor else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "native import is not authorized to enter MainActor"
+                )
+            }
+        }
+        try checkpoint()
+        try state.lock.withLock {
+            guard !state.isFinished else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "native invocation context escaped its call"
+                )
+            }
+            state.enteredRequiredMainActor = true
+        }
+        return try await operation()
+    }
+
     func finish(requireCooperation: Bool) throws {
-        let snapshot = try state.lock.withLock { () -> UInt32 in
+        let snapshot = try state.lock.withLock {
+            () -> (checkpointCount: UInt32, enteredRequiredMainActor: Bool) in
             guard !state.isFinished else {
                 throw VM.RuntimeTrap.nativeFailure("native invocation context finished twice")
             }
             state.isFinished = true
-            return state.checkpointCount
+            return (
+                state.checkpointCount,
+                state.enteredRequiredMainActor
+            )
         }
         let callbackFailure = state.callbackEpoch?.finish()
         try state.budget.finishNativeInvocation(
             id: state.id,
             deadlineNanoseconds: state.deadlineNanoseconds,
             requiresCooperation: requireCooperation && state.requiresCooperation,
-            checkpointCount: snapshot
+            checkpointCount: snapshot.checkpointCount
         )
+        guard !state.requiresAsyncMainActorEntry
+                || snapshot.enteredRequiredMainActor else {
+            throw VM.RuntimeTrap.nativeFailure(
+                "async MainActor native import bypassed its actor gate"
+            )
+        }
         if let callbackFailure { throw callbackFailure }
     }
 }
@@ -244,6 +308,14 @@ public protocol NativeImportFactory {
         id: Core.NativeImportID,
         key: Core.NativeImportKey
     ) -> any VM.NativeInvoker
+}
+
+/// Implemented by App code that explicitly exposes one typed async operation.
+public protocol AsyncNativeImportFactory {
+    static func make(
+        id: Core.NativeImportID,
+        key: Core.NativeImportKey
+    ) -> any VM.AsyncNativeInvoker
 }
 
 /// A small concrete invoker for factory implementations that do not need a
@@ -289,6 +361,48 @@ public struct ClosureNativeInvoker: VM.NativeInvoker {
     }
 }
 
+/// Closure-backed async invoker used by generated exact NativeImport adapters.
+public struct ClosureAsyncNativeInvoker: VM.AsyncNativeInvoker {
+    public let id: Core.NativeImportID
+    public let key: Core.NativeImportKey
+    public let parameterTypes: [Bytecode.ValueType]
+    public let resultType: Bytecode.ValueType
+    public let effects: Core.Effects
+    public let contract: Core.NativeImportContract
+    private let body: @Sendable (
+        [VM.Value],
+        VM.NativeInvocationContext
+    ) async throws -> VM.NativeInvocationResult
+
+    public init(
+        id: Core.NativeImportID,
+        key: Core.NativeImportKey,
+        parameterTypes: [Bytecode.ValueType],
+        resultType: Bytecode.ValueType,
+        effects: Core.Effects,
+        contract: Core.NativeImportContract,
+        invoke: @escaping @Sendable (
+            [VM.Value],
+            VM.NativeInvocationContext
+        ) async throws -> VM.NativeInvocationResult
+    ) {
+        self.id = id
+        self.key = key
+        self.parameterTypes = parameterTypes
+        self.resultType = resultType
+        self.effects = effects
+        self.contract = contract
+        body = invoke
+    }
+
+    public func invoke(
+        arguments: [VM.Value],
+        context: VM.NativeInvocationContext
+    ) async throws -> VM.NativeInvocationResult {
+        try await body(arguments, context)
+    }
+}
+
 public struct NativeCatalog: Sendable {
     private let invokers: [Core.NativeImportID: any VM.NativeInvoker]
 
@@ -306,6 +420,11 @@ public struct NativeCatalog: Sendable {
                     "invalid native import \(invoker.id) contract: \(error)"
                 )
             }
+            guard !invoker.effects.isAsync else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "synchronous native import \(invoker.id) has async effects"
+                )
+            }
             guard table.updateValue(invoker, forKey: invoker.id) == nil else {
                 throw VM.RuntimeTrap.nativeFailure("duplicate native import \(invoker.id)")
             }
@@ -318,11 +437,55 @@ public struct NativeCatalog: Sendable {
     }
 }
 
+/// Immutable async NativeImport table. Synchronous and suspending descriptors
+/// can never alias the same execution path inside the interpreter.
+public struct AsyncNativeCatalog: Sendable {
+    private let invokers: [Core.NativeImportID: any VM.AsyncNativeInvoker]
+
+    public init() {
+        invokers = [:]
+    }
+
+    public init(_ invokers: [any VM.AsyncNativeInvoker]) throws {
+        var table: [Core.NativeImportID: any VM.AsyncNativeInvoker] = [:]
+        for invoker in invokers {
+            do {
+                try invoker.contract.validate(effects: invoker.effects)
+            } catch {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "invalid async native import \(invoker.id) contract: \(error)"
+                )
+            }
+            guard invoker.effects.isAsync else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "async native import \(invoker.id) has synchronous effects"
+                )
+            }
+            guard table.updateValue(invoker, forKey: invoker.id) == nil else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "duplicate async native import \(invoker.id)"
+                )
+            }
+        }
+        self.invokers = table
+    }
+
+    public subscript(id: Core.NativeImportID) -> (any VM.AsyncNativeInvoker)? {
+        invokers[id]
+    }
+}
+
 public typealias EntryInvocation = @Sendable (
     _ entry: Core.EntryIndex,
     _ arguments: [VM.Value],
     _ budget: VM.InvocationBudget
 ) -> VM.EntryInvocationResult
+
+public typealias AsyncEntryInvocation = @isolated(any) @Sendable (
+    _ entry: Core.EntryIndex,
+    _ arguments: [VM.Value],
+    _ budget: VM.InvocationBudget
+) async -> VM.EntryInvocationResult
 }
 
 private extension NSLock {

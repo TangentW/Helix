@@ -1280,7 +1280,7 @@ struct Interpreter {
     @Test("MainActor entries fail closed when invoked off the main thread")
     func mainActorEntryRequiresMainThread() async throws {
         let limits = Core.ResourceLimits(maxWallTimeMainThreadMilliseconds: 1_000)
-        let capabilities: Set<Core.Capability> = [.baselineV1, .mainActorSyncV1]
+        let capabilities: Set<Core.Capability> = [.baselineV1, .mainActorIsolationV1]
         let function = Bytecode.Function(
             id: .init(rawValue: 0),
             name: "mainActorIdentity",
@@ -1304,7 +1304,7 @@ struct Interpreter {
             policy: .init(
                 acceptedCapabilities: capabilities,
                 resourceCeiling: limits,
-                allowMainActorSynchronousEntries: true
+                allowMainActorEntries: true
             )
         )
         let input = VM.Value.integer(
@@ -6613,13 +6613,13 @@ struct Interpreter {
         let image = try makeVerified(
             function: root,
             capabilities: [
-                .baselineV1, .closureValuesV1, .mainActorSyncV1,
+                .baselineV1, .closureValuesV1, .mainActorIsolationV1,
             ],
             policy: .init(
                 acceptedCapabilities: [
-                    .baselineV1, .closureValuesV1, .mainActorSyncV1,
+                    .baselineV1, .closureValuesV1, .mainActorIsolationV1,
                 ],
-                allowMainActorSynchronousEntries: true
+                allowMainActorEntries: true
             ),
             additionalFunctions: [closureBody]
         )
@@ -7551,7 +7551,7 @@ struct Interpreter {
             .escapingClosureValuesV1,
         ]
         if restrictToMainActor {
-            capabilities.insert(.mainActorSyncV1)
+            capabilities.insert(.mainActorIsolationV1)
         }
         return try makeVerified(
             function: function,
@@ -7561,7 +7561,7 @@ struct Interpreter {
             policy: .init(
                 acceptedCapabilities: capabilities,
                 allowedNativeImports: [.init(rawValue: 0)],
-                allowMainActorSynchronousEntries: restrictToMainActor
+                allowMainActorEntries: restrictToMainActor
             ),
             signature: .init(parameters: [], result: "Swift.Int"),
             parameterTypes: [],

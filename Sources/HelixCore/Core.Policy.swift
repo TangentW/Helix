@@ -25,8 +25,8 @@ public struct Capability: RawRepresentable, Hashable, Codable, Sendable, Compara
     public static let mutableCapturesV1: Self = "mutable-captures-1"
     public static let nonOwningReferencesV1: Self = "non-owning-references-1"
     public static let compilerSpecializationsV1: Self = "compiler-specializations-1"
-    public static let mainActorSyncV1: Self = "main-actor-sync-1"
-    public static let asyncLeafEntriesV1: Self = "async-leaf-entry-1"
+    public static let mainActorIsolationV1: Self = "main-actor-isolation-1"
+    public static let sequentialAsyncV1: Self = "sequential-async-1"
     public static let anyValuesV1: Self = "swift-any-1"
     public static let localClassesV1: Self = "local-classes-1"
     public static let hostedObjectiveCClassesV1: Self = "hosted-objc-classes-1"
@@ -52,7 +52,7 @@ public struct ResourceLimits: Codable, Hashable, Sendable {
         maxNativeCallsPerEntry: UInt32 = 1_024,
         maxWallTimeMainThreadMilliseconds: UInt32 = 16,
         maxWallTimeBackgroundMilliseconds: UInt32 = 1_000,
-        maxSuspendedFrames: UInt32 = 0
+        maxSuspendedFrames: UInt32 = 64
     ) {
         self.instructionFuelPerEntry = instructionFuelPerEntry
         self.maxCallDepth = maxCallDepth
@@ -91,20 +91,20 @@ public struct RuntimePolicy: Codable, Hashable, Sendable {
     public var acceptedCapabilities: Set<Core.Capability>
     public var resourceCeiling: Core.ResourceLimits
     public var allowedNativeImports: Set<Core.NativeImportID>
-    public var allowMainActorSynchronousEntries: Bool
+    public var allowMainActorEntries: Bool
     public var productionChannelEnabled: Bool
 
     public init(
         acceptedCapabilities: Set<Core.Capability> = [.baselineV1],
         resourceCeiling: Core.ResourceLimits = .init(),
         allowedNativeImports: Set<Core.NativeImportID> = [],
-        allowMainActorSynchronousEntries: Bool = false,
+        allowMainActorEntries: Bool = false,
         productionChannelEnabled: Bool = false
     ) {
         self.acceptedCapabilities = acceptedCapabilities
         self.resourceCeiling = resourceCeiling
         self.allowedNativeImports = allowedNativeImports
-        self.allowMainActorSynchronousEntries = allowMainActorSynchronousEntries
+        self.allowMainActorEntries = allowMainActorEntries
         self.productionChannelEnabled = productionChannelEnabled
     }
 }

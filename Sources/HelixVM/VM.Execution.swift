@@ -56,6 +56,8 @@ public enum RuntimeTrap: Error, Equatable, Sendable, CustomStringConvertible {
     case vmHeapLimitExceeded
     case nativeOwnedMemoryLimitExceeded
     case wallTimeExceeded
+    case suspendedFrameLimitExceeded
+    case executionCancelled
     case nativeFailure(String)
     case sourceFailure(prefix: String, detail: String)
     case explicit(String)
@@ -125,6 +127,8 @@ public enum RuntimeTrap: Error, Equatable, Sendable, CustomStringConvertible {
         case .vmHeapLimitExceeded: "maximum HLVM heap budget exceeded"
         case .nativeOwnedMemoryLimitExceeded: "maximum native-owned memory budget exceeded"
         case .wallTimeExceeded: "HLBC wall-time budget exceeded"
+        case .suspendedFrameLimitExceeded: "maximum suspended HLVM frame count exceeded"
+        case .executionCancelled: "HLBC execution was cancelled"
         case let .nativeFailure(message): "native invocation failed: \(message)"
         case let .sourceFailure(prefix, detail):
             detail.isEmpty ? prefix : "\(prefix): \(detail)"
@@ -177,24 +181,15 @@ public struct TrapDiagnostic: Equatable, Sendable {
 
 public typealias TrapObserver = @Sendable (VM.TrapDiagnostic) -> Void
 
-/// Authorizes the executor prologue that lives in a generated Swift wrapper,
-/// outside HLVM. The async authorization is package-scoped so application code
-/// cannot manufacture it through the public interpreter API.
-public struct RootExecutionContext: Equatable, Sendable {
-    private enum Kind: Equatable, Sendable {
-        case synchronous
-        case generatedAsyncBridge
-        case hostedCallback
-    }
-
-    private let kind: Kind
-
-    public static let synchronous = Self(kind: .synchronous)
-    package static let generatedAsyncBridge = Self(kind: .generatedAsyncBridge)
-    package static let hostedCallback = Self(kind: .hostedCallback)
+/// Identifies who owns values at one interpreter root boundary. Ordinary Shell
+/// calls accept only portable boundary values; Runtime-hosted image callbacks
+/// may re-enter with object identities already owned by the pinned image.
+package enum RootArgumentDomain: Sendable {
+    case shell
+    case hostedImage
 
     var permitsPatchLocalObjectArguments: Bool {
-        kind == .hostedCallback
+        self == .hostedImage
     }
 }
 
@@ -208,9 +203,11 @@ public final class InvocationBudget: @unchecked Sendable {
     private let maximumNativeCalls: UInt32
     private var remainingVMHeapBytes: UInt64
     private var remainingNativeOwnedBytes: UInt64
-    private let deadlineNanoseconds: UInt64
+    private var deadlineNanoseconds: UInt64
     private let nowNanoseconds: @Sendable () -> UInt64
     private var sideEffectsCommittedStorage = false
+    private var cancellationRequested = false
+    private var suspensionStartedNanoseconds: UInt64?
 
     public convenience init(
         limits: Core.ResourceLimits,
@@ -249,6 +246,62 @@ public final class InvocationBudget: @unchecked Sendable {
 
     public func markSideEffectsCommitted() {
         lock.withLock { sideEffectsCommittedStorage = true }
+    }
+
+    /// Requests cooperative cancellation. Async execution checks this before
+    /// suspension, after resumption, and at every ordinary budget checkpoint.
+    public func cancel() {
+        lock.withLock { cancellationRequested = true }
+    }
+
+    /// Verifies that the currently retained HLBC frame stack may cross one
+    /// suspension point. This check is separate from active-time accounting:
+    /// actor hops and nested patched entries retain frames but continue to
+    /// charge root time, while an exact async NativeImport pauses root time.
+    package func checkSuspensionPoint() throws {
+        try lock.withLock {
+            try ensureWithinDeadline()
+            guard currentDepth > 0,
+                  currentDepth <= resourceLimits.maxSuspendedFrames
+            else {
+                throw VM.RuntimeTrap.suspendedFrameLimitExceeded
+            }
+        }
+    }
+
+    package func beginSuspension() throws {
+        try lock.withLock {
+            try ensureWithinDeadline()
+            guard suspensionStartedNanoseconds == nil else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "one invocation attempted nested host suspension"
+                )
+            }
+            guard currentDepth > 0,
+                  currentDepth <= resourceLimits.maxSuspendedFrames else {
+                throw VM.RuntimeTrap.suspendedFrameLimitExceeded
+            }
+            suspensionStartedNanoseconds = nowNanoseconds()
+        }
+    }
+
+    package func endSuspension() throws {
+        try lock.withLock {
+            guard let started = suspensionStartedNanoseconds else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "one invocation resumed without an active suspension"
+                )
+            }
+            suspensionStartedNanoseconds = nil
+            let elapsed = nowNanoseconds().subtractingReportingOverflow(started)
+            guard !elapsed.overflow else { throw VM.RuntimeTrap.wallTimeExceeded }
+            let shifted = deadlineNanoseconds.addingReportingOverflow(
+                elapsed.partialValue
+            )
+            deadlineNanoseconds = shifted.overflow
+                ? UInt64.max : shifted.partialValue
+            try ensureWithinDeadline()
+        }
     }
 
     func consumeInstruction(weight: UInt64 = 1) throws {
@@ -436,10 +489,14 @@ public final class InvocationBudget: @unchecked Sendable {
         isMainThread: Bool = Thread.isMainThread
     ) throws -> VM.NativeInvocationContext {
         try contract.validate(effects: effects)
-        guard !isMainThread || contract.execution.allowsMainThread else {
+        guard effects.isAsync
+                || !isMainThread
+                || contract.execution.allowsMainThread else {
             throw VM.RuntimeTrap.nativeImportThreadViolation(id)
         }
-        guard !effects.requiresMainActor || isMainThread else {
+        guard effects.isAsync
+                || !effects.requiresMainActor
+                || isMainThread else {
             throw VM.RuntimeTrap.mainActorViolation
         }
         return try lock.withLock {
@@ -453,15 +510,18 @@ public final class InvocationBudget: @unchecked Sendable {
                 .multipliedReportingOverflow(by: 1_000)
             let now = nowNanoseconds()
             let candidate = now.addingReportingOverflow(delta.partialValue)
-            let importDeadline = delta.overflow || candidate.overflow
-                ? deadlineNanoseconds
-                : min(deadlineNanoseconds, candidate.partialValue)
+            let exactDeadline = delta.overflow || candidate.overflow
+                ? UInt64.max : candidate.partialValue
+            let importDeadline = contract.execution.deadlineMode == .suspending
+                ? exactDeadline : min(deadlineNanoseconds, exactDeadline)
             return VM.NativeInvocationContext(
                 id: id,
                 budget: self,
                 deadlineNanoseconds: importDeadline,
                 requiresCooperation: contract.execution.deadlineMode == .cooperative,
                 requiresMainActor: effects.requiresMainActor,
+                requiresAsyncMainActorEntry: effects.isAsync
+                    && effects.requiresMainActor,
                 callbacks: contract.callbacks,
                 parameterTypes: parameterTypes,
                 callbackHost: callbackHost
@@ -728,6 +788,16 @@ public final class InvocationBudget: @unchecked Sendable {
     }
 
     private func ensureWithinDeadline() throws {
+        let currentTaskIsCancelled = withUnsafeCurrentTask {
+            $0?.isCancelled ?? false
+        }
+        guard !cancellationRequested, !currentTaskIsCancelled else {
+            throw VM.RuntimeTrap.executionCancelled
+        }
+        // Suspended host time is governed by the exact async NativeImport
+        // deadline. The root budget resumes after its active-time deadline is
+        // shifted by the measured suspension interval.
+        guard suspensionStartedNanoseconds == nil else { return }
         guard nowNanoseconds() <= deadlineNanoseconds else {
             throw VM.RuntimeTrap.wallTimeExceeded
         }

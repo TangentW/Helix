@@ -1855,7 +1855,7 @@ struct NativeImportDiscoveryTests {
         #expect(generated.contains(".invokeResult("))
         #expect(generated.contains("failureResult: {"))
         #expect(generated.contains("Swift.Character(\"\\0\")"))
-        #expect(shell.archive.capabilities.contains(.mainActorSyncV1))
+        #expect(shell.archive.capabilities.contains(.mainActorIsolationV1))
         #expect(generated.contains("(0, false)"))
         let bridge = try #require(
             shell.bridge.sourceFiles["Generated/\(moduleName)Bridge.swift"]
@@ -2614,7 +2614,7 @@ struct NativeImportDiscoveryTests {
             policy: .init(
                 acceptedCapabilities: Set(shell.archive.capabilities),
                 allowedNativeImports: Set(shell.archive.nativeImports.compactMap(\.id)),
-                allowMainActorSynchronousEntries: true
+                allowMainActorEntries: true
             )
         )
     }
@@ -3025,7 +3025,7 @@ struct NativeImportDiscoveryTests {
             policy: .init(
                 acceptedCapabilities: Set(shell.archive.capabilities),
                 allowedNativeImports: Set(shell.archive.nativeImports.compactMap(\.id)),
-                allowMainActorSynchronousEntries: true
+                allowMainActorEntries: true
             )
         )
     }

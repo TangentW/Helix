@@ -277,7 +277,7 @@ public struct Indexer: Sendable {
         if records.contains(where: {
             $0.patchability.isEligible && $0.effects.isAsync
         }) {
-            capabilities.insert(.asyncLeafEntriesV1)
+            capabilities.insert(.sequentialAsyncV1)
         }
         if imports.contains(where: \.isEmittedToDevice) { capabilities.insert(.nativeImportsV1) }
         if request.nativeTypes.contains(where: \.isEmittedToDevice) { capabilities.insert(.nativeTypesV1) }
@@ -293,7 +293,7 @@ public struct Indexer: Sendable {
                             where: containsMainActorClosure
                         ))
             }) {
-            capabilities.insert(.mainActorSyncV1)
+            capabilities.insert(.mainActorIsolationV1)
         }
 
         var metadata = request.metadata

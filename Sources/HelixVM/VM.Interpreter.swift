@@ -5,7 +5,7 @@ import HelixCore
 import HelixVerifier
 #endif
 
-private final class ExecutionTrace {
+private final class ExecutionTrace: @unchecked Sendable {
     var programCounter: VM.ProgramCounter?
 }
 
@@ -54,8 +54,32 @@ private struct FrameCall {
     var continuation: CallContinuation
 }
 
+private enum BoundaryCallTarget {
+    case entry(Core.EntryIndex)
+    case nativeImport(Core.NativeImportID)
+}
+
+private struct BoundaryCall {
+    var target: BoundaryCallTarget
+    var arguments: [VM.Value]
+    var continuation: CallContinuation
+}
+
+private struct NativeCallDescriptor {
+    var parameterTypes: [Bytecode.ValueType]
+    var parameterConventions: [Bytecode.ParameterConvention]
+    var resultType: Bytecode.ValueType
+    var effects: Core.Effects
+}
+
+private struct ShellEntryCall {
+    var logicalArguments: [VM.Value]
+    var writebackAddresses: [UInt32: VM.Address]
+}
+
 private enum FrameOutcome {
     case call(FrameCall)
+    case boundary(BoundaryCall)
     case returned(VM.Value?)
 }
 
@@ -65,26 +89,44 @@ private struct RootWritebackRegion {
     var pointee: Bytecode.ValueType
 }
 
+private enum RootInvocationMode {
+    case synchronous
+    case asynchronous
+}
+
+private struct PreparedRootInvocation {
+    var functions: [Bytecode.FunctionID: Bytecode.Function]
+    var localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition]
+    var budget: VM.InvocationBudget
+    var physicalArguments: [VM.Value]
+}
+
 extension VM {
 public struct Interpreter: Sendable {
     public var nativeCatalog: VM.NativeCatalog
+    public var asyncNativeCatalog: VM.AsyncNativeCatalog
     public var nativeTypeCatalog: VM.NativeTypeCatalog
     public var entryInvocation: VM.EntryInvocation?
+    public var asyncEntryInvocation: VM.AsyncEntryInvocation?
     public var objectHost: VM.ObjectHost?
     public var nativeCallbackHost: VM.NativeCallbackHost?
     public var trapObserver: VM.TrapObserver?
 
     public init(
         nativeCatalog: VM.NativeCatalog = .init(),
+        asyncNativeCatalog: VM.AsyncNativeCatalog = .init(),
         nativeTypeCatalog: VM.NativeTypeCatalog = .init(),
         entryInvocation: VM.EntryInvocation? = nil,
+        asyncEntryInvocation: VM.AsyncEntryInvocation? = nil,
         objectHost: VM.ObjectHost? = nil,
         nativeCallbackHost: VM.NativeCallbackHost? = nil,
         trapObserver: VM.TrapObserver? = nil
     ) {
         self.nativeCatalog = nativeCatalog
+        self.asyncNativeCatalog = asyncNativeCatalog
         self.nativeTypeCatalog = nativeTypeCatalog
         self.entryInvocation = entryInvocation
+        self.asyncEntryInvocation = asyncEntryInvocation
         self.objectHost = objectHost
         self.nativeCallbackHost = nativeCallbackHost
         self.trapObserver = trapObserver
@@ -94,8 +136,7 @@ public struct Interpreter: Sendable {
         entry: Core.EntryIndex,
         image: Verification.Image,
         arguments: [VM.Value],
-        budget: VM.InvocationBudget? = nil,
-        rootContext: VM.RootExecutionContext = .synchronous
+        budget: VM.InvocationBudget? = nil
     ) -> VM.ExecutionResult {
         guard let mapping = image.module.entries.first(where: { $0.entryIndex == entry }) else {
             let trap = VM.RuntimeTrap.unknownEntry(entry)
@@ -106,8 +147,7 @@ public struct Interpreter: Sendable {
             function: mapping.functionID,
             image: image,
             arguments: arguments,
-            budget: budget,
-            rootContext: rootContext
+            budget: budget
         )
     }
 
@@ -115,8 +155,7 @@ public struct Interpreter: Sendable {
         entry: Core.EntryIndex,
         image: Verification.Image,
         arguments: [VM.Value],
-        budget: VM.InvocationBudget? = nil,
-        rootContext: VM.RootExecutionContext = .synchronous
+        budget: VM.InvocationBudget? = nil
     ) -> VM.EntryInvocationResult {
         guard let mapping = image.module.entries.first(where: {
             $0.entryIndex == entry
@@ -129,8 +168,7 @@ public struct Interpreter: Sendable {
             function: mapping.functionID,
             image: image,
             arguments: arguments,
-            budget: budget,
-            rootContext: rootContext
+            budget: budget
         )
     }
 
@@ -138,8 +176,7 @@ public struct Interpreter: Sendable {
         function: Bytecode.FunctionID,
         image: Verification.Image,
         arguments: [VM.Value],
-        budget: VM.InvocationBudget? = nil,
-        rootContext: VM.RootExecutionContext = .synchronous
+        budget: VM.InvocationBudget? = nil
     ) -> VM.ExecutionResult {
         if image.module.functions.first(where: { $0.id == function })?
             .parameterConventions.contains(.inout) == true {
@@ -153,12 +190,81 @@ public struct Interpreter: Sendable {
             function: function,
             image: image,
             arguments: arguments,
-            budget: budget,
-            rootContext: rootContext
+            budget: budget
         )
         guard invocation.writebacks.isEmpty else {
             return .trapped(.explicit(
                 "an inout Shell entry requires the writeback-aware invocation API"
+            ))
+        }
+        return invocation.outcome
+    }
+
+    public func invokeAsync(
+        entry: Core.EntryIndex,
+        image: Verification.Image,
+        arguments: [VM.Value],
+        budget: VM.InvocationBudget? = nil
+    ) async -> VM.ExecutionResult {
+        guard let mapping = image.module.entries.first(where: {
+            $0.entryIndex == entry
+        }) else {
+            let trap = VM.RuntimeTrap.unknownEntry(entry)
+            trapObserver?(.init(trap: trap, programCounter: nil))
+            return .trapped(trap)
+        }
+        return await invokeAsync(
+            function: mapping.functionID,
+            image: image,
+            arguments: arguments,
+            budget: budget
+        )
+    }
+
+    public func invokeEntryAsync(
+        entry: Core.EntryIndex,
+        image: Verification.Image,
+        arguments: [VM.Value],
+        budget: VM.InvocationBudget? = nil
+    ) async -> VM.EntryInvocationResult {
+        guard let mapping = image.module.entries.first(where: {
+            $0.entryIndex == entry
+        }) else {
+            let trap = VM.RuntimeTrap.unknownEntry(entry)
+            trapObserver?(.init(trap: trap, programCounter: nil))
+            return .trapped(trap)
+        }
+        return await invokeEntryAsync(
+            function: mapping.functionID,
+            image: image,
+            arguments: arguments,
+            budget: budget
+        )
+    }
+
+    public func invokeAsync(
+        function: Bytecode.FunctionID,
+        image: Verification.Image,
+        arguments: [VM.Value],
+        budget: VM.InvocationBudget? = nil
+    ) async -> VM.ExecutionResult {
+        guard image.module.functions.first(where: { $0.id == function })?
+            .parameterConventions.contains(.inout) != true else {
+            let trap = VM.RuntimeTrap.explicit(
+                "an async Shell entry cannot expose inout writeback"
+            )
+            trapObserver?(.init(trap: trap, programCounter: nil))
+            return .trapped(trap)
+        }
+        let invocation = await invokeEntryAsync(
+            function: function,
+            image: image,
+            arguments: arguments,
+            budget: budget
+        )
+        guard invocation.writebacks.isEmpty else {
+            return .trapped(.explicit(
+                "an async Shell entry returned forbidden writeback"
             ))
         }
         return invocation.outcome
@@ -172,137 +278,29 @@ public struct Interpreter: Sendable {
         image: Verification.Image,
         arguments: [VM.Value],
         budget: VM.InvocationBudget? = nil,
-        rootContext: VM.RootExecutionContext = .synchronous
+        argumentDomain: VM.RootArgumentDomain = .shell
     ) -> VM.EntryInvocationResult {
         let trace = ExecutionTrace()
         var writebackRegions: [RootWritebackRegion] = []
         do {
-            try validate(image: image)
-            let resolvedBudget = budget ?? VM.InvocationBudget(limits: image.effectiveResourceLimits)
-            let functions = Dictionary(uniqueKeysWithValues: image.module.functions.map { ($0.id, $0) })
-            let localTypes = Dictionary(
-                uniqueKeysWithValues: image.module.localTypes.map { ($0.key, $0) }
+            let prepared = try prepareRootInvocation(
+                function: function,
+                image: image,
+                arguments: arguments,
+                budget: budget,
+                argumentDomain: argumentDomain,
+                mode: .synchronous,
+                writebackRegions: &writebackRegions
             )
-            guard let rootFunction = functions[function] else {
-                throw VM.RuntimeTrap.unknownFunction(function)
-            }
-            guard !rootFunction.effects.isAsync
-                    || rootContext == .generatedAsyncBridge
-            else {
-                throw VM.RuntimeTrap.explicit(
-                    "async HLBC entry requires its generated Swift async Bridge"
-                )
-            }
-            guard !rootFunction.effects.requiresMainActor || Thread.isMainThread else {
-                throw VM.RuntimeTrap.mainActorViolation
-            }
-            guard rootFunction.parameterConventions.count
-                    == rootFunction.parameterRegisters.count,
-                  arguments.count == rootFunction.parameterRegisters.count
-            else {
-                throw VM.RuntimeTrap.typeMismatch(
-                    expected: .tuple(
-                        rootFunction.parameterRegisters.compactMap {
-                            rootFunction.type(of: $0)
-                        }
-                    ),
-                    actual: .tuple(arguments.map(\.type))
-                )
-            }
-
-            let inoutCount = rootFunction.parameterConventions.reduce(into: 0) {
-                if $1 == .inout { $0 += 1 }
-            }
-            guard inoutCount <= 1 else {
-                throw VM.RuntimeTrap.explicit(
-                    "a Shell entry may expose at most one inout writeback region"
-                )
-            }
-
-            var physicalArguments: [VM.Value] = []
-            physicalArguments.reserveCapacity(arguments.count)
-            for parameterIndex in rootFunction.parameterRegisters.indices {
-                let register = rootFunction.parameterRegisters[parameterIndex]
-                let convention = rootFunction.parameterConventions[parameterIndex]
-                let value = arguments[parameterIndex]
-                guard let physicalType = rootFunction.type(of: register) else {
-                    throw VM.RuntimeTrap.invalidProgramCounter
-                }
-                let logicalType: Bytecode.ValueType
-                switch convention {
-                case .owned, .borrowed:
-                    guard !isInternalStorageType(physicalType) else {
-                        throw VM.RuntimeTrap.explicit(
-                            "internal storage values cannot cross the root invocation boundary"
-                        )
-                    }
-                    logicalType = physicalType
-                case .inout:
-                    guard case let .address(pointee) = physicalType,
-                          !isInternalStorageType(pointee)
-                    else {
-                        throw VM.RuntimeTrap.explicit(
-                            "a root inout parameter must be one logical value address"
-                        )
-                    }
-                    logicalType = pointee
-                }
-
-                if case .object = value,
-                   rootContext.permitsPatchLocalObjectArguments {
-                    // The Runtime reconstructed this identity from storage
-                    // already owned by the pinned image; no boundary heap was
-                    // introduced, but the validation work still consumes fuel.
-                    try resolvedBudget.consumeWork(units: 1)
-                } else {
-                    try resolvedBudget.consumeBoundaryValue(value)
-                }
-                try validateRuntimeValue(
-                    value,
-                    expected: logicalType,
-                    localTypes: localTypes,
-                    budget: resolvedBudget
-                )
-                try resolvedBudget.checkDeadline()
-
-                switch convention {
-                case .owned, .borrowed:
-                    physicalArguments.append(value)
-                case .inout:
-                    guard let parameterIndex = UInt32(exactly: parameterIndex) else {
-                        throw VM.RuntimeTrap.vmHeapLimitExceeded
-                    }
-                    let cell = VM.MemoryCell(
-                        value,
-                        storageShape: try storageShape(
-                            logicalType,
-                            localTypes: localTypes
-                        )
-                    )
-                    let address = try VM.Address(
-                        cell: cell,
-                        pointee: logicalType
-                    ).begin(.modify)
-                    writebackRegions.append(
-                        .init(
-                            parameterIndex: parameterIndex,
-                            address: address,
-                            pointee: logicalType
-                        )
-                    )
-                    physicalArguments.append(.address(address))
-                }
-            }
-
             let outcome: VM.ExecutionResult
             do {
                 let value = try execute(
                     functionID: function,
-                    functions: functions,
-                    arguments: physicalArguments,
+                    functions: prepared.functions,
+                    arguments: prepared.physicalArguments,
                     entries: image.shell.entries,
-                    localTypes: localTypes,
-                    budget: resolvedBudget,
+                    localTypes: prepared.localTypes,
+                    budget: prepared.budget,
                     trace: trace
                 )
                 outcome = .returned(value)
@@ -312,8 +310,8 @@ public struct Interpreter: Sendable {
             return try finishRootInvocation(
                 outcome,
                 regions: &writebackRegions,
-                localTypes: localTypes,
-                budget: resolvedBudget
+                localTypes: prepared.localTypes,
+                budget: prepared.budget
             )
         } catch let trap as VM.RuntimeTrap {
             discardRootWritebackRegions(&writebackRegions)
@@ -325,6 +323,226 @@ public struct Interpreter: Sendable {
             trapObserver?(.init(trap: trap, programCounter: trace.programCounter))
             return .trapped(trap)
         }
+    }
+
+    package func invokeEntryAsync(
+        function: Bytecode.FunctionID,
+        image: Verification.Image,
+        arguments: [VM.Value],
+        budget: VM.InvocationBudget? = nil,
+        argumentDomain: VM.RootArgumentDomain = .shell
+    ) async -> VM.EntryInvocationResult {
+        let trace = ExecutionTrace()
+        var writebackRegions: [RootWritebackRegion] = []
+        do {
+            let prepared = try prepareRootInvocation(
+                function: function,
+                image: image,
+                arguments: arguments,
+                budget: budget,
+                argumentDomain: argumentDomain,
+                mode: .asynchronous,
+                writebackRegions: &writebackRegions
+            )
+            let outcome: VM.ExecutionResult
+            do {
+                let root = prepared.functions[function]!
+                let value: VM.Value?
+                if root.effects.requiresMainActor {
+                    value = try await executeAsync(
+                        isolation: MainActor.shared,
+                        functionID: function,
+                        functions: prepared.functions,
+                        arguments: prepared.physicalArguments,
+                        entries: image.shell.entries,
+                        localTypes: prepared.localTypes,
+                        budget: prepared.budget,
+                        trace: trace
+                    )
+                } else {
+                    value = try await executeAsync(
+                        isolation: nil,
+                        functionID: function,
+                        functions: prepared.functions,
+                        arguments: prepared.physicalArguments,
+                        entries: image.shell.entries,
+                        localTypes: prepared.localTypes,
+                        budget: prepared.budget,
+                        trace: trace
+                    )
+                }
+                outcome = .returned(value)
+            } catch let business as VM.BusinessError {
+                outcome = .businessError(business.message)
+            }
+            return try finishRootInvocation(
+                outcome,
+                regions: &writebackRegions,
+                localTypes: prepared.localTypes,
+                budget: prepared.budget
+            )
+        } catch let trap as VM.RuntimeTrap {
+            discardRootWritebackRegions(&writebackRegions)
+            trapObserver?(.init(trap: trap, programCounter: trace.programCounter))
+            return .trapped(trap)
+        } catch {
+            discardRootWritebackRegions(&writebackRegions)
+            let trap = VM.RuntimeTrap.nativeFailure(String(describing: error))
+            trapObserver?(.init(trap: trap, programCounter: trace.programCounter))
+            return .trapped(trap)
+        }
+    }
+
+    private func prepareRootInvocation(
+        function: Bytecode.FunctionID,
+        image: Verification.Image,
+        arguments: [VM.Value],
+        budget: VM.InvocationBudget?,
+        argumentDomain: VM.RootArgumentDomain,
+        mode: RootInvocationMode,
+        writebackRegions: inout [RootWritebackRegion]
+    ) throws -> PreparedRootInvocation {
+        try validate(image: image)
+        let functions = Dictionary(
+            uniqueKeysWithValues: image.module.functions.map { ($0.id, $0) }
+        )
+        let localTypes = Dictionary(
+            uniqueKeysWithValues: image.module.localTypes.map { ($0.key, $0) }
+        )
+        guard let rootFunction = functions[function] else {
+            throw VM.RuntimeTrap.unknownFunction(function)
+        }
+        switch mode {
+        case .synchronous:
+            guard !rootFunction.effects.isAsync else {
+                throw VM.RuntimeTrap.explicit(
+                    "async HLBC entry requires the async invocation API"
+                )
+            }
+            guard !rootFunction.effects.requiresMainActor
+                    || Thread.isMainThread else {
+                throw VM.RuntimeTrap.mainActorViolation
+            }
+        case .asynchronous:
+            guard rootFunction.effects.isAsync else {
+                throw VM.RuntimeTrap.explicit(
+                    "the async invocation API requires an async HLBC entry"
+                )
+            }
+            guard !rootFunction.parameterConventions.contains(.inout) else {
+                throw VM.RuntimeTrap.explicit(
+                    "an async Shell entry cannot expose inout writeback"
+                )
+            }
+        }
+        let startsOnMainThread: Bool = switch mode {
+        case .synchronous: Thread.isMainThread
+        case .asynchronous: rootFunction.effects.requiresMainActor
+        }
+        let resolvedBudget = budget ?? VM.InvocationBudget(
+            limits: image.effectiveResourceLimits,
+            isMainThread: startsOnMainThread
+        )
+        guard rootFunction.parameterConventions.count
+                == rootFunction.parameterRegisters.count,
+              arguments.count == rootFunction.parameterRegisters.count
+        else {
+            throw VM.RuntimeTrap.typeMismatch(
+                expected: .tuple(
+                    rootFunction.parameterRegisters.compactMap {
+                        rootFunction.type(of: $0)
+                    }
+                ),
+                actual: .tuple(arguments.map(\.type))
+            )
+        }
+
+        let inoutCount = rootFunction.parameterConventions.reduce(into: 0) {
+            if $1 == .inout { $0 += 1 }
+        }
+        guard inoutCount <= 1 else {
+            throw VM.RuntimeTrap.explicit(
+                "a Shell entry may expose at most one inout writeback region"
+            )
+        }
+
+        var physicalArguments: [VM.Value] = []
+        physicalArguments.reserveCapacity(arguments.count)
+        for parameterIndex in rootFunction.parameterRegisters.indices {
+            let register = rootFunction.parameterRegisters[parameterIndex]
+            let convention = rootFunction.parameterConventions[parameterIndex]
+            let value = arguments[parameterIndex]
+            guard let physicalType = rootFunction.type(of: register) else {
+                throw VM.RuntimeTrap.invalidProgramCounter
+            }
+            let logicalType: Bytecode.ValueType
+            switch convention {
+            case .owned, .borrowed:
+                guard !isInternalStorageType(physicalType) else {
+                    throw VM.RuntimeTrap.explicit(
+                        "internal storage values cannot cross the root invocation boundary"
+                    )
+                }
+                logicalType = physicalType
+            case .inout:
+                guard case let .address(pointee) = physicalType,
+                      !isInternalStorageType(pointee)
+                else {
+                    throw VM.RuntimeTrap.explicit(
+                        "a root inout parameter must be one logical value address"
+                    )
+                }
+                logicalType = pointee
+            }
+
+            if case .object = value,
+               argumentDomain.permitsPatchLocalObjectArguments {
+                try resolvedBudget.consumeWork(units: 1)
+            } else {
+                try resolvedBudget.consumeBoundaryValue(value)
+            }
+            try validateRuntimeValue(
+                value,
+                expected: logicalType,
+                localTypes: localTypes,
+                budget: resolvedBudget
+            )
+            try resolvedBudget.checkDeadline()
+
+            switch convention {
+            case .owned, .borrowed:
+                physicalArguments.append(value)
+            case .inout:
+                guard let parameterIndex = UInt32(exactly: parameterIndex) else {
+                    throw VM.RuntimeTrap.vmHeapLimitExceeded
+                }
+                let cell = VM.MemoryCell(
+                    value,
+                    storageShape: try storageShape(
+                        logicalType,
+                        localTypes: localTypes
+                    )
+                )
+                let address = try VM.Address(
+                    cell: cell,
+                    pointee: logicalType
+                ).begin(.modify)
+                writebackRegions.append(
+                    .init(
+                        parameterIndex: parameterIndex,
+                        address: address,
+                        pointee: logicalType
+                    )
+                )
+                physicalArguments.append(.address(address))
+            }
+        }
+        return .init(
+            functions: functions,
+            localTypes: localTypes,
+            budget: resolvedBudget,
+            physicalArguments: physicalArguments
+        )
     }
 
     private func finishRootInvocation(
@@ -625,16 +843,38 @@ public struct Interpreter: Sendable {
             guard let expected = image.shell.imports[requirement.id] else {
                 throw VM.RuntimeTrap.unknownNativeImport(requirement.id)
             }
-            guard let invoker = nativeCatalog[requirement.id] else {
-                throw VM.RuntimeTrap.unknownNativeImport(requirement.id)
-            }
-            guard invoker.key == expected.key,
-                  invoker.parameterTypes == expected.parameterTypes,
-                  invoker.resultType == expected.resultType,
-                  invoker.effects == expected.effects,
-                  invoker.contract == expected.contract
-            else {
-                throw VM.RuntimeTrap.nativeImportDescriptorMismatch(requirement.id)
+            if expected.effects.isAsync {
+                guard nativeCatalog[requirement.id] == nil,
+                      let invoker = asyncNativeCatalog[requirement.id]
+                else {
+                    throw VM.RuntimeTrap.unknownNativeImport(requirement.id)
+                }
+                guard invoker.key == expected.key,
+                      invoker.parameterTypes == expected.parameterTypes,
+                      invoker.resultType == expected.resultType,
+                      invoker.effects == expected.effects,
+                      invoker.contract == expected.contract
+                else {
+                    throw VM.RuntimeTrap.nativeImportDescriptorMismatch(
+                        requirement.id
+                    )
+                }
+            } else {
+                guard asyncNativeCatalog[requirement.id] == nil,
+                      let invoker = nativeCatalog[requirement.id]
+                else {
+                    throw VM.RuntimeTrap.unknownNativeImport(requirement.id)
+                }
+                guard invoker.key == expected.key,
+                      invoker.parameterTypes == expected.parameterTypes,
+                      invoker.resultType == expected.resultType,
+                      invoker.effects == expected.effects,
+                      invoker.contract == expected.contract
+                else {
+                    throw VM.RuntimeTrap.nativeImportDescriptorMismatch(
+                        requirement.id
+                    )
+                }
             }
         }
 
@@ -740,39 +980,25 @@ public struct Interpreter: Sendable {
                     trace: trace
                 )
             } catch let business as VM.BusinessError {
-                budget.leaveFrame()
-                activeFrameCount -= 1
-
-                let pendingError = business
-                var didFindHandler = false
-                while let caller = suspended.popLast() {
-                    current = caller.frame
-                    switch caller.continuation {
-                    case .returning:
-                        budget.leaveFrame()
-                        activeFrameCount -= 1
-                    case let .throwing(_, errorTarget, programCounter):
-                        trace.programCounter = programCounter
-                        try transferBusinessError(
-                            pendingError,
-                            to: current.blocks[errorTarget]!,
-                            function: current.function,
-                            registers: &current.registers,
-                            localTypes: localTypes,
-                            budget: budget
-                        )
-                        current.currentBlock = errorTarget
-                        current.instructionOffset = 0
-                        didFindHandler = true
-                    }
-                    if didFindHandler { break }
-                }
-                guard didFindHandler else { throw pendingError }
+                try unwindBusinessError(
+                    business,
+                    current: &current,
+                    suspended: &suspended,
+                    activeFrameCount: &activeFrameCount,
+                    localTypes: localTypes,
+                    budget: budget,
+                    trace: trace
+                )
                 continue
             }
 
             switch outcome {
             case let .call(call):
+                guard functions[call.functionID]?.effects.isAsync != true else {
+                    throw VM.RuntimeTrap.explicit(
+                        "synchronous HLVM execution reached an async image function"
+                    )
+                }
                 let callee = try makeFrame(
                     functionID: call.functionID,
                     functions: functions,
@@ -785,6 +1011,34 @@ public struct Interpreter: Sendable {
                     SuspendedFrame(frame: current, continuation: call.continuation)
                 )
                 current = callee
+
+            case let .boundary(call):
+                do {
+                    try resumeBoundaryCall(
+                        try invokeBoundarySynchronously(
+                            call.target,
+                            arguments: call.arguments,
+                            entries: entries,
+                            localTypes: localTypes,
+                            budget: budget
+                        ),
+                        continuation: call.continuation,
+                        frame: current,
+                        localTypes: localTypes,
+                        budget: budget,
+                        trace: trace
+                    )
+                } catch let business as VM.BusinessError {
+                    try unwindBusinessError(
+                        business,
+                        current: &current,
+                        suspended: &suspended,
+                        activeFrameCount: &activeFrameCount,
+                        localTypes: localTypes,
+                        budget: budget,
+                        trace: trace
+                    )
+                }
 
             case let .returned(value):
                 budget.leaveFrame()
@@ -816,6 +1070,459 @@ public struct Interpreter: Sendable {
                     current.instructionOffset = 0
                 }
             }
+        }
+    }
+
+    private func executeAsync(
+        isolation: isolated (any Actor)?,
+        functionID: Bytecode.FunctionID,
+        functions: [Bytecode.FunctionID: Bytecode.Function],
+        arguments: [VM.Value],
+        entries: [Core.EntryIndex: Verification.ResolvedEntry],
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
+        budget: VM.InvocationBudget,
+        trace: ExecutionTrace
+    ) async throws -> VM.Value? {
+        _ = isolation
+        guard let root = functions[functionID], root.effects.isAsync else {
+            throw VM.RuntimeTrap.explicit(
+                "async execution requires an async image function"
+            )
+        }
+        let runsOnMainActor = root.effects.requiresMainActor
+        var current = try makeFrame(
+            functionID: functionID,
+            functions: functions,
+            arguments: arguments,
+            localTypes: localTypes,
+            budget: budget
+        )
+        var suspended: [SuspendedFrame] = []
+        var activeFrameCount = 1
+        defer {
+            while activeFrameCount > 0 {
+                budget.leaveFrame()
+                activeFrameCount -= 1
+            }
+        }
+
+        while true {
+            let outcome: FrameOutcome
+            do {
+                outcome = try executeFrame(
+                    current,
+                    functions: functions,
+                    entries: entries,
+                    localTypes: localTypes,
+                    budget: budget,
+                    trace: trace
+                )
+            } catch let business as VM.BusinessError {
+                try unwindBusinessError(
+                    business,
+                    current: &current,
+                    suspended: &suspended,
+                    activeFrameCount: &activeFrameCount,
+                    localTypes: localTypes,
+                    budget: budget,
+                    trace: trace
+                )
+                continue
+            }
+
+            switch outcome {
+            case let .call(call):
+                guard let calleeFunction = functions[call.functionID] else {
+                    throw VM.RuntimeTrap.unknownFunction(call.functionID)
+                }
+                if calleeFunction.effects.isAsync,
+                   calleeFunction.effects.requiresMainActor != runsOnMainActor {
+                    do {
+                        try budget.checkSuspensionPoint()
+                        let value: VM.Value?
+                        if calleeFunction.effects.requiresMainActor {
+                            value = try await executeAsync(
+                                isolation: MainActor.shared,
+                                functionID: call.functionID,
+                                functions: functions,
+                                arguments: call.arguments,
+                                entries: entries,
+                                localTypes: localTypes,
+                                budget: budget,
+                                trace: trace
+                            )
+                        } else {
+                            value = try await executeAsync(
+                                isolation: nil,
+                                functionID: call.functionID,
+                                functions: functions,
+                                arguments: call.arguments,
+                                entries: entries,
+                                localTypes: localTypes,
+                                budget: budget,
+                                trace: trace
+                            )
+                        }
+                        try budget.checkDeadline()
+                        try resumeBoundaryCall(
+                            .returned(value),
+                            continuation: call.continuation,
+                            frame: current,
+                            localTypes: localTypes,
+                            budget: budget,
+                            trace: trace
+                        )
+                    } catch let business as VM.BusinessError {
+                        do {
+                            try resumeImageCallError(
+                                business,
+                                continuation: call.continuation,
+                                frame: current,
+                                localTypes: localTypes,
+                                budget: budget,
+                                trace: trace
+                            )
+                        } catch let propagated as VM.BusinessError {
+                            try unwindBusinessError(
+                                propagated,
+                                current: &current,
+                                suspended: &suspended,
+                                activeFrameCount: &activeFrameCount,
+                                localTypes: localTypes,
+                                budget: budget,
+                                trace: trace
+                            )
+                        }
+                    }
+                } else {
+                    guard !calleeFunction.effects.requiresMainActor
+                            || runsOnMainActor else {
+                        throw VM.RuntimeTrap.mainActorViolation
+                    }
+                    let callee = try makeFrame(
+                        functionID: call.functionID,
+                        functions: functions,
+                        arguments: call.arguments,
+                        localTypes: localTypes,
+                        budget: budget
+                    )
+                    activeFrameCount += 1
+                    suspended.append(
+                        .init(frame: current, continuation: call.continuation)
+                    )
+                    current = callee
+                }
+
+            case let .boundary(call):
+                do {
+                    let effects = try boundaryEffects(
+                        call.target,
+                        entries: entries
+                    )
+                    let result: VM.ExecutionResult
+                    if effects.isAsync {
+                        result = try await invokeBoundaryAsynchronously(
+                            call.target,
+                            arguments: call.arguments,
+                            entries: entries,
+                            localTypes: localTypes,
+                            budget: budget
+                        )
+                    } else {
+                        result = try invokeBoundarySynchronously(
+                            call.target,
+                            arguments: call.arguments,
+                            entries: entries,
+                            localTypes: localTypes,
+                            budget: budget
+                        )
+                    }
+                    try resumeBoundaryCall(
+                        result,
+                        continuation: call.continuation,
+                        frame: current,
+                        localTypes: localTypes,
+                        budget: budget,
+                        trace: trace
+                    )
+                } catch let business as VM.BusinessError {
+                    try unwindBusinessError(
+                        business,
+                        current: &current,
+                        suspended: &suspended,
+                        activeFrameCount: &activeFrameCount,
+                        localTypes: localTypes,
+                        budget: budget,
+                        trace: trace
+                    )
+                }
+
+            case let .returned(value):
+                budget.leaveFrame()
+                activeFrameCount -= 1
+                guard let caller = suspended.popLast() else { return value }
+                current = caller.frame
+                try resumeBoundaryCall(
+                    .returned(value),
+                    continuation: caller.continuation,
+                    frame: current,
+                    localTypes: localTypes,
+                    budget: budget,
+                    trace: trace
+                )
+            }
+        }
+    }
+
+    private func resumeImageCallError(
+        _ business: VM.BusinessError,
+        continuation: CallContinuation,
+        frame: ExecutionFrame,
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
+        budget: VM.InvocationBudget,
+        trace: ExecutionTrace
+    ) throws {
+        switch continuation {
+        case .returning:
+            throw business
+        case let .throwing(_, errorTarget, programCounter):
+            trace.programCounter = programCounter
+            try transferBusinessError(
+                business,
+                to: frame.blocks[errorTarget]!,
+                function: frame.function,
+                registers: &frame.registers,
+                localTypes: localTypes,
+                budget: budget
+            )
+            frame.currentBlock = errorTarget
+            frame.instructionOffset = 0
+        }
+    }
+
+    private func unwindBusinessError(
+        _ business: VM.BusinessError,
+        current: inout ExecutionFrame,
+        suspended: inout [SuspendedFrame],
+        activeFrameCount: inout Int,
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
+        budget: VM.InvocationBudget,
+        trace: ExecutionTrace
+    ) throws {
+        budget.leaveFrame()
+        activeFrameCount -= 1
+        while let caller = suspended.popLast() {
+            current = caller.frame
+            switch caller.continuation {
+            case .returning:
+                budget.leaveFrame()
+                activeFrameCount -= 1
+            case let .throwing(_, errorTarget, programCounter):
+                trace.programCounter = programCounter
+                try transferBusinessError(
+                    business,
+                    to: current.blocks[errorTarget]!,
+                    function: current.function,
+                    registers: &current.registers,
+                    localTypes: localTypes,
+                    budget: budget
+                )
+                current.currentBlock = errorTarget
+                current.instructionOffset = 0
+                return
+            }
+        }
+        throw business
+    }
+
+    private func resumeBoundaryCall(
+        _ outcome: VM.ExecutionResult,
+        continuation: CallContinuation,
+        frame: ExecutionFrame,
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
+        budget: VM.InvocationBudget,
+        trace: ExecutionTrace
+    ) throws {
+        switch outcome {
+        case let .returned(value):
+            switch continuation {
+            case let .returning(result, programCounter):
+                trace.programCounter = programCounter
+                try storeCallResult(
+                    value,
+                    in: result,
+                    function: frame.function,
+                    registers: &frame.registers,
+                    localTypes: localTypes,
+                    budget: budget
+                )
+            case let .throwing(normalTarget, _, programCounter):
+                trace.programCounter = programCounter
+                try transferCallOutcome(
+                    value,
+                    to: frame.blocks[normalTarget]!,
+                    function: frame.function,
+                    registers: &frame.registers,
+                    localTypes: localTypes,
+                    budget: budget
+                )
+                frame.currentBlock = normalTarget
+                frame.instructionOffset = 0
+            }
+        case let .businessError(message):
+            let business = VM.BusinessError(
+                message: message,
+                requiresBoundaryCharge: true
+            )
+            switch continuation {
+            case .returning:
+                throw business
+            case let .throwing(_, errorTarget, programCounter):
+                trace.programCounter = programCounter
+                try transferBusinessError(
+                    business,
+                    to: frame.blocks[errorTarget]!,
+                    function: frame.function,
+                    registers: &frame.registers,
+                    localTypes: localTypes,
+                    budget: budget
+                )
+                frame.currentBlock = errorTarget
+                frame.instructionOffset = 0
+            }
+        case let .trapped(trap):
+            throw trap
+        }
+    }
+
+    private func invokeBoundarySynchronously(
+        _ target: BoundaryCallTarget,
+        arguments: [VM.Value],
+        entries: [Core.EntryIndex: Verification.ResolvedEntry],
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
+        budget: VM.InvocationBudget
+    ) throws -> VM.ExecutionResult {
+        switch target {
+        case let .entry(entry):
+            guard let descriptor = entries[entry] else {
+                throw VM.RuntimeTrap.unknownEntry(entry)
+            }
+            guard !descriptor.effects.isAsync else {
+                throw VM.RuntimeTrap.explicit(
+                    "synchronous HLVM execution reached an async Shell entry"
+                )
+            }
+            guard let entryInvocation else {
+                throw VM.RuntimeTrap.unknownEntry(entry)
+            }
+            return try invokeShellEntry(
+                entryInvocation,
+                entry: entry,
+                arguments: arguments,
+                descriptor: descriptor,
+                localTypes: localTypes,
+                budget: budget
+            )
+        case let .nativeImport(importID):
+            guard let invoker = nativeCatalog[importID] else {
+                if asyncNativeCatalog[importID] != nil {
+                    throw VM.RuntimeTrap.explicit(
+                        "synchronous HLVM execution reached an async NativeImport"
+                    )
+                }
+                throw VM.RuntimeTrap.unknownNativeImport(importID)
+            }
+            let result = try invokeNative(
+                invoker,
+                id: importID,
+                arguments: arguments,
+                budget: budget
+            )
+            return try validateNativeBoundaryResult(
+                result,
+                id: importID,
+                resultType: invoker.resultType,
+                effects: invoker.effects,
+                localTypes: localTypes,
+                budget: budget
+            )
+        }
+    }
+
+    private func boundaryEffects(
+        _ target: BoundaryCallTarget,
+        entries: [Core.EntryIndex: Verification.ResolvedEntry]
+    ) throws -> Core.Effects {
+        switch target {
+        case let .entry(entry):
+            guard let descriptor = entries[entry] else {
+                throw VM.RuntimeTrap.unknownEntry(entry)
+            }
+            return descriptor.effects
+        case let .nativeImport(importID):
+            return try nativeCallDescriptor(importID).effects
+        }
+    }
+
+    private func invokeBoundaryAsynchronously(
+        _ target: BoundaryCallTarget,
+        arguments: [VM.Value],
+        entries: [Core.EntryIndex: Verification.ResolvedEntry],
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
+        budget: VM.InvocationBudget
+    ) async throws -> VM.ExecutionResult {
+        switch target {
+        case let .entry(entry):
+            guard let descriptor = entries[entry] else {
+                throw VM.RuntimeTrap.unknownEntry(entry)
+            }
+            guard descriptor.effects.isAsync else {
+                return try invokeBoundarySynchronously(
+                    target,
+                    arguments: arguments,
+                    entries: entries,
+                    localTypes: localTypes,
+                    budget: budget
+                )
+            }
+            guard let asyncEntryInvocation else {
+                throw VM.RuntimeTrap.unknownEntry(entry)
+            }
+            return try await invokeShellEntryAsync(
+                asyncEntryInvocation,
+                entry: entry,
+                arguments: arguments,
+                descriptor: descriptor,
+                localTypes: localTypes,
+                budget: budget
+            )
+        case let .nativeImport(importID):
+            guard let invoker = asyncNativeCatalog[importID] else {
+                if nativeCatalog[importID] != nil {
+                    return try invokeBoundarySynchronously(
+                        target,
+                        arguments: arguments,
+                        entries: entries,
+                        localTypes: localTypes,
+                        budget: budget
+                    )
+                }
+                throw VM.RuntimeTrap.unknownNativeImport(importID)
+            }
+            let result = try await invokeNativeAsync(
+                invoker,
+                id: importID,
+                arguments: arguments,
+                budget: budget
+            )
+            return try validateNativeBoundaryResult(
+                result,
+                id: importID,
+                resultType: invoker.resultType,
+                effects: invoker.effects,
+                localTypes: localTypes,
+                budget: budget
+            )
         }
     }
 
@@ -4674,8 +5381,7 @@ public struct Interpreter: Sendable {
                         )
                     )
                 case let .entryApply(result, entry, arguments):
-                    guard let entryInvocation,
-                          let descriptor = entries[entry]
+                    guard let descriptor = entries[entry]
                     else { throw VM.RuntimeTrap.unknownEntry(entry) }
                     let values = try arguments.map { try read($0, registers: registers) }
                     try chargeCallShape(values, budget: budget)
@@ -4686,33 +5392,29 @@ public struct Interpreter: Sendable {
                         localTypes: localTypes,
                         registers: &registers
                     )
-                    switch try invokeShellEntry(
-                        entryInvocation,
-                        entry: entry,
-                        arguments: values,
-                        descriptor: descriptor,
-                        localTypes: localTypes,
-                        budget: budget
-                    ) {
-                    case let .returned(value):
-                        try storeCallResult(
-                            value,
-                            in: result,
-                            function: function,
-                            registers: &registers,
-                            localTypes: localTypes,
-                            budget: budget
+                    persist(
+                        frame,
+                        registers: registers,
+                        stackSlots: stackSlots,
+                        currentBlock: currentBlock,
+                        nextInstruction: instructionIndex + 1
+                    )
+                    return .boundary(
+                        .init(
+                            target: .entry(entry),
+                            arguments: values,
+                            continuation: .returning(
+                                result: result,
+                                programCounter: programCounter
+                            )
                         )
-                    case let .businessError(message):
-                        throw VM.BusinessError(message: message, requiresBoundaryCharge: true)
-                    case let .trapped(trap): throw trap
-                    }
+                    )
                 case let .nativeApply(result, importID, arguments):
-                    guard let invoker = nativeCatalog[importID] else { throw VM.RuntimeTrap.unknownNativeImport(importID) }
+                    let descriptor = try nativeCallDescriptor(importID)
                     let values = try arguments.map { try read($0, registers: registers) }
                     try chargeCallShape(values, budget: budget)
-                    guard values.count == invoker.parameterTypes.count,
-                          zip(values, invoker.parameterTypes).allSatisfy({
+                    guard values.count == descriptor.parameterTypes.count,
+                          zip(values, descriptor.parameterTypes).allSatisfy({
                               $0.matches($1)
                           })
                     else {
@@ -4720,45 +5422,28 @@ public struct Interpreter: Sendable {
                     }
                     try consumeOwnedCallArguments(
                         arguments,
-                        conventions: nativeParameterConventions(invoker),
+                        conventions: descriptor.parameterConventions,
                         function: function,
                         localTypes: localTypes,
                         registers: &registers
                     )
-                    switch try invokeNative(
-                        invoker,
-                        id: importID,
-                        arguments: values,
-                        budget: budget
-                    ) {
-                    case let .returned(value):
-                        if let value {
-                            try budget.consumeNativeCallableBoundaryValue(value)
-                        }
-                        if let value {
-                            try validateRuntimeValue(
-                                value,
-                                expected: invoker.resultType,
-                                localTypes: localTypes,
-                                budget: budget
+                    persist(
+                        frame,
+                        registers: registers,
+                        stackSlots: stackSlots,
+                        currentBlock: currentBlock,
+                        nextInstruction: instructionIndex + 1
+                    )
+                    return .boundary(
+                        .init(
+                            target: .nativeImport(importID),
+                            arguments: values,
+                            continuation: .returning(
+                                result: result,
+                                programCounter: programCounter
                             )
-                        }
-                        try storeCallResult(
-                            value,
-                            in: result,
-                            function: function,
-                            registers: &registers,
-                            localTypes: localTypes,
-                            budget: budget
                         )
-                    case let .businessError(message):
-                        guard invoker.effects.mayThrow else {
-                            throw VM.RuntimeTrap.nativeFailure(
-                                "nonthrowing import \(importID) returned a business error"
-                            )
-                        }
-                        throw VM.BusinessError(message: message, requiresBoundaryCharge: true)
-                    }
+                    )
                 case let .makeClosure(result, target, captures, lifetime):
                     guard case let .closure(signature) = function.type(of: result) else {
                         throw VM.RuntimeTrap.typeMismatch(
@@ -5367,8 +6052,7 @@ public struct Interpreter: Sendable {
                         )
                     )
                 case let .entryTryApply(entry, arguments, normalTarget, errorTarget):
-                    guard let entryInvocation,
-                          let descriptor = entries[entry]
+                    guard let descriptor = entries[entry]
                     else { throw VM.RuntimeTrap.unknownEntry(entry) }
                     let values = try arguments.map { try read($0, registers: registers) }
                     try chargeCallShape(values, budget: budget)
@@ -5379,46 +6063,30 @@ public struct Interpreter: Sendable {
                         localTypes: localTypes,
                         registers: &registers
                     )
-                    switch try invokeShellEntry(
-                        entryInvocation,
-                        entry: entry,
-                        arguments: values,
-                        descriptor: descriptor,
-                        localTypes: localTypes,
-                        budget: budget
-                    ) {
-                    case let .returned(value):
-                        try transferCallOutcome(
-                            value,
-                            to: frame.blocks[normalTarget]!,
-                            function: function,
-                            registers: &registers,
-                            localTypes: localTypes,
-                            budget: budget
+                    persist(
+                        frame,
+                        registers: registers,
+                        stackSlots: stackSlots,
+                        currentBlock: currentBlock,
+                        nextInstruction: instructionIndex + 1
+                    )
+                    return .boundary(
+                        .init(
+                            target: .entry(entry),
+                            arguments: values,
+                            continuation: .throwing(
+                                normalTarget: normalTarget,
+                                errorTarget: errorTarget,
+                                programCounter: programCounter
+                            )
                         )
-                        currentBlock = normalTarget
-                    case let .businessError(message):
-                        try transferBusinessError(
-                            VM.BusinessError(message: message, requiresBoundaryCharge: true),
-                            to: frame.blocks[errorTarget]!,
-                            function: function,
-                            registers: &registers,
-                            localTypes: localTypes,
-                            budget: budget
-                        )
-                        currentBlock = errorTarget
-                    case let .trapped(trap):
-                        throw trap
-                    }
-                    advancedToNextBlock = true
+                    )
                 case let .nativeTryApply(importID, arguments, normalTarget, errorTarget):
-                    guard let invoker = nativeCatalog[importID] else {
-                        throw VM.RuntimeTrap.unknownNativeImport(importID)
-                    }
+                    let descriptor = try nativeCallDescriptor(importID)
                     let values = try arguments.map { try read($0, registers: registers) }
                     try chargeCallShape(values, budget: budget)
-                    guard values.count == invoker.parameterTypes.count,
-                          zip(values, invoker.parameterTypes).allSatisfy({
+                    guard values.count == descriptor.parameterTypes.count,
+                          zip(values, descriptor.parameterTypes).allSatisfy({
                               $0.matches($1)
                           })
                     else {
@@ -5428,53 +6096,29 @@ public struct Interpreter: Sendable {
                     }
                     try consumeOwnedCallArguments(
                         arguments,
-                        conventions: nativeParameterConventions(invoker),
+                        conventions: descriptor.parameterConventions,
                         function: function,
                         localTypes: localTypes,
                         registers: &registers
                     )
-                    switch try invokeNative(
-                        invoker,
-                        id: importID,
-                        arguments: values,
-                        budget: budget
-                    ) {
-                    case let .returned(value):
-                        if let value {
-                            try budget.consumeBoundaryValue(value)
-                            try validateRuntimeValue(
-                                value,
-                                expected: invoker.resultType,
-                                localTypes: localTypes,
-                                budget: budget
+                    persist(
+                        frame,
+                        registers: registers,
+                        stackSlots: stackSlots,
+                        currentBlock: currentBlock,
+                        nextInstruction: instructionIndex + 1
+                    )
+                    return .boundary(
+                        .init(
+                            target: .nativeImport(importID),
+                            arguments: values,
+                            continuation: .throwing(
+                                normalTarget: normalTarget,
+                                errorTarget: errorTarget,
+                                programCounter: programCounter
                             )
-                        }
-                        try transferCallOutcome(
-                            value,
-                            to: frame.blocks[normalTarget]!,
-                            function: function,
-                            registers: &registers,
-                            localTypes: localTypes,
-                            budget: budget
                         )
-                        currentBlock = normalTarget
-                    case let .businessError(message):
-                        guard invoker.effects.mayThrow else {
-                            throw VM.RuntimeTrap.nativeFailure(
-                                "nonthrowing import \(importID) returned a business error"
-                            )
-                        }
-                        try transferBusinessError(
-                            VM.BusinessError(message: message, requiresBoundaryCharge: true),
-                            to: frame.blocks[errorTarget]!,
-                            function: function,
-                            registers: &registers,
-                            localTypes: localTypes,
-                            budget: budget
-                        )
-                        currentBlock = errorTarget
-                    }
-                    advancedToNextBlock = true
+                    )
                 case let .returnValue(register):
                     try budget.checkDeadline()
                     return .returned(
@@ -5789,6 +6433,62 @@ public struct Interpreter: Sendable {
         localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
         budget: VM.InvocationBudget
     ) throws -> VM.ExecutionResult {
+        let call = try prepareShellEntryCall(
+            entry: entry,
+            arguments: arguments,
+            descriptor: descriptor,
+            localTypes: localTypes,
+            budget: budget
+        )
+        try budget.checkDeadline()
+        let result = invocation(entry, call.logicalArguments, budget)
+        try budget.checkDeadline()
+        return try finishShellEntryCall(
+            result,
+            entry: entry,
+            descriptor: descriptor,
+            writebackAddresses: call.writebackAddresses,
+            localTypes: localTypes,
+            budget: budget
+        )
+    }
+
+    private func invokeShellEntryAsync(
+        _ invocation: VM.AsyncEntryInvocation,
+        entry: Core.EntryIndex,
+        arguments: [VM.Value],
+        descriptor: Verification.ResolvedEntry,
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
+        budget: VM.InvocationBudget
+    ) async throws -> VM.ExecutionResult {
+        let call = try prepareShellEntryCall(
+            entry: entry,
+            arguments: arguments,
+            descriptor: descriptor,
+            localTypes: localTypes,
+            budget: budget
+        )
+        try budget.checkDeadline()
+        try budget.checkSuspensionPoint()
+        let result = await invocation(entry, call.logicalArguments, budget)
+        try budget.checkDeadline()
+        return try finishShellEntryCall(
+            result,
+            entry: entry,
+            descriptor: descriptor,
+            writebackAddresses: call.writebackAddresses,
+            localTypes: localTypes,
+            budget: budget
+        )
+    }
+
+    private func prepareShellEntryCall(
+        entry: Core.EntryIndex,
+        arguments: [VM.Value],
+        descriptor: Verification.ResolvedEntry,
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
+        budget: VM.InvocationBudget
+    ) throws -> ShellEntryCall {
         guard arguments.count == descriptor.parameterTypes.count,
               descriptor.parameterConventions.count
                 == descriptor.parameterTypes.count
@@ -5836,10 +6536,20 @@ public struct Interpreter: Sendable {
                 writebackAddresses[parameterIndex] = address
             }
         }
+        return .init(
+            logicalArguments: logicalArguments,
+            writebackAddresses: writebackAddresses
+        )
+    }
 
-        try budget.checkDeadline()
-        let result = invocation(entry, logicalArguments, budget)
-        try budget.checkDeadline()
+    private func finishShellEntryCall(
+        _ result: VM.EntryInvocationResult,
+        entry: Core.EntryIndex,
+        descriptor: Verification.ResolvedEntry,
+        writebackAddresses: [UInt32: VM.Address],
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
+        budget: VM.InvocationBudget
+    ) throws -> VM.ExecutionResult {
         if case .businessError = result.outcome,
            !descriptor.effects.mayThrow {
             throw VM.RuntimeTrap.nativeFailure(
@@ -8048,6 +8758,34 @@ public struct Interpreter: Sendable {
         }
     }
 
+    private func nativeCallDescriptor(
+        _ id: Core.NativeImportID
+    ) throws -> NativeCallDescriptor {
+        switch (nativeCatalog[id], asyncNativeCatalog[id]) {
+        case let (.some(invoker), .none):
+            return .init(
+                parameterTypes: invoker.parameterTypes,
+                parameterConventions: nativeParameterConventions(invoker),
+                resultType: invoker.resultType,
+                effects: invoker.effects
+            )
+        case let (.none, .some(invoker)):
+            return .init(
+                parameterTypes: invoker.parameterTypes,
+                parameterConventions: Array(
+                    repeating: .owned,
+                    count: invoker.parameterTypes.count
+                ),
+                resultType: invoker.resultType,
+                effects: invoker.effects
+            )
+        case (.some, .some):
+            throw VM.RuntimeTrap.nativeImportDescriptorMismatch(id)
+        case (.none, .none):
+            throw VM.RuntimeTrap.unknownNativeImport(id)
+        }
+    }
+
     private func invokeNative(
         _ invoker: any VM.NativeInvoker,
         id: Core.NativeImportID,
@@ -8077,6 +8815,89 @@ public struct Interpreter: Sendable {
         }
         try context.finish(requireCooperation: true)
         return result
+    }
+
+    private func invokeNativeAsync(
+        _ invoker: any VM.AsyncNativeInvoker,
+        id: Core.NativeImportID,
+        arguments: [VM.Value],
+        budget: VM.InvocationBudget
+    ) async throws -> VM.NativeInvocationResult {
+        try budget.checkSuspensionPoint()
+        let context = try budget.beginNativeInvocation(
+            id: id,
+            effects: invoker.effects,
+            contract: invoker.contract,
+            parameterTypes: invoker.parameterTypes
+        )
+        do {
+            try budget.beginSuspension()
+        } catch {
+            let suspensionError = error
+            _ = try? context.finish(requireCooperation: false)
+            throw suspensionError
+        }
+        let invocationResult: Result<VM.NativeInvocationResult, any Error>
+        do {
+            invocationResult = .success(
+                try await invoker.invoke(
+                    arguments: arguments,
+                    context: context
+                )
+            )
+        } catch {
+            invocationResult = .failure(error)
+        }
+
+        var completionError: (any Error)?
+        do { try budget.endSuspension() } catch { completionError = error }
+        do {
+            try context.finish(requireCooperation: false)
+        } catch where completionError == nil {
+            completionError = error
+        }
+        if let completionError { throw completionError }
+
+        switch invocationResult {
+        case let .success(result):
+            return result
+        case let .failure(error as VM.RuntimeTrap):
+            throw error
+        case let .failure(error):
+            throw VM.RuntimeTrap.nativeFailure(
+                "async native import \(id) threw an undeclared runtime error: \(error)"
+            )
+        }
+    }
+
+    private func validateNativeBoundaryResult(
+        _ result: VM.NativeInvocationResult,
+        id: Core.NativeImportID,
+        resultType: Bytecode.ValueType,
+        effects: Core.Effects,
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
+        budget: VM.InvocationBudget
+    ) throws -> VM.ExecutionResult {
+        switch result {
+        case let .returned(value):
+            if let value {
+                try budget.consumeNativeCallableBoundaryValue(value)
+                try validateRuntimeValue(
+                    value,
+                    expected: resultType,
+                    localTypes: localTypes,
+                    budget: budget
+                )
+            }
+            return .returned(value)
+        case let .businessError(message):
+            guard effects.mayThrow else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "nonthrowing import \(id) returned a business error"
+                )
+            }
+            return .businessError(message)
+        }
     }
 
     private func nativeParameterConventions(

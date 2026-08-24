@@ -264,6 +264,48 @@ struct Identities {
         #expect(throws: Core.NativeImportContractError.self) {
             try duplicateCallbacks.validate(effects: .init())
         }
+
+        let asyncIO = Core.NativeImportContract.suspending(
+            kind: .serviceMethod,
+            domain: .application,
+            access: .io,
+            maximumDurationMicroseconds: 5_000_000,
+            allowsMainThread: false
+        )
+        try asyncIO.validate(
+            effects: .init(hasExternalSideEffects: true, isAsync: true)
+        )
+        #expect(throws: Core.NativeImportContractError.self) {
+            try asyncIO.validate(
+                effects: .init(hasExternalSideEffects: true)
+            )
+        }
+        #expect(throws: Core.NativeImportContractError.self) {
+            try io.validate(
+                effects: .init(hasExternalSideEffects: true, isAsync: true)
+            )
+        }
+
+        var asyncCallback = asyncIO
+        asyncCallback.callbacks = [
+            .init(parameterIndex: 0, lifetime: .nonescaping),
+        ]
+        #expect(throws: Core.NativeImportContractError.self) {
+            try asyncCallback.validate(
+                effects: .init(hasExternalSideEffects: true, isAsync: true)
+            )
+        }
+
+        let oversizedAsync = Core.NativeImportContract.suspending(
+            kind: .serviceMethod,
+            domain: .application,
+            access: .read,
+            maximumDurationMicroseconds: 60_000_001,
+            allowsMainThread: true
+        )
+        #expect(throws: Core.NativeImportContractError.self) {
+            try oversizedAsync.validate(effects: .init(isAsync: true))
+        }
     }
 
     @Test("Requested quotas are intersected with the runtime ceiling")
@@ -273,6 +315,7 @@ struct Identities {
         let resolved = request.constrained(by: ceiling)
         #expect(resolved.instructionFuelPerEntry == 50_000)
         #expect(resolved.maxCallDepth == 8)
+        #expect(Core.ResourceLimits().maxSuspendedFrames == 64)
     }
 
     @Test("Semantic versions parse one to three bounded decimal components")

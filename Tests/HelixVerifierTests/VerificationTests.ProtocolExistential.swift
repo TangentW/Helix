@@ -18,6 +18,20 @@ struct ProtocolExistentialVerifier {
         #expect(image.module.functions.count == 3)
     }
 
+    @Test("Sequential async rejects dynamic existential dispatch")
+    func rejectsAsyncExistentialDispatch() throws {
+        var fixture = dispatchFixture()
+        fixture.effects = .init(isAsync: true)
+        for index in fixture.functions.indices {
+            fixture.functions[index].effects = fixture.effects
+        }
+
+        try expectInvalid(
+            fixture,
+            reason: "async existential dispatch is outside the sequential async contract"
+        )
+    }
+
     @Test("Checked protocol casts admit an empty closed set")
     func acceptsEmptyCheckedCastSet() throws {
         var fixture = dispatchFixture()
@@ -280,6 +294,7 @@ struct ProtocolExistentialVerifier {
         var localTypes: [Bytecode.LocalTypeDefinition]
         var dispatch: Bytecode.ExistentialDispatchTable
         var resultType: Bytecode.ValueType = .int64
+        var effects: Core.Effects = .init()
     }
 
     private func dispatchFixture() -> Fixture {
@@ -424,11 +439,12 @@ struct ProtocolExistentialVerifier {
             canonicalDeclaration: "func dispatch(_ value: Any)",
             loweredSignature: .init(
                 parameters: ["Swift.Any"],
-                result: fixture.resultType.description
+                result: fixture.resultType.description,
+                isAsync: fixture.effects.isAsync
             ),
             role: .function
         )
-        let capabilities: Set<Core.Capability> = [
+        var capabilities: Set<Core.Capability> = [
             .baselineV1,
             .anyValuesV1,
             .borrowCallsV1,
@@ -436,6 +452,9 @@ struct ProtocolExistentialVerifier {
             .localNominalsV1,
             .localClassesV1,
         ]
+        if fixture.effects.isAsync {
+            capabilities.insert(.sequentialAsyncV1)
+        }
         let module = Bytecode.Module(
             name: "ProtocolExistentialVerifierFixture",
             shellInterfaceHash: shellHash,
@@ -462,7 +481,7 @@ struct ProtocolExistentialVerifier {
                     parameterTypes: [.any],
                     parameterConventions: [.owned],
                     resultType: fixture.resultType,
-                    effects: .init()
+                    effects: fixture.effects
                 ),
             ]
         )

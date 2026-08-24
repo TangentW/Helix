@@ -600,7 +600,7 @@ public final class Bootstrap: @unchecked Sendable {
         let policy = options.runtimePolicy ?? Core.RuntimePolicy(
             acceptedCapabilities: shell.capabilities,
             allowedNativeImports: Set(shell.imports.keys),
-            allowMainActorSynchronousEntries: true,
+            allowMainActorEntries: true,
             productionChannelEnabled: false
         )
         let graph = SessionGraph(

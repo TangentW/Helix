@@ -61,6 +61,8 @@ public final class Engine: @unchecked Sendable {
     public let originals: Runtime.OriginalCatalog
     /// Native functions callable from verified bytecode.
     public let nativeCatalog: VM.NativeCatalog
+    /// Suspending native functions callable from verified async bytecode.
+    public let asyncNativeCatalog: VM.AsyncNativeCatalog
     /// Native Swift value types allowed to cross generated bridges.
     public let nativeTypeCatalog: VM.NativeTypeCatalog
     /// Telemetry sink for activation, rollback, and trap events.
@@ -81,6 +83,7 @@ public final class Engine: @unchecked Sendable {
         originals: Runtime.OriginalCatalog,
         shellInterfaceHash: Core.Digest? = nil,
         nativeCatalog: VM.NativeCatalog = .init(),
+        asyncNativeCatalog: VM.AsyncNativeCatalog = .init(),
         nativeTypeCatalog: VM.NativeTypeCatalog = .init(),
         observer: any Runtime.Observing = Runtime.NoopObserver(),
         bridgeInputLimits: Runtime.BridgeInputLimits = .init()
@@ -89,6 +92,7 @@ public final class Engine: @unchecked Sendable {
         self.originals = originals
         self.shellInterfaceHash = shellInterfaceHash
         self.nativeCatalog = nativeCatalog
+        self.asyncNativeCatalog = asyncNativeCatalog
         self.nativeTypeCatalog = nativeTypeCatalog
         self.observer = observer
         self.bridgeInputLimits = bridgeInputLimits
@@ -125,6 +129,11 @@ public final class Engine: @unchecked Sendable {
     /// Generated Swift bridges use lazy encoding so original calls avoid bridge
     /// allocation when no patch route exists.
     public func invoke(entry: Core.EntryIndex, arguments: [VM.Value]) -> VM.ExecutionResult {
+        guard originals[entry]?.effects.isAsync != true else {
+            return .trapped(.explicit(
+                "async HLBC entry requires its generated Swift async Bridge"
+            ))
+        }
         guard originals[entry]?.parameterConventions.contains(.inout) != true else {
             return .trapped(.explicit(
                 "an inout Shell entry requires the writeback-aware invocation API"
@@ -146,8 +155,51 @@ public final class Engine: @unchecked Sendable {
         entry: Core.EntryIndex,
         arguments: [VM.Value]
     ) -> VM.EntryInvocationResult {
-        entryInvocationResult(
+        guard let original = originals[entry] else {
+            return .trapped(.unknownEntry(entry))
+        }
+        guard !original.effects.isAsync else {
+            return .trapped(.explicit(
+                "async HLBC entry requires the async invocation API"
+            ))
+        }
+        return entryInvocationResult(
             invoke(entry: entry, arguments: arguments, originalResolution: .catalog)
+        )
+    }
+
+    /// Invokes an async Shell entry from already encoded VM values.
+    public func invokeAsync(
+        entry: Core.EntryIndex,
+        arguments: [VM.Value]
+    ) async -> VM.ExecutionResult {
+        let result = await invokeEntryAsync(entry: entry, arguments: arguments)
+        guard result.writebacks.isEmpty else {
+            return .trapped(.explicit(
+                "an async Shell entry returned forbidden writeback"
+            ))
+        }
+        return result.outcome
+    }
+
+    public func invokeEntryAsync(
+        entry: Core.EntryIndex,
+        arguments: [VM.Value]
+    ) async -> VM.EntryInvocationResult {
+        guard let original = originals[entry] else {
+            return .trapped(.unknownEntry(entry))
+        }
+        guard original.effects.isAsync else {
+            return .trapped(.explicit(
+                "the async invocation API requires an async HLBC entry"
+            ))
+        }
+        return entryInvocationResult(
+            await invokeAsync(
+                entry: entry,
+                arguments: arguments,
+                originalResolution: .catalog
+            )
         )
     }
 
@@ -171,6 +223,42 @@ public final class Engine: @unchecked Sendable {
         let context = Runtime.ExecutionContext(lease: lease)
         return try contexts.withContext(context) {
             try routeEncodedFromBridgePinned(
+                entry: entry,
+                arguments: arguments,
+                context: context
+            )
+        }
+    }
+
+    func routeEncodedFromBridgeAsync(
+        isolation: isolated (any Actor)? = #isolation,
+        entry: Core.EntryIndex,
+        arguments: (Runtime.BridgeValueCodec.Encoder) throws -> [VM.Value]
+    ) async throws -> Runtime.BridgeRoutingResult {
+        _ = isolation
+        if let context = contexts.current {
+            return try await contexts.withContext(
+                isolation: isolation,
+                context
+            ) {
+                try await routeEncodedFromBridgePinnedAsync(
+                    isolation: isolation,
+                    entry: entry,
+                    arguments: arguments,
+                    context: context
+                )
+            }
+        }
+        guard let lease = registry.activeLease() else {
+            return .originalRequired
+        }
+        let context = Runtime.ExecutionContext(lease: lease)
+        return try await contexts.withContext(
+            isolation: isolation,
+            context
+        ) {
+            try await routeEncodedFromBridgePinnedAsync(
+                isolation: isolation,
                 entry: entry,
                 arguments: arguments,
                 context: context
@@ -218,6 +306,39 @@ public final class Engine: @unchecked Sendable {
         }
     }
 
+    private func invokeAsync(
+        entry: Core.EntryIndex,
+        arguments: [VM.Value],
+        originalResolution: OriginalResolution
+    ) async -> InvocationOutcome {
+        if let context = contexts.current {
+            return await contexts.withContext(context) {
+                await invokePinnedAsync(
+                    entry: entry,
+                    arguments: arguments,
+                    context: context,
+                    originalResolution: originalResolution
+                )
+            }
+        }
+        guard let lease = registry.activeLease() else {
+            return await invokeOriginalAsync(
+                entry: entry,
+                arguments: arguments,
+                resolution: originalResolution
+            )
+        }
+        let context = Runtime.ExecutionContext(lease: lease)
+        return await contexts.withContext(context) {
+            await invokePinnedAsync(
+                entry: entry,
+                arguments: arguments,
+                context: context,
+                originalResolution: originalResolution
+            )
+        }
+    }
+
     private func invokePinned(
         entry: Core.EntryIndex,
         arguments: [VM.Value],
@@ -244,6 +365,32 @@ public final class Engine: @unchecked Sendable {
         )
     }
 
+    private func invokePinnedAsync(
+        entry: Core.EntryIndex,
+        arguments: [VM.Value],
+        context: Runtime.ExecutionContext,
+        originalResolution: OriginalResolution
+    ) async -> InvocationOutcome {
+        let route = context.lease.route(for: entry)
+        markNestedEntrySideEffectsIfNeeded(entry: entry, context: context)
+        guard let route else {
+            let budget = context.isExecutingPatch ? context.budget() : nil
+            return await invokeOriginalAsync(
+                entry: entry,
+                arguments: arguments,
+                budget: budget,
+                resolution: originalResolution
+            )
+        }
+        return await invokePatchedAsync(
+            route: route,
+            entry: entry,
+            arguments: arguments,
+            context: context,
+            originalResolution: originalResolution
+        )
+    }
+
     private func invokePatched(
         route: Runtime.Route,
         entry: Core.EntryIndex,
@@ -258,15 +405,121 @@ public final class Engine: @unchecked Sendable {
         }
         defer { context.leave(entry: entry) }
 
-        let budget = context.budget()
-        let generationID = context.lease.generation.id
+        let budget = context.budget(
+            isMainActorRoot: originals[entry]?.effects.requiresMainActor
+        )
         let image = route.image
+        let trapObserver = makePatchedTrapObserver(
+            entry: entry,
+            context: context,
+            image: image
+        )
+        let interpreter = makePatchedInterpreter(
+            context: context,
+            image: image,
+            budget: budget,
+            trapObserver: trapObserver
+        )
+        let result = interpreter.invokeEntry(
+            function: route.functionID,
+            image: route.image,
+            arguments: arguments,
+            budget: budget
+        )
+        guard case let .trapped(trap) = result.outcome else {
+            return .executed(result)
+        }
+
+        quarantineIfInvariantViolation(
+            trap,
+            generationID: context.lease.generation.id
+        )
+        if trap != .executionCancelled,
+           let original = originals[entry],
+           original.fallbackAllowed,
+           !budget.sideEffectsCommitted {
+            return invokeOriginal(
+                entry: entry,
+                arguments: arguments,
+                resolution: originalResolution
+            )
+        }
+        return .executed(result)
+    }
+
+    private func invokePatchedAsync(
+        route: Runtime.Route,
+        entry: Core.EntryIndex,
+        arguments: [VM.Value],
+        context: Runtime.ExecutionContext,
+        originalResolution: OriginalResolution
+    ) async -> InvocationOutcome {
+        guard context.enter(entry: entry) else {
+            return .executed(
+                .trapped(.explicit(
+                    "unexpected native re-entry into patched entry \(entry)"
+                ))
+            )
+        }
+        defer { context.leave(entry: entry) }
+
+        let budget = context.budget(
+            isMainActorRoot: originals[entry]?.effects.requiresMainActor
+        )
+        let image = route.image
+        let trapObserver = makePatchedTrapObserver(
+            entry: entry,
+            context: context,
+            image: image
+        )
+        let interpreter = makePatchedInterpreter(
+            context: context,
+            image: image,
+            budget: budget,
+            trapObserver: trapObserver
+        )
+        let result = await interpreter.invokeEntryAsync(
+            function: route.functionID,
+            image: image,
+            arguments: arguments,
+            budget: budget
+        )
+        guard case let .trapped(trap) = result.outcome else {
+            return .executed(result)
+        }
+
+        quarantineIfInvariantViolation(
+            trap,
+            generationID: context.lease.generation.id
+        )
+        if trap != .executionCancelled,
+           let original = originals[entry],
+           original.fallbackAllowed,
+           !budget.sideEffectsCommitted {
+            return await invokeOriginalAsync(
+                entry: entry,
+                arguments: arguments,
+                resolution: originalResolution
+            )
+        }
+        return .executed(result)
+    }
+
+    private func makePatchedTrapObserver(
+        entry: Core.EntryIndex,
+        context: Runtime.ExecutionContext,
+        image: Verification.Image
+    ) -> VM.TrapObserver {
+        let generationID = context.lease.generation.id
         let telemetryObserver = observer
-        let trapObserver: VM.TrapObserver = { diagnostic in
+        return { diagnostic in
             let function = diagnostic.programCounter.flatMap { programCounter in
-                image.module.functions.first { $0.id == programCounter.functionID }
+                image.module.functions.first {
+                    $0.id == programCounter.functionID
+                }
             }
-            let sourceLocation = diagnostic.programCounter.flatMap { programCounter in
+            let sourceLocation = diagnostic.programCounter.flatMap {
+                programCounter in
                 image.module.sourceLocation(
                     functionID: programCounter.functionID,
                     blockID: programCounter.blockID,
@@ -284,18 +537,53 @@ public final class Engine: @unchecked Sendable {
                 )
             )
         }
-        let interpreter = VM.Interpreter(
+    }
+
+    private func makePatchedInterpreter(
+        context: Runtime.ExecutionContext,
+        image: Verification.Image,
+        budget: VM.InvocationBudget,
+        trapObserver: @escaping VM.TrapObserver
+    ) -> VM.Interpreter {
+        VM.Interpreter(
             nativeCatalog: nativeCatalog,
+            asyncNativeCatalog: asyncNativeCatalog,
             nativeTypeCatalog: nativeTypeCatalog,
-            entryInvocation: { [weak self, weak context] nestedEntry, nestedArguments, nestedBudget in
+            entryInvocation: { [weak self, weak context]
+                nestedEntry, nestedArguments, nestedBudget in
                 guard let self, let context else {
-                    return .trapped(.explicit("Helix Runtime was released during a nested invocation"))
+                    return .trapped(.explicit(
+                        "Helix Runtime was released during a nested invocation"
+                    ))
                 }
                 guard nestedBudget === budget else {
-                    return .trapped(.explicit("nested entry attempted to replace the root invocation budget"))
+                    return .trapped(.explicit(
+                        "nested entry attempted to replace the root invocation budget"
+                    ))
                 }
                 return self.entryInvocationResult(
                     self.invokePinned(
+                        entry: nestedEntry,
+                        arguments: nestedArguments,
+                        context: context,
+                        originalResolution: .catalog
+                    )
+                )
+            },
+            asyncEntryInvocation: { [weak self, weak context]
+                nestedEntry, nestedArguments, nestedBudget in
+                guard let self, let context else {
+                    return .trapped(.explicit(
+                        "Helix Runtime was released during an async nested invocation"
+                    ))
+                }
+                guard nestedBudget === budget else {
+                    return .trapped(.explicit(
+                        "async nested entry attempted to replace the root invocation budget"
+                    ))
+                }
+                return self.entryInvocationResult(
+                    await self.invokePinnedAsync(
                         entry: nestedEntry,
                         arguments: nestedArguments,
                         context: context,
@@ -315,36 +603,6 @@ public final class Engine: @unchecked Sendable {
             ),
             trapObserver: trapObserver
         )
-        let result = interpreter.invokeEntry(
-            function: route.functionID,
-            image: route.image,
-            arguments: arguments,
-            budget: budget,
-            rootContext: originalResolution == .signalBridge
-                ? VM.RootExecutionContext.generatedAsyncBridge
-                : VM.RootExecutionContext.synchronous
-        )
-        guard case let .trapped(trap) = result.outcome else {
-            return .executed(result)
-        }
-
-        if isRuntimeInvariantViolation(trap) {
-            let activeBeforeQuarantine = registry.snapshot().activeGenerationID
-            registry.quarantine(context.lease.generation.id)
-            let activeAfterQuarantine = registry.snapshot().activeGenerationID
-            if activeBeforeQuarantine == context.lease.generation.id,
-               activeAfterQuarantine != activeBeforeQuarantine {
-                observer.didRollback(from: context.lease.generation.id, to: activeAfterQuarantine)
-            }
-        }
-        if let original = originals[entry], original.fallbackAllowed, !budget.sideEffectsCommitted {
-            return invokeOriginal(
-                entry: entry,
-                arguments: arguments,
-                resolution: originalResolution
-            )
-        }
-        return .executed(result)
     }
 
     func invokeHostedMethod(
@@ -386,6 +644,7 @@ public final class Engine: @unchecked Sendable {
             }
             let interpreter = VM.Interpreter(
                 nativeCatalog: nativeCatalog,
+                asyncNativeCatalog: asyncNativeCatalog,
                 nativeTypeCatalog: nativeTypeCatalog,
                 entryInvocation: { [weak self, weak context] nestedEntry, nestedArguments, nestedBudget in
                     guard let self, let context else {
@@ -419,13 +678,13 @@ public final class Engine: @unchecked Sendable {
                 ),
                 trapObserver: trapObserver
             )
-            let result = interpreter.invoke(
+            let result = interpreter.invokeEntry(
                 function: method.functionID,
                 image: image,
                 arguments: arguments,
                 budget: budget,
-                rootContext: .hostedCallback
-            )
+                argumentDomain: .hostedImage
+            ).outcome
             if case let .trapped(trap) = result, isRuntimeInvariantViolation(trap) {
                 let activeBeforeQuarantine = registry.snapshot().activeGenerationID
                 registry.quarantine(generationID)
@@ -521,6 +780,7 @@ public final class Engine: @unchecked Sendable {
         ) -> VM.ExecutionResult = { [self] context, budget in
             let interpreter = VM.Interpreter(
                 nativeCatalog: nativeCatalog,
+                asyncNativeCatalog: asyncNativeCatalog,
                 nativeTypeCatalog: nativeTypeCatalog,
                 entryInvocation: { [weak self, weak context] entry, values, nestedBudget in
                     guard let self, let context else {
@@ -609,12 +869,19 @@ public final class Engine: @unchecked Sendable {
         guard originals[entry] != nil else {
             return .executed(.trapped(.unknownEntry(entry)))
         }
+        guard originals[entry]?.effects.isAsync != true else {
+            return .executed(.trapped(.explicit(
+                "async HLBC entry requires its generated Swift async Bridge"
+            )))
+        }
         guard let route = context.lease.route(for: entry) else {
             markNestedEntrySideEffectsIfNeeded(entry: entry, context: context)
             return .originalRequired
         }
 
-        let budget = context.budget()
+        let budget = context.budget(
+            isMainActorRoot: originals[entry]?.effects.requiresMainActor
+        )
         let encoder = Runtime.BridgeValueCodec.Encoder(
             limits: bridgeInputLimits.constrained(
                 by: context.lease.resourceLimits
@@ -637,6 +904,64 @@ public final class Engine: @unchecked Sendable {
 
         markNestedEntrySideEffectsIfNeeded(entry: entry, context: context)
         switch invokePatched(
+            route: route,
+            entry: entry,
+            arguments: encoded,
+            context: context,
+            originalResolution: .signalBridge
+        ) {
+        case .originalRequired:
+            return .originalRequired
+        case let .executed(result):
+            return .executed(result)
+        }
+    }
+
+    private func routeEncodedFromBridgePinnedAsync(
+        isolation: isolated (any Actor)?,
+        entry: Core.EntryIndex,
+        arguments: (Runtime.BridgeValueCodec.Encoder) throws -> [VM.Value],
+        context: Runtime.ExecutionContext
+    ) async throws -> Runtime.BridgeRoutingResult {
+        _ = isolation
+        guard let original = originals[entry] else {
+            return .executed(.trapped(.unknownEntry(entry)))
+        }
+        guard original.effects.isAsync else {
+            return .executed(.trapped(.explicit(
+                "synchronous HLBC entry requires the synchronous Swift Bridge"
+            )))
+        }
+        guard let route = context.lease.route(for: entry) else {
+            markNestedEntrySideEffectsIfNeeded(entry: entry, context: context)
+            return .originalRequired
+        }
+
+        let budget = context.budget(
+            isMainActorRoot: original.effects.requiresMainActor
+        )
+        let encoder = Runtime.BridgeValueCodec.Encoder(
+            limits: bridgeInputLimits.constrained(
+                by: context.lease.resourceLimits
+            ),
+            checkDeadline: { try budget.checkDeadline() }
+        )
+        let encoded: [VM.Value]
+        do {
+            encoded = try arguments(encoder)
+            try encoder.finalize(arguments: encoded)
+        } catch let error as Runtime.BridgeInputError {
+            guard original.fallbackAllowed else { throw error }
+            return .originalRequired
+        } catch VM.RuntimeTrap.wallTimeExceeded {
+            guard original.fallbackAllowed else {
+                throw VM.RuntimeTrap.wallTimeExceeded
+            }
+            return .originalRequired
+        }
+
+        markNestedEntrySideEffectsIfNeeded(entry: entry, context: context)
+        switch await invokePatchedAsync(
             route: route,
             entry: entry,
             arguments: encoded,
@@ -687,7 +1012,73 @@ public final class Engine: @unchecked Sendable {
         if case .signalBridge = resolution {
             return .originalRequired
         }
-        let result = original.invoke(arguments)
+        guard !original.effects.isAsync else {
+            return .executed(.trapped(.explicit(
+                "async HLBC entry requires its generated Swift async Bridge"
+            )))
+        }
+        return validateOriginalResult(
+            original.invoke(arguments),
+            entry: entry,
+            original: original,
+            budget: budget
+        )
+    }
+
+    private func invokeOriginalAsync(
+        entry: Core.EntryIndex,
+        arguments: [VM.Value],
+        budget: VM.InvocationBudget? = nil,
+        resolution: OriginalResolution
+    ) async -> InvocationOutcome {
+        guard let original = originals[entry] else {
+            return .executed(.trapped(.unknownEntry(entry)))
+        }
+        guard arguments.count == original.parameterTypes.count,
+              original.parameterConventions.count
+                == original.parameterTypes.count,
+              !original.parameterConventions.contains(.inout),
+              zip(arguments, original.parameterTypes).allSatisfy({
+                  $0.matches($1)
+              })
+        else {
+            return .executed(.trapped(.nativeFailure(
+                "original entry \(entry) argument mismatch"
+            )))
+        }
+        if case .signalBridge = resolution {
+            return .originalRequired
+        }
+        guard original.effects.isAsync else {
+            return .executed(.trapped(.explicit(
+                "synchronous HLBC entry requires the synchronous Swift Bridge"
+            )))
+        }
+        do {
+            if let budget { try budget.checkSuspensionPoint() }
+            let result = await original.invokeAsync(arguments)
+            if let budget { try budget.checkDeadline() }
+            return validateOriginalResult(
+                result,
+                entry: entry,
+                original: original,
+                budget: budget
+            )
+        } catch let trap as VM.RuntimeTrap {
+            return .executed(.trapped(trap))
+        } catch {
+            return .executed(.trapped(.nativeFailure(
+                String(describing: error)
+            )))
+        }
+    }
+
+    private func validateOriginalResult(
+        _ result: VM.EntryInvocationResult,
+        entry: Core.EntryIndex,
+        original: Runtime.OriginalEntry,
+        budget: VM.InvocationBudget?
+    ) -> InvocationOutcome {
         let expectedWritebacks = Set(
             original.parameterConventions.indices.compactMap { index in
                 original.parameterConventions[index] == .inout
@@ -769,9 +1160,27 @@ public final class Engine: @unchecked Sendable {
         }
     }
 
+    private func quarantineIfInvariantViolation(
+        _ trap: VM.RuntimeTrap,
+        generationID: Runtime.GenerationID
+    ) {
+        guard isRuntimeInvariantViolation(trap) else { return }
+        let activeBeforeQuarantine = registry.snapshot().activeGenerationID
+        registry.quarantine(generationID)
+        let activeAfterQuarantine = registry.snapshot().activeGenerationID
+        if activeBeforeQuarantine == generationID,
+           activeAfterQuarantine != activeBeforeQuarantine {
+            observer.didRollback(
+                from: generationID,
+                to: activeAfterQuarantine
+            )
+        }
+    }
+
     private func validateForActivation(_ generation: Runtime.Generation) throws {
         let interpreter = VM.Interpreter(
             nativeCatalog: nativeCatalog,
+            asyncNativeCatalog: asyncNativeCatalog,
             nativeTypeCatalog: nativeTypeCatalog
         )
         for image in generation.images {
@@ -839,7 +1248,8 @@ public final class Engine: @unchecked Sendable {
              .arrayIndexOutOfBounds, .collectionCursorOutOfBounds, .unknownEntry,
              .instructionFuelExhausted, .callDepthExceeded, .nativeCallLimitExceeded,
              .vmHeapLimitExceeded, .nativeOwnedMemoryLimitExceeded,
-             .wallTimeExceeded, .mainActorViolation, .nativeImportThreadViolation,
+             .wallTimeExceeded, .suspendedFrameLimitExceeded,
+             .executionCancelled, .mainActorViolation, .nativeImportThreadViolation,
              .nativeImportDeadlineExceeded, .nativeImportCooperationViolation,
              .nativeFailure, .sourceFailure, .explicit:
             false

@@ -57,11 +57,15 @@ public enum NativeImportDeadlineMode: String, Codable, Hashable, Sendable, CaseI
     case bounded
     /// Work that must periodically call `NativeInvocationContext.checkpoint`.
     case cooperative
+    /// An async operation may suspend without consuming the root's active-time
+    /// budget, but its own wall-clock deadline remains continuous.
+    case suspending
 }
 
 public struct NativeImportExecutionPolicy: Codable, Hashable, Sendable {
     public static let maximumBoundedDurationMicroseconds: UInt32 = 2_000
     public static let maximumCooperativeDurationMicroseconds: UInt32 = 1_000_000
+    public static let maximumSuspendingDurationMicroseconds: UInt32 = 60_000_000
     public static let maximumMainThreadDurationMicroseconds: UInt32 = 16_000
 
     public var deadlineMode: Core.NativeImportDeadlineMode
@@ -144,10 +148,29 @@ public struct NativeImportContract: Codable, Hashable, Sendable {
         )
     }
 
+    public static func suspending(
+        kind: Core.NativeImportKind,
+        domain: Core.NativeImportDomain,
+        access: Core.NativeImportAccess,
+        maximumDurationMicroseconds: UInt32,
+        allowsMainThread: Bool
+    ) -> Self {
+        Self(
+            kind: kind,
+            domain: domain,
+            access: access,
+            execution: .init(
+                deadlineMode: .suspending,
+                maximumDurationMicroseconds: maximumDurationMicroseconds,
+                allowsMainThread: allowsMainThread
+            )
+        )
+    }
+
     public func validate(effects: Core.Effects) throws {
-        guard !effects.isAsync else {
+        guard effects.isAsync == (execution.deadlineMode == .suspending) else {
             throw Core.NativeImportContractError.invalid(
-                "native imports use the synchronous invocation contract"
+                "async effects require the suspending invocation contract"
             )
         }
         guard callbacks.count <= 64,
@@ -169,9 +192,17 @@ public struct NativeImportContract: Codable, Hashable, Sendable {
         guard execution.maximumDurationMicroseconds > 0 else {
             throw Core.NativeImportContractError.invalid("maximum duration must be positive")
         }
-        if access == .io, execution.deadlineMode != .cooperative {
+        if effects.isAsync, !callbacks.isEmpty {
             throw Core.NativeImportContractError.invalid(
-                "synchronous I/O native imports must use cooperative deadlines"
+                "suspending native imports cannot carry callback parameters"
+            )
+        }
+        if access == .io,
+           execution.deadlineMode != (effects.isAsync ? .suspending : .cooperative) {
+            throw Core.NativeImportContractError.invalid(
+                effects.isAsync
+                    ? "async I/O native imports must use suspending deadlines"
+                    : "synchronous I/O native imports must use cooperative deadlines"
             )
         }
         switch execution.deadlineMode {
@@ -191,8 +222,16 @@ public struct NativeImportContract: Codable, Hashable, Sendable {
                     "cooperative native imports exceed the 1 s qualification limit"
                 )
             }
+        case .suspending:
+            guard execution.maximumDurationMicroseconds
+                    <= Core.NativeImportExecutionPolicy.maximumSuspendingDurationMicroseconds
+            else {
+                throw Core.NativeImportContractError.invalid(
+                    "suspending native imports exceed the 60 s qualification limit"
+                )
+            }
         }
-        if execution.allowsMainThread {
+        if execution.allowsMainThread, !effects.isAsync {
             guard execution.maximumDurationMicroseconds
                     <= Core.NativeImportExecutionPolicy.maximumMainThreadDurationMicroseconds
             else {

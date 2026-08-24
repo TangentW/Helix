@@ -454,8 +454,8 @@ struct Routing {
         #expect(encodedCalls.value == 0)
     }
 
-    @Test("Only generated Bridge routing may execute an async HLBC entry")
-    func asyncEntryRequiresBridgeContext() throws {
+    @Test("Only the generated async Bridge may execute an async HLBC entry")
+    func asyncEntryRequiresBridgeContext() async throws {
         let entry = Core.EntryIndex(rawValue: 0)
         let shellHash = Core.Digest.sha256("runtime-async-shell")
         let compatibility = Core.Compatibility(
@@ -483,7 +483,7 @@ struct Routing {
         let effects = Core.Effects(isAsync: true)
         let function = Bytecode.Function(
             id: .init(rawValue: 0),
-            name: "async leaf",
+            name: "async entry",
             parameterRegisters: [.init(rawValue: 0)],
             resultType: .int64,
             registerTypes: [.int64, .int64],
@@ -501,7 +501,7 @@ struct Routing {
             effects: effects
         )
         let capabilities: Set<Core.Capability> = [
-            .baselineV1, .asyncLeafEntriesV1,
+            .baselineV1, .sequentialAsyncV1,
         ]
         let module = Bytecode.Module(
             name: "RuntimeAsyncFixture",
@@ -548,8 +548,11 @@ struct Routing {
                     index: entry,
                     parameterTypes: [.int64],
                     resultType: .int64,
-                    effects: effects
-                ) { _ in .returned(.integer(try! int(1))) },
+                    effects: effects,
+                    invokeAsync: { _ in
+                        .returned(.integer(try! int(1)))
+                    }
+                ),
             ]),
             shellInterfaceHash: shellHash
         )
@@ -580,7 +583,8 @@ struct Routing {
             interfaceHash: shellHash,
             registrationCount: 1
         )
-        let decision: Runtime.BridgeDispatchResult<Int64> = try bridge.dispatch(
+        let decision: Runtime.BridgeDispatchResult<Int64> = try await bridge
+            .dispatchAsync(
             entry: entry,
             arguments: { encoder in [try encoder.encode(Int64(9))] },
             decodeResult: { value in
@@ -591,7 +595,7 @@ struct Routing {
             }
         )
         guard case let .returned(result) = decision else {
-            Issue.record("the generated Bridge path did not execute the async leaf")
+            Issue.record("the generated Bridge path did not execute the async entry")
             return
         }
         #expect(result == 41)

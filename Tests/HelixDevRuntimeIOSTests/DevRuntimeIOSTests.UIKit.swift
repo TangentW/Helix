@@ -328,7 +328,7 @@ struct UIKitIntegration {
             .localClassesV1,
             .borrowCallsV1,
             .hostedObjectiveCClassesV1,
-            .mainActorSyncV1,
+            .mainActorIsolationV1,
         ]
         let module = Bytecode.Module(
             name: "HostedUIKitFixture",
@@ -444,7 +444,7 @@ struct UIKitIntegration {
             shell: shell,
             policy: .init(
                 acceptedCapabilities: capabilities,
-                allowMainActorSynchronousEntries: true
+                allowMainActorEntries: true
             )
         )
         let fallback = try typeCatalog.box(UIViewController(), as: typeID)

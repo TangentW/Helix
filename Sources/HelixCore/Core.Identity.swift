@@ -110,7 +110,7 @@ public struct LoweredSignature: Codable, Hashable, Sendable {
     public var result: String
     public var isThrowing: Bool
     /// Describes the Swift ABI. HLBC may still restrict the accepted body to a
-    /// non-suspending async leaf profile.
+    /// sequential async execution profile.
     public var isAsync: Bool
     public var isolation: String?
 

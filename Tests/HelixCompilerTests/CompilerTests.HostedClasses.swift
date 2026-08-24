@@ -126,7 +126,7 @@ struct HostedClasses {
                 .localNominalsV1,
                 .localClassesV1,
                 .hostedObjectiveCClassesV1,
-                .mainActorSyncV1,
+                .mainActorIsolationV1,
                 .borrowCallsV1,
             ],
             entries: [
@@ -156,7 +156,7 @@ struct HostedClasses {
             shell: shell,
             policy: .init(
                 acceptedCapabilities: shell.capabilities,
-                allowMainActorSynchronousEntries: true
+                allowMainActorEntries: true
             )
         )
 
@@ -172,7 +172,7 @@ struct HostedClasses {
                 shell: shell,
                 policy: .init(
                     acceptedCapabilities: shell.capabilities,
-                    allowMainActorSynchronousEntries: true
+                    allowMainActorEntries: true
                 )
             )
         }
@@ -192,7 +192,7 @@ struct HostedClasses {
                 shell: shell,
                 policy: .init(
                     acceptedCapabilities: shell.capabilities,
-                    allowMainActorSynchronousEntries: true
+                    allowMainActorEntries: true
                 )
             )
         }

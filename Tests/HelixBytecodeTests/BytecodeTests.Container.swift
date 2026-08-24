@@ -1080,10 +1080,10 @@ struct Container {
         #expect(!Bytecode.ValueType.array(.int64).containsClosureValue)
     }
 
-    @Test("HLBC 1.0 canonically carries the non-suspending async entry ABI")
-    func asyncLeafWireFormat() throws {
+    @Test("HLBC 1.0 canonically carries the sequential async entry ABI")
+    func sequentialAsyncWireFormat() throws {
         var module = try makeAddModule()
-        module.capabilities.insert(.asyncLeafEntriesV1)
+        module.capabilities.insert(.sequentialAsyncV1)
         module.functions[0].effects.isAsync = true
 
         let bytes = try Bytecode.Encoder.encode(module)

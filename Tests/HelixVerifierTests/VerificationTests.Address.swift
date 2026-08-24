@@ -1292,6 +1292,306 @@ struct AddressSemantics {
         }
     }
 
+    @Test("An async call cannot retain an active or live address")
+    func rejectsAddressesAcrossSuspension() throws {
+        let activeAccess = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "activeAccessAcrossAwait",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [
+                .int64, .address(.int64), .address(.int64),
+                .int64, .int64, .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .storeStack(
+                            slot: .init(rawValue: 0),
+                            source: .init(rawValue: 0),
+                            mode: .initialize
+                        ),
+                        .stackAddress(
+                            result: .init(rawValue: 1),
+                            slot: .init(rawValue: 0)
+                        ),
+                        .beginAccess(
+                            result: .init(rawValue: 2),
+                            address: .init(rawValue: 1),
+                            kind: .read
+                        ),
+                        .apply(
+                            result: .init(rawValue: 3),
+                            function: .init(rawValue: 1),
+                            arguments: [.init(rawValue: 0)]
+                        ),
+                        .loadAddress(
+                            result: .init(rawValue: 4),
+                            address: .init(rawValue: 2),
+                            mode: .copy
+                        ),
+                        .endAccess(.init(rawValue: 2)),
+                        .loadStack(
+                            result: .init(rawValue: 5),
+                            slot: .init(rawValue: 0),
+                            mode: .take
+                        ),
+                        .returnValue(.init(rawValue: 3)),
+                    ]
+                ),
+            ],
+            stackSlotTypes: [.int64],
+            effects: .init(isAsync: true)
+        )
+        let capabilities: Set<Core.Capability> = [
+            .baselineV1, .addressValuesV1, .sequentialAsyncV1,
+        ]
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 3,
+                reason: "async call cannot suspend with an active address access"
+            )
+        ) {
+            try verify(
+                root: activeAccess,
+                additionalFunctions: [asyncIdentity(id: 1)],
+                capabilities: capabilities
+            )
+        }
+
+        var liveAddress = activeAccess
+        liveAddress.name = "liveAddressAcrossAwait"
+        liveAddress.registerTypes = [
+            .int64, .address(.int64), .int64, .address(.int64),
+            .int64, .int64,
+        ]
+        liveAddress.blocks[0].instructions = [
+            .storeStack(
+                slot: .init(rawValue: 0),
+                source: .init(rawValue: 0),
+                mode: .initialize
+            ),
+            .stackAddress(
+                result: .init(rawValue: 1),
+                slot: .init(rawValue: 0)
+            ),
+            .apply(
+                result: .init(rawValue: 2),
+                function: .init(rawValue: 1),
+                arguments: [.init(rawValue: 0)]
+            ),
+            .beginAccess(
+                result: .init(rawValue: 3),
+                address: .init(rawValue: 1),
+                kind: .read
+            ),
+            .loadAddress(
+                result: .init(rawValue: 4),
+                address: .init(rawValue: 3),
+                mode: .copy
+            ),
+            .endAccess(.init(rawValue: 3)),
+            .loadStack(
+                result: .init(rawValue: 5),
+                slot: .init(rawValue: 0),
+                mode: .take
+            ),
+            .returnValue(.init(rawValue: 2)),
+        ]
+        #expect(
+            throws: Verification.Error.invalidInstruction(
+                function: .init(rawValue: 0),
+                block: .init(rawValue: 0),
+                offset: 2,
+                reason: "async call cannot retain an address across suspension"
+            )
+        ) {
+            try verify(
+                root: liveAddress,
+                additionalFunctions: [asyncIdentity(id: 1)],
+                capabilities: capabilities
+            )
+        }
+    }
+
+    @Test("Dead address capabilities do not block a later async call")
+    func acceptsDeadAddressBeforeSuspension() throws {
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "deadAddressBeforeAwait",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [
+                .int64, .address(.int64), .address(.int64),
+                .int64, .int64, .int64,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .storeStack(
+                            slot: .init(rawValue: 0),
+                            source: .init(rawValue: 0),
+                            mode: .initialize
+                        ),
+                        .stackAddress(
+                            result: .init(rawValue: 1),
+                            slot: .init(rawValue: 0)
+                        ),
+                        .beginAccess(
+                            result: .init(rawValue: 2),
+                            address: .init(rawValue: 1),
+                            kind: .read
+                        ),
+                        .loadAddress(
+                            result: .init(rawValue: 3),
+                            address: .init(rawValue: 2),
+                            mode: .copy
+                        ),
+                        .endAccess(.init(rawValue: 2)),
+                        .loadStack(
+                            result: .init(rawValue: 4),
+                            slot: .init(rawValue: 0),
+                            mode: .take
+                        ),
+                        .apply(
+                            result: .init(rawValue: 5),
+                            function: .init(rawValue: 1),
+                            arguments: [.init(rawValue: 4)]
+                        ),
+                        .returnValue(.init(rawValue: 5)),
+                    ]
+                ),
+            ],
+            stackSlotTypes: [.int64],
+            effects: .init(isAsync: true)
+        )
+        _ = try verify(
+            root: root,
+            additionalFunctions: [asyncIdentity(id: 1)],
+            capabilities: [
+                .baselineV1, .addressValuesV1, .sequentialAsyncV1,
+            ]
+        )
+    }
+
+    @Test("A borrowing closure created after await may flow through a CFG edge")
+    func acceptsPostSuspensionBorrowOnCFGEdge() throws {
+        let signature = Bytecode.ClosureSignature(
+            parameters: [],
+            parameterConventions: [],
+            result: .void
+        )
+        let closureType = Bytecode.ValueType.closure(signature)
+        let body = Bytecode.Function(
+            id: .init(rawValue: 2),
+            name: "postAwaitBorrowBody",
+            kind: .closureBody,
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .void,
+            registerTypes: [.mutableCell(.int64), .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .loadMutableCell(
+                            result: .init(rawValue: 1),
+                            cell: .init(rawValue: 0)
+                        ),
+                        .returnValue(nil),
+                    ]
+                ),
+            ]
+        )
+        let root = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "postAwaitBorrow",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [
+                .int64, .int64, .address(.int64), .address(.int64),
+                .mutableCell(.int64), closureType, closureType,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .apply(
+                            result: .init(rawValue: 1),
+                            function: .init(rawValue: 1),
+                            arguments: [.init(rawValue: 0)]
+                        ),
+                        .storeStack(
+                            slot: .init(rawValue: 0),
+                            source: .init(rawValue: 1),
+                            mode: .initialize
+                        ),
+                        .stackAddress(
+                            result: .init(rawValue: 2),
+                            slot: .init(rawValue: 0)
+                        ),
+                        .beginAccess(
+                            result: .init(rawValue: 3),
+                            address: .init(rawValue: 2),
+                            kind: .modify
+                        ),
+                        .borrowMutableCell(
+                            result: .init(rawValue: 4),
+                            address: .init(rawValue: 3)
+                        ),
+                        .makeClosure(
+                            result: .init(rawValue: 5),
+                            target: .image(body.id),
+                            captures: [.init(rawValue: 4)],
+                            lifetime: .lexical
+                        ),
+                        .branch(
+                            target: .init(rawValue: 1),
+                            arguments: [.init(rawValue: 5)]
+                        ),
+                    ]
+                ),
+                .init(
+                    id: .init(rawValue: 1),
+                    parameters: [.init(rawValue: 6)],
+                    instructions: [
+                        .closureApply(
+                            result: nil,
+                            closure: .init(rawValue: 6),
+                            arguments: []
+                        ),
+                        .endClosureScope(closure: .init(rawValue: 5)),
+                        .endAccess(.init(rawValue: 3)),
+                        .destroyStack(.init(rawValue: 0)),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ],
+            stackSlotTypes: [.int64],
+            effects: .init(isAsync: true)
+        )
+
+        _ = try verify(
+            root: root,
+            additionalFunctions: [asyncIdentity(id: 1), body],
+            capabilities: [
+                .baselineV1, .addressValuesV1, .closureValuesV1,
+                .mutableCapturesV1, .sequentialAsyncV1,
+            ]
+        )
+    }
+
     private var initializedPrefix: [Bytecode.Instruction] {
         [
             .constantInteger(result: .init(rawValue: 0), bitPattern: 1),
@@ -1355,6 +1655,25 @@ struct AddressSemantics {
         )
     }
 
+    private func asyncIdentity(id: UInt32) -> Bytecode.Function {
+        .init(
+            id: .init(rawValue: id),
+            name: "asyncIdentity",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [.returnValue(.init(rawValue: 0))]
+                ),
+            ],
+            effects: .init(isAsync: true)
+        )
+    }
+
     @discardableResult
     private func verify(
         root: Bytecode.Function? = nil,
@@ -1371,7 +1690,8 @@ struct AddressSemantics {
         )
         let signature = Core.LoweredSignature(
             parameters: ["Swift.Int"],
-            result: "Swift.Int"
+            result: "Swift.Int",
+            isAsync: root.effects.isAsync
         )
         let key = try Core.FunctionKey.derive(
             namespace: namespace,
@@ -1412,7 +1732,8 @@ struct AddressSemantics {
                     key: key,
                     parameterTypes: [.int64],
                     parameterConventions: root.parameterConventions,
-                    resultType: .int64
+                    resultType: .int64,
+                    effects: root.effects
                 ),
             ]
         )

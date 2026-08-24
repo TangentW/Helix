@@ -134,8 +134,8 @@ struct Pipeline {
                 acceptedCapabilities: artifact.compilation.module.capabilities,
                 resourceCeiling: artifact.compilation.module.requestedResources,
                 allowedNativeImports: Set(fixture.archive.nativeImports.compactMap(\.id)),
-                allowMainActorSynchronousEntries: artifact.compilation.module.capabilities
-                    .contains(.mainActorSyncV1)
+                allowMainActorEntries: artifact.compilation.module.capabilities
+                    .contains(.mainActorIsolationV1)
             ),
             trustStore: try .init(roots: [fixture.root]),
             targetContext: fixture.targetContext,

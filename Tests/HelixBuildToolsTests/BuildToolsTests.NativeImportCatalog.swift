@@ -475,7 +475,7 @@ struct NativeImportCatalogPipeline {
             canonicalType: typeName
         ))
         #expect(receipt.capabilities.contains(.nativeTypesV1))
-        #expect(receipt.capabilities.contains(.mainActorSyncV1))
+        #expect(receipt.capabilities.contains(.mainActorIsolationV1))
         #expect(receipt.nativeTypeBindings.first?.importedModules == ["NativeSupport"])
         let identity = try #require(receipt.declarations.first {
             $0.canonicalDeclaration.contains("func identity(")

@@ -246,7 +246,7 @@ struct FrontendExecutionHarness {
                 allowedNativeImports: Set(
                     resolvedImports.map { $0.requirement.id }
                 ),
-                allowMainActorSynchronousEntries: rootEffects.requiresMainActor
+                allowMainActorEntries: rootEffects.requiresMainActor
             )
         )
         return .init(image: image, entry: entry)

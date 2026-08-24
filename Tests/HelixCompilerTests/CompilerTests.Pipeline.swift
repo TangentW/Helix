@@ -303,7 +303,7 @@ struct Pipeline {
     }
 
     @Test("Non-suspending async Swift entries retain their ABI and execute through an async Bridge context")
-    func lowersAsyncLeafEntry() throws {
+    func lowersAsyncLeafEntry() async throws {
         let effects = Core.Effects(isAsync: true)
         let fixture = try compileFixture(
             source: "public func asyncLeaf(_ value: Int) async -> Int { value + 9 }",
@@ -317,7 +317,7 @@ struct Pipeline {
             resultType: .int64,
             effects: effects
         )
-        #expect(fixture.compiled.module.capabilities.contains(.asyncLeafEntriesV1))
+        #expect(fixture.compiled.module.capabilities.contains(.sequentialAsyncV1))
         #expect(fixture.compiled.module.functions[0].effects.isAsync)
 
         let input = try VM.Integer(signed: 4, bitWidth: 64, isSigned: true)
@@ -327,24 +327,23 @@ struct Pipeline {
                 image: fixture.image,
                 arguments: [.integer(input)]
             ) == .trapped(.explicit(
-                "async HLBC entry requires its generated Swift async Bridge"
+                "async HLBC entry requires the async invocation API"
             ))
         )
-        let result = VM.Interpreter().invoke(
+        let result = await VM.Interpreter().invokeAsync(
             entry: .init(rawValue: 0),
             image: fixture.image,
-            arguments: [.integer(input)],
-            rootContext: .generatedAsyncBridge
+            arguments: [.integer(input)]
         )
         guard case let .returned(.some(.integer(value))) = result else {
-            Issue.record("unexpected async leaf result: \(result)")
+            Issue.record("unexpected async entry result: \(result)")
             return
         }
         #expect(value.signedValue == 13)
     }
 
     @Test("Async throwing leaves preserve both return and business-error paths")
-    func lowersAsyncThrowingLeafEntry() throws {
+    func lowersAsyncThrowingLeafEntry() async throws {
         let fixture = try compileFixture(
             source: """
             public enum AsyncFailure: Error { case rejected }
@@ -364,25 +363,23 @@ struct Pipeline {
             resultType: .int64,
             effects: .init(mayThrow: true, isAsync: true)
         )
-        #expect(fixture.compiled.module.capabilities.contains(.asyncLeafEntriesV1))
+        #expect(fixture.compiled.module.capabilities.contains(.sequentialAsyncV1))
         #expect(fixture.compiled.module.capabilities.contains(.untypedThrowsV1))
 
         #expect(
-            VM.Interpreter().invoke(
+            await VM.Interpreter().invokeAsync(
                 entry: .init(rawValue: 0),
                 image: fixture.image,
-                arguments: [.integer(try VM.Integer(signed: 4, bitWidth: 64, isSigned: true))],
-                rootContext: .generatedAsyncBridge
+                arguments: [.integer(try VM.Integer(signed: 4, bitWidth: 64, isSigned: true))]
             ) == .returned(
                 .integer(try VM.Integer(signed: 6, bitWidth: 64, isSigned: true))
             )
         )
         #expect(
-            VM.Interpreter().invoke(
+            await VM.Interpreter().invokeAsync(
                 entry: .init(rawValue: 0),
                 image: fixture.image,
-                arguments: [.integer(try VM.Integer(signed: -1, bitWidth: 64, isSigned: true))],
-                rootContext: .generatedAsyncBridge
+                arguments: [.integer(try VM.Integer(signed: -1, bitWidth: 64, isSigned: true))]
             ) == .businessError("AsyncFailure.rejected")
         )
     }
@@ -479,8 +476,8 @@ struct Pipeline {
             effects: effects
         )
 
-        #expect(fixture.compiled.module.capabilities.contains(.asyncLeafEntriesV1))
-        #expect(fixture.compiled.module.capabilities.contains(.mainActorSyncV1))
+        #expect(fixture.compiled.module.capabilities.contains(.sequentialAsyncV1))
+        #expect(fixture.compiled.module.capabilities.contains(.mainActorIsolationV1))
         #expect(!fixture.compiled.disassembly.contains("hop_to_executor"))
     }
 
@@ -4492,7 +4489,7 @@ struct Pipeline {
             shell: shell,
             policy: .init(
                 acceptedCapabilities: compiled.module.capabilities,
-                allowMainActorSynchronousEntries: effects.requiresMainActor
+                allowMainActorEntries: effects.requiresMainActor
             )
         )
         return .init(compiled: compiled, image: image)

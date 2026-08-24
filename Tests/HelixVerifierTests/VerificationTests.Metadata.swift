@@ -241,7 +241,7 @@ struct Metadata {
         _ = try Verification.ShellInterface(
             interfaceHash: .sha256("callable-result-shell"),
             compatibility: compatibility,
-            capabilities: capabilities.union([.mainActorSyncV1]),
+            capabilities: capabilities.union([.mainActorIsolationV1]),
             imports: [descriptor]
         )
 
@@ -265,7 +265,7 @@ struct Metadata {
         _ = try Verification.ShellInterface(
             interfaceHash: .sha256("callable-result-shell"),
             compatibility: compatibility,
-            capabilities: capabilities.union([.mainActorSyncV1]),
+            capabilities: capabilities.union([.mainActorIsolationV1]),
             imports: [descriptor]
         )
 

@@ -855,11 +855,13 @@ public struct Archive: Codable, Hashable, Sendable {
                     throw InterfaceArchive.Error.invalidArchive("untyped throws capability is absent")
                 }
             }
-            if effects.requiresMainActor, !capabilities.contains(.mainActorSyncV1) {
+            if effects.requiresMainActor, !capabilities.contains(.mainActorIsolationV1) {
                 throw InterfaceArchive.Error.invalidArchive("MainActor capability is absent")
             }
-            if effects.isAsync, !capabilities.contains(.asyncLeafEntriesV1) {
-                throw InterfaceArchive.Error.invalidArchive("async leaf-entry capability is absent")
+            if effects.isAsync, !capabilities.contains(.sequentialAsyncV1) {
+                throw InterfaceArchive.Error.invalidArchive(
+                    "sequential async capability is absent"
+                )
             }
         }
         func validateNativeCallable(

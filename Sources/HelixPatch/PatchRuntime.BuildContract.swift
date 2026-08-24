@@ -96,7 +96,7 @@ public struct BuildContract: Hashable, Sendable {
             acceptedCapabilities: capabilities,
             resourceCeiling: resourceCeiling,
             allowedNativeImports: nativeImportIDs,
-            allowMainActorSynchronousEntries: capabilities.contains(.mainActorSyncV1),
+            allowMainActorEntries: capabilities.contains(.mainActorIsolationV1),
             productionChannelEnabled: true
         )
     }

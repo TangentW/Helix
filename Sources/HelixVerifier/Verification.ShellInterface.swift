@@ -294,7 +294,7 @@ public struct ShellInterface: Sendable {
               let shape = type.directClosureShape,
               shape.signature.isNativeBridgeCallback,
               !shape.signature.effects.requiresMainActor
-                || capabilities.contains(.mainActorSyncV1),
+                || capabilities.contains(.mainActorIsolationV1),
               !shape.signature.parameters.contains(where: \.containsClosureValue)
                 || capabilities.contains(.escapingClosureValuesV1),
               !(callback.lifetime == .nonescaping && shape.isOptional)
@@ -342,7 +342,7 @@ public struct ShellInterface: Sendable {
               capabilities.contains(.escapingClosureValuesV1),
               signature.isNativeBridgeCallable,
               !signature.effects.requiresMainActor
-                || capabilities.contains(.mainActorSyncV1)
+                || capabilities.contains(.mainActorIsolationV1)
         else {
             throw Verification.Error.invalidShellInterface(
                 "\(owner) has an unsupported native callable"

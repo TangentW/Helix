@@ -645,6 +645,10 @@ does not by itself certify a physical device or distribution channel.
 - Top-level non-suspending `async`, `async throws`, and `@MainActor async`
   entries. Exact generated Swift wrappers preserve their ABI while HLVM runs a
   body proven not to suspend.
+  The Verifier/HLVM suspension engine and task-local generation pinning already
+  exist internally, but source lowering and generated async boundaries are not
+  enabled in this stage; they therefore do not yet expand this user-facing
+  capability.
 - VM-owned `Any`, `is`, `as?`, and `as!`. A closed recursive logical descriptor
   distinguishes source types that deliberately share HLBC storage, including
   `Int`/`Int64`, `UInt`/`UInt64`, `Double`/`CGFloat`, String/Character,

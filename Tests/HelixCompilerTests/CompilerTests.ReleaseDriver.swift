@@ -1054,7 +1054,7 @@ struct ReleaseDriver {
             shell: Verification.ShellInterface(archive: archive),
             policy: .init(
                 acceptedCapabilities: Set(archive.capabilities),
-                allowMainActorSynchronousEntries: true
+                allowMainActorEntries: true
             )
         )
     }
@@ -3046,7 +3046,7 @@ struct ReleaseDriver {
     }
 
     @Test("Production replay preserves async ABI and rejects a newly suspending body")
-    func buildsAsyncLeafAndRejectsAwait() throws {
+    func buildsAsyncLeafAndRejectsAwait() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(
                 "helix-release-async-leaf-\(UUID().uuidString)",
@@ -3086,7 +3086,7 @@ struct ReleaseDriver {
         let record = try #require(archive.functions.first)
         let entry = try #require(record.entryIndex)
         #expect(record.effects.isAsync)
-        #expect(archive.capabilities.contains(.asyncLeafEntriesV1))
+        #expect(archive.capabilities.contains(.sequentialAsyncV1))
 
         let changed = """
         public func transform(_ value: Int) async -> Int {
@@ -3104,11 +3104,10 @@ struct ReleaseDriver {
         )
         let input = try VM.Integer(signed: 4, bitWidth: 64, isSigned: true)
         #expect(
-            VM.Interpreter().invoke(
+            await VM.Interpreter().invokeAsync(
                 entry: entry,
                 image: image,
-                arguments: [.integer(input)],
-                rootContext: .generatedAsyncBridge
+                arguments: [.integer(input)]
             ) == .returned(
                 .integer(try VM.Integer(signed: 13, bitWidth: 64, isSigned: true))
             )

@@ -102,6 +102,21 @@ Both workflows depend on stable, build-specific identities:
 - An immutable `Runtime.Generation` makes all routes in one activation visible
   atomically. A call chain pins one generation so it cannot observe a mixture
   during concurrent activation or rollback.
+- The Verifier and HLVM now have a sequential-async execution foundation. A
+  dedicated async driver retains VM-owned frames across direct image calls,
+  exact Shell entries, and exact async NativeImports without blocking a
+  thread. Suspension checks the signed frame budget and rejects live address
+  accesses, address values, or address-borrowing storage. MainActor and
+  nonisolated segments resume through Swift actor isolation rather than thread
+  guesses. Runtime keeps the generation lease and root budget in task-local
+  context across executor migration; cancellation is cooperative at VM and
+  native checkpoints. An async NativeImport retains its own continuous
+  deadline while its awaited host time is excluded from the root active-time
+  budget. Async closure values, dynamic existential async dispatch, tasks,
+  continuations, async `inout`, and parallel execution remain fail-closed.
+  This is currently a runtime/verifier foundation: until the compiler and
+  generated-Bridge stages land, patch-source admission still accepts only the
+  previously proven non-suspending async roots.
 - One `make_closure` instruction carries a typed static target: an image
   function, a frozen Shell `EntryIndex`, or a declared `NativeImportID`.
   Unchanged Swift callables therefore do not copy archived bodies. Imported

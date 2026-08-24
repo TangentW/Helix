@@ -70,7 +70,6 @@ public struct Engine: Verification.ImageVerifying {
             shell: shell,
             capabilities: module.capabilities
         )
-        let entryFunctionIDs = Set(module.entries.map(\.functionID))
         try verifyLocalTypeReferences(module.functions, localTypes: localTypes)
         try verifySourceMap(module.sourceMap, functions: functionMap)
         try verifyEntries(
@@ -114,8 +113,7 @@ public struct Engine: Verification.ImageVerifying {
                 effectiveLimits: effectiveLimits,
                 declaredImports: declaredImports,
                 localTypes: localTypes,
-                capabilities: module.capabilities,
-                entryFunctionIDs: entryFunctionIDs
+                capabilities: module.capabilities
             )
         }
 
@@ -901,16 +899,23 @@ public struct Engine: Verification.ImageVerifying {
                 )
             }
             if shellEntry.effects.requiresMainActor {
-                guard policy.allowMainActorSynchronousEntries,
-                      shell.capabilities.contains(.mainActorSyncV1),
-                      capabilities.contains(.mainActorSyncV1)
+                guard policy.allowMainActorEntries,
+                      shell.capabilities.contains(.mainActorIsolationV1),
+                      capabilities.contains(.mainActorIsolationV1)
                 else {
-                    throw Verification.Error.capabilityDenied(.mainActorSyncV1)
+                    throw Verification.Error.capabilityDenied(.mainActorIsolationV1)
                 }
             }
             if shellEntry.effects.isAsync,
-               !capabilities.contains(.asyncLeafEntriesV1) {
-                throw Verification.Error.capabilityDenied(.asyncLeafEntriesV1)
+               !capabilities.contains(.sequentialAsyncV1) {
+                throw Verification.Error.capabilityDenied(.sequentialAsyncV1)
+            }
+            if shellEntry.effects.isAsync,
+               shellEntry.parameterConventions.contains(.inout) {
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "async Shell entries cannot expose inout storage"
+                )
             }
             if shellEntry.effects.mayThrow,
                !capabilities.contains(.untypedThrowsV1),
@@ -1114,8 +1119,8 @@ public struct Engine: Verification.ImageVerifying {
                     throw Verification.Error.capabilityDenied(.closureValuesV1)
                 }
                 if signature.effects.requiresMainActor,
-                   !capabilities.contains(.mainActorSyncV1) {
-                    throw Verification.Error.capabilityDenied(.mainActorSyncV1)
+                   !capabilities.contains(.mainActorIsolationV1) {
+                    throw Verification.Error.capabilityDenied(.mainActorIsolationV1)
                 }
                 if let thrownType = signature.thrownType {
                     switch thrownType {
@@ -1235,8 +1240,7 @@ public struct Engine: Verification.ImageVerifying {
         effectiveLimits: Core.ResourceLimits,
         declaredImports: [Core.NativeImportID: Bytecode.ImportRequirement],
         localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition],
-        capabilities: Set<Core.Capability>,
-        entryFunctionIDs: Set<Bytecode.FunctionID>
+        capabilities: Set<Core.Capability>
     ) throws {
         switch function.kind {
         case .ordinary:
@@ -1289,17 +1293,23 @@ public struct Engine: Verification.ImageVerifying {
                 )
             }
         }
-        if function.effects.requiresMainActor, !capabilities.contains(.mainActorSyncV1) {
-            throw Verification.Error.capabilityDenied(.mainActorSyncV1)
+        if function.effects.requiresMainActor, !capabilities.contains(.mainActorIsolationV1) {
+            throw Verification.Error.capabilityDenied(.mainActorIsolationV1)
         }
         if function.effects.isAsync {
-            guard capabilities.contains(.asyncLeafEntriesV1) else {
-                throw Verification.Error.capabilityDenied(.asyncLeafEntriesV1)
+            guard capabilities.contains(.sequentialAsyncV1) else {
+                throw Verification.Error.capabilityDenied(.sequentialAsyncV1)
             }
-            guard function.kind == .ordinary, entryFunctionIDs.contains(function.id) else {
+            guard function.kind != .closureBody else {
                 throw Verification.Error.invalidFunction(
                     function: function.id,
-                    reason: "async functions must be non-suspending Shell entries"
+                    reason: "async closure bodies are outside the sequential async contract"
+                )
+            }
+            guard !function.parameterConventions.contains(.inout) else {
+                throw Verification.Error.invalidFunction(
+                    function: function.id,
+                    reason: "async functions cannot expose inout storage"
                 )
             }
         }
@@ -1492,7 +1502,10 @@ public struct Engine: Verification.ImageVerifying {
                 )
             }
         }
-        let borrowedMutableCells = try borrowedMutableCellFacts(function)
+        let borrowedMutableCells = try borrowedMutableCellFacts(
+            function,
+            localTypes: localTypes
+        )
         try verifyBorrowedMutableCellLifetimes(
             function,
             facts: borrowedMutableCells
@@ -2229,89 +2242,145 @@ public struct Engine: Verification.ImageVerifying {
     }
 
     private struct BorrowedMutableCellFacts {
-        var sourceAddressByCell: [
-            Bytecode.Register: Bytecode.Register
+        var sourceAddressesByCell: [
+            Bytecode.Register: Set<Bytecode.Register>
         ] = [:]
-        var sourceAddressesByClosure: [
+        var sourceAddressesByValue: [
             Bytecode.Register: Set<Bytecode.Register>
         ] = [:]
 
-        var isEmpty: Bool { sourceAddressByCell.isEmpty }
+        var isEmpty: Bool { sourceAddressesByValue.isEmpty }
     }
 
-    /// Resolves every borrowed-cell projection back to the active address that
-    /// owns its lifetime. Lexical closures retain those roots as verifier-only
-    /// facts; no address capability enters their runtime value representation.
+    /// Resolves every value that can transitively retain a borrowed mutable
+    /// cell back to its active source addresses. The propagation is expressed
+    /// over generic result/operand dependencies so copies, aggregate wrappers,
+    /// closure conversions, and block arguments cannot hide a borrow from the
+    /// suspension check.
     private func borrowedMutableCellFacts(
-        _ function: Bytecode.Function
+        _ function: Bytecode.Function,
+        localTypes: [Bytecode.LocalTypeKey: Bytecode.LocalTypeDefinition]
     ) throws -> BorrowedMutableCellFacts {
-        var definitions: [Bytecode.Register: Bytecode.Instruction] = [:]
-        for block in function.blocks {
-            for instruction in block.instructions {
-                for result in instruction.resultRegisters {
-                    definitions[result] = instruction
+        func canRetainBorrow(
+            _ type: Bytecode.ValueType,
+            visiting: Set<Bytecode.LocalTypeKey> = []
+        ) -> Bool {
+            switch type {
+            case .mutableCell, .closure, .any, .error,
+                 .arrayState, .dictionaryState:
+                return true
+            case let .tuple(elements):
+                return elements.contains {
+                    canRetainBorrow($0, visiting: visiting)
                 }
+            case let .optional(wrapped), let .array(wrapped),
+                 let .set(wrapped):
+                return canRetainBorrow(wrapped, visiting: visiting)
+            case let .dictionary(key, value):
+                return canRetainBorrow(key, visiting: visiting)
+                    || canRetainBorrow(value, visiting: visiting)
+            case let .local(key):
+                guard !visiting.contains(key),
+                      let definition = localTypes[key] else { return false }
+                var next = visiting
+                next.insert(key)
+                switch definition.kind {
+                case let .structure(fields):
+                    return fields.contains {
+                        canRetainBorrow($0.type, visiting: next)
+                    }
+                case let .enumeration(cases):
+                    return cases.contains {
+                        $0.payloadType.map {
+                            canRetainBorrow($0, visiting: next)
+                        } ?? false
+                    }
+                case .class:
+                    return true
+                }
+            case .void, .never, .bool, .integer, .float, .string,
+                 .native, .address, .nonOwningReference:
+                return false
             }
         }
+
         var facts = BorrowedMutableCellFacts()
-        var resolving = Set<Bytecode.Register>()
-
-        func sourceAddress(
-            of register: Bytecode.Register
-        ) throws -> Bytecode.Register? {
-            if let cached = facts.sourceAddressByCell[register] {
-                return cached
-            }
-            guard resolving.insert(register).inserted else {
-                throw Verification.Error.invalidFunction(
-                    function: function.id,
-                    reason: "borrowed mutable-cell provenance contains a cycle"
-                )
-            }
-            defer { resolving.remove(register) }
-            let result: Bytecode.Register? = switch definitions[register] {
-            case let .borrowMutableCell(_, address):
-                address
-            case let .copyValue(_, source), let .moveValue(_, source):
-                try sourceAddress(of: source)
-            case let .projectMutableCell(_, cell, _):
-                try sourceAddress(of: cell)
-            default:
-                nil
-            }
-            if let result {
-                facts.sourceAddressByCell[register] = result
-            }
-            return result
-        }
-
-        for index in function.registerTypes.indices {
-            guard let raw = UInt32(exactly: index) else { continue }
-            _ = try sourceAddress(of: .init(rawValue: raw))
-        }
-        guard !facts.isEmpty else { return facts }
+        var propagationEdges: [
+            (source: Bytecode.Register, result: Bytecode.Register)
+        ] = []
 
         for block in function.blocks {
             for instruction in block.instructions {
-                let construction: (
-                    result: Bytecode.Register,
-                    captures: [Bytecode.Register],
-                    lifetime: Bytecode.ClosureLifetime
-                )? = switch instruction {
-                case let .makeClosure(result, _, captures, lifetime):
-                    (result, captures, lifetime)
-                default:
-                    nil
+                if case let .borrowMutableCell(result, address) = instruction {
+                    facts.sourceAddressesByValue[result, default: []]
+                        .insert(address)
                 }
-                guard let construction,
-                      construction.lifetime == .lexical
-                else { continue }
-                let sources = try Set(construction.captures.compactMap { capture in
-                    try sourceAddress(of: capture)
-                })
-                if !sources.isEmpty {
-                    facts.sourceAddressesByClosure[construction.result] = sources
+                for result in instruction.resultRegisters
+                where function.type(of: result).map({
+                    canRetainBorrow($0)
+                }) == true {
+                    propagationEdges.append(contentsOf:
+                        instruction.operandRegisters.map {
+                            (source: $0, result: result)
+                        }
+                    )
                 }
+            }
+        }
+
+        for block in function.blocks {
+            guard let terminator = block.instructions.last else { continue }
+            let edges: [(
+                target: Bytecode.BlockID,
+                values: [Bytecode.Register]
+            )] = switch terminator {
+            case let .branch(target, arguments):
+                [(target, arguments)]
+            case let .conditionalBranch(
+                _, trueTarget, trueArguments, falseTarget, falseArguments
+            ):
+                [
+                    (trueTarget, trueArguments),
+                    (falseTarget, falseArguments),
+                ]
+            case let .switchOptional(optional, someTarget, _):
+                [(someTarget, [optional])]
+            case let .switchEnum(enumeration, cases, _):
+                cases.map { ($0.target, [enumeration]) }
+            default:
+                []
+            }
+            for edge in edges {
+                guard let target = function.blocks.first(where: {
+                    $0.id == edge.target
+                }) else { continue }
+                for (parameter, value) in zip(target.parameters, edge.values)
+                where function.type(of: parameter).map({
+                    canRetainBorrow($0)
+                }) == true {
+                    propagationEdges.append((value, parameter))
+                }
+            }
+        }
+
+        var changed = true
+        while changed {
+            changed = false
+            for edge in propagationEdges {
+                guard let sources = facts.sourceAddressesByValue[edge.source],
+                      !sources.isEmpty else { continue }
+                let previous = facts.sourceAddressesByValue[edge.result, default: []]
+                let merged = previous.union(sources)
+                if merged != previous {
+                    facts.sourceAddressesByValue[edge.result] = merged
+                    changed = true
+                }
+            }
+        }
+
+        for (register, sources) in facts.sourceAddressesByValue {
+            if case .mutableCell? = function.type(of: register) {
+                facts.sourceAddressesByCell[register] = sources
             }
         }
         return facts
@@ -2330,7 +2399,7 @@ public struct Engine: Verification.ImageVerifying {
         for block in function.blocks {
             for (offset, instruction) in block.instructions.enumerated() {
                 let borrowedOperands = instruction.operandRegisters.filter(
-                    { facts.sourceAddressByCell[$0] != nil }
+                    { facts.sourceAddressesByCell[$0]?.isEmpty == false }
                 )
                 guard !borrowedOperands.isEmpty else { continue }
                 let permitted: Bool = switch instruction {
@@ -4235,6 +4304,7 @@ public struct Engine: Verification.ImageVerifying {
             try verifyEffects(
                 callee.effects,
                 allowedBy: function.effects,
+                maximumSuspendedFrames: effectiveLimits.maxSuspendedFrames,
                 operation: "hlbc_apply",
                 fail: fail
             )
@@ -4268,6 +4338,11 @@ public struct Engine: Verification.ImageVerifying {
                 dispatch,
                 arguments: arguments
             )
+            guard !abi.effects.isAsync else {
+                throw fail(
+                    "async existential dispatch is outside the sequential async contract"
+                )
+            }
             guard !zip(arguments, abi.parameterConventions).contains(where: {
                 $0.0 == existential && $0.1 == .owned
             }) else {
@@ -4278,6 +4353,7 @@ public struct Engine: Verification.ImageVerifying {
             try verifyEffects(
                 abi.effects,
                 allowedBy: function.effects,
+                maximumSuspendedFrames: effectiveLimits.maxSuspendedFrames,
                 operation: "existential_apply",
                 fail: fail
             )
@@ -4310,6 +4386,7 @@ public struct Engine: Verification.ImageVerifying {
             try verifyEffects(
                 descriptor.effects,
                 allowedBy: function.effects,
+                maximumSuspendedFrames: effectiveLimits.maxSuspendedFrames,
                 operation: "entry_apply",
                 fail: fail
             )
@@ -4339,6 +4416,7 @@ public struct Engine: Verification.ImageVerifying {
             try verifyEffects(
                 descriptor.effects,
                 allowedBy: function.effects,
+                maximumSuspendedFrames: effectiveLimits.maxSuspendedFrames,
                 operation: "native_apply",
                 fail: fail
             )
@@ -4457,6 +4535,7 @@ public struct Engine: Verification.ImageVerifying {
             try verifyEffects(
                 signature.effects,
                 allowedBy: function.effects,
+                maximumSuspendedFrames: effectiveLimits.maxSuspendedFrames,
                 operation: "closure_apply",
                 fail: fail
             )
@@ -4502,6 +4581,7 @@ public struct Engine: Verification.ImageVerifying {
             try verifyEffects(
                 signature.effects,
                 allowedBy: function.effects,
+                maximumSuspendedFrames: effectiveLimits.maxSuspendedFrames,
                 operation: "closure_try_apply",
                 catchesError: true,
                 fail: fail
@@ -4535,6 +4615,7 @@ public struct Engine: Verification.ImageVerifying {
             try verifyEffects(
                 callee.effects,
                 allowedBy: function.effects,
+                maximumSuspendedFrames: effectiveLimits.maxSuspendedFrames,
                 operation: "try_apply",
                 catchesError: true,
                 fail: fail
@@ -4573,6 +4654,11 @@ public struct Engine: Verification.ImageVerifying {
                 dispatch,
                 arguments: arguments
             )
+            guard !abi.effects.isAsync else {
+                throw fail(
+                    "async existential dispatch is outside the sequential async contract"
+                )
+            }
             guard !zip(arguments, abi.parameterConventions).contains(where: {
                 $0.0 == existential && $0.1 == .owned
             }) else {
@@ -4588,6 +4674,7 @@ public struct Engine: Verification.ImageVerifying {
             try verifyEffects(
                 abi.effects,
                 allowedBy: function.effects,
+                maximumSuspendedFrames: effectiveLimits.maxSuspendedFrames,
                 operation: "existential_try_apply",
                 catchesError: true,
                 fail: fail
@@ -4628,6 +4715,7 @@ public struct Engine: Verification.ImageVerifying {
             try verifyEffects(
                 descriptor.effects,
                 allowedBy: function.effects,
+                maximumSuspendedFrames: effectiveLimits.maxSuspendedFrames,
                 operation: "entry_try_apply",
                 catchesError: true,
                 fail: fail
@@ -4666,6 +4754,7 @@ public struct Engine: Verification.ImageVerifying {
             try verifyEffects(
                 descriptor.effects,
                 allowedBy: function.effects,
+                maximumSuspendedFrames: effectiveLimits.maxSuspendedFrames,
                 operation: "native_try_apply",
                 catchesError: true,
                 fail: fail
@@ -4800,12 +4889,22 @@ public struct Engine: Verification.ImageVerifying {
     private func verifyEffects(
         _ callee: Core.Effects,
         allowedBy caller: Core.Effects,
+        maximumSuspendedFrames: UInt32,
         operation: String,
         catchesError: Bool = false,
         fail: (String) -> Verification.Error
     ) throws {
         if callee.isAsync {
-            throw fail("\(operation) calls an async entry without a suspension contract")
+            guard caller.isAsync else {
+                throw fail(
+                    "\(operation) calls an async operation from a synchronous function"
+                )
+            }
+            guard maximumSuspendedFrames > 0 else {
+                throw fail(
+                    "\(operation) requires a positive suspended-frame budget"
+                )
+            }
         }
         if callee.mayThrow, !caller.mayThrow, !catchesError {
             throw fail("\(operation) calls a throwing operation from a nonthrowing function")
@@ -4816,7 +4915,8 @@ public struct Engine: Verification.ImageVerifying {
         if callee.hasExternalSideEffects, !caller.hasExternalSideEffects {
             throw fail("\(operation) calls an externally side-effecting operation from a pure function")
         }
-        if callee.requiresMainActor, !caller.requiresMainActor {
+        if callee.requiresMainActor, !caller.requiresMainActor,
+           !callee.isAsync {
             throw fail("\(operation) crosses into MainActor from a nonisolated function")
         }
     }
@@ -5937,6 +6037,7 @@ public struct Engine: Verification.ImageVerifying {
         }) else { return }
         let provenance = try addressProvenance(function: function)
         let blocks = Dictionary(uniqueKeysWithValues: function.blocks.map { ($0.id, $0) })
+        let liveAfter = liveRegistersAfterInstructions(function: function)
         var incoming: [Bytecode.BlockID: [Bytecode.Register: ActiveAddressAccess]] = [
             function.entryBlock: [:],
         ]
@@ -6017,14 +6118,39 @@ public struct Engine: Verification.ImageVerifying {
                     }
                 }
 
+                if isSuspensionPoint(
+                    instruction,
+                    function: function,
+                    functions: functions,
+                    shell: shell
+                ) {
+                    guard active.isEmpty else {
+                        throw fail(
+                            "async call cannot suspend with an active address access"
+                        )
+                    }
+                    var retained = liveAfter[block.id]?[offset] ?? []
+                    retained.subtract(instruction.resultRegisters)
+                    retained.formUnion(instruction.operandRegisters)
+                    for register in retained {
+                        if case .address? = function.type(of: register) {
+                            throw fail(
+                                "async call cannot retain an address across suspension"
+                            )
+                        }
+                        if borrowedMutableCells
+                            .sourceAddressesByValue[register]?.isEmpty == false {
+                            throw fail(
+                                "async call cannot retain address-borrowing storage across suspension"
+                            )
+                        }
+                    }
+                }
+
                 var borrowedSources = Set<Bytecode.Register>()
                 for operand in instruction.operandRegisters {
-                    if let address = borrowedMutableCells
-                        .sourceAddressByCell[operand] {
-                        borrowedSources.insert(address)
-                    }
                     borrowedSources.formUnion(
-                        borrowedMutableCells.sourceAddressesByClosure[operand]
+                        borrowedMutableCells.sourceAddressesByValue[operand]
                             ?? []
                     )
                 }
@@ -6213,6 +6339,107 @@ public struct Engine: Verification.ImageVerifying {
                     pending.append(target)
                 }
             }
+        }
+    }
+
+    /// Computes ordinary SSA liveness after every instruction. Suspension
+    /// checks use this to reject frame state whose lifetime cannot legally
+    /// cross an `await`; call operands are considered separately because they
+    /// remain live for the duration of the suspended call itself.
+    private func liveRegistersAfterInstructions(
+        function: Bytecode.Function
+    ) -> [Bytecode.BlockID: [Set<Bytecode.Register>]] {
+        let blocks = Dictionary(
+            uniqueKeysWithValues: function.blocks.map { ($0.id, $0) }
+        )
+        var liveBeforeBlock = Dictionary(
+            uniqueKeysWithValues: function.blocks.map {
+                ($0.id, Set<Bytecode.Register>())
+            }
+        )
+
+        func liveAcrossSuccessorEdges(
+            of block: Bytecode.Block
+        ) -> Set<Bytecode.Register> {
+            Set(
+                (block.instructions.last?.successorBlocks ?? []).flatMap {
+                    successor -> Set<Bytecode.Register> in
+                    guard let successorBlock = blocks[successor] else {
+                        return []
+                    }
+                    // Block parameters are defined by the edge. Explicit
+                    // branch operands are reintroduced while walking the
+                    // terminator; implicit try/switch payloads do not exist
+                    // before their producing instruction.
+                    return (liveBeforeBlock[successor] ?? []).subtracting(
+                        successorBlock.parameters
+                    )
+                }
+            )
+        }
+
+        var changed = true
+        while changed {
+            changed = false
+            for block in function.blocks.reversed() {
+                var live = liveAcrossSuccessorEdges(of: block)
+                for instruction in block.instructions.reversed() {
+                    live.subtract(instruction.resultRegisters)
+                    live.formUnion(instruction.operandRegisters)
+                }
+                if liveBeforeBlock[block.id] != live {
+                    liveBeforeBlock[block.id] = live
+                    changed = true
+                }
+            }
+        }
+
+        return Dictionary(uniqueKeysWithValues: function.blocks.map { block in
+            var live = liveAcrossSuccessorEdges(of: block)
+            var result = Array(
+                repeating: Set<Bytecode.Register>(),
+                count: block.instructions.count
+            )
+            for offset in block.instructions.indices.reversed() {
+                let instruction = block.instructions[offset]
+                result[offset] = live
+                live.subtract(instruction.resultRegisters)
+                live.formUnion(instruction.operandRegisters)
+            }
+            return (block.id, result)
+        })
+    }
+
+    private func isSuspensionPoint(
+        _ instruction: Bytecode.Instruction,
+        function: Bytecode.Function,
+        functions: [Bytecode.FunctionID: Bytecode.Function],
+        shell: Verification.ShellInterface
+    ) -> Bool {
+        return switch instruction {
+        case let .apply(_, callee, _),
+             let .tryApply(callee, _, _, _):
+            functions[callee]?.effects.isAsync == true
+        case let .existentialApply(_, _, _, dispatch),
+             let .existentialTryApply(_, _, dispatch, _, _):
+            dispatch.targets.contains {
+                functions[$0.function]?.effects.isAsync == true
+            }
+        case let .closureApply(_, closure, _),
+             let .closureTryApply(closure, _, _, _):
+            if case let .closure(signature)? = function.type(of: closure) {
+                signature.effects.isAsync
+            } else {
+                false
+            }
+        case let .entryApply(_, entry, _),
+             let .entryTryApply(entry, _, _, _):
+            shell.entries[entry]?.effects.isAsync == true
+        case let .nativeApply(_, importID, _),
+             let .nativeTryApply(importID, _, _, _):
+            shell.imports[importID]?.effects.isAsync == true
+        default:
+            false
         }
     }
 
