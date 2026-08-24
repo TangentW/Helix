@@ -302,6 +302,123 @@ struct Pipeline {
         #expect(call.1 == [copy.0])
     }
 
+    @Test("Borrowed Shell entries preserve a guaranteed native receiver")
+    func preservesBorrowedShellEntryReceiver() throws {
+        let receiverID = Core.TypeID(rawValue: .sha256("Fixture.Receiver"))
+        let helper = "$s7Fixture8ReceiverC6helperyyF"
+        let entry = Core.EntryIndex(rawValue: 4)
+        let effects = Core.Effects(
+            mayAllocate: true,
+            hasExternalSideEffects: true,
+            requiresMainActor: true
+        )
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture8ReceiverC4rootyyF",
+            loweredType: "@convention(method) @MainActor (@guaranteed Fixture.Receiver) -> ()",
+            body: """
+            bb0(%0 : @guaranteed $Fixture.Receiver):
+              %1 = function_ref @\(helper) : $@convention(method) (@guaranteed Fixture.Receiver) -> ()
+              %2 = apply %1(%0) : $@convention(method) (@guaranteed Fixture.Receiver) -> ()
+              return %2
+            """
+        )
+        let table = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: helper,
+                parameterTypes: [.native(receiverID)],
+                parameterConventions: [.borrowed],
+                resultType: .void,
+                effects: effects,
+                target: .entry(entry)
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty.includingNativeTypes(
+            ["Fixture.Receiver": receiverID],
+            requiresMainActor: [receiverID]
+        )
+
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            function,
+            displayName: "Fixture.Receiver.root",
+            directCalls: table,
+            expectedEffects: effects
+        )
+        let instructions = lowered.blocks.flatMap(\.instructions)
+        let calls: [(Core.EntryIndex, [Bytecode.Register])] = instructions
+            .compactMap { instruction in
+                guard case let .entryApply(_, target, arguments) = instruction
+                else { return nil }
+                return (target, arguments)
+            }
+        let callArguments = try #require(calls.first { target, _ in
+            target == entry
+        }?.1)
+
+        #expect(callArguments == [lowered.parameterRegisters[0]])
+        #expect(!instructions.contains { instruction in
+            guard case let .copyValue(_, source) = instruction else {
+                return false
+            }
+            return source == lowered.parameterRegisters[0]
+        })
+
+        let entryConventions = try table.entryParameterConventions(
+            referencedBy: [lowered]
+        )
+        #expect(entryConventions == [entry: [.borrowed]])
+        #expect(CompilerCapabilities.infer(
+            for: [lowered],
+            entryParameterConventions: entryConventions
+        ).contains(.borrowCallsV1))
+    }
+
+    @Test("Borrowed Shell entries reject a consuming physical argument")
+    func rejectsOwnedArgumentForBorrowedShellEntry() throws {
+        let receiverID = Core.TypeID(rawValue: .sha256("Fixture.Receiver"))
+        let helper = "$s7Fixture8ReceiverC6helperyyF"
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture8ReceiverC4rootyyF",
+            loweredType: "@convention(method) (@owned Fixture.Receiver) -> ()",
+            body: """
+            bb0(%0 : @owned $Fixture.Receiver):
+              %1 = function_ref @\(helper) : $@convention(method) (@owned Fixture.Receiver) -> ()
+              %2 = apply %1(%0) : $@convention(method) (@owned Fixture.Receiver) -> ()
+              return %2
+            """
+        )
+        let table = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: helper,
+                parameterTypes: [.native(receiverID)],
+                parameterConventions: [.borrowed],
+                resultType: .void,
+                target: .entry(.init(rawValue: 5))
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty.includingNativeTypes([
+            "Fixture.Receiver": receiverID,
+        ])
+
+        do {
+            _ = try CanonicalSIL.Lowerer(
+                typeEnvironment: environment
+            ).lower(
+                function,
+                displayName: "Fixture.Receiver.root",
+                directCalls: table
+            )
+            Issue.record("a consuming physical argument satisfied a borrowed Shell ABI")
+        } catch let error as CanonicalSIL.LoweringError {
+            guard case let .callSignatureMismatch(_, symbol, _) = error else {
+                Issue.record("unexpected lowering error: \(error)")
+                return
+            }
+            #expect(symbol == helper)
+        }
+    }
+
     @Test("Non-suspending async Swift entries retain their ABI and execute through an async Bridge context")
     func lowersAsyncLeafEntry() async throws {
         let effects = Core.Effects(isAsync: true)

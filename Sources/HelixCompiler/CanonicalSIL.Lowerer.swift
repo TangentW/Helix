@@ -3578,6 +3578,21 @@ public struct Lowerer: Sendable {
             guard physical.count == binding.parameterConventions.count else {
                 return false
             }
+
+            func acceptsValueBoundary() -> Bool {
+                zip(physical, binding.parameterConventions).allSatisfy {
+                    physical, logical in
+                    guard physical != .inout, logical != .inout else {
+                        return false
+                    }
+                    // A +0 value can satisfy an owning boundary through one
+                    // explicit VM copy. A borrowed boundary must keep the
+                    // caller's +0 convention; accepting +1 there would lose
+                    // the source-level consume when the callee does not take it.
+                    return logical == .owned || physical == .borrowed
+                }
+            }
+
             switch binding.abiAdapter {
             case .direct:
                 switch binding.target {
@@ -3592,26 +3607,8 @@ public struct Lowerer: Sendable {
                         }
                         return pair.0 == pair.1
                     }
-                case .entry:
-                    // Device boundaries own values. A guaranteed physical
-                    // parameter is adapted with an explicit VM copy.
-                    return !physical.contains(.inout)
-                        && binding.parameterConventions.allSatisfy { $0 == .owned }
-                case .nativeImport:
-                    return zip(physical, binding.parameterConventions)
-                        .allSatisfy { pair in
-                        let (physical, logical) = pair
-                        guard physical != .inout, logical != .inout else {
-                            return false
-                        }
-                        // Nonescaping callback authority is borrowed all the
-                        // way through the NativeImport, so a physical +1
-                        // callback cannot be silently weakened. Escaping
-                        // callbacks and ordinary logical parameters own their
-                        // boundary value and may adapt a physical +0 argument
-                        // with an explicit copy.
-                        return logical == .owned || physical == .borrowed
-                    }
+                case .entry, .nativeImport:
+                    return acceptsValueBoundary()
                 }
             case .mutatingValueReceiver:
                 guard case .nativeImport = binding.target,
@@ -6189,14 +6186,7 @@ public struct Lowerer: Sendable {
             switch binding.target {
             case .function:
                 return arguments
-            case .entry:
-                return try zip(arguments, physicalConventions).map {
-                    argument, physical in
-                    physical == .borrowed
-                        ? try copyOwnedValue(argument)
-                        : argument
-                }
-            case .nativeImport:
+            case .entry, .nativeImport:
                 return try zip(
                     zip(arguments, physicalConventions),
                     binding.parameterConventions

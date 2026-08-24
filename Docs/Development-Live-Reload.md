@@ -365,13 +365,16 @@ this stage come from exact project-source discovery or an explicit catalog;
 the managed SDK measurement path does not infer async declarations or convert
 completion handlers.
 
-Swift commonly spells a class receiver as `@guaranteed self` in SIL, while an
-Entry/NativeImport Bridge owns each value that crosses the device boundary.
-Helix preserves the physical SIL convention for call validation, then inserts a
-typed VM copy only for that borrowed-to-owned boundary. Local same-image calls
-still require an exact ownership ABI. This prevents a harmless borrow
-convention from rejecting private instance helpers without weakening type,
-effect, address, or capability checks.
+Swift commonly spells a class receiver as `@guaranteed self` in SIL. Each
+frozen Entry or NativeImport descriptor independently records whether a value
+crosses that boundary as owned or borrowed. Helix preserves the physical SIL
+convention for call validation: borrowed-to-borrowed values pass through,
+while borrowed-to-owned values receive one typed VM copy. An owned physical
+value cannot satisfy a borrowed boundary because that would erase the
+source-level consume. Local same-image calls still require an exact ownership
+ABI. This prevents a harmless borrow convention from rejecting private
+instance helpers without weakening type, effect, address, or capability
+checks.
 
 The frontend may encode an Objective-C `super` dispatch with both an upcast for
 the call ABI and a same-type `unchecked_ref_cast` as its lookup token. Helix
