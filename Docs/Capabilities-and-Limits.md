@@ -642,13 +642,16 @@ does not by itself certify a physical device or distribution channel.
   other uses fail closed. Compiler-generated bound-method factories recover
   an erased nested MainActor result only from unanimous body-isolation evidence;
   source-written factories are not inferred or rewritten.
-- Top-level non-suspending `async`, `async throws`, and `@MainActor async`
-  entries. Exact generated Swift wrappers preserve their ABI while HLVM runs a
-  body proven not to suspend.
-  The Verifier/HLVM suspension engine and task-local generation pinning already
-  exist internally, but source lowering and generated async boundaries are not
-  enabled in this stage; they therefore do not yet expand this user-facing
-  capability.
+- Sequential `await` between fully concrete patch-local image functions,
+  including multiple awaits, `async throws` propagation or handling, and exact
+  nonisolated/MainActor transitions. Compiler accepts only statically bound
+  `@async` `apply`/`try_apply` forms and VM rejects address, access, or
+  address-borrowing state live across a suspension point. The patch-local
+  suspension graph is executable through verified async image invocation, and
+  top-level async declarations retain their frozen Swift ABI. Patched routing
+  from an app-facing generated Shell async wrapper, including a leaf entry, and
+  generated async NativeImport adapters are still pending the next boundary
+  stage.
 - VM-owned `Any`, `is`, `as?`, and `as!`. A closed recursive logical descriptor
   distinguishes source types that deliberately share HLBC storage, including
   `Int`/`Int64`, `UInt`/`UInt64`, `Double`/`CGFloat`, String/Character,
@@ -735,10 +738,18 @@ contract passes the checks above; the examples do not form an API allowlist.
   than one indirect normal result. These remain explicit compile-time
   boundaries; Helix does not synthesize runtime opaque or generic metadata to
   guess their layout.
-- True suspension: `await`, continuations, tasks, async callees, async closures,
-  cancellation, and cross-suspension ownership or generation leases.
-- Actor-isolated instance roots, custom global actors, and arbitrary executor
-  hops. The limited `@MainActor async` leaf case above is distinct.
+- Task creation or parallel concurrency (`Task`, detached tasks, async-let and
+  task groups), public continuations, async closure values, dynamic existential
+  async dispatch, AsyncSequence/AsyncStream execution, and generic `Sendable`
+  semantics. Cancellation is observed only at the sequential VM/native
+  checkpoints described above.
+- Live `inout`, address/access/borrow storage across suspension, actor-isolated
+  instance roots, custom global actors, and arbitrary executor hops. Exact
+  nonisolated/MainActor transitions between concrete image functions are the
+  bounded exception.
+- Generated Shell suspension dispatch and generated exact async NativeImport
+  adapters. Until that boundary stage lands, a normal App integration cannot
+  use the patch-local suspension graph to cross either generated boundary.
 - A closure crossing a Shell Entry, or crossing NativeImport outside the exact
   callable profile above. Ordinary native values and the general boundary
   codec cannot contain closures; only an exact callback parameter or a direct

@@ -3045,8 +3045,8 @@ struct ReleaseDriver {
         )
     }
 
-    @Test("Production replay preserves async ABI and rejects a newly suspending body")
-    func buildsAsyncLeafAndRejectsAwait() async throws {
+    @Test("Production replay preserves async ABI and rejects task primitives")
+    func buildsAsyncLeafAndRejectsTaskConcurrency() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(
                 "helix-release-async-leaf-\(UUID().uuidString)",
@@ -3113,22 +3113,137 @@ struct ReleaseDriver {
             )
         )
 
-        let suspending = """
+        let taskBased = """
         public func transform(_ value: Int) async -> Int {
             await Task.yield()
             return value + 9
         }
         """
-        try Data(suspending.utf8).write(to: sourceURL)
+        try Data(taskBased.utf8).write(to: sourceURL)
         do {
             _ = try driver.build(
                 .init(archive: archive, sourceFiles: [sourceURL])
             )
-            Issue.record("expected a newly suspending async body to be rejected")
+            Issue.record("expected task-based concurrency to be rejected")
         } catch let error as CanonicalSIL.LoweringError {
-            #expect(error.description.contains("async leaf profile"))
-            #expect(error.description.contains("can suspend"))
+            #expect(error.description.contains("sequential async profile"))
+            #expect(error.description.contains("task"))
         }
+    }
+
+    @Test("Production replay executes patch-local sequential await and async throws")
+    func buildsPatchLocalSequentialAsyncGraph() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "helix-release-sequential-async-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Patch.swift")
+        let baseline = """
+        public func transform(_ value: Int) async -> Int {
+            value
+        }
+        """
+        try Data(baseline.utf8).write(to: sourceURL)
+
+        let driver = ReleaseCompiler.Driver()
+        let effects = Core.Effects(mayAllocate: true, isAsync: true)
+        let archive = try makeArchive(
+            sourceURL: sourceURL,
+            baselineSource: baseline,
+            compilerFingerprint: driver.toolchainIdentity().fingerprint,
+            transformSignature: .init(
+                parameters: ["Swift.Int"],
+                result: "Swift.Int",
+                isAsync: true
+            ),
+            transformCanonicalDeclaration:
+                "func transform(_: Int) async -> Int",
+            transformFormalType: "(Swift.Int) async -> Swift.Int",
+            transformLoweredSILType:
+                "@convention(thin) @async (Int) -> Int",
+            transformEffects: effects,
+            additionalCapabilities: [.untypedThrowsV1]
+        )
+        let record = try #require(archive.functions.first)
+        let entry = try #require(record.entryIndex)
+
+        let changed = """
+        private enum StepFailure: Error { case rejected }
+
+        @inline(never)
+        private func incrementStep(_ value: Int) async -> Int {
+            value + 1
+        }
+
+        @inline(never)
+        private func checkedStep(_ value: Int) async throws -> Int {
+            guard value >= 0 else { throw StepFailure.rejected }
+            return value * 2
+        }
+
+        public func transform(_ value: Int) async -> Int {
+            let incremented = await incrementStep(value)
+            do {
+                return try await checkedStep(incremented)
+            } catch {
+                return -1
+            }
+        }
+        """
+        try Data(changed.utf8).write(to: sourceURL)
+        let result = try driver.build(
+            .init(archive: archive, sourceFiles: [sourceURL])
+        )
+        let image = try Verification.Engine().verify(
+            bytes: result.bytecode,
+            shell: Verification.ShellInterface(archive: archive),
+            policy: .init(acceptedCapabilities: Set(archive.capabilities))
+        )
+        let instructions = result.module.functions.flatMap {
+            $0.blocks.flatMap(\.instructions)
+        }
+
+        #expect(result.module.functions.count == 3)
+        #expect(instructions.filter {
+            if case .apply = $0 { return true }
+            return false
+        }.count == 1)
+        #expect(instructions.filter {
+            if case .tryApply = $0 { return true }
+            return false
+        }.count == 1)
+        let positiveInput = VM.Value.integer(
+            try VM.Integer(signed: 3, bitWidth: 64, isSigned: true)
+        )
+        let positiveResult = VM.Value.integer(
+            try VM.Integer(signed: 8, bitWidth: 64, isSigned: true)
+        )
+        let negativeInput = VM.Value.integer(
+            try VM.Integer(signed: -3, bitWidth: 64, isSigned: true)
+        )
+        let negativeResult = VM.Value.integer(
+            try VM.Integer(signed: -1, bitWidth: 64, isSigned: true)
+        )
+        #expect(
+            await VM.Interpreter().invokeAsync(
+                entry: entry,
+                image: image,
+                arguments: [positiveInput]
+            ) == .returned(positiveResult)
+        )
+        #expect(
+            await VM.Interpreter().invokeAsync(
+                entry: entry,
+                image: image,
+                arguments: [negativeInput]
+            ) == .returned(negativeResult)
+        )
     }
 
     @Test("The exact iOS SDK build is enforced before SIL replay")

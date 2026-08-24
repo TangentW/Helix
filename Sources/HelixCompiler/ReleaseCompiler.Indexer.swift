@@ -391,7 +391,7 @@ public struct Indexer: Sendable {
         }
         if candidate.isAsync {
             do {
-                try CanonicalSIL.AsyncLeaf.validate(
+                try CanonicalSIL.SequentialAsync.validate(
                     .init(
                         mangledName: candidate.mangledName,
                         loweredType: candidate.interface.loweredSILType,
@@ -402,7 +402,7 @@ public struct Indexer: Sendable {
             } catch {
                 return .rejected(
                     "HLXIDX005",
-                    explanation: "async root is outside the non-suspending leaf profile: \(error)"
+                    explanation: "async root is outside the sequential async profile: \(error)"
                 )
             }
         }

@@ -55,8 +55,8 @@ private extension BridgeGeneration.Root {
 extension CompilerTests {
 @Suite("Release index, transform, Bridge, and archive-driven compilation")
 struct ReleasePipeline {
-    @Test("Indexer admits only non-suspending async roots and freezes their capability")
-    func indexesAsyncLeafProfile() throws {
+    @Test("Indexer admits sequential awaits and rejects task-based concurrency")
+    func indexesSequentialAsyncProfile() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("helix-async-index-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -66,6 +66,10 @@ struct ReleasePipeline {
         public func leaf(_ value: Int) async -> Int { value + 1 }
         @inline(never) public func helper(_ value: Int) async -> Int { value + 2 }
         public func suspending(_ value: Int) async -> Int { await helper(value) }
+        public func taskBased(_ value: Int) async -> Int {
+            await Task.yield()
+            return value
+        }
         """
         try Data(sourceText.utf8).write(to: source)
         let sil = try SwiftFrontend.Driver().emitCanonicalSIL(
@@ -75,6 +79,7 @@ struct ReleasePipeline {
         let file = try CanonicalSIL.File(text: sil)
         let leaf = try file.uniqueFunction(mangledNameContaining: "4leaf")
         let suspending = try file.uniqueFunction(mangledNameContaining: "10suspending")
+        let taskBased = try file.uniqueFunction(mangledNameContaining: "9taskBased")
         let namespace = Core.ShellNamespaceID.derive(
             bundleID: "dev.helix.async-index",
             buildNumber: "1",
@@ -147,19 +152,26 @@ struct ReleasePipeline {
             declarations: [
                 candidate(leaf, name: "leaf"),
                 candidate(suspending, name: "suspending"),
+                candidate(taskBased, name: "taskBased"),
             ]
         )
 
         let report = try ReleaseCompiler.Indexer().index(request)
-        #expect(report.eligibleCount == 1)
+        #expect(report.eligibleCount == 2)
         #expect(report.rejectedCount == 1)
         #expect(report.archive.capabilities.contains(.sequentialAsyncV1))
         #expect(report.archive.capabilities.contains(.anyValuesV1))
         #expect(report.archive.functions.first(where: {
             $0.mangledName == leaf.mangledName
         })?.patchability.isEligible == true)
+        #expect(report.archive.functions.first(where: {
+            $0.mangledName == suspending.mangledName
+        })?.patchability.isEligible == true)
+        #expect(report.archive.functions.first(where: {
+            $0.mangledName == taskBased.mangledName
+        })?.patchability.isEligible == false)
         #expect(report.diagnostics.contains(where: {
-            $0.code == "HLXIDX005" && $0.message.contains("non-suspending leaf profile")
+            $0.code == "HLXIDX005" && $0.message.contains("sequential async profile")
         }))
     }
 

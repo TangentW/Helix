@@ -205,11 +205,19 @@ enum ImageFunctions {
             let parsed = try CanonicalSIL.Lowerer(
                 typeEnvironment: environment
             ).parseFunctionType(function.loweredType)
-            guard !parsed.effects.isAsync else {
-                throw DiscoveryError.unsupported(
-                    symbol: symbol,
-                    reason: "async helpers require a suspension-aware call contract"
-                )
+            if parsed.effects.isAsync {
+                guard kind != .closureBody else {
+                    throw DiscoveryError.unsupported(
+                        symbol: symbol,
+                        reason: "async closure values are outside sequential async"
+                    )
+                }
+                guard !parsed.parameterConventions.contains(.inout) else {
+                    throw DiscoveryError.unsupported(
+                        symbol: symbol,
+                        reason: "an inout parameter cannot cross an async suspension boundary"
+                    )
+                }
             }
             var effects = parsed.effects
             let hostedContext = try environment.hostedMethodContext(for: function)
@@ -222,7 +230,7 @@ enum ImageFunctions {
             case let .globalActor(actor):
                 throw DiscoveryError.unsupported(
                     symbol: symbol,
-                    reason: "global actor \(actor) has no frozen synchronous executor contract"
+                    reason: "global actor \(actor) has no frozen executor contract"
                 )
             case let .unknown(description):
                 throw DiscoveryError.unsupported(
@@ -234,7 +242,7 @@ enum ImageFunctions {
                     symbol: symbol,
                     reason: "actor-instance isolation"
                         + (name.map { " (\($0))" } ?? "")
-                        + " has no frozen synchronous executor contract"
+                        + " has no frozen executor contract"
                 )
             case .unspecified, .nonisolated, .actorInstance:
                 break

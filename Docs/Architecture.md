@@ -114,9 +114,14 @@ Both workflows depend on stable, build-specific identities:
   deadline while its awaited host time is excluded from the root active-time
   budget. Async closure values, dynamic existential async dispatch, tasks,
   continuations, async `inout`, and parallel execution remain fail-closed.
-  This is currently a runtime/verifier foundation: until the compiler and
-  generated-Bridge stages land, patch-source admission still accepts only the
-  previously proven non-suspending async roots.
+  Compiler lowering now recognizes the pinned optimizer's exact direct
+  `@async` `apply`/`try_apply` shape, removes only proven nonisolated or
+  MainActor resume scaffolding, and links fully concrete patch-local async
+  helpers into the image. Multiple sequential awaits, handled or propagated
+  async errors, and nonisolated/MainActor image transitions therefore execute
+  through the verified async driver. App-facing generated Shell async wrappers
+  and generated async NativeImport adapters remain a separate boundary stage;
+  this compiler milestone does not yet claim those integration paths.
 - One `make_closure` instruction carries a typed static target: an image
   function, a frozen Shell `EntryIndex`, or a declared `NativeImportID`.
   Unchanged Swift callables therefore do not copy archived bodies. Imported

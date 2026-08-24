@@ -384,33 +384,131 @@ struct Pipeline {
         )
     }
 
-    @Test("An async await remains a stable suspension-profile rejection")
-    func rejectsSuspendingAsyncEntry() throws {
+    @Test("Multiple awaits lower to exact patch-local async direct calls")
+    func lowersPatchLocalSequentialAwaits() throws {
         let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("helix-async-reject-\(UUID().uuidString)")
+            .appendingPathComponent("helix-sequential-async-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let source = directory.appendingPathComponent("Patch.swift")
         try Data(
             """
             @inline(never) public func helper(_ value: Int) async -> Int { value + 1 }
-            public func caller(_ value: Int) async -> Int { await helper(value) }
+            public func caller(_ value: Int) async -> Int {
+                let first = await helper(value)
+                return await helper(first)
+            }
             """.utf8
         ).write(to: source)
         let sil = try SwiftFrontend.Driver().emitCanonicalSIL(
             sourceFiles: [source],
-            moduleName: "HelixAsyncRejectFixture"
+            moduleName: "HelixSequentialAsyncFixture"
         )
-        let function = try CanonicalSIL.File(text: sil)
-            .uniqueFunction(mangledNameContaining: "caller")
+        let file = try CanonicalSIL.File(text: sil)
+        let caller = try file.uniqueFunction(mangledNameContaining: "caller")
+        let helper = try file.uniqueFunction(mangledNameContaining: "helper")
+        let effects = Core.Effects(isAsync: true)
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: helper.mangledName,
+                parameterTypes: [.int64],
+                resultType: .int64,
+                effects: effects,
+                target: .function(.init(rawValue: 1))
+            ),
+        ])
+        let lowerer = CanonicalSIL.Lowerer(
+            typeEnvironment: file.typeEnvironment,
+            file: file
+        )
+        let loweredHelper = try lowerer.lower(
+            helper,
+            displayName: "helper",
+            expectedEffects: effects
+        )
+        let loweredCaller = try lowerer.lower(
+            caller,
+            displayName: "caller",
+            directCalls: calls,
+            expectedEffects: effects
+        )
 
-        #expect(throws: CanonicalSIL.LoweringError.self) {
-            _ = try CanonicalSIL.Lowerer().lower(
-                function,
-                displayName: "caller",
-                expectedEffects: .init(isAsync: true)
+        #expect(loweredHelper.effects.isAsync)
+        let appliedFunctions: [Bytecode.FunctionID] = loweredCaller.blocks
+            .flatMap(\.instructions).compactMap { instruction in
+                guard case let .apply(_, function, _) = instruction else {
+                    return nil
+                }
+                return function
+            }
+        #expect(appliedFunctions == [
+            Bytecode.FunctionID(rawValue: 1),
+            Bytecode.FunctionID(rawValue: 1),
+        ])
+    }
+
+    @Test("MainActor resume scaffolding normalizes around a nonisolated await")
+    func lowersMainActorSequentialAwait() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("helix-main-actor-await-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("Patch.swift")
+        try Data(
+            """
+            @inline(never)
+            public func worker(_ value: Int) async -> Int { value + 1 }
+            @MainActor
+            public func mainCaller(_ value: Int) async -> Int {
+                await worker(value) + 2
+            }
+            """.utf8
+        ).write(to: source)
+        let sil = try SwiftFrontend.Driver().emitCanonicalSIL(
+            sourceFiles: [source],
+            moduleName: "HelixMainActorAwaitFixture"
+        )
+        let file = try CanonicalSIL.File(text: sil)
+        let caller = try file.uniqueFunction(
+            mangledNameContaining: "mainCaller"
+        )
+        let worker = try file.uniqueFunction(mangledNameContaining: "worker")
+        let workerEffects = Core.Effects(isAsync: true)
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: worker.mangledName,
+                parameterTypes: [.int64],
+                resultType: .int64,
+                effects: workerEffects,
+                target: .function(.init(rawValue: 1))
+            ),
+        ])
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: file.typeEnvironment,
+            file: file
+        ).lower(
+            caller,
+            displayName: "mainCaller",
+            directCalls: calls,
+            expectedEffects: .init(
+                requiresMainActor: true,
+                isAsync: true
             )
+        )
+
+        #expect(lowered.effects.requiresMainActor)
+        #expect(lowered.effects.isAsync)
+        let hasWorkerCall = lowered.blocks.flatMap(\.instructions).contains {
+            instruction in
+            if case let .apply(_, function, _) = instruction {
+                return function.rawValue == 1
+            }
+            return false
         }
+        #expect(hasWorkerCall)
     }
 
     @Test("A real async escaping closure is rejected before HLBC packaging")
@@ -459,7 +557,7 @@ struct Pipeline {
         }
     }
 
-    @Test("A MainActor async leaf uses the same synchronous VM segment after its Swift executor prologue")
+    @Test("A MainActor async leaf removes only its pinned executor scaffold")
     func lowersMainActorAsyncLeafEntry() throws {
         let effects = Core.Effects(requiresMainActor: true, isAsync: true)
         let fixture = try compileFixture(

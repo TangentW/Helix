@@ -720,7 +720,7 @@ public struct Lowerer: Sendable {
         }
         let usesRuntimeAddresses = signature.parameterConventions.contains(.inout)
             || directCalls.referencesInoutCallee(in: function.body)
-        let normalizedBody = try CanonicalSIL.AsyncLeaf.normalizedBody(
+        let normalizedBody = try CanonicalSIL.SequentialAsync.normalizedBody(
             of: function,
             effects: effectiveEffects
         )
@@ -22451,6 +22451,39 @@ public struct Lowerer: Sendable {
             }
         }
 
+        func validateSequentialAsyncDirectCall(
+            _ binding: CanonicalSIL.DirectCallBinding,
+            physicalConventions: [Bytecode.ParameterConvention],
+            hasIndirectStorage: Bool,
+            line: Int
+        ) throws {
+            guard binding.effects.isAsync else { return }
+            guard effectiveEffects.isAsync else {
+                throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                    line: line,
+                    mangledName: binding.mangledName,
+                    detail: "a synchronous caller cannot invoke an async callee"
+                )
+            }
+            let hasAddressParameter = binding.parameterTypes.contains { type in
+                if case .address = type { return true }
+                return false
+            }
+            guard binding.abiAdapter == .direct,
+                  !hasIndirectStorage,
+                  !hasAddressParameter,
+                  !physicalConventions.contains(.inout),
+                  !binding.parameterConventions.contains(.inout)
+            else {
+                throw CanonicalSIL.LoweringError.unsupportedInstruction(
+                    line: line,
+                    text: "sequential async direct call @\(binding.mangledName) "
+                        + "would keep inout, address, or indirect-result storage "
+                        + "active across suspension"
+                )
+            }
+        }
+
         for (lineIndex, originalRawLine) in rawLines.enumerated() {
             currentSILLineIndex = lineIndex
             let rawLine = nsErrorBridges.replacementLines[lineIndex]
@@ -26794,10 +26827,7 @@ public struct Lowerer: Sendable {
                         text: "static KeyPath projection must be formed by partial_apply"
                     )
                 }
-                guard
-                      physicalBinding.effects.mayThrow,
-                      !physicalBinding.effects.isAsync
-                else {
+                guard physicalBinding.effects.mayThrow else {
                     throw CanonicalSIL.LoweringError.unsupportedInstruction(
                         line: sourceLine,
                         text: line
@@ -26858,8 +26888,9 @@ public struct Lowerer: Sendable {
                       appliedType.indirectErrorType
                         == reference.indirectErrorType,
                       appliedType.erasedMetatypes == reference.erasedMetatypes,
+                      binding.effects.mayThrow,
                       appliedType.effects.mayThrow,
-                      !appliedType.effects.isAsync,
+                      appliedType.effects.isAsync == binding.effects.isAsync,
                       physicalActorIsolationIsCompatible(
                           appliedType.effects,
                           authoritative: binding.effects
@@ -26872,6 +26903,13 @@ public struct Lowerer: Sendable {
                         mangledName: binding.mangledName
                     )
                 }
+                try validateSequentialAsyncDirectCall(
+                    binding,
+                    physicalConventions: reference.physicalParameterConventions,
+                    hasIndirectStorage: destinations.hasResult
+                        || destinations.error != nil,
+                    line: sourceLine
+                )
                 try validateProtocolExistentialBoundary(
                     binding: binding,
                     appliedTypeSpelling: appliedLoweredType,
@@ -27554,14 +27592,20 @@ public struct Lowerer: Sendable {
                       physicalActorIsolationIsCompatible(
                           appliedType.effects,
                           authoritative: binding.effects
-                      ),
-                      !binding.effects.isAsync
+                      )
                 else {
                     throw CanonicalSIL.LoweringError.callSignatureMismatch(
                         line: sourceLine,
                         mangledName: binding.mangledName
                     )
                 }
+                try validateSequentialAsyncDirectCall(
+                    binding,
+                    physicalConventions: reference.physicalParameterConventions,
+                    hasIndirectStorage: destinations.hasResult
+                        || destinations.error != nil,
+                    line: sourceLine
+                )
                 try validateProtocolExistentialBoundary(
                     binding: binding,
                     appliedTypeSpelling: appliedLoweredType,
