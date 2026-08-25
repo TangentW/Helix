@@ -812,16 +812,18 @@ memory during the hidden compilation.
 The Xcode integration captures the frontend, link, SDK, module, source, and
 target facts from a real Debug build. A source monitor turns editor writes and
 atomic renames into a stable, monotonically numbered snapshot. The development
-compiler rechecks the transaction in the original module context, lowers the
-same supported canonical SIL used by the release compiler, and emits one
-immutable HLBC generation. The authenticated daemon transports those bytes;
-the Debug App verifies them before atomically activating an ephemeral runtime
-generation.
+compiler rechecks the transaction in the original module context. Automatic
+routing prefers a fresh native Swift Dynamic Replacement image on a qualified
+iOS Simulator and otherwise lowers the supported canonical SIL used by the
+release compiler into an immutable HLBC generation. The authenticated daemon
+transports the selected bounded artifact; the Debug App validates it before
+atomic activation.
 
-There is no mutable dynamic library to which source files are appended. Native
-Dynamic Replacement remains available only through an explicit internal
-backend selection for compiler experiments and differential validation. The
-automatic and default route never falls back to it.
+There is no mutable dynamic library to which source files are appended: every
+native generation is a separate signed image and already loaded images remain
+immutable. Native loading is a Debug/Simulator capability with process-lifetime
+count and byte budgets. Physical devices retain HLBC by default, and production
+Hot Patch has no development image-loading path.
 
 The Debug App activates code first and refreshes UI second. `ReloadIndex`
 metadata maps changed roots to stable nominal type IDs. UIKit reconstructs those

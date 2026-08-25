@@ -21,6 +21,7 @@ struct DevSessionConfiguration {
         #expect(prepared.manifest.sessionBuildID == fixture.manifest.sessionBuildID)
         #expect(prepared.resolved.manifestURL == fixture.manifestURL)
         #expect(prepared.resolved.interfaceArchiveURL == fixture.archiveURL)
+        #expect(prepared.resolved.document.backendPreference == .automatic)
 
         var object = try #require(
             JSONSerialization.jsonObject(
@@ -196,8 +197,7 @@ private struct DaemonFixture {
             manifestPath: manifestURL.lastPathComponent,
             reloadIndexPath: indexURL.lastPathComponent,
             interfaceArchivePath: archiveURL.lastPathComponent,
-            nativeOutputDirectory: "Native",
-            backendPreference: .hlbc
+            nativeOutputDirectory: "Native"
         )
         try Core.CanonicalJSON.encode(manifest).write(to: manifestURL)
         try Core.CanonicalJSON.encode(index).write(to: indexURL)

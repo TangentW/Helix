@@ -24,7 +24,7 @@ flowchart LR
     P["Build pre-action"] --> S["DerivedData 中的 Shell 元数据"]
     S --> H["隐藏 Bridge object"]
     H --> A
-    D["保存 Swift 函数体"] --> N["验证后开发期 HLBC"]
+    D["保存 Swift 函数体"] --> N["自动选择原生 Swift 或验证后 HLBC"]
     N --> A
 ```
 
@@ -163,7 +163,7 @@ try await runtimeOwner.session.connect(pairingCode: "AB2C")
 
 业务代码只 import 稳定 Runtime module。启动时，`Runtime.LinkedBridge` 从当前进程 image 解析 `hlx_bridge_provider_v1`。Provider 通过 type-erased API 提供精确 Build Contract、Shell interface、Runtime factory 与 Bridge installer。隐藏 object 缺失或身份不匹配时会明确启动失败，不会悄悄把 Helix 关闭。
 
-公开默认配置只接受经过认证的 HLBC live artifact。Native Dynamic Replacement 只能通过内部实验配置显式选择，不是 App 接入前置条件。
+公开默认配置会自动协商：经过资格验证的 iOS Simulator 使用原生 Swift Dynamic Replacement，物理设备默认继续使用认证后的 HLBC，除非另有单独资格证据。App 代码不配置后端。
 
 ### Release / Hot Patch
 
@@ -224,7 +224,7 @@ swift run helix xcode doctor \
 2. 打开要修改的 UIKit 页面，并制造一些需要保留的内存状态。
 3. 只修改已索引声明的函数体并保存，不要 Build。
 4. 分别确认 compile、transfer、`codeActive` 与 `UI refreshed`。
-5. 再保存一次，验证后一代 HLBC generation 会在同一个 App 进程中原子替换第一代。
+5. 再保存一次，验证后一代 generation 会在同一个 App 进程中原子替换第一代。
 
 已有原生类型的 stored layout、函数签名、继承、conformance、enum case、actor isolation、源码 membership、链接依赖或 Build Settings 变化都需要正常构建。变化 root 可以使用现有受监视源码文件中新加、且可达的普通 helper、class private 方法、计算 accessor，以及不导出 ABI 的文件/module scope struct/enum/pure class。新增 `final` class 还可在闭合 hosted profile 内继承已冻结的 `NSObject` 兼容项目类或系统类，以 superclass 身份交给原生代码；当前仅开放继承无参初始化、无新增 stored property 与 no-arg/Bool `Void` override。新增文件或任意新原生 Swift metadata 仍不属于这条工作流。
 
@@ -248,7 +248,7 @@ swift run helix xcode doctor \
 | 源码已索引但没有 patchable root | 检查 patch 配置 pattern 是否相对 `sourceRoot`，且确实匹配 logical path |
 | `codeActive` 但 UI 没变化 | 函数是 observe-only、当前没有匹配的 UIKit/SwiftUI 实例，或确实需要显式 hook/factory |
 | Interface 或源码 membership 变化 | 已超出 body-only transaction，执行正常构建 |
-| HLBC lowering 报告不支持的语法 | 按精确诊断调整到受支持子集，或执行一次正常构建 |
+| 当前后端不支持函数体 | Simulator 自动路由通常使用原生 Swift；设备或生产 HLBC 路径应按精确诊断处理，或执行一次正常构建 |
 | Release baseline 不匹配 | 恢复审计时的源码、Xcode/SDK、target、configuration 与二进制身份 |
 
 继续阅读[总体架构](Architecture.zh-CN.md)、[开发期热重载](Development-Live-Reload.zh-CN.md)、[生产热补丁](Production-Hot-Patching.zh-CN.md)和[能力与限制](Capabilities-and-Limits.zh-CN.md)。

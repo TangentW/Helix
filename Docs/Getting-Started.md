@@ -31,7 +31,7 @@ flowchart LR
     P["Build pre-action"] --> S["Shell metadata in DerivedData"]
     S --> H["Hidden Bridge object"]
     H --> A
-    D["Saved Swift body"] --> N["Verified development HLBC"]
+    D["Saved Swift body"] --> N["Automatic native Swift or verified HLBC"]
     N --> A
 ```
 
@@ -239,9 +239,9 @@ Runtime factory, and Bridge installer through a type-erased API. A missing or
 mismatched hidden object fails startup explicitly instead of silently disabling
 Helix.
 
-The public default accepts only authenticated HLBC live artifacts. Native
-Dynamic Replacement can be selected only through the internal experimental
-configuration and is not required for App integration.
+The public default negotiates automatically: a qualified iOS Simulator uses
+native Swift Dynamic Replacement, while physical devices retain authenticated
+HLBC unless separately qualified. App code configures neither backend.
 
 ### Release / Hot Patch
 
@@ -318,8 +318,8 @@ Then:
 2. Navigate to the UIKit page you want to edit and change some in-memory state.
 3. Edit only the body of an indexed declaration and save; do not Build.
 4. Confirm compile, transfer, `codeActive`, and `UI refreshed` separately.
-5. Save another edit to verify that a later HLBC generation atomically replaces
-   the first one in the same App process.
+5. Save another edit to verify that a later generation atomically replaces the
+   first one in the same App process.
 
 Changing an existing native stored layout, signature, inheritance, conformance,
 enum cases, actor isolation, source membership, linked dependencies, or build
@@ -358,7 +358,7 @@ rejects App Store and controlled-native Release configurations.
 | Source is indexed but no root is patchable | Check that the patch configuration pattern is relative to `sourceRoot` and includes the logical path |
 | Code is active but UI is unchanged | The changed function is observe-only, no displayed UIKit/SwiftUI target matches, or explicit hook/factory work is required |
 | Interface or source membership changed | This is not a body-only transaction; perform a full build |
-| HLBC lowering reports an unsupported construct | Follow the precise diagnostic, simplify the edit to the supported subset, or perform a normal build |
+| A body is unsupported on the selected backend | Simulator automatic routing normally uses native Swift; on a device or production HLBC path, follow the precise diagnostic or perform a normal build |
 | Release baseline mismatch | Restore the audited sources, Xcode/SDK, target, configuration, and binary identity |
 
 Continue with [Architecture](Architecture.md),

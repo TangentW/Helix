@@ -89,6 +89,11 @@ struct DevConnectionBootstrap {
             isEnabled: true,
             supportedBackends: [.hlbc]
         ).validate()
+        let explicitNative = DevRuntime.Bootstrap.Options(
+            supportedBackends: [.hlbc, .nativeDynamicReplacement]
+        )
+        #expect(!explicitNative.nativeChainingProbePassed)
+        try explicitNative.validate()
     }
 
     @Test("Identity construction waits for the granted Shell ID")

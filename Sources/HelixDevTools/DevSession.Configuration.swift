@@ -27,7 +27,7 @@ public struct Configuration: Codable, Hashable, Sendable {
         interfaceArchivePath: String,
         compilerPath: String = "/usr/bin/swiftc",
         nativeOutputDirectory: String = ".helix/dev-native",
-        backendPreference: DevBackendSelection.Preference = .hlbc,
+        backendPreference: DevBackendSelection.Preference = .automatic,
         deviceNativeMatrixQualified: Bool = false,
         debounceMilliseconds: UInt32 = 120,
         maximumSourceBytes: Int = 8 * 1_024 * 1_024,

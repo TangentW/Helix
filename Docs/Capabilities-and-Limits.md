@@ -14,9 +14,9 @@ current practical boundary.
 | --- | --- | --- |
 | Release Shell | Exact frontend indexing, Derived Sources, interface archive, permanent bridge, NativeImport discovery, Xcode integration, bundle leakage audit | Broad real-application migration and long-running CI matrix |
 | Production HLBC | HLBC 1.0 / HLXI 1.0 compiler path, verifier, HLVM, signed package, safe installation, immutable activation, rollback and revocation; checked-in business corpus | App Store distribution approval, external top-200 corpus, long fuzz/sanitizer campaigns, real-device macro performance, and hosted UIKit-page soak |
-| Development Live Reload | Exact build capture, stable snapshots, body diff, session-bound verified HLBC, authenticated transfer, atomic activation, UIKit/SwiftUI refresh, logical source maps, an eight-generation/five-scenario UIKit Simulator acceptance matrix, and a 128-generation in-process soak | Physical-iPhone matrix, long-duration device soak, interactive bytecode stepping, large-project latency qualification |
+| Development Live Reload | Exact build capture, stable snapshots, automatic native-Swift/HLBC routing, authenticated transfer, atomic activation, UIKit/SwiftUI refresh, logical source maps, an eight-native-generation/five-scenario UIKit Simulator acceptance matrix, and a 128-generation HLBC in-process soak | Physical-iPhone matrix, long-duration device soak, interactive bytecode stepping, large-project latency qualification |
 | Helix Hub | SwiftUI status-bar app, project discovery, transactional Hot Patch/Live Reload onboarding, secure helper discovery, unified service, exact Build Context registry, Xcode automatic invitation, and manual four-character pairing | Distribution signing/notarization and broad third-party project migration matrix |
-| Native experiment | Explicit-only Dynamic Replacement builder, recursion/previous tests, signed dylib and loader probes | Product support; it is intentionally absent from automatic routing |
+| Development native backend | Automatic qualified-Simulator routing, exact Swift compilation, signed immutable images, loader/recursion/chaining coverage, dSYM generation, and process-lifetime resource limits | Physical-device qualification, automatic process restart, and production use (intentionally unavailable) |
 | Control plane | Client-side package and policy contracts | Production Registry, HSM operations, approval, rollout, telemetry, and fleet coordination services |
 
 The full SwiftPM suite, warnings-as-errors build, optimized Release build, iOS
@@ -917,8 +917,9 @@ visibility is not itself a runtime capability. An operation that cannot be
 represented in HLBC and has no exact generated Entry/NativeImport fails at
 compile time even when ordinary Swift would allow it.
 
-Simulator and device use the same HLBC protocol and runtime. The checked-in
-Simulator E2E applies eight generations in one App process: changed/restored
+Simulator and device share the authenticated transaction protocol, while the
+automatic execution backend is platform-qualified. The checked-in Simulator
+E2E applies eight native Swift generations in one App process: changed/restored
 layout bodies, target-action view construction and Auto Layout, an escaping
 configuration handler, nonescaping/escaping animation callbacks, controller
 presentation/dismissal callbacks, and final source restoration. It asserts
@@ -926,9 +927,8 @@ persisted UIKit/App state and retains screenshots rather than treating
 compilation or activation as success. A separate 128-generation in-process soak proves bounded active,
 rollback, failed-save, high-water, and compaction behavior. A physical-iPhone
 run and long-duration memory-pressure soak are still required before device
-behavior is listed as qualified. Native Dynamic Replacement remains an
-explicitly selected internal experiment and is not an alternate product
-fallback.
+behavior is listed as qualified. Physical devices retain verified HLBC by
+default; the native backend is never available to production Hot Patch.
 
 ## UI refresh boundary
 

@@ -84,10 +84,12 @@ public enum Reason: String, Codable, Hashable, Sendable {
 }
 
 public enum Preference: String, Codable, Hashable, Sendable {
-    /// Selects the verified HLBC backend. Automatic selection has the same
-    /// behavior and never falls through to executable-image injection.
+    /// Selects the broadest backend that the running development process and
+    /// captured toolchain have both prepared. Simulator builds prefer native
+    /// Swift replacement; device builds retain verified HLBC by default.
     case automatic
-    /// Selects the internal Native Dynamic Replacement experiment explicitly.
+    /// Selects Native Dynamic Replacement explicitly for diagnostics and
+    /// backend qualification.
     case native
     /// Selects the verified HLBC backend explicitly.
     case hlbc
@@ -151,8 +153,6 @@ public struct Selector: Sendable {
             return .init(backend: active, reason: .activeBackendRequired)
         }
 
-        // Native code loading is retained only as an explicit research mode.
-        // Product-default routing must remain identical on Simulator and device.
         let nativeAvailable = input.identity.supportedBackends.contains(.nativeDynamicReplacement)
             && input.identity.nativeChainingProbePassed
             && !input.identity.nativeImageSoftLimitReached
@@ -174,6 +174,19 @@ public struct Selector: Sendable {
                 : .init(backend: nil, reason: .forcedBackendUnavailable)
         case .automatic:
             break
+        }
+        if nativeAvailable, input.identity.platform == .iOSSimulator {
+            return .init(
+                backend: .nativeDynamicReplacement,
+                reason: .simulatorNativePreferred
+            )
+        }
+        if nativeAvailable, input.identity.platform == .iOS,
+           input.deviceNativeMatrixQualified {
+            return .init(
+                backend: .nativeDynamicReplacement,
+                reason: .deviceNativeQualified
+            )
         }
         if hlbcAvailable {
             return .init(backend: .hlbc, reason: .hlbcUnifiedDefault)

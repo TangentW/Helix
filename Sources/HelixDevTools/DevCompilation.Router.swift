@@ -152,7 +152,10 @@ public actor Router {
             )
             compilers.append(.bytecode(builder, eligibleFunctionKeys: eligible))
         }
-        if identity.supportedBackends.contains(.nativeDynamicReplacement) {
+        if identity.supportedBackends.contains(.nativeDynamicReplacement),
+           manifest.toolchainCapabilities.privateImports,
+           manifest.toolchainCapabilities.dynamicReplacementChaining,
+           manifest.frontendArguments.contains("-enable-private-imports") {
             let eligible = Set(reloadIndex.nativeReplacements.map(\.functionKey))
             let builder = try DevCompilation.NativeBuilder(
                 archive: archive,

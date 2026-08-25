@@ -330,7 +330,7 @@ public struct Application: Sendable {
         let prepared = try DevSession.Preparer(
             probe: BuildCapture.DefaultFrontendReplayProbe(runner: .init())
         ).prepare(request)
-        let backendValue = try options.value("backend") ?? "hlbc"
+        let backendValue = try options.value("backend") ?? "automatic"
         guard let backend = DevBackendSelection.Preference(rawValue: backendValue) else {
             throw CLI.Error.usage("--backend must be automatic, native, or hlbc")
         }
@@ -742,11 +742,12 @@ Options:
   --team-identifier VALUE       Capture the signing team identifier
   --entitlements PATH           Hash the expanded entitlements file
   --native-output-directory P   Native generation directory (default: .helix/dev-native)
-  --backend hlbc|native          HLBC is the product path; Native is experimental
+  --backend automatic|hlbc|native
+                                 Automatic prefers qualified Simulator Native, then HLBC
   --debounce-milliseconds N     Save debounce window (default: 120)
   --maximum-source-bytes N      Per-source safety limit
   --native-image-limit N        Native image soft limit (default: 50)
-  --device-native-qualified     Qualify the explicitly selected Native experiment
+  --device-native-qualified     Allow automatic/explicit Native on a qualified device matrix
   --force                       Atomically replace existing outputs
 
 Use --link-argument=VALUE when VALUE begins with '--'. No build setting is

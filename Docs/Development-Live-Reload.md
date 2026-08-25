@@ -423,17 +423,21 @@ Direct recursion resolves to the function in the same immutable HLBC image, so
 an ordinary recursive Swift body remains ordinary recursion. A call chain pins
 one runtime generation, preventing a concurrent save from mixing generations
 halfway through the call. `LiveReload.previous` belongs to the explicit Native
-Dynamic Replacement experiment and is not accepted by the default HLBC path;
-restoring older behavior is done by another save or an explicit generation
-rollback/tombstone, not by a hidden source-level call convention.
+Dynamic Replacement backend and is not portable to HLBC. Automatic routing may
+select that backend on a qualified Simulator, but source intended to work on
+both Simulator and device should restore older behavior with another save or an
+explicit generation rollback/tombstone instead of depending on this
+backend-specific call convention.
 
 ## Generations, transfer, and lifetime
 
-Each successful transaction is one immutable bytecode generation. Helix does
-not maintain a mutable dylib or append Swift files to an image. The daemon sends
-an offer manifest and bounded HLBC bytes over the authenticated Dev Session;
-the App verifies the complete artifact before activation. A baseline restore
-may legitimately carry no bytecode and only remove inherited routes.
+Each successful transaction is one immutable development generation. On a
+qualified Simulator build the payload is a newly compiled, signed native Swift
+image; on a device or when native replacement is unavailable it is verified
+HLBC. Helix never mutates an already loaded image. The daemon sends an offer
+manifest and a bounded payload over the authenticated Dev Session, and the App
+validates the complete artifact before activation. An HLBC baseline restore may
+legitimately carry no bytecode and only remove inherited routes.
 
 The default live HLBC payload limit is 16 MiB. Activation flattens inherited
 routes into one immutable snapshot, so a lookup does not depend on keeping an
@@ -459,17 +463,20 @@ still qualification gates.
 
 ## Backend policy
 
-`.automatic` and the public default select HLBC on both Simulator and device.
-The router does not silently fall back to Native when bytecode lowering rejects
-a transaction: it reports the exact unsupported construct and requires either a
-supported edit or a normal build. This keeps behavior and source coverage
-consistent across targets.
+`.automatic` is the generated and public default. A qualified iOS Simulator
+prefers native Swift Dynamic Replacement, which preserves the compiler's normal
+body semantics and avoids making HLBC syntax coverage the everyday reload
+ceiling. If that backend is not prepared for every changed root, routing falls
+back to verified HLBC. Physical-device builds continue to select HLBC unless a
+separate device/native matrix has been explicitly qualified; production Hot
+Patch never receives this development image-loading authority.
 
-Native Dynamic Replacement remains an explicit internal experiment for Swift
-compiler investigation and differential tests. It may still build and load a
-dylib on a qualified environment, but it is never selected automatically and is
-not the product Live Reload contract. The checked-in HLBC Simulator E2E is
-passing; physical-iPhone qualification remains an outstanding evidence gate.
+The checked-in Simulator E2E now applies eight native generations in one App
+process and verifies five observable UIKit scenarios plus final source
+restoration. Native images cannot be unloaded safely, so count and mapped-byte
+limits remain process-lifetime resource bounds; the diagnostic asks for an App
+restart before those bounds are exhausted. The 128-generation deterministic
+soak continues to exercise the independently verified HLBC lifecycle.
 
 ## Why code activation does not automatically redraw a page
 
@@ -841,8 +848,8 @@ logical source location.
 The terminal and Debug overlay report source revision, generation, backend,
 activation result, UI refresh result, whether old code remains active, and the
 next action. A failed save is not presented as a successful reload. Interactive
-HLBC breakpoints, stepping, and expression evaluation remain future work; the
-explicit Native experiment retains its separate dSYM tooling.
+HLBC breakpoints, stepping, and expression evaluation remain future work;
+native development generations emit and register their own dSYM artifacts.
 
 Compiler and rebuild diagnostics cross the same authenticated Dev channel as
 the generation. The App therefore leaves `Compiling` and presents the failure

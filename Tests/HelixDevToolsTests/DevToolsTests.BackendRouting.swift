@@ -8,15 +8,15 @@ import Testing
 extension DevToolsTests {
 @Suite("Development backend routing")
 struct BackendRouting {
-    @Test("Automatic selection is Bytecode-only while Native remains explicit")
+    @Test("Automatic selection prefers native Swift on Simulator and falls back to HLBC")
     func automaticSelection() throws {
         let fixture = try RoutingFixture()
         let selector = DevBackendSelection.Selector()
         let automatic = selector.select(
             fixture.input(candidateFunctions: [fixture.first])
         )
-        #expect(automatic.backend == .hlbc)
-        #expect(automatic.reason == .hlbcUnifiedDefault)
+        #expect(automatic.backend == .nativeDynamicReplacement)
+        #expect(automatic.reason == .simulatorNativePreferred)
 
         let explicitNative = selector.select(
             fixture.input(
@@ -47,8 +47,29 @@ struct BackendRouting {
 
         var nativeOnly = fixture.input(candidateFunctions: [fixture.first])
         nativeOnly.hlbcEligibleFunctions = []
-        #expect(selector.select(nativeOnly).backend == nil)
-        #expect(selector.select(nativeOnly).reason == .unsupported)
+        #expect(selector.select(nativeOnly).backend == .nativeDynamicReplacement)
+        #expect(selector.select(nativeOnly).reason == .simulatorNativePreferred)
+
+        var hlbcOnly = fixture.input(candidateFunctions: [fixture.first])
+        hlbcOnly.nativeEligibleFunctions = []
+        #expect(selector.select(hlbcOnly).backend == .hlbc)
+        #expect(selector.select(hlbcOnly).reason == .hlbcUnifiedDefault)
+
+        var deviceIdentity = fixture.identity
+        deviceIdentity.platform = .iOS
+        let unqualifiedDevice = selector.select(
+            fixture.input(identity: deviceIdentity, candidateFunctions: [fixture.first])
+        )
+        #expect(unqualifiedDevice.backend == .hlbc)
+        #expect(unqualifiedDevice.reason == .hlbcUnifiedDefault)
+
+        var qualifiedDevice = fixture.input(
+            identity: deviceIdentity,
+            candidateFunctions: [fixture.first]
+        )
+        qualifiedDevice.deviceNativeMatrixQualified = true
+        #expect(selector.select(qualifiedDevice).backend == .nativeDynamicReplacement)
+        #expect(selector.select(qualifiedDevice).reason == .deviceNativeQualified)
     }
 
     @Test("Reconnect affinity overrides preference and mixed transactions are rejected")

@@ -134,11 +134,11 @@ frontend 可能同时用一次 upcast 表达 Objective-C `super` 调用的物理
 
 Imported Optional property 在比较或复制时还会产生 address-form SIL。Helix 会先以不消费 storage 的方式判断分支，在 `.some` case 内把证明沿精确 `copy_addr` 传递，再只 unwrap 已证明的地址；兄弟控制流的状态彼此独立，没有受 `.some` edge 支配的 payload take 会 fail closed。
 
-直接递归会解析到同一个不可变 HLBC image 内的函数，因此普通递归 Swift 语义保持不变。一次调用链会固定一个 Runtime generation，并发保存不会让它在中途混用两代实现。`LiveReload.previous` 只属于显式 Native Dynamic Replacement 实验，默认 HLBC 路径不接受它；恢复旧行为应通过再次保存或显式 generation rollback/tombstone 完成，而不是依赖隐藏的源码调用约定。
+直接递归会解析到同一个不可变 HLBC image 内的函数，因此普通递归 Swift 语义保持不变。一次调用链会固定一个 Runtime generation，并发保存不会让它在中途混用两代实现。`LiveReload.previous` 只属于 Native Dynamic Replacement 后端，不能移植到 HLBC；自动路由可能在经过资格验证的 Simulator 上选择该后端，但同时面向 Simulator 与设备的源码不应依赖这种后端专用调用约定。恢复旧行为应通过再次保存或显式 generation rollback/tombstone 完成。
 
 ## Generation、传输与生命周期
 
-每个成功 transaction 都是一个不可变 bytecode generation。Helix 不维护可变 dylib，也不会往 image 中持续追加 Swift 文件。Daemon 通过认证 Dev Session 发送 offer manifest 与有界 HLBC 字节，App 验证完整 artifact 后才激活。恢复 baseline 时可以没有 bytecode，只携带停止继承旧 route 的信息。
+每个成功 transaction 都是一个不可变开发 generation。经过资格验证的 Simulator build 使用新编译并签名的原生 Swift image；设备或原生替换不可用时使用验证后的 HLBC。Helix 不会修改已经加载的 image。Daemon 通过认证 Dev Session 发送 offer manifest 与有界 payload，App 验证完整 artifact 后才激活。HLBC 恢复 baseline 时可以没有 bytecode，只携带停止继承旧 route 的信息。
 
 默认单个 live HLBC payload 上限为 16 MiB。激活会把继承 route 展平成一个不可变、自包含 snapshot，因此路由查询不依赖一条无限增长的祖先链。Registry 默认强保留当前 snapshot 与直接回滚前代；更旧 snapshot 只有在已开始调用或显式诊断 lease 仍固定它时才继续存活。lease 自身携带完成调用所需的已解析 route 与已验证 image。
 
@@ -148,9 +148,9 @@ Imported Optional property 在比较或复制时还会产生 address-form SIL。
 
 ## 后端策略
 
-`.automatic` 与公开默认配置在 Simulator 和设备上都选择 HLBC。字节码 lowering 拒绝 transaction 时，路由器不会偷偷回退到 Native；它会报告精确的不支持语法，要求调整为受支持修改或正常构建。这样两个目标上的行为和源码覆盖保持一致。
+`.automatic` 是生成配置和公开 API 的默认值。经过资格验证的 iOS Simulator 会优先选择原生 Swift Dynamic Replacement，直接保留 Swift 编译器的普通函数体语义，避免把 HLBC 语法覆盖变成日常热重载上限；只要变化 root 不能全部使用该后端，就回退到验证后的 HLBC。物理设备默认仍选择 HLBC，除非另有明确通过的 device/native 矩阵；生产 Hot Patch 不具备这项开发期 image 加载权限。
 
-Native Dynamic Replacement 只保留为必须显式选择的内部 Swift 编译器实验与差分测试。它仍可在经过资格验证的环境中构建、加载 dylib，但不会自动选中，也不属于产品 Live Reload 合同。仓库 HLBC Simulator E2E 已通过，真实 iPhone 资格验证仍是待补证据。
+仓库 Simulator E2E 已在同一个 App 进程中应用八代原生 generation，验证五个可观察 UIKit 场景和最终源码恢复。原生 image 无法安全卸载，因此数量和累计映射字节仍是进程生命周期资源边界，接近边界时会明确要求重启 App；另一个 128 代确定性 soak 继续独立验证 HLBC 生命周期。
 
 ## 为什么代码激活后页面不会天然重绘
 
@@ -244,7 +244,7 @@ Tuple label 同样只属于编译期结构：frontend 若用 Array 或 Dictionar
 
 HLBC 是验证后字节码而不是 Mach-O image，因此没有原生 dSYM。编译器 debug metadata 会降低成经过 Verifier 检查的 function/block/instruction → 逻辑 Swift 文件、行、列映射；生产 artifact 会移除构建机绝对路径。反汇编使用该映射标注指令；发生 trap 时 VM 给出精确 program counter，Runtime 再补充固定的 generation、Shell entry、函数名与逻辑源码位置。
 
-终端与 Debug Overlay 会报告 source revision、generation、backend、激活结果、UI 刷新结果、旧代码是否仍然有效以及下一步动作。失败的保存不会被展示成成功热重载。HLBC 的交互式 breakpoint、单步和表达式求值仍是后续工作；显式 Native 实验保留自己独立的 dSYM 工具。
+终端与 Debug Overlay 会报告 source revision、generation、backend、激活结果、UI 刷新结果、旧代码是否仍然有效以及下一步动作。失败的保存不会被展示成成功热重载。HLBC 的交互式 breakpoint、单步和表达式求值仍是后续工作；原生开发 generation 会生成并注册自己的 dSYM artifact。
 
 编译失败与必须完整构建的诊断会沿同一条认证 Dev 通道回到 App。因此即使 Mac 端无法生成 payload，浮层也会离开 `Compiling` 并显示失败；错误事件会自动展开详情。折叠 pill 始终保持单行，可拖动到当前 scene 安全区的其他位置，展开/折叠时保持右上锚点。默认在 5 秒没有新状态后动画隐藏，新事件到达时再动画显示。如果希望常驻，可以这样配置：
 

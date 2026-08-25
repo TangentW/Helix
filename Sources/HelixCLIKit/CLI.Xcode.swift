@@ -852,7 +852,7 @@ private func registerXcodeLiveSession(
         interfaceArchivePath: context.environment.finalArchiveURL.path,
         compilerPath: prepared.compilerURL.path,
         nativeOutputDirectory: nativeOutput.path,
-        backendPreference: .hlbc,
+        backendPreference: .automatic,
         deviceNativeMatrixQualified: false,
         debounceMilliseconds: 120,
         maximumSourceBytes: 8 * 1_024 * 1_024,

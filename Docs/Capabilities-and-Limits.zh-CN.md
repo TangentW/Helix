@@ -10,9 +10,9 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 | --- | --- | --- |
 | Release Shell | 精确 frontend 索引、Derived Sources、Interface Archive、永久 Bridge、NativeImport 发现、Xcode 集成、bundle 泄漏审计 | 大型真实业务迁移和长期 CI 矩阵 |
 | 生产 HLBC | HLBC 1.0 / HLXI 1.0 编译链、Verifier、HLVM、签名包、安全安装、不可变激活、回滚与吊销；仓库内业务 corpus | App Store 分发批准、外部 top-200 corpus、长时间 fuzz/sanitizer、真机 macro 性能与 hosted UIKit 页面 soak |
-| 开发期 Live Reload | 精确构建捕获、稳定快照、body 差分、会话绑定的验证后 HLBC、认证传输、原子激活、UIKit/SwiftUI 刷新、逻辑源码映射、八代/五场景 UIKit Simulator 验收矩阵与 128 代进程内 soak | 真实 iPhone 矩阵、真机长时间 soak、交互式字节码单步调试、大型工程延迟资格 |
+| 开发期 Live Reload | 精确构建捕获、稳定快照、原生 Swift/HLBC 自动路由、认证传输、原子激活、UIKit/SwiftUI 刷新、逻辑源码映射、八代原生 generation/五场景 UIKit Simulator 验收矩阵与 128 代 HLBC 进程内 soak | 真实 iPhone 矩阵、真机长时间 soak、交互式字节码单步调试、大型工程延迟资格 |
 | Helix Hub | SwiftUI 菜单栏应用、工程发现、Hot Patch/Live Reload 事务接入、安全 helper 发现、统一 Service、精确 Build Context registry、Xcode 自动邀请与手动四位码配对 | 分发签名/公证与大范围第三方工程迁移矩阵 |
-| Native 实验 | 仅显式选择的 Dynamic Replacement builder、递归/previous 测试、签名 dylib 与 loader probe | 产品支持；自动路由有意不选择它 |
+| 开发期原生后端 | 经过资格验证的 Simulator 自动路由、精确 Swift 编译、签名不可变 image、loader/递归/chaining 覆盖、dSYM 生成与进程生命周期资源限制 | 物理设备资格验证、自动进程重启，以及有意不开放的生产使用 |
 | 控制面 | 客户端包与 policy 合同 | 生产 Registry、HSM 运维、审批、灰度、遥测和设备群协调服务 |
 
 完整 SwiftPM 测试、warnings-as-errors、优化 Release 构建、iOS fixture 与仓库 Demo 分别作为证据 Gate。全部通过也不等于已经完成真实设备或分发通道认证。
@@ -136,7 +136,7 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 
 捕获的编译器上下文会保留原 access control，但可见性本身不是 Runtime capability。一个操作无法表示成 HLBC、也没有精确生成的 Entry/NativeImport 时，即便普通 Swift 允许访问，编译仍会失败。
 
-Simulator 与设备使用同一套 HLBC 协议和 Runtime。仓库 Simulator E2E 已在同一 App 进程中连续应用八代：修改/恢复 layout body、经 target-action 创建视图和 Auto Layout、escaping configuration handler、nonescaping/escaping 动画 callback、controller present/dismiss completion，以及最终源码恢复。测试会断言持久化 UIKit/App 状态并保留截图，不会把编译或激活本身当成成功；另有 128 代进程内 soak 验证 active/rollback、失败保存、generation 高水位与压缩保持有界。真实 iPhone 运行和长时间内存压力 soak 仍需补齐，才能列为经过验证。Native Dynamic Replacement 只保留为必须显式选择的内部实验，不是产品 fallback。
+Simulator 与设备共用认证 transaction 协议，但自动执行后端按平台资格选择。仓库 Simulator E2E 已在同一 App 进程中连续应用八代原生 Swift generation：修改/恢复 layout body、经 target-action 创建视图和 Auto Layout、escaping configuration handler、nonescaping/escaping 动画 callback、controller present/dismiss completion，以及最终源码恢复。测试会断言持久化 UIKit/App 状态并保留截图，不会把编译或激活本身当成成功；另有 128 代 HLBC 进程内 soak 验证 active/rollback、失败保存、generation 高水位与压缩保持有界。真实 iPhone 运行和长时间内存压力 soak 仍需补齐，才能列为经过验证。物理设备默认继续使用验证后的 HLBC；生产 Hot Patch 永远不开放原生开发后端。
 
 ## UI 刷新边界
 

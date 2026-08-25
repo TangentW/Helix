@@ -388,26 +388,40 @@ public final class Bootstrap: @unchecked Sendable {
         /// let options = DevRuntime.Bootstrap.Options()
         /// ```
         ///
-        /// The default enables only the unified HLBC product backend. Internal
-        /// Native experiments must opt in and pass their chaining probe.
+        /// Defaults are derived from the build destination. iOS Simulator
+        /// builds enable native Swift replacement and HLBC without App-side
+        /// configuration; physical-device builds enable HLBC until their
+        /// native loading matrix is qualified explicitly.
         public init(
             isEnabled: Bool = _isDebugAssertConfiguration(),
-            supportedBackends: [LiveReload.Backend] = [.hlbc],
-            nativeChainingProbePassed: Bool = false,
+            supportedBackends: [LiveReload.Backend]? = nil,
+            nativeChainingProbePassed: Bool? = nil,
             runtimePolicy: Core.RuntimePolicy? = nil,
             activationLimits: DevActivation.Limits = .init(),
             reconnectPolicy: DevConnection.ReconnectPolicy = .init(),
             liveness: DevProtocol.LivenessConfiguration = .init(),
             cacheDirectory: URL? = nil
         ) {
+            let usesAutomaticBackends = supportedBackends == nil
+            let resolvedBackends = supportedBackends ?? Self.defaultBackends
             self.isEnabled = isEnabled
-            self.supportedBackends = supportedBackends.sorted { $0.rawValue < $1.rawValue }
+            self.supportedBackends = resolvedBackends.sorted { $0.rawValue < $1.rawValue }
             self.nativeChainingProbePassed = nativeChainingProbePassed
+                ?? (usesAutomaticBackends
+                    && resolvedBackends.contains(.nativeDynamicReplacement))
             self.runtimePolicy = runtimePolicy
             self.activationLimits = activationLimits
             self.reconnectPolicy = reconnectPolicy
             self.liveness = liveness
             self.cacheDirectory = cacheDirectory
+        }
+
+        private static var defaultBackends: [LiveReload.Backend] {
+            #if os(iOS) && targetEnvironment(simulator)
+            [.hlbc, .nativeDynamicReplacement]
+            #else
+            [.hlbc]
+            #endif
         }
 
         /// Validates all resource and transport settings before networking starts.
