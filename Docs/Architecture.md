@@ -543,7 +543,11 @@ Both workflows depend on stable, build-specific identities:
   an exclusive upper bound. The String specialization first enters this arm
   through its verified Character Array. The finite-progression arm drives the
   existing Optional-valued progression cursor from typed start/end/stride registers.
-  Both arms therefore feed the same closure CFG without importing a Swift
+  Reverse consumers of finite integer Range Collections use the same bounded
+  Array materialization adapter as other stored/random-access consumers, while
+  predicate index searches return the matched `Range<Int>` element as its exact
+  index; `ClosedRange.Index` remains opaque. Both arms therefore feed the same
+  closure CFG without importing a Swift
   iterator or witness-table ABI. The Verifier rejects unsupported reverse or
   unordered traversal, and the VM rejects corrupt cursor state instead of
   treating it as exhaustion.

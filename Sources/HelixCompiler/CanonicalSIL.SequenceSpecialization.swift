@@ -40,5 +40,28 @@ enum SequenceSpecialization: Equatable, Sendable {
             nil
         }
     }
+
+    /// Whether reverse traversal can preserve the concrete source order.
+    /// Finite Range values are materialized through the same bounded Array
+    /// adapter already used by `reversed()` and other finite consumers.
+    var supportsReverseTraversal: Bool {
+        switch self {
+        case .stringCharacters:
+            true
+        case let .managedCollection(type, _):
+            if case .array = type { true } else { false }
+        case let .progression(type):
+            (type.family == .range || type.family == .closedRange)
+                && type.supportsIteration
+        }
+    }
+
+    /// Range<Int>.Index is its element value. ClosedRange uses an opaque Index,
+    /// while the remaining progression families are Sequences rather than
+    /// integer-indexed Collections; neither may enter index-returning operations.
+    var usesElementAsIntegerIndex: Bool {
+        guard case let .progression(type) = self else { return false }
+        return type.family == .range && type.element == .int64
+    }
 }
 }

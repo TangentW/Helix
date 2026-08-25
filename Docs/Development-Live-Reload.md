@@ -676,7 +676,8 @@ source's logical base; String/Substring full-range materialization retains its
 separate Character representation. The compiler erases these range wrappers
 instead of binding Swift's generic Collection ABI as NativeImports or adding
 one opcode per source API. Using a one-sided range as a potentially infinite
-Sequence, progression index results, private `String.Index`,
+Sequence, progression index results other than the exact element-valued index
+of finite `Range<Int>`, private `String.Index`,
 `ReversedCollection.Index`, and other opaque index identities remain
 fail-closed rather than acquiring guessed semantics.
 `Bool.toggle()` and global `swap` likewise use a value-mutation plan over the

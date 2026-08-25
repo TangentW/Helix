@@ -248,13 +248,18 @@ does not by itself certify a physical device or distribution channel.
   progression consumers stream the shared cursor without an intermediate
   Array; String performs one validated Character-Array materialization before
   entering that same cursor.
-  Reverse `last(where:)` accepts String and Array-backed sources. String and
+  Reverse `last(where:)` accepts String, Array-backed sources, and finite
+  integer `Range`/`ClosedRange` values. The Range path materializes through
+  the same bounded typed adapter used by other reverse consumers, preserving
+  reverse predicate order and short-circuiting. String and
   Array-backed sources support Collection `prefix(while:)`/`drop(while:)`;
   direct Sequence `prefix(while:)` also accepts represented finite
   specializations, including supported progressions. Array-backed integer-index
   sources preserve their logical base for `firstIndex(where:)`/
   `lastIndex(where:)`, mutating sort, `reverse()`, `removeAll(where:)`, and
-  `partition(by:)`. Producing
+  `partition(by:)`; finite `Range<Int>` predicate index
+  searches return the matched element as their exact Collection index without
+  inventing a generic index representation. Producing
   variants use one linear invocation-local element buffer followed by a typed
   String, Array, Dictionary, or Set finalizer instead of repeated copy-on-write edits.
   The `last` searches invoke their predicates from the end; comparator selection
@@ -270,7 +275,10 @@ does not by itself certify a physical device or distribution channel.
   sources reuse the same forward traversal for `map`, `flatMap`, `filter`,
   `compactMap`, `reduce`, `reduce(into:_:)`, `forEach`, `first(where:)`,
   `contains(where:)`, `allSatisfy`, `count(where:)`, and comparator-driven
-  `min(by:)`/`max(by:)`; producing transforms return Arrays. They also support
+  `min(by:)`/`max(by:)`; finite integer `Range`/`ClosedRange` Collections
+  additionally support reverse `last(where:)`, while `Range<Int>` additionally
+  supports exact `firstIndex(where:)`/`lastIndex(where:)`. Producing transforms
+  return Arrays. They also support
   equality `contains(_:)`, natural `min()`/`max()`, mixed-source Sequence
   relations, natural/comparator `sorted`, `Set(sequence)`, and generic Set
   algebra whose sequence operand is concrete and finite. Element-only
@@ -289,10 +297,11 @@ does not by itself certify a physical device or distribution channel.
   `overlaps`, `clamped(to:)`, and direct lower/upper-bound access without
   implying iteration. Empty ranges never overlap; clamping preserves the selected
   original bound on equality, including floating signed zero.
-  Progression index results, opaque-index collection operations, and using a
-  one-sided partial range as a potentially infinite Sequence source remain
-  rejected until their direction, index identity, complexity, or termination
-  can be represented exactly.
+  Progression index results other than the exact element-valued index of finite
+  `Range<Int>`, opaque-index collection operations, and
+  using a one-sided partial range as a potentially infinite Sequence source
+  remain rejected until their direction, index identity, complexity, or
+  termination can be represented exactly.
   Array-backed Collection and String `split` support both the
   `separator:maxSplits:omittingEmptySubsequences:` overload for recursively
   VM-defined Equatable elements and the throwing `whereSeparator:` overload

@@ -399,6 +399,15 @@ public struct Lowerer: Sendable {
         case stringCharacters
     }
 
+    private enum SequencePredicateIndexSource: Equatable {
+        /// The source exposes a represented integer Collection index. The
+        /// callback cursor is converted back to that logical index on match.
+        case collectionBaseAndCursorOffset
+        /// `Range<Int>.Index == Int`, so the matched element already is the
+        /// exact logical index and no materialized cursor offset may leak out.
+        case element
+    }
+
     private struct CollectionQueryPlan {
         var source: CanonicalSIL.SequenceSpecialization
         /// The Collection getter is exact. Zip2Sequence instead invokes each
@@ -421,10 +430,13 @@ public struct Lowerer: Sendable {
         var callbackShape: SequenceCallbackShape = .element
         var consumesSource = false
         var builderOutput: SequenceBuilderOutput = .representedCollection
-        /// Present only when a result exposes the source Collection's
-        /// represented integer-index identity.
-        var sourceIndexModel: CanonicalSIL.CollectionIndex.Model? = nil
+        var predicateIndexSource: SequencePredicateIndexSource? = nil
         var preservesSubsequenceIndexBase = false
+
+        var requiresSourceIndexBase: Bool {
+            predicateIndexSource == .collectionBaseAndCursorOffset
+                || preservesSubsequenceIndexBase
+        }
     }
 
     private enum SequenceCursor {
@@ -10136,7 +10148,7 @@ public struct Lowerer: Sendable {
             let cursorSlot = traversal.cursor.slot
 
             let sourceIndexBase: Bytecode.Register?
-            if plan.sourceIndexModel != nil {
+            if plan.requiresSourceIndexBase {
                 guard case let .managedCollection(collection, _) =
                     traversal.cursor,
                     case .array = registerTypes[Int(collection.rawValue)]
@@ -11178,29 +11190,13 @@ public struct Lowerer: Sendable {
                         + [.branch(target: loop, arguments: [])]
                 )
             case .firstIndexWhere, .lastIndexWhere:
-                guard let sourceIndexBase else {
-                    throw CanonicalSIL.LoweringError.malformedSIL(
-                        "predicate index search lost its Collection base"
-                    )
-                }
                 let predicate = try requiredRegister(
                     continuationResult,
                     "first/lastIndex(where:) predicate"
                 )
                 let matched = try allocateSyntheticBlockID()
-                let wrap = try allocateSyntheticBlockID()
-                let overflowTrap = try allocateSyntheticBlockID()
                 let skipped = try allocateSyntheticBlockID()
-                let advancedIndex = try allocate(type: .int64)
-                let cursorAdjustment = try allocate(type: .int64)
-                let physicalIndex = try allocate(type: .int64)
-                let subtractionOverflow = try allocate(type: .bool)
-                let matchedIndex = try allocate(type: .int64)
-                let additionOverflow = try allocate(type: .bool)
-                let overflow = try allocate(type: .bool)
                 let result = try allocate(type: plan.callResultType)
-                let cursorAdjustmentBitPattern: UInt64 =
-                    traversalDirection == .forward ? 1 : 0
                 appendSyntheticBlock(
                     id: closureContinuation,
                     parameters: continuationParameters,
@@ -11214,63 +11210,106 @@ public struct Lowerer: Sendable {
                         ),
                     ]
                 )
-                appendSyntheticBlock(
-                    id: matched,
-                    instructions: closureArgumentCleanup + [
-                        .loadStack(
-                            result: advancedIndex,
-                            slot: cursorSlot,
-                            mode: .copy
-                        ),
-                        .constantInteger(
-                            result: cursorAdjustment,
-                            bitPattern: cursorAdjustmentBitPattern
-                        ),
-                        .checkedBinary(
-                            result: physicalIndex,
-                            overflow: subtractionOverflow,
-                            operation: .subtract,
-                            lhs: advancedIndex,
-                            rhs: cursorAdjustment
-                        ),
-                        .checkedBinary(
-                            result: matchedIndex,
-                            overflow: additionOverflow,
-                            operation: .add,
-                            lhs: sourceIndexBase,
-                            rhs: physicalIndex
-                        ),
-                        .booleanBinary(
-                            result: overflow,
-                            operation: .or,
-                            lhs: subtractionOverflow,
-                            rhs: additionOverflow
-                        ),
-                        .conditionalBranch(
-                            condition: overflow,
-                            trueTarget: overflowTrap,
-                            trueArguments: [],
-                            falseTarget: wrap,
-                            falseArguments: []
-                        ),
-                    ]
-                )
-                appendSyntheticBlock(
-                    id: wrap,
-                    instructions: [
-                        .makeOptionalSome(
-                            result: result,
-                            value: matchedIndex
-                        ),
-                        .destroyStack(cursorSlot),
-                    ] + sourceCleanup + [
-                        .branch(target: normalTarget, arguments: [result]),
-                    ]
-                )
-                appendSyntheticBlock(
-                    id: overflowTrap,
-                    instructions: [.trap(.integerOverflow)]
-                )
+                guard let predicateIndexSource = plan.predicateIndexSource else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "predicate index search lost its index source"
+                    )
+                }
+                switch predicateIndexSource {
+                case .element:
+                    appendSyntheticBlock(
+                        id: matched,
+                        instructions: closureArgumentCleanup + [
+                            .makeOptionalSome(
+                                result: result,
+                                value: element
+                            ),
+                            .destroyStack(cursorSlot),
+                        ] + sourceCleanup + [
+                            .branch(
+                                target: normalTarget,
+                                arguments: [result]
+                            ),
+                        ]
+                    )
+                case .collectionBaseAndCursorOffset:
+                    guard let sourceIndexBase else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "predicate index search lost its Collection base"
+                        )
+                    }
+                    let wrap = try allocateSyntheticBlockID()
+                    let overflowTrap = try allocateSyntheticBlockID()
+                    let advancedIndex = try allocate(type: .int64)
+                    let cursorAdjustment = try allocate(type: .int64)
+                    let physicalIndex = try allocate(type: .int64)
+                    let subtractionOverflow = try allocate(type: .bool)
+                    let matchedIndex = try allocate(type: .int64)
+                    let additionOverflow = try allocate(type: .bool)
+                    let overflow = try allocate(type: .bool)
+                    let cursorAdjustmentBitPattern: UInt64 =
+                        traversalDirection == .forward ? 1 : 0
+                    appendSyntheticBlock(
+                        id: matched,
+                        instructions: closureArgumentCleanup + [
+                            .loadStack(
+                                result: advancedIndex,
+                                slot: cursorSlot,
+                                mode: .copy
+                            ),
+                            .constantInteger(
+                                result: cursorAdjustment,
+                                bitPattern: cursorAdjustmentBitPattern
+                            ),
+                            .checkedBinary(
+                                result: physicalIndex,
+                                overflow: subtractionOverflow,
+                                operation: .subtract,
+                                lhs: advancedIndex,
+                                rhs: cursorAdjustment
+                            ),
+                            .checkedBinary(
+                                result: matchedIndex,
+                                overflow: additionOverflow,
+                                operation: .add,
+                                lhs: sourceIndexBase,
+                                rhs: physicalIndex
+                            ),
+                            .booleanBinary(
+                                result: overflow,
+                                operation: .or,
+                                lhs: subtractionOverflow,
+                                rhs: additionOverflow
+                            ),
+                            .conditionalBranch(
+                                condition: overflow,
+                                trueTarget: overflowTrap,
+                                trueArguments: [],
+                                falseTarget: wrap,
+                                falseArguments: []
+                            ),
+                        ]
+                    )
+                    appendSyntheticBlock(
+                        id: wrap,
+                        instructions: [
+                            .makeOptionalSome(
+                                result: result,
+                                value: matchedIndex
+                            ),
+                            .destroyStack(cursorSlot),
+                        ] + sourceCleanup + [
+                            .branch(
+                                target: normalTarget,
+                                arguments: [result]
+                            ),
+                        ]
+                    )
+                    appendSyntheticBlock(
+                        id: overflowTrap,
+                        instructions: [.trap(.integerOverflow)]
+                    )
+                }
                 appendSyntheticBlock(
                     id: skipped,
                     instructions: closureArgumentCleanup + [
@@ -12863,9 +12902,27 @@ public struct Lowerer: Sendable {
                 )
 
             case let .progression(type):
-                guard !consumesSource, direction == .forward else {
+                guard !consumesSource else {
                     throw CanonicalSIL.LoweringError.unsupportedType(
-                        "progression traversal supports only borrowed forward iteration"
+                        "consuming progression traversal is not supported"
+                    )
+                }
+                if direction == .reverse {
+                    guard specialization.supportsReverseTraversal else {
+                        throw CanonicalSIL.LoweringError.unsupportedType(
+                            "reverse progression traversal requires a finite Collection"
+                        )
+                    }
+                    let materialized = try materializeSequenceOperand(
+                        specialization,
+                        token: token,
+                        context: "reverse progression traversal",
+                        line: line
+                    )
+                    return try makeCollectionCursor(
+                        source: materialized.array,
+                        sourceType: .array(type.element),
+                        cleanup: materialized.cleanup
                     )
                 }
                 let value = try progressionOperand(
@@ -33945,8 +34002,6 @@ public struct Lowerer: Sendable {
                 inputType: input,
                 closureResultType: .bool,
                 callResultType: .array(input),
-                sourceIndexModel: hasIndirectResult && indexModel != .opaque
-                    ? indexModel : nil,
                 preservesSubsequenceIndexBase: hasIndirectResult
                     && indexModel != .opaque
             )
@@ -34031,25 +34086,26 @@ public struct Lowerer: Sendable {
             let source = try sequence(0)
             let input = source.element
             if operation.traversalDirection == .reverse {
-                guard source.normalizedCollectionType == .array(input)
-                else {
+                guard source.supportsReverseTraversal else {
                     throw CanonicalSIL.LoweringError.unsupportedType(
-                        "reverse higher-order traversal requires Array-backed normalization"
+                        "reverse higher-order traversal requires finite represented Collection semantics"
                     )
                 }
             }
             if operation == .firstIndexWhere
                 || operation == .lastIndexWhere {
-                switch typeEnvironment.collectionIndexModel(
-                    for: genericSpellings[0]
-                ) {
-                case .zeroBasedInteger, .preservedBaseInteger:
-                    break
-                case .opaque:
-                    throw CanonicalSIL.LoweringError.unsupportedType(
-                        "predicate index search requires a represented index for "
-                            + genericSpellings[0]
-                    )
+                if !source.usesElementAsIntegerIndex {
+                    switch typeEnvironment.collectionIndexModel(
+                        for: genericSpellings[0]
+                    ) {
+                    case .zeroBasedInteger, .preservedBaseInteger:
+                        break
+                    case .opaque:
+                        throw CanonicalSIL.LoweringError.unsupportedType(
+                            "predicate index search requires a represented index for "
+                                + genericSpellings[0]
+                        )
+                    }
                 }
             }
             let closureResult: Bytecode.ValueType = operation == .forEach
@@ -34078,11 +34134,11 @@ public struct Lowerer: Sendable {
                 inputType: input,
                 closureResultType: closureResult,
                 callResultType: callResult,
-                sourceIndexModel: operation == .firstIndexWhere
+                predicateIndexSource: operation == .firstIndexWhere
                         || operation == .lastIndexWhere
-                    ? typeEnvironment.collectionIndexModel(
-                        for: genericSpellings[0]
-                    ) : nil
+                    ? (source.usesElementAsIntegerIndex
+                        ? .element
+                        : .collectionBaseAndCursorOffset) : nil
             )
         }
     }

@@ -175,6 +175,76 @@ struct ProgressionSequenceSemanticsMatrix {
                 expected: try integer(10)
             ),
             Probe(
+                name: "rangePredicateIndices",
+                source: """
+                public func rangePredicateIndices(
+                    _ lower: Int,
+                    _ upper: Int
+                ) -> (Int?, Int?) {
+                    let values = lower..<upper
+                    return (
+                        values.firstIndex { $0.isMultiple(of: 3) },
+                        values.lastIndex { $0.isMultiple(of: 3) }
+                    )
+                }
+                """,
+                arguments: [try integer(5), try integer(12)],
+                expected: .tuple([
+                    .optional(try integer(6)),
+                    .optional(try integer(9)),
+                ])
+            ),
+            Probe(
+                name: "rangeLastShortCircuit",
+                source: """
+                public func rangeLastShortCircuit(
+                    _ upper: Int
+                ) -> (Int?, Int) {
+                    var visits = 0
+                    let last = (0..<upper).last { value in
+                        visits += 1
+                        return value.isMultiple(of: 3)
+                    }
+                    return (last, visits)
+                }
+                """,
+                arguments: [try integer(8)],
+                expected: .tuple([
+                    .optional(try integer(6)),
+                    try integer(2),
+                ])
+            ),
+            Probe(
+                name: "emptyRangeLastShortCircuit",
+                source: """
+                public func emptyRangeLastShortCircuit(
+                    _ bound: Int
+                ) -> (Int?, Int) {
+                    var visits = 0
+                    let last = (bound..<bound).last { value in
+                        visits += 1
+                        return value == bound
+                    }
+                    return (last, visits)
+                }
+                """,
+                arguments: [try integer(8)],
+                expected: .tuple([
+                    .optional(nil),
+                    try integer(0),
+                ])
+            ),
+            Probe(
+                name: "closedRangeLastBoundary",
+                source: """
+                public func closedRangeLastBoundary(_ bound: Int) -> Int? {
+                    ((bound - 1)...bound).last { $0 == bound }
+                }
+                """,
+                arguments: [try integer(.max)],
+                expected: .optional(try integer(.max))
+            ),
+            Probe(
                 name: "rangeFirst",
                 source: """
                 public func rangeFirst(_ upper: Int) -> Int? {
@@ -565,22 +635,18 @@ struct ProgressionSequenceSemanticsMatrix {
     @Test("Unrepresented Sequence semantics fail closed")
     func rejectsUnsupportedSequenceSources() {
         expectUnsupported(
-            name: "rangeFirstIndex",
+            name: "closedRangeFirstIndex",
             source: """
-            public func rangeFirstIndex(_ upper: Int) -> Int? {
-                (0..<upper).firstIndex { $0 == 2 }
+            public func closedRangeFirstIndex(
+                _ lower: Int,
+                _ upper: Int
+            ) -> Bool {
+                let values = lower...upper
+                return values.firstIndex { $0 == lower }
+                    == values.startIndex
             }
             """,
-            diagnostic: "predicate index search requires a represented index"
-        )
-        expectUnsupported(
-            name: "rangeLast",
-            source: """
-            public func rangeLast(_ upper: Int) -> Int? {
-                (0..<upper).last { $0.isMultiple(of: 2) }
-            }
-            """,
-            diagnostic: "reverse higher-order traversal requires Array-backed normalization"
+            diagnostic: "ClosedRange<Int>.Index"
         )
         expectUnsupported(
             name: "unboundedRangeArray",
