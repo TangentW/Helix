@@ -235,6 +235,21 @@ enum FunctionTypeSpelling {
         return boundary.declaredSpelling
     }
 
+    /// Non-Sendable closure literals inherit their enclosing global actor even
+    /// when Swift's printed callback type omits that region-isolation detail.
+    /// Preserve the restriction at a frozen native boundary; `@Sendable`
+    /// callbacks retain their explicitly declared executor contract.
+    static func applyingInheritedGlobalActor(
+        _ actor: String,
+        to raw: String
+    ) -> String? {
+        guard let boundary = callbackBoundary(in: raw) else { return nil }
+        guard !boundary.function.attributes.isSendable else {
+            return boundary.declaredSpelling
+        }
+        return applyingGlobalActor(actor, to: raw)
+    }
+
     private static func consumeAnnotation(from value: inout String) -> String? {
         guard value.first == "@" else { return nil }
         var index = value.index(after: value.startIndex)

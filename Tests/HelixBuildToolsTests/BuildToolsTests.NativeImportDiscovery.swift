@@ -80,6 +80,22 @@ struct NativeImportDiscoveryTests {
         #expect(!FrontendReceipt.SwiftTypeSpelling.isGeneratedType(
             "any any Swift.Error"
         ))
+        #expect(
+            FrontendReceipt.FunctionTypeSpelling
+                .applyingInheritedGlobalActor(
+                    "MainActor",
+                    to: "Swift.Optional<(UIKit.UIButton) -> Swift.Void>"
+                )
+                == "Swift.Optional<@MainActor (UIKit.UIButton) -> ()>"
+        )
+        #expect(
+            FrontendReceipt.FunctionTypeSpelling
+                .applyingInheritedGlobalActor(
+                    "MainActor",
+                    to: "@escaping @Sendable () -> Swift.Void"
+                )
+                == "@escaping @Sendable () -> ()"
+        )
         let aliases = [
             "NSBundle": "Bundle",
             "NSProcessInfo": "ProcessInfo",
@@ -677,6 +693,16 @@ struct NativeImportDiscoveryTests {
                     requiresMainActor: true
                 ),
                 .init(
+                    canonicalName: "UIButton",
+                    swiftType: "UIButton",
+                    kind: .reference,
+                    aliases: ["__C.UIButton", "UIKit.UIButton"],
+                    representation: .reference,
+                    sourceFileLogicalID: "Sources/Fixture.swift",
+                    importedModules: ["UIKit"],
+                    requiresMainActor: true
+                ),
+                .init(
                     canonicalName: "UIColor",
                     swiftType: "UIColor",
                     kind: .reference,
@@ -695,6 +721,60 @@ struct NativeImportDiscoveryTests {
                     sourceFileLogicalID: "Sources/Fixture.swift",
                     importedModules: ["UIKit"],
                     requiresMainActor: false
+                ),
+                .init(
+                    canonicalName: "NSLayoutAnchor<NSLayoutXAxisAnchor>",
+                    swiftType: "NSLayoutAnchor<NSLayoutXAxisAnchor>",
+                    kind: .reference,
+                    aliases: [
+                        "UIKit.NSLayoutAnchor<UIKit.NSLayoutXAxisAnchor>",
+                    ],
+                    representation: .reference,
+                    sourceFileLogicalID: "Sources/Fixture.swift",
+                    importedModules: ["UIKit"],
+                    requiresMainActor: true
+                ),
+                .init(
+                    canonicalName: "NSLayoutAnchor<NSLayoutYAxisAnchor>",
+                    swiftType: "NSLayoutAnchor<NSLayoutYAxisAnchor>",
+                    kind: .reference,
+                    aliases: [
+                        "UIKit.NSLayoutAnchor<UIKit.NSLayoutYAxisAnchor>",
+                    ],
+                    representation: .reference,
+                    sourceFileLogicalID: "Sources/Fixture.swift",
+                    importedModules: ["UIKit"],
+                    requiresMainActor: true
+                ),
+                .init(
+                    canonicalName: "NSLayoutXAxisAnchor",
+                    swiftType: "NSLayoutXAxisAnchor",
+                    kind: .reference,
+                    aliases: ["UIKit.NSLayoutXAxisAnchor"],
+                    representation: .reference,
+                    sourceFileLogicalID: "Sources/Fixture.swift",
+                    importedModules: ["UIKit"],
+                    requiresMainActor: true
+                ),
+                .init(
+                    canonicalName: "NSLayoutYAxisAnchor",
+                    swiftType: "NSLayoutYAxisAnchor",
+                    kind: .reference,
+                    aliases: ["UIKit.NSLayoutYAxisAnchor"],
+                    representation: .reference,
+                    sourceFileLogicalID: "Sources/Fixture.swift",
+                    importedModules: ["UIKit"],
+                    requiresMainActor: true
+                ),
+                .init(
+                    canonicalName: "NSLayoutConstraint",
+                    swiftType: "NSLayoutConstraint",
+                    kind: .reference,
+                    aliases: ["UIKit.NSLayoutConstraint"],
+                    representation: .reference,
+                    sourceFileLogicalID: "Sources/Fixture.swift",
+                    importedModules: ["UIKit"],
+                    requiresMainActor: true
                 ),
             ],
             minimumOS: .init(15),
@@ -733,6 +813,96 @@ struct NativeImportDiscoveryTests {
                 && $0.baseName == "black"
                 && $0.dispatch == .staticGetter
         })
+        let configurationHandler = try #require(expansion.operations.first {
+            $0.ownerType == "UIButton"
+                && $0.baseName == "configurationUpdateHandler"
+                && $0.dispatch == .instanceSetter
+        })
+        let configurationParameter = try #require(
+            configurationHandler.parameterSwiftTypes.first
+        )
+        let configurationCallback = try #require(
+            FrontendReceipt.FunctionTypeSpelling.callbackBoundary(
+                in: configurationParameter
+            )
+        )
+        #expect(configurationCallback.isOptional)
+        #expect(configurationCallback.lifetime == .escaping)
+        #expect(
+            configurationCallback.function.attributes.globalActor
+                == "MainActor"
+        )
+        let nonescapingAnimation = try #require(expansion.operations.first {
+            $0.ownerType == "UIView"
+                && $0.baseName == "performWithoutAnimation"
+                && $0.dispatch == .staticMethod
+                && $0.argumentLabels == ["_"]
+        })
+        let nonescapingBody = try #require(
+            nonescapingAnimation.parameterSwiftTypes.first
+        )
+        #expect(
+            FrontendReceipt.FunctionTypeSpelling.callbackBoundary(
+                in: nonescapingBody
+            )?.lifetime == .nonescaping
+        )
+        let animation = try #require(expansion.operations.first {
+            $0.ownerType == "UIView"
+                && $0.baseName == "animate"
+                && $0.dispatch == .staticMethod
+                && $0.argumentLabels == ["withDuration", "animations"]
+        })
+        #expect(animation.parameterSwiftTypes.count == 2)
+        let animationBody = try #require(
+            animation.parameterSwiftTypes.dropFirst().first
+        )
+        #expect(
+            FrontendReceipt.FunctionTypeSpelling.callbackBoundary(
+                in: animationBody
+            )?.lifetime == .escaping
+        )
+        let animationWithCompletion = try #require(
+            expansion.operations.first {
+                $0.ownerType == "UIView"
+                    && $0.baseName == "animate"
+                    && $0.dispatch == .staticMethod
+                    && $0.argumentLabels == [
+                        "withDuration", "animations", "completion",
+                    ]
+            }
+        )
+        #expect(animationWithCompletion.parameterSwiftTypes.count == 3)
+        let completionAnimationBody = try #require(
+            animationWithCompletion.parameterSwiftTypes.dropFirst().first
+        )
+        let animationCompletion = try #require(
+            animationWithCompletion.parameterSwiftTypes.dropFirst(2).first
+        )
+        #expect(
+            FrontendReceipt.FunctionTypeSpelling.callbackBoundary(
+                in: completionAnimationBody
+            )?.lifetime == .escaping
+        )
+        #expect(
+            FrontendReceipt.FunctionTypeSpelling.callbackBoundary(
+                in: animationCompletion
+            )?.lifetime == .escaping
+        )
+        for axis in ["NSLayoutXAxisAnchor", "NSLayoutYAxisAnchor"] {
+            let owner = "NSLayoutAnchor<\(axis)>"
+            let constraint = try #require(expansion.operations.first {
+                $0.ownerType == owner
+                    && $0.baseName == "constraint"
+                    && $0.dispatch == .instanceMethod
+                    && $0.argumentLabels == ["equalTo"]
+            })
+            #expect(constraint.parameterSwiftTypes == [owner, owner])
+            let frozenType = try #require(expansion.importedTypes.first {
+                $0.swiftType == owner
+            })
+            #expect(!frozenType.aliases.contains("NSLayoutAnchor"))
+            #expect(!frozenType.aliases.contains("UIKit.NSLayoutAnchor"))
+        }
         #expect(!expansion.operations.contains {
             $0.ownerType == "UIUserInterfaceStyle"
                 && $0.dispatch == .initializer
@@ -2976,8 +3146,31 @@ struct NativeImportDiscoveryTests {
             $0.canonicalCallee.contains("NSLayoutAnchor")
                 && $0.canonicalCallee.contains("constraint")
         }
-        #expect(constraintImports.count == 2)
-        #expect(Set(constraintImports.flatMap(\.silMangledNames)).count == 2)
+        let constraintShapes = Set(
+            output.receipt.nativeImportBindings.compactMap(\.generated)
+                .filter { $0.baseName == "constraint" }
+                .compactMap { operation in
+                    operation.ownerType.map {
+                        "\($0).\(operation.argumentLabels.joined(separator: ","))"
+                    }
+                }
+        )
+        #expect(constraintShapes == Set([
+            "NSLayoutAnchor<NSLayoutXAxisAnchor>.equalTo",
+            "NSLayoutAnchor<NSLayoutXAxisAnchor>.equalTo,constant",
+            "NSLayoutAnchor<NSLayoutYAxisAnchor>.equalTo",
+            "NSLayoutAnchor<NSLayoutYAxisAnchor>.equalTo,constant",
+            "NSLayoutXAxisAnchor.equalToSystemSpacingAfter,multiplier",
+            "NSLayoutYAxisAnchor.equalToSystemSpacingBelow,multiplier",
+        ]))
+        let genericConstraintShapeCount = constraintShapes.filter {
+            $0.hasPrefix("NSLayoutAnchor<")
+        }.count
+        #expect(constraintImports.count == genericConstraintShapeCount)
+        #expect(
+            Set(constraintImports.flatMap(\.silMangledNames)).count
+                == genericConstraintShapeCount
+        )
         #expect(generatedSymbols.contains { $0.hasPrefix("$hlx_native_option_set_literal_") })
         #expect(generatedSymbols.contains { $0.hasPrefix("$hlx_native_global_") })
         #expect(generatedSymbols.contains { $0.hasPrefix("$s") })
@@ -3156,7 +3349,12 @@ struct NativeImportDiscoveryTests {
                 of: "present(viewController, animated: true)",
                 with: "let presentedController = UIViewController()\n"
                     + "                presentedController.view.backgroundColor = .black\n"
-                    + "                present(presentedController, animated: true)"
+                    + "                present(presentedController, animated: true)\n"
+                    + "                UIView.animate(withDuration: 0.1) {\n"
+                    + "                    presentedController.view.alpha = 0.8\n"
+                    + "                } completion: { [weak self] _ in\n"
+                    + "                    self?.label.text = \"Presented\"\n"
+                    + "                }"
             )
         try Data(changed.utf8).write(to: sourceURL)
         let patch = try ReleaseCompiler.Driver().build(

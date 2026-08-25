@@ -1,0 +1,8 @@
+        actionCount += 1
+        let controller = UIViewController()
+        controller.view.backgroundColor = .black
+        controller.title = "HELIX PRESENTED"
+        present(controller, animated: false) { [weak self] in
+            self?.titleLabel.text = "HELIX PRESENTED"
+            print("HELIX E2E PRESENT COMPLETION")
+        }

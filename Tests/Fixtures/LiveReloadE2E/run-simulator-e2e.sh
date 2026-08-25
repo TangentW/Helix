@@ -13,6 +13,7 @@ repository_root="$(cd "$script_directory/../../.." && pwd -P)"
 generated_directory="$script_directory/.helix-e2e"
 derived_data="$generated_directory/DerivedData"
 source_file="$script_directory/Sources/LiveReloadE2E.Feature.swift"
+scenario_directory="$script_directory/Scenarios"
 project="$script_directory/LiveReloadE2EHost.xcodeproj"
 scheme="LiveReloadE2EHost"
 bundle_id="dev.helix.live-reload-e2e"
@@ -22,20 +23,24 @@ debugger_log="$generated_directory/Debugger.log"
 build_log="$generated_directory/BuildConsole.log"
 build_settings="$generated_directory/BuildSettings.json"
 helix="$repository_root/.build/debug/helix"
-source_backup="$(mktemp "${TMPDIR:-/tmp}/helix-live-reload-source.XXXXXX")"
+source_backup=""
 hub_pid=""
 debugger_pid=""
 app_pid=""
+evidence_file=""
 
 cleanup() {
     local status=$?
+    if ! restore_baseline_source; then
+        echo "Failed to restore the Live Reload fixture source." >&2
+        status=1
+    fi
     if [[ $status -ne 0 ]]; then
         echo "LiveReloadE2E failed with status $status." >&2
         tail -n 80 "$hub_log" 2>/dev/null >&2 || true
         tail -n 80 "$debugger_log" 2>/dev/null >&2 || true
         tail -n 80 "$build_log" 2>/dev/null >&2 || true
     fi
-    cp "$source_backup" "$source_file"
     xcrun simctl terminate "$simulator_udid" "$bundle_id" >/dev/null 2>&1 || true
     if [[ -n "$debugger_pid" ]] && kill -0 "$debugger_pid" 2>/dev/null; then
         kill -TERM "$debugger_pid" 2>/dev/null || true
@@ -48,11 +53,28 @@ cleanup() {
     rm -f "$source_backup"
     exit "$status"
 }
+
+restore_baseline_source() {
+    local restored_source
+    restored_source="$(mktemp "${TMPDIR:-/tmp}/helix-live-reload-baseline.XXXXXX")" \
+        || return 1
+    if ! cp "$source_backup" "$restored_source" \
+        || ! mv "$restored_source" "$source_file"; then
+        rm -f "$restored_source"
+        return 1
+    fi
+}
+
+source_backup="$(mktemp "${TMPDIR:-/tmp}/helix-live-reload-source.XXXXXX")"
+if ! cp "$source_file" "$source_backup"; then
+    rm -f "$source_backup"
+    echo "Failed to back up the Live Reload fixture source." >&2
+    exit 1
+fi
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-cp "$source_file" "$source_backup"
 if [[ "$(uname -m)" != "arm64" ]]; then
     echo "LiveReloadE2E currently requires an arm64 Mac." >&2
     exit 1
@@ -84,6 +106,11 @@ if [[ "$(grep -Fc 'HELIX BASELINE' "$source_file")" -ne 1 ]] \
     echo "The fixture source is not at its committed HELIX BASELINE state." >&2
     exit 1
 fi
+if [[ "$(grep -Fc 'HELIX_E2E_SCENARIO_BEGIN' "$source_file")" -ne 1 ]] \
+    || [[ "$(grep -Fc 'HELIX_E2E_SCENARIO_END' "$source_file")" -ne 1 ]]; then
+    echo "The fixture source has an invalid scenario replacement region." >&2
+    exit 1
+fi
 
 wait_for_log() {
     local pattern="$1"
@@ -102,6 +129,67 @@ wait_for_log() {
         fi
         sleep 0.1
     done
+}
+
+wait_for_evidence() {
+    local pattern="$1"
+    local timeout_seconds="$2"
+    local started=$SECONDS
+    while ! grep -Fq "$pattern" "$evidence_file" 2>/dev/null; do
+        if [[ -n "$app_pid" ]] && ! kill -0 "$app_pid" 2>/dev/null; then
+            echo "App exited before observable UI state: $pattern" >&2
+            tail -n 20 "$evidence_file" >&2 || true
+            exit 1
+        fi
+        if (( SECONDS - started >= timeout_seconds )); then
+            echo "Timed out waiting for observable UI state: $pattern" >&2
+            tail -n 20 "$evidence_file" >&2 || true
+            exit 1
+        fi
+        sleep 0.1
+    done
+}
+
+install_scenario() {
+    local scenario_file="$1"
+    local generated_source
+    if [[ ! -f "$scenario_file" ]]; then
+        echo "Missing Live Reload E2E scenario: $scenario_file" >&2
+        exit 1
+    fi
+    generated_source="$(mktemp "${TMPDIR:-/tmp}/helix-live-reload-scenario.XXXXXX")"
+    if ! awk -v scenario="$scenario_file" '
+        /\/\/ HELIX_E2E_SCENARIO_BEGIN/ {
+            print
+            while ((getline line < scenario) > 0) print line
+            close(scenario)
+            replacing = 1
+            next
+        }
+        /\/\/ HELIX_E2E_SCENARIO_END/ {
+            replacing = 0
+            print
+            next
+        }
+        !replacing { print }
+    ' "$source_file" > "$generated_source"; then
+        rm -f "$generated_source"
+        echo "Failed to install Live Reload E2E scenario: $scenario_file" >&2
+        exit 1
+    fi
+    mv "$generated_source" "$source_file"
+}
+
+activate_scenario() {
+    local revision="$1"
+    local scenario_name="$2"
+    local expected_evidence="$3"
+    install_scenario "$scenario_directory/$scenario_name.swiftbody"
+    wait_for_log "r$revision/g$revision: codeActive" 45
+    kill -0 "$app_pid"
+    touch "$data_container/Documents/HelixE2ERun-$revision"
+    wait_for_evidence "$expected_evidence" 15
+    kill -0 "$app_pid"
 }
 
 setting() {
@@ -167,6 +255,8 @@ env \
 
 xcrun simctl terminate "$simulator_udid" "$bundle_id" >/dev/null 2>&1 || true
 xcrun simctl install "$simulator_udid" "$app"
+data_container="$(xcrun simctl get_app_container "$simulator_udid" "$bundle_id" data)"
+evidence_file="$data_container/Documents/HelixE2EEvidence.txt"
 launch_output="$(xcrun simctl launch --wait-for-debugger "$simulator_udid" "$bundle_id")"
 app_pid="${launch_output##*: }"
 xcrun lldb --batch \
@@ -183,5 +273,30 @@ sed -i '' 's/"HELIX PATCHED"/"HELIX BASELINE"/' "$source_file"
 wait_for_log "r2/g2: codeActive, UI refreshed." 30
 kill -0 "$app_pid"
 
-echo "LiveReloadE2E passed in process $app_pid."
+activate_scenario 3 ViewHierarchy "transient=true"
+xcrun simctl io "$simulator_udid" screenshot \
+    "$generated_directory/ViewHierarchy.png" >/dev/null
+
+activate_scenario 4 ButtonConfiguration "button=Configured 2"
+
+activate_scenario 5 Animation "state=animation-complete"
+
+activate_scenario 6 Presentation "presented=HELIX PRESENTED"
+xcrun simctl io "$simulator_udid" screenshot \
+    "$generated_directory/Presentation.png" >/dev/null
+
+activate_scenario 7 Dismissal "state=dismissed"
+xcrun simctl io "$simulator_udid" screenshot \
+    "$generated_directory/Dismissal.png" >/dev/null
+
+restore_baseline_source
+wait_for_log "r8/g8: codeActive" 45
+kill -0 "$app_pid"
+touch "$data_container/Documents/HelixE2ERun-8"
+wait_for_evidence "title=HELIX ACTION BASELINE 6" 15
+kill -0 "$app_pid"
+
+echo "LiveReloadE2E passed eight generations and five UI scenarios in process $app_pid."
 echo "Hub log: $hub_log"
+echo "Debugger log: $debugger_log"
+echo "Scenario screenshots: $generated_directory"

@@ -14,7 +14,7 @@ current practical boundary.
 | --- | --- | --- |
 | Release Shell | Exact frontend indexing, Derived Sources, interface archive, permanent bridge, NativeImport discovery, Xcode integration, bundle leakage audit | Broad real-application migration and long-running CI matrix |
 | Production HLBC | HLBC 1.0 / HLXI 1.0 compiler path, verifier, HLVM, signed package, safe installation, immutable activation, rollback and revocation; checked-in business corpus | App Store distribution approval, external top-200 corpus, long fuzz/sanitizer campaigns, real-device macro performance, and hosted UIKit-page soak |
-| Development Live Reload | Exact build capture, stable snapshots, body diff, session-bound verified HLBC, authenticated transfer, atomic activation, UIKit/SwiftUI refresh, logical source maps and a 128-generation in-process soak | Physical-iPhone matrix, long-duration device soak, interactive bytecode stepping, large-project latency qualification |
+| Development Live Reload | Exact build capture, stable snapshots, body diff, session-bound verified HLBC, authenticated transfer, atomic activation, UIKit/SwiftUI refresh, logical source maps, an eight-generation/five-scenario UIKit Simulator acceptance matrix, and a 128-generation in-process soak | Physical-iPhone matrix, long-duration device soak, interactive bytecode stepping, large-project latency qualification |
 | Helix Hub | SwiftUI status-bar app, project discovery, transactional Hot Patch/Live Reload onboarding, secure helper discovery, unified service, exact Build Context registry, Xcode automatic invitation, and manual four-character pairing | Distribution signing/notarization and broad third-party project migration matrix |
 | Native experiment | Explicit-only Dynamic Replacement builder, recursion/previous tests, signed dylib and loader probes | Product support; it is intentionally absent from automatic routing |
 | Control plane | Client-side package and policy contracts | Production Registry, HSM operations, approval, rollout, telemetry, and fleet coordination services |
@@ -707,8 +707,16 @@ does not by itself certify a physical device or distribution channel.
   isolation, and the exact canonical `NSError **` bridge for an Objective-C
   instance method imported as logical Swift `throws -> Void`. Examples include
   `UIColor.black`, `UIColor.init(white:alpha:)`, `UIView.alpha`, `UIView.setNeedsLayout()`,
-  `UIView.setAnimationsEnabled(_:)`, `URLCache.shared`,
+  `UIView.setAnimationsEnabled(_:)`, `UIView.performWithoutAnimation(_:)`,
+  `UIView.animate(withDuration:animations:completion:)`,
+  `UIButton.configurationUpdateHandler`, concrete X/Y `NSLayoutAnchor`
+  members, `URLCache.shared`,
   `Bundle.path(forResource:ofType:)`, and `FileManager.removeItem(atPath:)`.
+  The full declaration recovers only omitted outer `@escaping`/`@autoclosure`
+  parameter markers. Concrete generic owners are substituted and probed per
+  frozen specialization without ambiguous unspecialized aliases. Non-Sendable
+  callbacks on MainActor declarations retain that inherited actor restriction;
+  explicitly `@Sendable` callbacks retain their own declared executor contract.
   An exact zero-argument `Type()` call is also nominated for each already-frozen
   imported SDK type and admitted only when the frontend proves that call, even
   if an inherited or importer-synthesized initializer is absent from the symbol
@@ -877,7 +885,7 @@ machine code.
 | Change an existing stored-property `willSet` or `didSet` body | Directly declared synchronous global, eligible frozen struct, and source reference-class observers are independently patchable through an exact hashed in-place wrapper in the derived source. Implicit/custom old/new-value names, baseline fallback, private same-file access, direct value-storage mutation, and transactional value-receiver writeback are preserved. Static/class, inherited, lazy/wrapped, weak/unowned/Objective-C, availability/generic, actor/global-actor, baseline-magic-literal, old/new-value ABI-shape changes, and direct self-property assignment from a reference observer fail closed; observer Native replacement is never emitted |
 | Use explicit `inout`, mutate an actor root, or change an existing native static/class method | One synchronous eligible Shell `inout` parameter is supported. Multiple/async regions remain rejected; actor executors and native metatype ABI are not implemented |
 | Call an existing private/internal/public declaration from that body | Supported only when it resolves to a same-image function, eligible Shell Entry, or exact emitted NativeImport |
-| First use a public SDK member in a managed Debug body | Supported for a uniquely measured, nondeprecated synchronous initializer, instance/static method, or readable/writable property when every boundary type is already representable in the frozen imported/Bridge surface and the declaration is valid at the Shell minimum OS. This includes a separately compiler-proven zero-argument `Type()` construction for an already-frozen imported SDK type; other inherited implicit constructors and project-subclass constructors do not expand the source boundary. Closure-bearing methods require the exact synchronous, nonthrowing bridge-and-failure-value profile above. Async SDK declarations, completion-handler conversion, unfamiliar error bridges, subscripts, and unrepresentable signatures require a full build; suspending NativeImports currently come from exact project-source discovery or an explicit catalog |
+| First use a public SDK member in a managed Debug body | Supported for a uniquely measured, nondeprecated synchronous initializer, instance/static method, or readable/writable property when every boundary type is already representable in the frozen imported/Bridge surface and the declaration is valid at the Shell minimum OS. This includes a separately compiler-proven zero-argument `Type()` construction and members of an already-frozen concrete SDK generic specialization; other inherited implicit constructors, project-subclass constructors, and open/unspecialized generic owners do not expand the source boundary. Closure-bearing members require the exact synchronous, nonthrowing bridge-and-failure-value profile above; declaration-level `@escaping`/`@autoclosure` and inherited MainActor restrictions are preserved. Async SDK declarations, completion-handler conversion, unfamiliar error bridges, subscripts, unsupported actor hops, and unrepresentable signatures require a full build; suspending NativeImports currently come from exact project-source discovery or an explicit catalog |
 | Add an ordinary top-level helper, private class instance method, or computed accessor in an existing source file | Supported when reachable from a changed root and its concrete signature/body fit HLBC; it remains private to that image |
 | Ordinary direct recursion | Resolves to the function in the same immutable HLBC image |
 | Deliberately call the previous generation from source | Not supported by HLBC; save/activate a restoring generation instead |
@@ -901,8 +909,12 @@ represented in HLBC and has no exact generated Entry/NativeImport fails at
 compile time even when ordinary Swift would allow it.
 
 Simulator and device use the same HLBC protocol and runtime. The checked-in
-Simulator E2E has applied a changed body and restored the baseline in one App
-process. A separate 128-generation in-process soak proves bounded active,
+Simulator E2E applies eight generations in one App process: changed/restored
+layout bodies, target-action view construction and Auto Layout, an escaping
+configuration handler, nonescaping/escaping animation callbacks, controller
+presentation/dismissal callbacks, and final source restoration. It asserts
+persisted UIKit/App state and retains screenshots rather than treating
+compilation or activation as success. A separate 128-generation in-process soak proves bounded active,
 rollback, failed-save, high-water, and compaction behavior. A physical-iPhone
 run and long-duration memory-pressure soak are still required before device
 behavior is listed as qualified. Native Dynamic Replacement remains an
@@ -931,7 +943,9 @@ whether a user sees that behavior immediately.
   `manualRefreshRequired`.
 
 The checked-in fixtures prove automatic UIKit controller/view and superclass
-matching without registration, invalidation, state preservation, SwiftUI pulse
+matching without registration, invalidation, state preservation, target-action
+entry into patched private code, common UIKit construction/configuration,
+nonescaping and escaping native callbacks, presentation/dismissal, SwiftUI pulse
 routing, and Debug Overlay behavior. They do not qualify every custom
 container, navigation/sheet interaction, observation graph, or long-running
 side effect pattern.

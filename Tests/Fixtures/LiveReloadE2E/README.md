@@ -3,12 +3,20 @@
 This fixture is Helix's executable acceptance case for development-time HLBC
 Live Reload. It builds a normal Swift framework and UIKit host, captures the
 real Xcode frontend invocation, boots the requested Apple Silicon iOS Simulator
-when necessary, launches the host, and verifies two generations in one
+when necessary, launches the host, and verifies eight generations in one
 unchanged process:
 
 1. `HELIX BASELINE` → `HELIX PATCHED` through a nonempty verified HLBC image.
 2. `HELIX PATCHED` → `HELIX BASELINE` through a zero-bytecode restoring
    generation that removes the inherited route.
+3. A button action creates, configures, constrains, and retains a new `UILabel`.
+4. An escaping `UIButton.configurationUpdateHandler` weakly captures its owner.
+5. `UIView.performWithoutAnimation` and multi-trailing-closure
+   `UIView.animate` execute nonescaping and escaping callbacks.
+6. A newly constructed `UIViewController` is presented with a weakly capturing
+   completion callback.
+7. The presented controller is dismissed with another completion callback.
+8. Restoring the committed source reactivates the original button action.
 
 Run it from the repository root with an available Simulator UDID:
 
@@ -20,8 +28,9 @@ Tests/Fixtures/LiveReloadE2E/run-simulator-e2e.sh \
 The script regenerates the hidden Xcode Integration Kit, starts the same
 persistent-service implementation used by Helix Hub, builds the Feature and
 App, performs an ordinary debugger launch without a custom LLDB init file,
-restores the Swift source byte-for-byte on every exit path, and leaves logs under
-`.helix-e2e` for diagnosis. Generated Bridge Swift is compiled only into
+restores the Swift source byte-for-byte on every exit path, and leaves Hub,
+debugger, build, and scenario screenshot evidence under `.helix-e2e` for
+diagnosis. Generated Bridge Swift is compiled only into
 DerivedData; it is not referenced by the project. The host imports only
 `HelixDevRuntime`, creates one `ApplicationSession`, and has no `typeRegistry`
 or `LiveReload.Reloadable` hook. This makes the fixture an acceptance test for
@@ -30,7 +39,14 @@ callback also executes an imported `NSTextAlignment` setter and interpolated
 `print`. It additionally calls QuartzCore's `CACurrentMediaTime`, covering
 an imported C global function outside UIKit. The same generation therefore
 exercises NativeImport discovery, generated Bridge invocation, and unoptimized
-SIL ownership.
+SIL ownership. Each interaction scenario replaces only the marked private
+button-action body. A host-side command file invokes
+`UIControl.sendActions(for:)`, so the path entering patched code is the same
+target-action path used by a physical tap rather than a test-only Helix callback
+registry. The host continuously persists the resulting title, button
+configuration, presentation, and view-tree state in the App data container;
+the script waits for that observable UIKit state instead of treating
+compilation or activation alone as success.
 
 The fixture requires Xcode, an arm64 Mac, and an installed iOS Simulator
 runtime. It waits for the requested device to finish booting. No third-party

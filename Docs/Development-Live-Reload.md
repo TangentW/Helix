@@ -289,7 +289,11 @@ For an imported Objective-C property descriptor, the generated concrete
 accessor remains in the image while its physical framework call resolves to the
 exact frozen NativeImport. Physical `NSString`/`Optional<NSString>` results are
 accepted as `String` only when that Swift-typed boundary proves and performs the
-bridge.
+bridge. When the compiler carries that physical bridge through a basic-block
+parameter, Helix derives the logical parameter type from every incoming edge,
+requires all predecessors to agree, and then validates the printed Objective-C
+type against that exact logical bridge. This covers ordinary ternary and
+Optional-expression joins without admitting an arbitrary foreign type.
 
 Local-class field initialization uses field-sensitive definite/possible-state
 dataflow across aliases and control-flow joins. It does not treat
@@ -329,11 +333,26 @@ through the same typed AST and canonical SIL pipeline used for project source.
 Only uniquely measured, Bridge-compatible synchronous initializers, instance
 or static methods, and readable or writable properties become exact
 NativeImports.
+The symbol-graph function signature is aligned with the full declaration before
+probing. Helix recovers only declaration-level `@escaping` and `@autoclosure`
+markers that the signature view is permitted to omit; any other missing
+attribute remains ineligible. For a frozen concrete specialization of an SDK
+generic owner, the probe substitutes the owner's generic parameters and freezes
+only that concrete member ABI. The unspecialized owner spelling is deliberately
+not installed as an alias of multiple specializations.
 This covers Swift and Objective-C APIs through one path, including
 `UIColor.black`, `UIColor.init(white:alpha:)`, `UIView.isHidden`,
 `UIView.alpha`, `UIView.setNeedsLayout()`,
-`UIView.setAnimationsEnabled(_:)`, `URLCache.shared`, `Bundle.main`, and
+`UIView.setAnimationsEnabled(_:)`, `UIView.performWithoutAnimation(_:)`,
+`UIView.animate(withDuration:animations:completion:)`,
+`UIButton.configurationUpdateHandler`, concrete
+`NSLayoutAnchor<NSLayoutXAxisAnchor>`/`NSLayoutAnchor<NSLayoutYAxisAnchor>`
+members, `URLCache.shared`, `Bundle.main`, and
 `Bundle.path(forResource:ofType:)` when every boundary type is already frozen.
+For a MainActor-isolated measured declaration, a non-Sendable callback retains
+the enclosing MainActor restriction even when the printed SDK typealias omits
+it; an explicitly `@Sendable` callback keeps its own declared executor
+contract. The exact frontend probe remains authoritative for the final ABI.
 For each such imported SDK type, Helix also nominates the exact zero-argument
 `Type()` expression even when an inherited or importer-synthesized initializer
 is absent from the symbol graph. It becomes a NativeImport only when the same
@@ -369,8 +388,9 @@ identify, and validate the object without exposing a process pointer in HLBC.
 This establishes the receiver path for class methods; individual property and
 method operations still need a supported Shell entry or exact NativeImport.
 The measured member path above supplies those exact imports for its proven
-shapes. Async or generic SDK members, closure-bearing members outside the exact
-synchronous callback profile, subscripts, actor executor hops, and any
+shapes. Async or unspecialized/open generic SDK members, closure-bearing members
+outside the exact synchronous callback profile, subscripts, unsupported actor
+executor hops, and any
 parameter/result shape outside the frozen Bridge surface are not silently
 approximated and currently require a normal build. Suspending NativeImports in
 this stage come from exact project-source discovery or an explicit catalog;
@@ -598,7 +618,12 @@ collection, tuple, and patch-local struct storage, including Swift escape
 boxes. Safe `weak` and checked `unowned` capture lists and captured weak locals
 use a second managed storage kind shared by patch-local and frozen native
 reference identities. Weak loads become `nil` after release; dead checked
-unowned loads produce a controlled VM trap. `unowned(unsafe)` and weak/unowned
+unowned loads produce a controlled VM trap. The compiler's
+`[inferred_immutable]` capture-box decoration is accepted only in its exact
+known position and has no semantic effect; read-only Optional address
+projections retire their detached payload owner before the parent stack storage
+is released. Unknown box decorations and unbalanced payload ownership remain
+fail-closed. `unowned(unsafe)` and weak/unowned
 stored-property layouts remain rejected. Fully concrete Array, Dictionary, and Set values share verified closure
 traversal for common `map`/`flatMap`/`compactMap`, reduction, visit, predicate,
 `count(where:)`, and comparator-selection operations. Container-preserving
@@ -731,6 +756,12 @@ may receive one source-proven escaping native callable argument layer; an
 import may return the same native callable shape, escaping by construction.
 Both become identity-bearing targets invoked by ordinary typed closure control
 flow, while image-local closures remain invalid as native results.
+Swift 6 may emit a synchronous MainActor executor assertion at the start of a
+closure body. Helix removes only the exact pinned `MainActor.shared` assertion
+shape after the function has acquired a verifier-visible MainActor effect; the
+VM independently enforces the main-thread requirement before root and native
+callback entry. A changed runtime ABI, escaping scaffold value, extra
+predecessor, duplicate assertion, or nonisolated function fails closed.
 When a direct NativeImport call omits an Optional Objective-C block parameter,
 the compiler-emitted `Optional.none` is checked against that exact physical
 block spelling and projected away without creating a VM closure value. The

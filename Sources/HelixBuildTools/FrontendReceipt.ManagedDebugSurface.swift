@@ -19,8 +19,14 @@ extension FrontendReceipt.ManagedDebugSurface {
         var preciseIdentifier: String
         var swiftPath: String
         var runtimeName: String?
+        var genericParameters: [String]
         var requiresMainActor: Bool
         var members: [SwiftFrontend.SymbolGraph.Symbol]
+    }
+
+    private struct OwnerSpecialization {
+        var probeType: String
+        var substitutions: [String: String]
     }
 
     private struct OwnerMatch: Sendable {
@@ -138,9 +144,6 @@ extension FrontendReceipt.ManagedDebugSurface {
             guard typeKinds.contains(symbol.kind.identifier),
                   !symbol.pathComponents.isEmpty,
                   symbol.pathComponents.allSatisfy(isProbeIdentifier),
-                  !symbol.declarationFragments.contains(where: {
-                      $0.kind == "genericParameter"
-                  }),
                   isAvailable(symbol, minimumOS: minimumOS)
             else { continue }
             if owners[symbol.identifier.precise] != nil {
@@ -176,11 +179,20 @@ extension FrontendReceipt.ManagedDebugSurface {
         }
         return owners.keys.sorted().compactMap { precise -> OwnerSurface? in
             guard let owner = owners[precise] else { return nil }
+            var genericParameters: [String] = []
+            for parameter in owner.declarationFragments.compactMap({
+                $0.kind == "genericParameter" ? $0.spelling : nil
+            }) where isProbeIdentifier(parameter)
+                && !genericParameters.contains(parameter) {
+                genericParameters.append(parameter)
+            }
+            guard genericParameters.count <= 16 else { return nil }
             return OwnerSurface(
                 moduleName: graph.module.name,
                 preciseIdentifier: precise,
                 swiftPath: owner.pathComponents.joined(separator: "."),
                 runtimeName: clangRuntimeName(precise),
+                genericParameters: genericParameters,
                 requiresMainActor: requiresMainActor(owner),
                 members: (membersByOwner[precise] ?? []).sorted {
                     ($0.pathComponents.joined(separator: "\u{0}"),
@@ -250,6 +262,11 @@ extension FrontendReceipt.ManagedDebugSurface {
         with surface: OwnerSurface
     ) -> FrontendReceipt.Adapter.ImportedNativeType {
         var result = type
+        result.requiresMainActor = surface.requiresMainActor
+        // An unspecialized generic SDK spelling is not an alias of any one
+        // concrete frozen specialization. Adding it to every specialization
+        // would make later type resolution ambiguous.
+        guard surface.genericParameters.isEmpty else { return result }
         let qualified = "\(surface.moduleName).\(surface.swiftPath)"
         result.aliases = Array(Set(
             result.aliases + [result.canonicalName, result.swiftType,
@@ -263,7 +280,6 @@ extension FrontendReceipt.ManagedDebugSurface {
             result.canonicalName = surface.swiftPath
             result.swiftType = surface.swiftPath
         }
-        result.requiresMainActor = surface.requiresMainActor
         return result
     }
 
@@ -271,11 +287,16 @@ extension FrontendReceipt.ManagedDebugSurface {
         surface: OwnerSurface,
         importedType: FrontendReceipt.Adapter.ImportedNativeType
     ) -> [Candidate] {
+        guard let specialization = ownerSpecialization(
+            surface: surface,
+            importedType: importedType
+        ) else { return [] }
         var candidates = surface.members.flatMap { member in
             makeCandidates(
                 member: member,
                 surface: surface,
-                importedType: importedType
+                importedType: importedType,
+                specialization: specialization
             )
         }
         // Imported SDK types can inherit or synthesize `init()` without a
@@ -291,7 +312,7 @@ extension FrontendReceipt.ManagedDebugSurface {
                 preciseIdentifier: surface.preciseIdentifier
                     + "#zero-argument-construction",
                 moduleName: surface.moduleName,
-                probeOwnerType: surface.swiftPath,
+                probeOwnerType: specialization.probeType,
                 ownerType: importedType.swiftType,
                 dispatch: .initializer,
                 memberName: "init",
@@ -309,7 +330,8 @@ extension FrontendReceipt.ManagedDebugSurface {
     private static func makeCandidates(
         member: SwiftFrontend.SymbolGraph.Symbol,
         surface: OwnerSurface,
-        importedType: FrontendReceipt.Adapter.ImportedNativeType
+        importedType: FrontendReceipt.Adapter.ImportedNativeType,
+        specialization: OwnerSpecialization
     ) -> [Candidate] {
         let isNonisolated = member.declarationFragments.contains {
             $0.spelling == "nonisolated"
@@ -327,7 +349,7 @@ extension FrontendReceipt.ManagedDebugSurface {
             Candidate(
                 preciseIdentifier: member.identifier.precise,
                 moduleName: surface.moduleName,
-                probeOwnerType: surface.swiftPath,
+                probeOwnerType: specialization.probeType,
                 ownerType: importedType.swiftType,
                 dispatch: dispatch,
                 memberName: memberName,
@@ -348,8 +370,20 @@ extension FrontendReceipt.ManagedDebugSurface {
                       $0.spelling == "async" || $0.spelling == "throws"
                           || $0.spelling == "rethrows"
                   }),
-                  let type = propertyType(member),
-                  FrontendReceipt.SwiftTypeSpelling.isGeneratedType(type)
+                  let declaredType = propertyType(member)
+            else { return [] }
+            let type = FrontendReceipt.SwiftTypeSpelling
+                .replacingNominalAliases(
+                    in: declaredType,
+                    aliases: specialization.substitutions
+                )
+            let isolatedType = inheritedCallbackType(
+                type,
+                requiresMainActor: requiresActor
+            )
+            guard FrontendReceipt.SwiftTypeSpelling.isGeneratedType(
+                isolatedType
+            )
             else { return [] }
             let isStatic = member.kind.identifier == "swift.type.property"
             var values = [candidate(
@@ -370,7 +404,7 @@ extension FrontendReceipt.ManagedDebugSurface {
                     dispatch: setter,
                     memberName: memberName,
                     labels: ["_"],
-                    parameterTypes: [type]
+                    parameterTypes: [isolatedType]
                 ))
             }
             return values
@@ -381,6 +415,20 @@ extension FrontendReceipt.ManagedDebugSurface {
                     || $0.spelling == "consuming"
             }), let signature = callableSignature(member)
             else { return [] }
+            let parameterTypes = signature.parameterTypes.map { type in
+                let substituted = FrontendReceipt.SwiftTypeSpelling
+                    .replacingNominalAliases(
+                        in: type,
+                        aliases: specialization.substitutions
+                    )
+                return inheritedCallbackType(
+                    substituted,
+                    requiresMainActor: requiresActor
+                )
+            }
+            guard parameterTypes.allSatisfy(
+                FrontendReceipt.SwiftTypeSpelling.isGeneratedType
+            ) else { return [] }
             let dispatch: NativeImportDiscovery.Dispatch = switch member.kind.identifier {
             case "swift.init": .initializer
             case "swift.type.method": .staticMethod
@@ -390,12 +438,28 @@ extension FrontendReceipt.ManagedDebugSurface {
                 dispatch: dispatch,
                 memberName: dispatch == .initializer ? "init" : signature.baseName,
                 labels: signature.argumentLabels,
-                parameterTypes: signature.parameterTypes,
+                parameterTypes: parameterTypes,
                 mayThrow: signature.mayThrow
             )]
         default:
             return []
         }
+    }
+
+    private static func inheritedCallbackType(
+        _ type: String,
+        requiresMainActor: Bool
+    ) -> String {
+        guard requiresMainActor,
+              FrontendReceipt.FunctionTypeSpelling.callbackBoundary(
+                  in: type
+              ) != nil
+        else { return type }
+        // The callback parser has already accepted the spelling, so failure
+        // here can only be a conflicting unsupported global actor. Preserve
+        // that spelling and let the exact frontend probe reject it.
+        return FrontendReceipt.FunctionTypeSpelling
+            .applyingInheritedGlobalActor("MainActor", to: type) ?? type
     }
 
     private struct CallableSignature {
@@ -420,11 +484,17 @@ extension FrontendReceipt.ManagedDebugSurface {
             fragment.kind == "externalParam" ? fragment.spelling : nil
         }
         let parameters = symbol.functionSignature?.parameters ?? []
+        guard let declarationAttributes = parameterAttributes(
+            in: symbol.declarationFragments,
+            count: parameters.count
+        ) else { return nil }
         guard labels.count == parameters.count,
               labels.allSatisfy({ $0 == "_" || isProbeIdentifier($0) }),
               parameters.count <= 16
         else { return nil }
-        let parameterTypes = parameters.compactMap(parameterType)
+        let parameterTypes = zip(parameters, declarationAttributes).compactMap {
+            parameterType($0.0, declarationAttributes: $0.1)
+        }
         guard parameterTypes.count == parameters.count else { return nil }
         let baseName: String
         if symbol.kind.identifier == "swift.init" {
@@ -448,17 +518,61 @@ extension FrontendReceipt.ManagedDebugSurface {
     }
 
     private static func parameterType(
-        _ parameter: SwiftFrontend.SymbolGraph.Parameter
+        _ parameter: SwiftFrontend.SymbolGraph.Parameter,
+        declarationAttributes: [String]
     ) -> String? {
         let value = parameter.declarationFragments.map(\.spelling).joined()
         guard let separator = value.firstIndex(of: ":") else { return nil }
-        let type = value[value.index(after: separator)...]
+        let measuredType = value[value.index(after: separator)...]
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        var measuredAttributes = parameter.declarationFragments.compactMap {
+            $0.kind == "attribute" ? normalizedAttribute($0.spelling) : nil
+        }
+        var recoveredAttributes: [String] = []
+        for attribute in declarationAttributes {
+            if let index = measuredAttributes.firstIndex(of: attribute) {
+                measuredAttributes.remove(at: index)
+            } else {
+                recoveredAttributes.append(attribute)
+            }
+        }
+        // `@escaping` and `@autoclosure` are declaration-parameter
+        // conventions, so symbol-graph function signatures may omit them even
+        // though the full declaration retains them. Other missing attributes
+        // could alter the callable ABI and therefore remain fail-closed.
+        guard recoveredAttributes.allSatisfy({
+            $0 == "@escaping" || $0 == "@autoclosure"
+        }) else { return nil }
+        let type = (recoveredAttributes + [measuredType])
+            .joined(separator: " ")
         guard type.utf8.count <= 16 * 1_024,
               FrontendReceipt.SwiftTypeSpelling.isGeneratedType(type),
               type != "Self", !type.hasPrefix("Self.")
         else { return nil }
         return type
+    }
+
+    private static func parameterAttributes(
+        in fragments: [SwiftFrontend.SymbolGraph.Fragment],
+        count: Int
+    ) -> [[String]]? {
+        let starts = fragments.indices.filter {
+            fragments[$0].kind == "externalParam"
+        }
+        guard starts.count == count else { return nil }
+        return starts.enumerated().map { offset, start in
+            let end = offset + 1 < starts.count
+                ? starts[offset + 1] : fragments.endIndex
+            return fragments[start..<end].compactMap {
+                $0.kind == "attribute"
+                    ? normalizedAttribute($0.spelling) : nil
+            }
+        }
+    }
+
+    private static func normalizedAttribute(_ raw: String) -> String? {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
     }
 
     private static func propertyType(
@@ -668,6 +782,21 @@ extension FrontendReceipt.ManagedDebugSurface {
                     }
                 }
             }
+            if candidate.requiresMainActor {
+                measured.parameterSwiftTypes = measured.parameterSwiftTypes.map {
+                    inheritedCallbackType(
+                        $0,
+                        requiresMainActor: true
+                    )
+                }
+                measured.invocationParameterSwiftTypes = measured
+                    .invocationParameterSwiftTypes?.map {
+                        inheritedCallbackType(
+                            $0,
+                            requiresMainActor: true
+                        )
+                    }
+            }
             measured.resultSwiftType = FrontendReceipt.SwiftTypeSpelling
                 .replacingNominalAliases(
                     in: operation.resultSwiftType,
@@ -715,7 +844,7 @@ extension FrontendReceipt.ManagedDebugSurface {
         let isolation = candidate.requiresMainActor ? "@MainActor " : ""
         let throwing = candidate.mayThrow ? " throws" : ""
         let tryPrefix = candidate.mayThrow ? "try " : ""
-        let owner = escapedPath(candidate.probeOwnerType)
+        let owner = escapedNominalType(candidate.probeOwnerType)
         let member = escapedIdentifier(candidate.memberName)
         var parameters: [String] = []
         if isInstanceDispatch(candidate.dispatch) {
@@ -785,6 +914,99 @@ extension FrontendReceipt.ManagedDebugSurface {
             }
         }
         return result
+    }
+
+    private static func ownerSpecialization(
+        surface: OwnerSurface,
+        importedType: FrontendReceipt.Adapter.ImportedNativeType
+    ) -> OwnerSpecialization? {
+        guard !surface.genericParameters.isEmpty else {
+            return OwnerSpecialization(
+                probeType: surface.swiftPath,
+                substitutions: [:]
+            )
+        }
+        let spellings = [importedType.swiftType, importedType.canonicalName]
+            + importedType.aliases
+        for spelling in spellings {
+            guard let arguments = genericArguments(
+                in: spelling,
+                ownerPath: surface.swiftPath,
+                moduleName: surface.moduleName
+            ), arguments.count == surface.genericParameters.count
+            else { continue }
+            return OwnerSpecialization(
+                probeType: spelling,
+                substitutions: Dictionary(
+                    uniqueKeysWithValues: zip(
+                        surface.genericParameters,
+                        arguments
+                    )
+                )
+            )
+        }
+        return nil
+    }
+
+    private static func genericArguments(
+        in raw: String,
+        ownerPath: String,
+        moduleName: String
+    ) -> [String]? {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard FrontendReceipt.SwiftTypeSpelling.isGeneratedType(value),
+              normalizedTypeName(value, moduleName: moduleName) == ownerPath,
+              let open = value.firstIndex(of: "<"),
+              value.last == ">"
+        else { return nil }
+        let body = value[
+            value.index(after: open)..<value.index(before: value.endIndex)
+        ]
+        var arguments: [String] = []
+        var start = body.startIndex
+        var angleDepth = 0
+        var parenthesisDepth = 0
+        var bracketDepth = 0
+        for index in body.indices {
+            switch body[index] {
+            case "<": angleDepth += 1
+            case ">":
+                let previous = index > body.startIndex
+                    ? body[body.index(before: index)] : nil
+                if previous != "-" { angleDepth -= 1 }
+            case "(": parenthesisDepth += 1
+            case ")": parenthesisDepth -= 1
+            case "[": bracketDepth += 1
+            case "]": bracketDepth -= 1
+            default: break
+            }
+            guard angleDepth >= 0,
+                  parenthesisDepth >= 0,
+                  bracketDepth >= 0
+            else { return nil }
+            if body[index] == ",",
+               angleDepth == 0,
+               parenthesisDepth == 0,
+               bracketDepth == 0 {
+                let argument = body[start..<index]
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard FrontendReceipt.SwiftTypeSpelling.isGeneratedType(
+                    argument
+                ) else { return nil }
+                arguments.append(argument)
+                start = body.index(after: index)
+            }
+        }
+        guard angleDepth == 0,
+              parenthesisDepth == 0,
+              bracketDepth == 0
+        else { return nil }
+        let tail = body[start...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard FrontendReceipt.SwiftTypeSpelling.isGeneratedType(tail)
+        else { return nil }
+        arguments.append(tail)
+        return arguments
     }
 
     private static func normalizedTypeName(
@@ -865,10 +1087,24 @@ extension FrontendReceipt.ManagedDebugSurface {
         return true
     }
 
-    private static func escapedPath(_ value: String) -> String {
-        value.split(separator: ".").map {
-            escapedIdentifier(String($0))
-        }.joined(separator: ".")
+    private static func escapedNominalType(_ value: String) -> String {
+        var result = ""
+        var identifier = ""
+        func appendIdentifier() {
+            guard !identifier.isEmpty else { return }
+            result += escapedIdentifier(identifier)
+            identifier.removeAll(keepingCapacity: true)
+        }
+        for character in value {
+            if character == "_" || character.isLetter || character.isNumber {
+                identifier.append(character)
+            } else {
+                appendIdentifier()
+                result.append(character)
+            }
+        }
+        appendIdentifier()
+        return result
     }
 
     private static func escapedIdentifier(_ value: String) -> String {

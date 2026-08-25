@@ -1,0 +1,18 @@
+        actionCount += 1
+        let badge = UILabel()
+        badge.text = "HELIX VIEW \(actionCount)"
+        badge.textColor = .systemGreen
+        badge.font = .boldSystemFont(ofSize: 18)
+        badge.accessibilityIdentifier = "helix.live-transient"
+        badge.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(badge)
+        NSLayoutConstraint.activate([
+            badge.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            badge.bottomAnchor.constraint(
+                equalTo: actionButton.topAnchor,
+                constant: -12
+            ),
+        ])
+        titleLabel.text = "HELIX VIEW MUTATION"
+        view.backgroundColor = .secondarySystemBackground
+        print("HELIX E2E VIEW MUTATION \(actionCount)")

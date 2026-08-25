@@ -3,3 +3,4 @@ modules:
   LiveReloadE2E:
     include:
       - "*.swift"
+    entrypoints: all

@@ -132,6 +132,153 @@ struct ImportedFrameworks {
         })
     }
 
+    @Test("Objective-C bridge values preserve their logical type across branch merges")
+    func lowersBridgedStringBranchMerge() throws {
+        let labelType = Core.TypeID(rawValue: .sha256("UIKit.UILabel"))
+        let physicalType = "@convention(objc_method) "
+            + "(Optional<NSString>, UILabel) -> ()"
+        let symbol = CanonicalSIL.NativeBridgeSymbols.foreignCall(
+            reference: "#UILabel.text!setter.foreign",
+            loweredType: physicalType
+        )
+        let requirement = importRequirement(id: 41)
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: symbol,
+                parameterTypes: [.optional(.string), .native(labelType)],
+                resultType: .void,
+                target: .nativeImport(requirement)
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["UILabel": labelType],
+                kinds: [labelType: .reference]
+            )
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture6updateyySo7UILabelC_SbSStF",
+            loweredType: "@convention(thin) (@guaranteed UILabel, Bool, "
+                + "@guaranteed String) -> ()",
+            body: """
+            bb0(%0 : @guaranteed $UILabel, %1 : $Bool, %2 : @guaranteed $String):
+              %3 = struct_extract %1, #Bool._value
+              cond_br %3, bb1, bb2
+            bb1:
+              %4 = function_ref @$sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF : $@convention(method) (@guaranteed String) -> @owned NSString
+              %5 = apply %4(%2) : $@convention(method) (@guaranteed String) -> @owned NSString
+              %6 = enum $Optional<NSString>, #Optional.some!enumelt, %5
+              br bb3(%6 : $Optional<NSString>)
+            bb2:
+              %7 = enum $Optional<NSString>, #Optional.none!enumelt
+              br bb3(%7 : $Optional<NSString>)
+            bb3(%8 : $Optional<NSString>):
+              %9 = objc_method %0, #UILabel.text!setter.foreign : (UILabel) -> (String?) -> (), $\(physicalType)
+              %10 = apply %9(%8, %0) : $\(physicalType)
+              release_value %8
+              %11 = tuple ()
+              return %11
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            function,
+            displayName: "Fixture.update",
+            directCalls: calls
+        )
+        let merged = try #require(lowered.blocks.first { block in
+            block.id == .init(rawValue: 3)
+        })
+        let parameter = try #require(merged.parameters.first)
+        #expect(lowered.registerTypes[Int(parameter.rawValue)] == .optional(.string))
+        #expect(lowered.blocks.flatMap(\.instructions).contains { instruction in
+            guard case let .nativeApply(_, id, _) = instruction else { return false }
+            return id == requirement.id
+        })
+
+        var forgedPhysicalMerge = function
+        forgedPhysicalMerge.body = function.body.replacingOccurrences(
+            of: "bb3(%8 : $Optional<NSString>):",
+            with: "bb3(%8 : $Optional<NSArray>):"
+        )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            try CanonicalSIL.Lowerer(typeEnvironment: environment).lower(
+                forgedPhysicalMerge,
+                displayName: "Fixture.forgedPhysicalMerge",
+                directCalls: calls
+            )
+        }
+
+        var conflictingPredecessor = function
+        conflictingPredecessor.body = function.body
+            .replacingOccurrences(
+                of: "%7 = enum $Optional<NSString>, #Optional.none!enumelt",
+                with: "%7 = enum $Optional<Int>, #Optional.none!enumelt"
+            )
+            .replacingOccurrences(
+                of: "br bb3(%7 : $Optional<NSString>)",
+                with: "br bb3(%7 : $Optional<Int>)"
+            )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            try CanonicalSIL.Lowerer(typeEnvironment: environment).lower(
+                conflictingPredecessor,
+                displayName: "Fixture.conflictingPredecessor",
+                directCalls: calls
+            )
+        }
+
+        var conditionalMerge = function
+        conditionalMerge.body = """
+        bb0(%0 : @guaranteed $UILabel, %1 : $Bool, %2 : @guaranteed $String):
+          %3 = struct_extract %1, #Bool._value
+          %4 = enum $Optional<NSString>, #Optional.none!enumelt
+          %5 = enum $Optional<NSString>, #Optional.none!enumelt
+          cond_br %3, bb1(%4 : $Optional<NSString>), bb1(%5 : $Optional<NSString>)
+        bb1(%6 : $Optional<NSString>):
+          %7 = objc_method %0, #UILabel.text!setter.foreign : (UILabel) -> (String?) -> (), $\(physicalType)
+          %8 = apply %7(%6, %0) : $\(physicalType)
+          release_value %6
+          %9 = tuple ()
+          return %9
+        """
+        let conditional = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            conditionalMerge,
+            displayName: "Fixture.conditionalMerge",
+            directCalls: calls
+        )
+        let conditionalBlock = try #require(
+            conditional.blocks.first { $0.id.rawValue == 1 }
+        )
+        let conditionalParameter = try #require(
+            conditionalBlock.parameters.first
+        )
+        #expect(
+            conditional.registerTypes[Int(conditionalParameter.rawValue)]
+                == .optional(.string)
+        )
+
+        var conflictingConditional = conditionalMerge
+        conflictingConditional.body = conditionalMerge.body
+            .replacingOccurrences(
+                of: "%5 = enum $Optional<NSString>, #Optional.none!enumelt",
+                with: "%5 = enum $Optional<Int>, #Optional.none!enumelt"
+            )
+            .replacingOccurrences(
+                of: "bb1(%5 : $Optional<NSString>)",
+                with: "bb1(%5 : $Optional<Int>)"
+            )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            try CanonicalSIL.Lowerer(typeEnvironment: environment).lower(
+                conflictingConditional,
+                displayName: "Fixture.conflictingConditional",
+                directCalls: calls
+            )
+        }
+    }
+
     @Test("Foundation native-value bridges preserve the frozen Swift overlay ABI")
     func lowersFoundationNativeValueBridge() throws {
         let urlType = Core.TypeID(rawValue: .sha256("Foundation.URL"))
@@ -1932,6 +2079,64 @@ struct ImportedFrameworks {
             guard case .switchOptional = instruction else { return false }
             return true
         })
+    }
+
+    @Test("Read-only Optional projections retire their detached payload owner")
+    func retiresDetachedOptionalReadPayloadOwner() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["NSObject": objectType],
+                kinds: [objectType: .reference]
+            )
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            .init(
+                mangledName: "$s7Fixture7inspectyySo8NSObjectCSgF",
+                loweredType: "@convention(thin) (@owned Optional<NSObject>) -> ()",
+                body: """
+                bb0(%0 : @owned $Optional<NSObject>):
+                  %1 = alloc_stack $Optional<NSObject>
+                  store %0 to %1
+                  switch_enum_addr %1, case #Optional.some!enumelt: bb1, case #Optional.none!enumelt: bb2
+                bb1:
+                  %2 = unchecked_take_enum_data_addr %1, #Optional.some!enumelt
+                  %3 = load [copy] %2
+                  destroy_value %3
+                  dealloc_stack %1
+                  br bb3
+                bb2:
+                  dealloc_stack %1
+                  br bb3
+                bb3:
+                  %4 = tuple ()
+                  return %4
+                """
+            ),
+            displayName: "Fixture.inspect"
+        )
+        let some = try #require(
+            lowered.blocks.first { $0.id.rawValue == 1 }
+        )
+        let payload = try #require(some.instructions.compactMap {
+            instruction -> Bytecode.Register? in
+            guard case let .unwrapOptional(result, _) = instruction else {
+                return nil
+            }
+            return result
+        }.first)
+        #expect(some.instructions.contains(.destroyValue(payload)))
+        let cleanupIndex = try #require(
+            some.instructions.firstIndex(of: .destroyValue(payload))
+        )
+        let stackCleanupIndex = try #require(
+            some.instructions.firstIndex {
+                if case .destroyStack = $0 { return true }
+                return false
+            }
+        )
+        #expect(cleanupIndex < stackCleanupIndex)
     }
 
     @Test("Optional address copies preserve some-case dominance and ownership")

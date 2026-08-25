@@ -1,4 +1,5 @@
 import HelixBytecode
+import HelixCore
 import Testing
 @testable import HelixCompiler
 
@@ -183,6 +184,72 @@ struct ManagedCaptureStorage {
         #expect(unowned.parameters == [unownedType])
         #expect(unowned.parameterConventions == [.owned])
         #expect(unowned.logicalIndices == [0])
+    }
+
+    @Test("Inferred-immutable weak boxes retain ordinary weak semantics")
+    func lowersInferredImmutableWeakBox() throws {
+        let owner = Core.TypeID(rawValue: .sha256("Fixture.Owner"))
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["Fixture.Owner": owner],
+                kinds: [owner: .reference]
+            )
+        let weakCapture = Bytecode.ValueType.nonOwningReference(
+            kind: .weak,
+            pointee: .optional(.native(owner))
+        )
+        let captureSignature = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).parseFunctionType(
+            "$@convention(thin) "
+                + "(@inferredImmutable ${ var @sil_weak Optional<Fixture.Owner> }) "
+                + "-> ()"
+        )
+        #expect(captureSignature.parameters == [weakCapture])
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture15captureWeakSelfyyAA5OwnerCF",
+            loweredType: "@convention(thin) (@guaranteed Fixture.Owner) -> ()",
+            body: """
+            bb0(%0 : @guaranteed $Fixture.Owner):
+              %1 = alloc_box [inferred_immutable] ${ var @sil_weak Optional<Fixture.Owner> }
+              %2 = project_box %1, 0
+              %3 = enum $Optional<Fixture.Owner>, #Optional.some!enumelt, %0
+              store_weak %3 to [init] %2
+              release_value %3
+              destroy_value %1
+              %4 = tuple ()
+              return %4
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(function, displayName: "Fixture.captureWeakSelf")
+        #expect(lowered.blocks.flatMap(\.instructions).contains {
+            guard case .makeNonOwningReference = $0 else { return false }
+            return true
+        })
+
+        var unknownDecoration = function
+        unknownDecoration.body = function.body.replacingOccurrences(
+            of: "[inferred_immutable]",
+            with: "[unknown_semantics]"
+        )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            try CanonicalSIL.Lowerer(typeEnvironment: environment).lower(
+                unknownDecoration,
+                displayName: "Fixture.unknownWeakBox"
+            )
+        }
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            try CanonicalSIL.Lowerer(
+                typeEnvironment: environment
+            ).parseFunctionType(
+                "$@convention(thin) "
+                    + "(@unknownCapture ${ var @sil_weak Optional<Fixture.Owner> }) "
+                    + "-> ()"
+            )
+        }
     }
 
     @Test("Non-owning capture ABI rejects mismatched ownership markers")

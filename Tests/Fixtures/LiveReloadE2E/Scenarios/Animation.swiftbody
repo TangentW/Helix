@@ -1,0 +1,19 @@
+        actionCount += 1
+        UIView.performWithoutAnimation {
+            self.titleLabel.alpha = 0.7
+            self.view.layoutIfNeeded()
+        }
+        UIView.animate(withDuration: 0.05) {
+            self.view.alpha = 0.8
+        } completion: { [weak self] finished in
+            guard let self else { return }
+            self.view.alpha = 1
+            self.titleLabel.alpha = 1
+            self.titleLabel.text = finished
+                ? "HELIX ANIMATION COMPLETE"
+                : "HELIX ANIMATION INTERRUPTED"
+            self.scenarioState = finished
+                ? "animation-complete"
+                : "animation-interrupted"
+            print("HELIX E2E ANIMATION COMPLETION \(self.actionCount)")
+        }

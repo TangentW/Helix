@@ -720,10 +720,15 @@ public struct Lowerer: Sendable {
         }
         let usesRuntimeAddresses = signature.parameterConventions.contains(.inout)
             || directCalls.referencesInoutCallee(in: function.body)
-        let normalizedBody = try CanonicalSIL.SequentialAsync.normalizedBody(
+        let sequentialBody = try CanonicalSIL.SequentialAsync.normalizedBody(
             of: function,
             effects: effectiveEffects
         )
+        let normalizedBody = try CanonicalSIL.MainActorExecutorCheck
+            .normalizedBody(
+                sequentialBody,
+                effects: effectiveEffects
+            )
         let storageInitializationPlan = try CanonicalSIL.StorageInitialization
             .analyze(
                 body: normalizedBody,
@@ -896,6 +901,9 @@ public struct Lowerer: Sendable {
         var declaredBlockParameterTypes: [
             Bytecode.BlockID: [Bytecode.ValueType]
         ] = [:]
+        var observedBranchParameterTypes: [
+            Bytecode.BlockID: [Bytecode.ValueType]
+        ] = [:]
         var declaredBlockIDs = Set<Bytecode.BlockID>()
         for rawLine in rawLines {
             let instruction = CanonicalSIL.DebugMetadata.strippingMetadata(
@@ -1016,6 +1024,7 @@ public struct Lowerer: Sendable {
         var setMetatypeValues: [String: Bytecode.ValueType] = [:]
         var stackAddressTypes: [String: Bytecode.ValueType] = [:]
         var stackAddressValues: [String: Bytecode.Register] = [:]
+        var detachedReadPayloadStorageRoots: [String: String] = [:]
         var stackSlotTypes: [Bytecode.ValueType] = []
         var runtimeStackSlots: [String: Bytecode.StackSlot] = [:]
         var runtimeAddressValues: [String: Bytecode.Register] = [:]
@@ -1846,10 +1855,13 @@ public struct Lowerer: Sendable {
             _ tokens: some Sequence<String>,
             after lineIndex: Int
         ) {
-            for token in Set(tokens) where !hasFutureSemanticUse(
-                ofCompilerTemporaryAliasedTo: token,
-                after: lineIndex
-            ) {
+            var releasedTokens = Set<String>()
+            for token in tokens
+            where releasedTokens.insert(token).inserted
+                && !hasFutureSemanticUse(
+                    ofCompilerTemporaryAliasedTo: token,
+                    after: lineIndex
+                ) {
                 if let value = removeBorrowedTemporaryValue(for: token) {
                     clearBorrowedTemporaryClassification(for: token)
                     appendInstruction(.destroyValue(value))
@@ -2556,11 +2568,13 @@ public struct Lowerer: Sendable {
             let canonicalRoot = addressBase(root)
             let matching = aggregateComponentValues.filter {
                 $0.key.root == canonicalRoot
+            }.sorted { lhs, rhs in
+                lhs.key.path.lexicographicallyPrecedes(rhs.key.path)
             }
-            for key in matching.keys {
+            for (key, _) in matching {
                 aggregateComponentValues.removeValue(forKey: key)
             }
-            return Array(matching.values)
+            return matching.map(\.value)
         }
 
         func reconstructedOptionalNone(
@@ -6470,6 +6484,37 @@ public struct Lowerer: Sendable {
                 )
                 arguments[index] = normalized
             }
+        }
+
+        func recordObservedBranchParameterTypes(
+            _ arguments: ArraySlice<Bytecode.Register>,
+            target: Bytecode.BlockID
+        ) throws {
+            let types = arguments.map { registerTypes[Int($0.rawValue)] }
+            if let previous = observedBranchParameterTypes[target] {
+                guard previous == types else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "branch predecessors disagree on the logical block parameter types"
+                    )
+                }
+                return
+            }
+            if let targetBlock = if current?.id == target {
+                current
+            } else {
+                blocks.last(where: { $0.id == target })
+            } {
+                guard targetBlock.parameters.count >= types.count,
+                      Array(targetBlock.parameters.prefix(types.count)).map({
+                          registerTypes[Int($0.rawValue)]
+                      }) == types
+                else {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "branch arguments differ from the logical target block parameters"
+                    )
+                }
+            }
+            observedBranchParameterTypes[target] = types
         }
 
         func appendSyntheticBlock(
@@ -22225,6 +22270,43 @@ public struct Lowerer: Sendable {
         /// A source failure terminates the HLBC edge before canonical SIL's
         /// lexical tail. Still validate and retire its compiler storage facts;
         /// frame unwinding owns runtime cleanup on the terminated edge.
+        func retireDetachedReadPayloads(
+            rootedAt storageRoot: String,
+            emitsRuntimeCleanup: Bool
+        ) {
+            let projections = detachedReadPayloadStorageRoots
+                .filter { $0.value == storageRoot }
+                .map(\.key)
+                .sorted()
+            var owners: [Bytecode.Register] = []
+            for projection in projections {
+                detachedReadPayloadStorageRoots.removeValue(
+                    forKey: projection
+                )
+                stackAddressTypes.removeValue(forKey: projection)
+                protocolExistentialAddressTypes.removeValue(
+                    forKey: projection
+                )
+                owners.append(
+                    contentsOf: removeAggregateComponentValues(
+                        rootedAt: projection
+                    )
+                )
+                if let owner = stackAddressValues.removeValue(
+                    forKey: projection
+                ) {
+                    owners.append(owner)
+                }
+            }
+            guard emitsRuntimeCleanup else { return }
+            var retiredOwners = Set<Bytecode.Register>()
+            for owner in owners
+            where retiredOwners.insert(owner).inserted
+                && requiresManagedOwnership(registerTypes[Int(owner.rawValue)]) {
+                appendInstruction(.destroyValue(owner))
+            }
+        }
+
         func lowerStackDeallocation(
             _ token: String,
             emitsRuntimeCleanup: Bool
@@ -22250,6 +22332,10 @@ public struct Lowerer: Sendable {
             } else {
                 remainingDeallocStackUses[token] = remainingUses - 1
             }
+            retireDetachedReadPayloads(
+                rootedAt: address,
+                emitsRuntimeCleanup: emitsRuntimeCleanup
+            )
             if let value = externalDefaultArgumentAddresses[address] {
                 guard value.isConsumed,
                       !explicitlyDestroyedAddresses.contains(token)
@@ -22442,8 +22528,10 @@ public struct Lowerer: Sendable {
             if let aggregate = stackAddressValues.removeValue(forKey: address) {
                 storedValues.append(aggregate)
             }
-            for value in Set(storedValues)
-            where requiresManagedOwnership(registerTypes[Int(value.rawValue)]) {
+            var destroyedValues = Set<Bytecode.Register>()
+            for value in storedValues
+            where destroyedValues.insert(value).inserted
+                && requiresManagedOwnership(registerTypes[Int(value.rawValue)]) {
                 emitCleanup(.destroyValue(value))
             }
         }
@@ -22560,16 +22648,29 @@ public struct Lowerer: Sendable {
                 continue
             }
 
-            let bridgedBlockParameterTypes: [Bytecode.ValueType]? = {
-                guard let number = parseBlockNumber(line),
-                      let sourceToken = optionalSourceBySomeBlock[
-                        .init(rawValue: number)
-                      ],
+            let parsedBlockID = parseBlockNumber(line).map {
+                Bytecode.BlockID(rawValue: $0)
+            }
+            let optionalPayloadParameterTypes: [Bytecode.ValueType]? = {
+                guard let parsedBlockID,
+                      let sourceToken = optionalSourceBySomeBlock[parsedBlockID],
                       let source = values[sourceToken],
                       case let .optional(wrapped) = registerTypes[Int(source.rawValue)]
                 else { return nil }
                 return [wrapped]
             }()
+            let observedParameterTypes = parsedBlockID.flatMap {
+                observedBranchParameterTypes[$0]
+            }
+            if let optionalPayloadParameterTypes,
+               let observedParameterTypes,
+               optionalPayloadParameterTypes != observedParameterTypes {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "Optional payload and branch edges disagree on block parameter types"
+                )
+            }
+            let bridgedBlockParameterTypes = optionalPayloadParameterTypes
+                ?? observedParameterTypes
             if let block = try parseBlockHeader(
                 line,
                 entryParameterTypes: entryBlock == nil
@@ -23577,7 +23678,7 @@ public struct Lowerer: Sendable {
 
             if let box = match(
                 line,
-                pattern: #"^(%[0-9]+) = alloc_box \$\{ var (.+) \}(?:, .*)?$"#
+                pattern: #"^(%[0-9]+) = alloc_box(?: \[inferred_immutable\])? \$\{ var (.+) \}(?:, .*)?$"#
             ) {
                 let pointee = try parseType(box[1])
                 guard pendingMutableBoxes.updateValue(
@@ -28207,6 +28308,10 @@ public struct Lowerer: Sendable {
                 }
                 stackAddressTypes[extraction[0]] = wrapped
                 stackAddressValues[extraction[0]] = payload
+                if payloadUse == .read {
+                    detachedReadPayloadStorageRoots[extraction[0]] =
+                        compilerStorageIdentity(for: extraction[1]).root
+                }
                 if let identity = optionalProtocolExistentialPayloadTypes[
                     addressBase(extraction[1])
                 ] {
@@ -30787,6 +30892,7 @@ public struct Lowerer: Sendable {
                         try resolveStorableValue(token, line: line)
                     }
                 )
+                let explicitArgumentCount = arguments.count
                 try transferCompilerTemporaryOwnersIntoControlFlow(
                     tokens: argumentTokens,
                     arguments: arguments
@@ -30797,6 +30903,10 @@ public struct Lowerer: Sendable {
                 )
                 try normalizeBuiltinIntegerBranchArguments(
                     &arguments,
+                    target: target
+                )
+                try recordObservedBranchParameterTypes(
+                    arguments.prefix(explicitArgumentCount),
                     target: target
                 )
                 appendInstruction(
@@ -30880,6 +30990,8 @@ public struct Lowerer: Sendable {
                         try resolveStorableValue(token, line: line)
                     }
                 )
+                let explicitTrueArgumentCount = trueArguments.count
+                let explicitFalseArgumentCount = falseArguments.count
                 try transferCompilerTemporaryOwnersIntoControlFlow(
                     tokens: trueArgumentTokens + falseArgumentTokens,
                     arguments: trueArguments + falseArguments
@@ -30898,6 +31010,14 @@ public struct Lowerer: Sendable {
                 )
                 try normalizeBuiltinIntegerBranchArguments(
                     &falseArguments,
+                    target: falseTarget
+                )
+                try recordObservedBranchParameterTypes(
+                    trueArguments.prefix(explicitTrueArgumentCount),
+                    target: trueTarget
+                )
+                try recordObservedBranchParameterTypes(
+                    falseArguments.prefix(explicitFalseArgumentCount),
                     target: falseTarget
                 )
                 appendInstruction(

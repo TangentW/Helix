@@ -11,9 +11,11 @@
   Presentation values intentionally live in that re-entrant callback rather
   than one-shot hierarchy installation, so the visible test edit exercises the
   same callback Helix invalidates after activation. The managed Debug Shell
-  also prefreezes the measured standard `UIColor` palette, so adding
-  `view.backgroundColor = .black` there exercises a first-use UIKit class
-  property without rebuilding the App.
+  also measures the public synchronous SDK-member surface whose boundary types
+  are already frozen, including concrete generic owners and supported callback
+  parameters. Adding `view.backgroundColor = .black`, UIKit animation calls,
+  or another eligible measured member therefore exercises first-use framework
+  code without rebuilding the App.
 
 The checked-in Xcode integration under `.helix/xcode` is owned by Helix Hub.
 The canonical plan is `.helix/xcode/HostPlan.json`; developers do not maintain a

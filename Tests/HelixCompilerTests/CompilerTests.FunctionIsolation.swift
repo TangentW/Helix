@@ -245,6 +245,147 @@ struct FunctionIsolation {
         }
     }
 
+    @Test("Pinned synchronous MainActor assertions defer to VM entry checks")
+    func normalizesPinnedMainActorExecutorAssertions() throws {
+        let branchingBody = """
+        bb0:
+          %0 = metatype $@thick MainActor.Type
+          %1 = function_ref @$sScM6sharedScMvgZ : $@convention(method) (@thick MainActor.Type) -> @owned MainActor
+          %2 = apply %1(%0) : $@convention(method) (@thick MainActor.Type) -> @owned MainActor
+          %3 = extract_executor %2
+          %4 = string_literal utf8 "Fixture.swift"
+          %5 = integer_literal $Builtin.Word, 13
+          %6 = integer_literal $Builtin.Int1, -1
+          %7 = integer_literal $Builtin.Word, 42
+          %8 = function_ref @swift_task_isCurrentExecutor : $@convention(thin) (Builtin.Executor) -> Bool
+          %9 = apply %8(%3) : $@convention(thin) (Builtin.Executor) -> Bool
+          %10 = struct_extract %9, #Bool._value
+          cond_br %10, bb1, bb2
+        bb1:
+          br bb3
+        bb2:
+          %11 = function_ref @swift_task_reportUnexpectedExecutor : $@convention(thin) (Builtin.RawPointer, Builtin.Word, Builtin.Int1, Builtin.Word, Builtin.Executor) -> ()
+          %12 = apply %11(%4, %5, %6, %7, %3) : $@convention(thin) (Builtin.RawPointer, Builtin.Word, Builtin.Int1, Builtin.Word, Builtin.Executor) -> ()
+          br bb3
+        bb3:
+          %13 = tuple ()
+          strong_release %2
+          return %13
+        """
+        var effects = Core.Effects()
+        effects.requiresMainActor = true
+        let normalized = try CanonicalSIL.MainActorExecutorCheck
+            .normalizedBody(branchingBody, effects: effects)
+        #expect(normalized.contains("br bb3"))
+        #expect(!normalized.contains("bb1:"))
+        #expect(!normalized.contains("bb2:"))
+        #expect(!normalized.contains("MainActor.Type"))
+        #expect(!normalized.contains("swift_task_"))
+
+        let lowered = try CanonicalSIL.Lowerer().lower(
+            .init(
+                mangledName: "$s7Fixture8callbackyyF",
+                loweredType: "@convention(thin) () -> ()",
+                body: branchingBody
+            ),
+            displayName: "Fixture.callback",
+            expectedEffects: effects
+        )
+        #expect(lowered.effects.requiresMainActor)
+        #expect(lowered.blocks.count == 2)
+
+        let directBody = """
+        bb0:
+          %0 = metatype $@thick MainActor.Type
+          %1 = function_ref @$sScM6sharedScMvgZ : $@convention(method) (@thick MainActor.Type) -> @owned MainActor
+          %2 = apply %1(%0) : $@convention(method) (@thick MainActor.Type) -> @owned MainActor
+          %3 = extract_executor %2
+          %4 = string_literal utf8 "Fixture.swift"
+          %5 = integer_literal $Builtin.Word, 13
+          %6 = integer_literal $Builtin.Int1, -1
+          %7 = integer_literal $Builtin.Word, 7
+          %8 = function_ref @$ss22_checkExpectedExecutor14_filenameStart01_D6Length01_D7IsASCII5_line9_executoryBp_BwBi1_BwBetF : $@convention(thin) (Builtin.RawPointer, Builtin.Word, Builtin.Int1, Builtin.Word, Builtin.Executor) -> ()
+          %9 = apply %8(%4, %5, %6, %7, %3) : $@convention(thin) (Builtin.RawPointer, Builtin.Word, Builtin.Int1, Builtin.Word, Builtin.Executor) -> ()
+          strong_release %2
+          %10 = tuple ()
+          return %10
+        """
+        let direct = try CanonicalSIL.MainActorExecutorCheck.normalizedBody(
+            directBody,
+            effects: effects
+        )
+        #expect(!direct.contains("MainActor.Type"))
+        #expect(!direct.contains("checkExpectedExecutor"))
+        #expect(direct.contains("return %10"))
+
+        let changedRuntimeABI = branchingBody.replacingOccurrences(
+            of: "@swift_task_reportUnexpectedExecutor",
+            with: "@swift_task_reportChangedExecutor"
+        )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            try CanonicalSIL.MainActorExecutorCheck.normalizedBody(
+                changedRuntimeABI,
+                effects: effects
+            )
+        }
+        let duplicateAssertion = branchingBody.replacingOccurrences(
+            of: "bb0:",
+            with: "bb0:\n  %99 = metatype $@thick MainActor.Type"
+        )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            try CanonicalSIL.MainActorExecutorCheck.normalizedBody(
+                duplicateAssertion,
+                effects: effects
+            )
+        }
+        let changedDiagnosticABI = branchingBody.replacingOccurrences(
+            of: "%5 = integer_literal $Builtin.Word, 13",
+            with: "%5 = integer_literal $Builtin.Int64, 13"
+        )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            try CanonicalSIL.MainActorExecutorCheck.normalizedBody(
+                changedDiagnosticABI,
+                effects: effects
+            )
+        }
+        let escapingExecutor = branchingBody.replacingOccurrences(
+            of: "  strong_release %2",
+            with: "  debug_value %3\n  strong_release %2"
+        )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            try CanonicalSIL.MainActorExecutorCheck.normalizedBody(
+                escapingExecutor,
+                effects: effects
+            )
+        }
+        let externalPredecessor = branchingBody.replacingOccurrences(
+            of: "bb0:",
+            with: "bb9:\n  br bb1\nbb0:"
+        )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            try CanonicalSIL.MainActorExecutorCheck.normalizedBody(
+                externalPredecessor,
+                effects: effects
+            )
+        }
+    }
+
+    @Test("MainActor assertion normalization fails closed without authority")
+    func rejectsUnrootedMainActorExecutorAssertion() {
+        let body = """
+        bb0:
+          %0 = metatype $@thick MainActor.Type
+          %1 = tuple ()
+          return %1
+        """
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            try CanonicalSIL.MainActorExecutorCheck.normalizedBody(
+                body,
+                effects: .init()
+            )
+        }
+    }
+
     @Test("Unsupported actor executors fail closed")
     func rejectsUnsupportedActorIsolation() throws {
         for isolation in [

@@ -1,0 +1,7 @@
+        actionCount += 1
+        dismiss(animated: false) { [weak self] in
+            guard let self else { return }
+            self.titleLabel.text = "HELIX DISMISSED"
+            self.scenarioState = "dismissed"
+            print("HELIX E2E DISMISS COMPLETION")
+        }

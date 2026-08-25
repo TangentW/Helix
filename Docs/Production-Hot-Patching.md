@@ -458,6 +458,18 @@ the closed hosted profile and cross into native code as that superclass. The
 current profile is limited to inherited no-argument initialization, no stored
 properties, and no-argument/Bool `Void` overrides.
 
+Two compiler-only shapes are normalized without widening this subset. Swift's
+`[inferred_immutable]` weak-capture box decoration is accepted only in its exact
+known position, and read-only Optional address projections retire their
+detached payload owner before parent stack cleanup. Swift 6's synchronous
+MainActor executor assertion is removed only after the function has a
+verifier-visible MainActor effect and only for the pinned `MainActor.shared`
+runtime shape; HLVM independently enforces main-thread entry. Unknown box
+decorations, changed executor ABIs, escaping scaffold values, duplicate checks,
+or nonisolated use fail closed. Likewise, a physical Objective-C bridge carried
+through a SIL basic-block parameter is admitted only when every predecessor
+proves the same logical type and the printed foreign type exactly bridges to it.
+
 Within one verified image, a concrete `throws(Failure)` callable preserves the
 exact Error-conforming patch-local nominal through direct and closure calls,
 escaping aggregate storage, concrete generic forwarding, supported concrete

@@ -1,0 +1,11 @@
+        actionCount += 1
+        actionButton.configurationUpdateHandler = { [weak self] button in
+            guard let self else { return }
+            var configuration = button.configuration
+            configuration?.title = "Configured \(self.actionCount)"
+            configuration?.baseBackgroundColor = .systemPurple
+            button.configuration = configuration
+            self.titleLabel.text = "HELIX BUTTON CALLBACK"
+            print("HELIX E2E BUTTON CALLBACK \(self.actionCount)")
+        }
+        actionButton.setNeedsUpdateConfiguration()

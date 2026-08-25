@@ -868,6 +868,7 @@ public struct TypeEnvironment: Sendable {
                 "@autoreleased ",
                 "@unowned_inner_pointer ",
                 "@closureCapture ",
+                "@inferredImmutable ",
                 "@in ",
                 "@in_guaranteed ",
                 "@out ",
