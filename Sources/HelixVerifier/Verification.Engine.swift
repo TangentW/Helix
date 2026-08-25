@@ -570,7 +570,7 @@ public struct Engine: Verification.ImageVerifying {
             guard let frozen = shell.frozenValueTypes[key] else { continue }
             guard definition == frozen.definition else {
                 throw Verification.Error.invalidModule(
-                    "local type \(key) disagrees with its frozen Shell value layout"
+                    "local type \(key) disagrees with its indexed Shell value layout"
                 )
             }
         }
@@ -733,7 +733,7 @@ public struct Engine: Verification.ImageVerifying {
                       native.isCopyable
                 else {
                     throw Verification.Error.invalidModule(
-                        "hosted class \(definition.key) has no frozen reference superclass"
+                        "hosted class \(definition.key) has no indexed reference superclass"
                     )
                 }
             }
@@ -3132,7 +3132,7 @@ public struct Engine: Verification.ImageVerifying {
                   let hostedSuperclass,
                   type(result) == .native(hostedSuperclass.typeID)
             else {
-                throw fail("project_hosted_object must produce the frozen native superclass")
+                throw fail("project_hosted_object must produce the indexed native superclass")
             }
         case let .hostedSuperApply(object, methodIndex, arguments):
             guard capabilities.contains(.hostedObjectiveCClassesV1),

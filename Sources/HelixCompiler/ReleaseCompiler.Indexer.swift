@@ -136,7 +136,7 @@ public struct Indexer: Sendable {
                 == request.frozenValueTypes.count
         else {
             throw ReleaseCompiler.IndexError.invalidInput(
-                "duplicate frozen Shell value type"
+                "duplicate indexed Shell value type"
             )
         }
         let frozenValueTypesByKey = Dictionary(

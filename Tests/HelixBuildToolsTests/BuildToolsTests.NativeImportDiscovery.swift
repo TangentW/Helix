@@ -11,6 +11,49 @@ import Testing
 extension BuildToolsTests {
 @Suite("Scoped NativeImport discovery")
 struct NativeImportDiscoveryTests {
+    @Test("Generated adapters preserve a namespace that matches the module name")
+    func preservesModuleNamedSourceNamespace() throws {
+        let metadata = makeMetadata(moduleName: "Collision")
+        let hostID = Core.TypeID.derive(
+            namespace: metadata.shellNamespaceID,
+            canonicalType: "Collision.Collision.HostViewController"
+        )
+        let controllerID = Core.TypeID.derive(
+            namespace: metadata.shellNamespaceID,
+            canonicalType: "UIViewController"
+        )
+        let operation = FrontendReceipt.Adapter.ImportedOperation(
+            silReferences: [],
+            sourceFileLogicalID: "Sources/Application.swift",
+            importedModules: ["UIKit"],
+            dispatch: .nativeUpcast,
+            ownerType: "UIViewController",
+            baseName: "upcast",
+            argumentLabels: ["_"],
+            parameterSwiftTypes: ["Collision.HostViewController"],
+            resultSwiftType: "UIViewController",
+            requiresMainActor: true,
+            compilerOperation: .nativeUpcast
+        )
+
+        let declarations = try FrontendReceipt.Adapter()
+            .makeImportedOperationDeclarations(
+                [operation],
+                moduleName: "Collision",
+                nativeTypes: [
+                    "Collision.Collision.HostViewController": hostID,
+                    "Collision.HostViewController": hostID,
+                    "UIViewController": controllerID,
+                ]
+            )
+        #expect(declarations.count == 1)
+        let declaration = try #require(declarations.first)
+        #expect(declaration.parameterSwiftTypes == ["Collision.HostViewController"])
+        #expect(declaration.resultSwiftType == "UIViewController")
+        #expect(declaration.parameterTypes == [.native(hostID)])
+        #expect(declaration.resultType == .native(controllerID))
+    }
+
     @Test("Measured declarations refine contextual isolation without admitting symbol aliases")
     func refinesManagedOperationIsolation() {
         let symbol = "$hlx_native_foreign_shared"
@@ -910,7 +953,7 @@ struct NativeImportDiscoveryTests {
         })
     }
 
-    @Test("Imported calls retain NSError-backed Swift throwing ABI")
+    @Test("Re-exported imported calls retain Swift overlay and NSError ABI")
     func discoversNSErrorBackedImportedCall() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "helix-nserror-import-\(UUID().uuidString)",
@@ -923,10 +966,10 @@ struct NativeImportDiscoveryTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let sourceURL = directory.appendingPathComponent("Fixture.swift")
         let source = """
-        import Foundation
+        import UIKit
 
-        public func remove(_ manager: FileManager, path: String) throws {
-            try manager.removeItem(atPath: path)
+        public func remove(path: String) throws {
+            try FileManager.default.removeItem(atPath: path)
         }
         """
         let contents = Data(source.utf8)
@@ -980,6 +1023,13 @@ struct NativeImportDiscoveryTests {
         #expect(operation.resultSwiftType == "()")
         #expect(operation.mayThrow)
         #expect(operation.parameterProjection == .identity(parameterCount: 2))
+        let defaultGetter = try #require(surface.operations.first {
+            $0.ownerType == "FileManager"
+                && $0.baseName == "default"
+                && $0.dispatch == .staticGetter
+        })
+        #expect(defaultGetter.resultSwiftType == "FileManager")
+        #expect(!surface.types.contains { $0.swiftType == "NSFileManager" })
     }
 
     @Test("Imported UIKit and Dispatch calls retain native callback boundaries")
@@ -2343,7 +2393,10 @@ struct NativeImportDiscoveryTests {
         var tampered = output.receipt
         let tamperedID = try #require(tampered.nativeImportCandidates.first?.id)
         tampered.nativeImportBindings[0].invokerExpression += ".tampered"
-        #expect(throws: BridgeGeneration.Error.nativeImportBindingMismatch(tamperedID)) {
+        #expect(throws: BridgeGeneration.Error.generatedNativeImportBindingMismatch(
+            tamperedID,
+            "generated factory expression"
+        )) {
             try ShellBuild.Materializer().materialize(
                 receipt: tampered,
                 sourceRoot: directory

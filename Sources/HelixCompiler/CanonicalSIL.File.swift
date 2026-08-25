@@ -328,13 +328,13 @@ public enum LoweringError: Error, Equatable, Sendable, CustomStringConvertible {
         case let .unsupportedInstruction(line, text): "canonical SIL:\(line): unsupported instruction: \(text)"
         case let .undefinedValue(line, value): "canonical SIL:\(line): undefined value \(value)"
         case let .unboundCallee(line, mangledName):
-            "canonical SIL:\(line): callee @\(mangledName) is not frozen in the target HLXI; "
+            "canonical SIL:\(line): callee @\(mangledName) is absent from the target HLXI; "
                 + "export it through the explicit NativeImport Catalog in a future Shell "
                 + "(runtime symbol lookup is intentionally unavailable)"
         case let .unavailableNativeImport(line, mangledName, canonicalCallee, reason):
             "canonical SIL:\(line): \(canonicalCallee) (@\(mangledName)) is unavailable: \(reason)"
         case let .callSignatureMismatch(line, mangledName, detail):
-            "canonical SIL:\(line): callee @\(mangledName) disagrees with its frozen HLXI signature"
+            "canonical SIL:\(line): callee @\(mangledName) disagrees with its captured HLXI signature"
                 + (detail.map { ": \($0)" } ?? "")
         case let .invalidCallTable(message): "invalid canonical-SIL call table: \(message)"
         }

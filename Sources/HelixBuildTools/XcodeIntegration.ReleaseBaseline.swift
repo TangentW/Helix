@@ -3,7 +3,7 @@ import HelixCore
 
 extension XcodeIntegration {
 /// Completion marker for one audited, distributable App build. Quick Patch
-/// consumes this frozen identity without rebuilding the App or redefining the
+/// consumes this captured build identity without rebuilding the App or redefining the
 /// source baseline after an incident edit.
 public struct ReleaseBaseline: Codable, Hashable, Sendable {
     public static let currentSchemaVersion: UInt16 = 1

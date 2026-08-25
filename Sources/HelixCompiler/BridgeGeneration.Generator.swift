@@ -1923,7 +1923,7 @@ public struct Generator: Sendable {
             \(indent(decodeCases.joined(separator: "\n"), spaces: 4))
                 default:
                     throw VM.RuntimeTrap.nativeFailure(
-                        "verified frozen enum decoder received an impossible case"
+                        "verified indexed enum decoder received an impossible case"
                     )
                 }
             }
@@ -2005,7 +2005,7 @@ public struct Generator: Sendable {
             payloadValues = ["payload"]
             prelude = [
                 "guard let payload = decoded.payload else {",
-                "    throw VM.RuntimeTrap.nativeFailure(\"verified frozen enum payload is missing\")",
+                "    throw VM.RuntimeTrap.nativeFailure(\"verified indexed enum payload is missing\")",
                 "}",
             ]
         } else {
@@ -2014,7 +2014,7 @@ public struct Generator: Sendable {
             }
             prelude = [
                 "guard let payload = decoded.payload else {",
-                "    throw VM.RuntimeTrap.nativeFailure(\"verified frozen enum payload is missing\")",
+                "    throw VM.RuntimeTrap.nativeFailure(\"verified indexed enum payload is missing\")",
                 "}",
                 "let payloadValues = try Runtime.BridgeValueCodec.decodeTuple(",
                 "    payload, count: \(item.associatedValues.count)",
@@ -2155,8 +2155,17 @@ public struct Generator: Sendable {
         ]
         let sorted = bindings.sorted { $0.id < $1.id }
         for (offset, binding) in sorted.enumerated() {
-            guard let generated = binding.generated, let record = records[binding.id] else {
-                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+            guard let generated = binding.generated else {
+                throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
+                    binding.id,
+                    "generated adapter"
+                )
+            }
+            guard let record = records[binding.id] else {
+                throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
+                    binding.id,
+                    "interface lookup"
+                )
             }
             if offset > 0 { lines.append("") }
             lines.append(
@@ -2702,7 +2711,7 @@ public struct Generator: Sendable {
                 + "catalog: \(nativeCatalog))"
         case let (.named, .local(key)):
             guard let record = frozenValueTypes[key] else {
-                preconditionFailure("validated frozen value requires a generated codec")
+                preconditionFailure("validated indexed value requires a generated codec")
             }
             let group = BridgeGeneration.GeneratedNativeType.groupName(
                 sourceFileLogicalID: record.sourceFileLogicalID
@@ -2931,7 +2940,7 @@ public struct Generator: Sendable {
                 + "typeID: \(render(typeID)))"
         case let (.named, .local(key)):
             guard let record = frozenValueTypes[key] else {
-                preconditionFailure("validated frozen value requires a generated codec")
+                preconditionFailure("validated indexed value requires a generated codec")
             }
             let group = BridgeGeneration.GeneratedNativeType.groupName(
                 sourceFileLogicalID: record.sourceFileLogicalID
@@ -3033,13 +3042,34 @@ public struct Generator: Sendable {
             record.id.map { ($0, record) }
         })
         for binding in imports {
-            guard let record = importsByID[binding.id],
-                  record.key == binding.key,
-                  isUsableExpression(binding.invokerExpression),
-                  binding.importedModules == Array(Set(binding.importedModules)).sorted(),
-                  binding.importedModules.allSatisfy(isValidModulePath)
-            else {
+            guard let record = importsByID[binding.id] else {
                 throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+            }
+            guard record.key == binding.key else {
+                throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
+                    binding.id,
+                    "native call identity"
+                )
+            }
+            guard isUsableExpression(binding.invokerExpression) else {
+                throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
+                    binding.id,
+                    "factory expression"
+                )
+            }
+            guard binding.importedModules
+                    == Array(Set(binding.importedModules)).sorted()
+            else {
+                throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
+                    binding.id,
+                    "module ordering"
+                )
+            }
+            guard binding.importedModules.allSatisfy(isValidModulePath) else {
+                throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
+                    binding.id,
+                    "module name"
+                )
             }
             if let generated = binding.generated {
                 try validateGeneratedNativeImport(
@@ -3127,6 +3157,9 @@ public struct Generator: Sendable {
         record: InterfaceArchive.NativeImportRecord,
         archive: InterfaceArchive.Archive
     ) throws {
+        func mismatch(_ reason: String) -> BridgeGeneration.Error {
+            .generatedNativeImportBindingMismatch(binding.id, reason)
+        }
         let expectedExpression = BridgeGeneration.GeneratedNativeImport.bindingExpression(
             sourceFileLogicalID: generated.sourceFileLogicalID,
             id: binding.id,
@@ -3136,37 +3169,63 @@ public struct Generator: Sendable {
             record.effects.isAsync ? .suspending : .bounded
         let invocationParameterSwiftTypes = generated
             .invocationParameterSwiftTypes ?? generated.parameterSwiftTypes
-        guard binding.invokerExpression == expectedExpression,
-              record.silMangledNames.contains(generated.declarationMangledName),
-              isSafeLogicalPath(generated.sourceFileLogicalID),
-              isValidSwiftIdentifier(generated.baseName)
+        guard binding.invokerExpression == expectedExpression else {
+            throw mismatch("generated factory expression")
+        }
+        guard record.silMangledNames.contains(generated.declarationMangledName) else {
+            throw mismatch("resolved Swift declaration identity")
+        }
+        guard isSafeLogicalPath(generated.sourceFileLogicalID) else {
+            throw mismatch("source file identity")
+        }
+        guard isValidSwiftIdentifier(generated.baseName)
                 || generated.dispatch == .globalFunction
-                    && Core.SwiftName.isOperator(generated.baseName),
-              generated.parameterSwiftTypes.count == record.parameterTypes.count,
-              invocationParameterSwiftTypes.count == record.parameterTypes.count,
-              generated.invocationParameterSwiftTypes == nil
-                || invocationParameterSwiftTypes != generated.parameterSwiftTypes,
-              !isReceiverDispatch(generated.dispatch) || !record.parameterTypes.isEmpty,
-              generated.argumentLabels.count == record.parameterTypes.count
+                    && Core.SwiftName.isOperator(generated.baseName)
+        else {
+            throw mismatch("Swift declaration name")
+        }
+        guard generated.parameterSwiftTypes.count == record.parameterTypes.count,
+              invocationParameterSwiftTypes.count == record.parameterTypes.count
+        else {
+            throw mismatch("parameter count")
+        }
+        guard generated.invocationParameterSwiftTypes == nil
+                || invocationParameterSwiftTypes != generated.parameterSwiftTypes
+        else {
+            throw mismatch("redundant invocation adapter")
+        }
+        guard !isReceiverDispatch(generated.dispatch) || !record.parameterTypes.isEmpty else {
+            throw mismatch("missing receiver parameter")
+        }
+        guard generated.argumentLabels.count == record.parameterTypes.count
                 - (isReceiverDispatch(generated.dispatch) ? 1 : 0),
               generated.argumentLabels.allSatisfy({
                   $0 == "_" || isValidSwiftIdentifier($0)
-              }),
-              record.capability == .nativeImportsV1,
-              record.contract.domain == .application,
-              record.contract.execution.deadlineMode == expectedDeadlineMode,
-              !record.effects.isAsync || (
-                  record.abiAdapter == .direct
-                      && record.contract.callbacks.isEmpty
-                      && !record.resultType.containsClosureValue
-                      && supportsAsyncGeneratedDispatch(generated.dispatch)
-              ),
-              areGeneratedNativeImportParameters(
-                  record.parameterTypes,
-                  callbacks: record.contract.callbacks
-              )
+              })
         else {
-            throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+            throw mismatch("Swift argument labels")
+        }
+        guard record.capability == .nativeImportsV1,
+              record.contract.domain == .application
+        else {
+            throw mismatch("native call capability")
+        }
+        guard record.contract.execution.deadlineMode == expectedDeadlineMode else {
+            throw mismatch("execution deadline mode")
+        }
+        guard !record.effects.isAsync || (
+            record.abiAdapter == .direct
+                && record.contract.callbacks.isEmpty
+                && !record.resultType.containsClosureValue
+                && supportsAsyncGeneratedDispatch(generated.dispatch)
+        ) else {
+            throw mismatch("async invocation shape")
+        }
+        guard areGeneratedNativeImportParameters(
+            record.parameterTypes,
+            callbacks: record.contract.callbacks
+        ) else {
+            throw mismatch("parameter bridge shape")
         }
         switch generated.dispatch {
         case .globalFunction:
@@ -3174,7 +3233,7 @@ public struct Generator: Sendable {
                   record.contract.kind == .globalFunction,
                   isGeneratedResultType(record.resultType)
             else {
-                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+                throw mismatch("global function dispatch")
             }
         case .initializer:
             guard record.contract.kind == .initializer,
@@ -3184,7 +3243,7 @@ public struct Generator: Sendable {
                   isNativeType(record.resultType),
                   generated.resultSwiftType == owner
             else {
-                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+                throw mismatch("initializer dispatch")
             }
         case .staticMethod:
             guard record.contract.kind == .staticMethod,
@@ -3192,7 +3251,7 @@ public struct Generator: Sendable {
                   isValidGeneratedSwiftTypeSpelling(owner),
                   isGeneratedResultType(record.resultType)
             else {
-                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+                throw mismatch("static method dispatch")
             }
         case .nativeUpcast:
             guard record.contract.kind == .staticMethod,
@@ -3205,7 +3264,7 @@ public struct Generator: Sendable {
                   isNativeType(record.resultType),
                   generated.resultSwiftType == owner
             else {
-                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+                throw mismatch("native upcast dispatch")
             }
         case .anyObjectBridge:
             guard record.contract.kind == .staticMethod,
@@ -3217,7 +3276,7 @@ public struct Generator: Sendable {
                   isNativeType(record.resultType),
                   generated.resultSwiftType == owner
             else {
-                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+                throw mismatch("AnyObject bridge dispatch")
             }
         case .staticGetter:
             guard record.contract.kind == .staticGetter,
@@ -3229,7 +3288,7 @@ public struct Generator: Sendable {
                   record.resultType != .void,
                   isGeneratedResultType(record.resultType)
             else {
-                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+                throw mismatch("static getter dispatch")
             }
         case .staticSetter:
             guard record.contract.kind == .staticSetter,
@@ -3240,7 +3299,7 @@ public struct Generator: Sendable {
                   record.resultType == .void,
                   generated.resultSwiftType == "Swift.Void"
             else {
-                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+                throw mismatch("static setter dispatch")
             }
         case .instanceMethod:
             guard record.contract.kind == .instanceMethod,
@@ -3251,7 +3310,7 @@ public struct Generator: Sendable {
                   invocationParameterSwiftTypes.last == owner,
                   isGeneratedResultType(record.resultType)
             else {
-                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+                throw mismatch("instance method dispatch")
             }
         case .instanceGetter:
             guard record.contract.kind == .instanceGetter,
@@ -3265,7 +3324,7 @@ public struct Generator: Sendable {
                   record.resultType != .void,
                   isGeneratedResultType(record.resultType)
             else {
-                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+                throw mismatch("instance getter dispatch")
             }
         case .instanceSetter:
             guard record.contract.kind == .instanceSetter,
@@ -3279,7 +3338,7 @@ public struct Generator: Sendable {
                   invocationParameterSwiftTypes.last == owner,
                   record.resultType == .void
             else {
-                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+                throw mismatch("reference property setter dispatch")
             }
         case .instanceValueSetter:
             guard record.contract.kind == .instanceSetter,
@@ -3294,7 +3353,7 @@ public struct Generator: Sendable {
                   record.resultType == record.parameterTypes[1],
                   generated.resultSwiftType == owner
             else {
-                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+                throw mismatch("value property setter dispatch")
             }
         }
         do {
@@ -3302,24 +3361,47 @@ public struct Generator: Sendable {
             let invocationParameterShapes = try invocationParameterSwiftTypes
                 .map(parseSwiftType)
             let resultShape = try parseSwiftType(generated.resultSwiftType)
-            guard zip(parameterShapes, record.parameterTypes).allSatisfy({
-                swiftTypeMatches($0.0, type: $0.1, archive: archive)
-            }), zip(
-                zip(parameterShapes, invocationParameterShapes),
-                record.parameterTypes
-            ).allSatisfy({ pair, type in
-                invocationSwiftTypeMatches(
-                    boundary: pair.0,
-                    invocation: pair.1,
-                    type: type,
+            for index in parameterShapes.indices {
+                let interfaceType = record.parameterTypes[index]
+                guard swiftTypeMatches(
+                    parameterShapes[index],
+                    type: interfaceType,
                     archive: archive
-                )
-            }), swiftTypeMatches(resultShape, type: record.resultType, archive: archive)
-            else {
-                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+                ) else {
+                    throw mismatch(
+                        "parameter \(index) value type for \(record.canonicalCallee) "
+                            + "(Swift \(parameterShapes[index].rendered), "
+                            + "interface \(String(describing: interfaceType)))"
+                    )
+                }
+                guard invocationSwiftTypeMatches(
+                    boundary: parameterShapes[index],
+                    invocation: invocationParameterShapes[index],
+                    type: interfaceType,
+                    archive: archive
+                ) else {
+                    throw mismatch(
+                        "parameter \(index) invocation type for \(record.canonicalCallee) "
+                            + "(boundary \(parameterShapes[index].rendered), "
+                            + "invocation \(invocationParameterShapes[index].rendered))"
+                    )
+                }
             }
+            guard swiftTypeMatches(
+                resultShape,
+                type: record.resultType,
+                archive: archive
+            ) else {
+                throw mismatch(
+                    "result value type for \(record.canonicalCallee) "
+                        + "(Swift \(resultShape.rendered), "
+                        + "interface \(String(describing: record.resultType)))"
+                )
+            }
+        } catch let error as BridgeGeneration.Error {
+            throw error
         } catch {
-            throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+            throw mismatch("generated Swift type syntax")
         }
     }
 
@@ -3557,7 +3639,10 @@ public struct Generator: Sendable {
         var asynchronousImportExpressions: [String] = []
         for binding in imports.sorted(by: { $0.id < $1.id }) {
             guard let record = recordsByID[binding.id], record.isEmittedToDevice else {
-                throw BridgeGeneration.Error.nativeImportBindingMismatch(binding.id)
+                throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
+                    binding.id,
+                    "catalog lookup"
+                )
             }
             if record.effects.isAsync {
                 asynchronousImportExpressions.append(binding.invokerExpression)
@@ -3690,7 +3775,7 @@ public struct Generator: Sendable {
                 "Bytecode.LocalEnumCase(name: \(quoted($0.name)), payloadType: \(render($0.payloadType)))"
             }.joined(separator: ", ") + "])"
         case .class:
-            preconditionFailure("a frozen Shell value cannot be a class")
+            preconditionFailure("an indexed Shell value cannot be a class")
         }
         return "Bytecode.LocalTypeDefinition(key: \(render(definition.key)), "
             + "kind: \(kind), conformsToError: \(definition.conformsToError))"
@@ -3919,6 +4004,7 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
     case unsupportedIsolatedRoot(Core.FunctionKey)
     case incompleteNativeImportBindings
     case nativeImportBindingMismatch(Core.NativeImportID)
+    case generatedNativeImportBindingMismatch(Core.NativeImportID, String)
     case incompleteNativeTypeBindings
     case nativeTypeBindingMismatch(Core.TypeID)
     case outputCollision(String)
@@ -3931,19 +4017,21 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
         case let .invalidRoot(key): "bridge root \(key) has incomplete typed source metadata"
         case let .invalidSwiftType(type): "bridge contains an invalid Swift type spelling: \(type)"
         case let .swiftTypeMismatch(key):
-            "bridge Swift type metadata disagrees with the frozen value type for \(key)"
+            "bridge Swift type metadata disagrees with the indexed value type for \(key)"
         case let .frozenValueTypeMismatch(key):
-            "bridge codec metadata disagrees with frozen Shell value \(key)"
+            "bridge codec metadata disagrees with indexed Shell value \(key)"
         case let .unsupportedIsolatedRoot(key):
             "bridge root \(key) uses an unsupported actor isolation; v1 accepts nonisolated and MainActor entries"
         case .incompleteNativeImportBindings:
             "native import bindings do not exactly cover the emitted HLXI imports"
         case let .nativeImportBindingMismatch(id):
-            "native import binding \(id) disagrees with its frozen HLXI descriptor"
+            "native import binding \(id) does not match its generated interface record"
+        case let .generatedNativeImportBindingMismatch(id, reason):
+            "native import binding \(id) has inconsistent \(reason) metadata"
         case .incompleteNativeTypeBindings:
             "native type bindings do not exactly cover the emitted HLXI types"
         case let .nativeTypeBindingMismatch(id):
-            "native type binding \(id) disagrees with its frozen HLXI descriptor"
+            "native type binding \(id) disagrees with its captured HLXI descriptor"
         case let .outputCollision(path):
             "generated Bridge source path collides: \(path)"
         }

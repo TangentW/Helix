@@ -341,7 +341,7 @@ extension NativeImportDiscovery {
             else {
                 return (
                     "HLXNID005",
-                    "signature is outside the automatic frozen-value Bridge profile"
+                    "signature is outside the automatic indexed-value Bridge profile"
                 )
             }
             if declaration.inferredEffects.requiresMainActor && !scope.allowsMainThread {

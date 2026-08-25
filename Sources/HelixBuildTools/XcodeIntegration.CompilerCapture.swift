@@ -11,14 +11,55 @@ public enum CompilerCapture {
     public static let invocationFileName = "FrontendInvocation.hlxswiftc"
     public static let shellRelativeInvocationPath =
         "Compiler/\(invocationFileName)"
+    public static let targetTriggerDirectory = "Compiler/Targets"
     public static let recordMarker = Core.CompilerCapture.recordMarker
+
+    public static func profileProxyPath(profileID: String) -> String {
+        "Profiles/\(profileID)/Compiler/\(proxyFileName)"
+    }
+
+    public static func profilePostCompilePath(profileID: String) -> String {
+        "Profiles/\(profileID)/Compiler/post-compile.sh"
+    }
+
+    /// One inert source per Xcode target forces Swift Driver to run before the
+    /// target-level compiler proxy performs its post-compile work. Sharing the
+    /// trigger across profiles prevents workflow-specific generated sources
+    /// from leaking into every configuration of the same target.
+    public static func targetTriggerPath(targetName: String) -> String {
+        let suffix = Core.Digest.sha256(targetName).hex.prefix(24)
+        return "\(targetTriggerDirectory)/HelixBuildTrigger_\(suffix).swift"
+    }
+
+    public static func isTargetTriggerLogicalPath(
+        _ logicalPath: String,
+        integrationRoot: String
+    ) -> Bool {
+        let prefix = "\(integrationRoot)/\(targetTriggerDirectory)/"
+        guard logicalPath.hasPrefix(prefix) else { return false }
+        let name = logicalPath.dropFirst(prefix.count)
+        return !name.contains("/")
+            && name.hasPrefix("HelixBuildTrigger_")
+            && name.hasSuffix(".swift")
+    }
 
     /// The proxy is toolchain-independent so it exists before the first clean
     /// Feature build. It derives a target-private capture directory from
     /// Swift Driver's own output paths because XCBuild does not export custom
     /// build settings to a custom compiler process.
-    public static func proxyScript() -> Data {
-        Data(
+    public static func proxyScript(
+        postCompileScriptName: String? = nil
+    ) -> Data {
+        let postCompile: String
+        if let postCompileScriptName {
+            postCompile = """
+                script_directory=$(CDPATH= cd -- "$(/usr/bin/dirname -- "$0")" && pwd -P)
+                /bin/sh "$script_directory/\(postCompileScriptName)" "$capture_file"
+            """
+        } else {
+            postCompile = ""
+        }
+        return Data(
             """
             #!/bin/sh
             set -eu
@@ -118,6 +159,7 @@ public enum CompilerCapture {
                     done
                 } > "$temporary"
                 /bin/mv -f "$temporary" "$capture_file"
+            \(postCompile)
             fi
             temporary=
             trap - 0 1 2 15

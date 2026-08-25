@@ -515,7 +515,7 @@ struct StaticKeyPath {
         } catch {
             #expect(
                 String(describing: error).contains(
-                    "not proven by its frozen boundary"
+                    "not proven by its captured boundary"
                 )
             )
         }

@@ -216,9 +216,34 @@ xcodebuild \
     -derivedDataPath "$derived_data" \
     clean build 2>&1 | tee "$build_log" >/dev/null
 echo "Built LiveReloadE2EHost."
-shell_receipt="$derived_data/Build/Products/HelixGenerated/live/Shell/ShellBuildReceipt.json"
+bonjour_services="$(/usr/bin/plutil -extract NSBonjourServices json -o - "$app/Info.plist")"
+if [[ "$bonjour_services" != '["_helix._tcp"]' ]]; then
+    echo "Helix did not configure development discovery in the processed App plist." >&2
+    exit 1
+fi
+local_network_description="$({
+    /usr/bin/plutil -extract NSLocalNetworkUsageDescription raw -o - "$app/Info.plist"
+})"
+if [[ -z "$local_network_description" ]]; then
+    echo "Helix did not configure the development local-network description." >&2
+    exit 1
+fi
+if /usr/bin/plutil -extract NSBonjourServices raw -o - \
+    "$script_directory/Host/Info.plist" >/dev/null 2>&1; then
+    echo "Helix modified the fixture's source Info.plist." >&2
+    exit 1
+fi
+if [[ -e "$script_directory/.helix/xcode/ProjectConfigurations/live-Application-Info.plist" ]]; then
+    echo "Helix left a stale copied Info.plist in the integration kit." >&2
+    exit 1
+fi
+shell_receipt="$derived_data/Build/Products/Debug-iphonesimulator/HelixGenerated/live/Shell/ShellBuildReceipt.json"
 if ! grep -Fq '"logicalPath":"Sources/LiveReloadE2E.Support.swift"' "$shell_receipt"; then
     echo "Helix did not capture the second Feature source automatically." >&2
+    exit 1
+fi
+if grep -Fq 'HelixBuildTrigger_' "$shell_receipt"; then
+    echo "Helix leaked its compiler scheduling source into the application Shell." >&2
     exit 1
 fi
 
@@ -234,6 +259,7 @@ xcodebuild \
 env \
     SRCROOT="$(setting SRCROOT)" \
     BUILD_DIR="$(setting BUILD_DIR)" \
+    BUILT_PRODUCTS_DIR="$(setting BUILT_PRODUCTS_DIR)" \
     CONFIGURATION="$(setting CONFIGURATION)" \
     PLATFORM_NAME="$(setting PLATFORM_NAME)" \
     SDKROOT="$(setting SDKROOT)" \

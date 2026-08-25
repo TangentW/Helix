@@ -96,6 +96,7 @@ if [ "$should_capture" = true ]; then
         done
     } > "$temporary"
     /bin/mv -f "$temporary" "$capture_file"
+
 fi
 temporary=
 trap - 0 1 2 15

@@ -278,14 +278,12 @@ extension FrontendReceipt.Adapter {
                         parameterTypes: parameterTypes
                     )
             else { return try omit("unsupported native bridge profile") }
-            let modulePrefix = moduleName + "."
-            func generatedSpelling(_ canonical: String) -> String {
-                canonical.hasPrefix(modulePrefix)
-                    ? String(canonical.dropFirst(modulePrefix.count))
-                    : canonical
-            }
-            let generatedOwnerType = generatedSpelling(operation.ownerType)
-            let generatedParameterTypes = bridgeParameterTypes.map(generatedSpelling)
+            // Imported operations have already passed through the compiler-
+            // proven nominal alias map. Stripping a textual module prefix
+            // here would be ambiguous when a source namespace has the same
+            // spelling as its module (Module.Module.NestedType).
+            let generatedOwnerType = operation.ownerType
+            let generatedParameterTypes = bridgeParameterTypes
             let logicalInvocationParameterTypes = operation
                 .invocationParameterSwiftTypes ?? operation.parameterSwiftTypes
             guard logicalInvocationParameterTypes.count
@@ -295,14 +293,13 @@ extension FrontendReceipt.Adapter {
             for index in logicalInvocationParameterTypes.indices
             where logicalInvocationParameterTypes[index]
                     != operation.parameterSwiftTypes[index] {
-                generatedInvocationParameterTypes[index] = generatedSpelling(
+                generatedInvocationParameterTypes[index] =
                     logicalInvocationParameterTypes[index]
-                )
             }
             let invocationParameterSwiftTypes =
                 generatedInvocationParameterTypes == generatedParameterTypes
                 ? nil : generatedInvocationParameterTypes
-            let generatedResultType = generatedSpelling(operation.resultSwiftType)
+            let generatedResultType = operation.resultSwiftType
             let prefix = [moduleName, "HelixExternal", operation.ownerType]
             let callableReference = operation.baseName + "("
                 + operation.argumentLabels.map { ($0 == "_" ? "_" : $0) + ":" }
@@ -1078,10 +1075,14 @@ extension FrontendReceipt.Adapter {
             base["type"],
             demangled: demangled
         )
-        guard let receiverType = staticOwner ?? instanceOwner else { return }
+        guard var receiverType = staticOwner ?? instanceOwner else { return }
         let isStatic = staticOwner != nil
         let marker = accessor == .instanceSetter ? "setter" : "getter"
+        let expectedLocation = sourceRange(in: expression).flatMap {
+            sourceLocation(atUTF8Offset: $0.start, in: source)
+        }
         var references: [String]
+        var foreignTypeEvidence: ForeignMemberTypeEvidence?
         let isObjectiveCProperty = usr.hasPrefix("c:")
             && (usr.contains("(py)") || usr.contains("(cpy)"))
         if isObjectiveCProperty {
@@ -1099,9 +1100,6 @@ extension FrontendReceipt.Adapter {
                 )
             })).sorted()
             if references.isEmpty {
-                let expectedLocation = sourceRange(in: expression).flatMap {
-                    sourceLocation(atUTF8Offset: $0.start, in: source)
-                }
                 references = renamedForeignMemberReferences(
                     in: function,
                     baseName: baseName,
@@ -1109,6 +1107,12 @@ extension FrontendReceipt.Adapter {
                     sourceLocation: expectedLocation
                 )
             }
+            foreignTypeEvidence = foreignMemberTypeEvidence(
+                in: function,
+                baseName: baseName,
+                marker: marker,
+                sourceLocation: expectedLocation
+            )
         } else if let reference = swiftPropertyReference(
             usr: usr,
             accessor: accessor,
@@ -1119,6 +1123,23 @@ extension FrontendReceipt.Adapter {
             references = []
         }
         guard !references.isEmpty else { return }
+
+        if let evidence = foreignTypeEvidence {
+            receiverType = resolvedForeignOwnerSpelling(
+                logical: receiverType,
+                physical: evidence.ownerType
+            )
+            if let mangled = expression["type"] as? String,
+               Self.objectiveCNominalIdentity(inMangledType: mangled) != nil {
+                let physical = accessor == .instanceSetter
+                    ? physicalParameterSpellings(in: evidence.loweredType).first
+                    : physicalResultSpelling(in: evidence.loweredType)
+                if let physical,
+                   let nominal = importedPhysicalNominalSpelling(physical) {
+                    propertyType = nominal
+                }
+            }
+        }
 
         let receiverRepresentation = isStatic ? nil : recordImportedNominalType(
             rawMangledType: base["type"],
@@ -1188,6 +1209,9 @@ extension FrontendReceipt.Adapter {
         var referenceToken: String
         var symbol: String
         var loweredType: String
+        /// Source-callable receiver spelling captured from `#Owner.member`.
+        /// Nil for ordinary Swift function references and global functions.
+        var foreignOwnerType: String? = nil
     }
 
     private func recordImportedSwiftCall(
@@ -1275,7 +1299,7 @@ extension FrontendReceipt.Adapter {
         }
 
         let dispatch: NativeImportDiscovery.Dispatch
-        let ownerType: String
+        var ownerType: String
         var receiver: [String: Any]?
         var staticOwner: [String: Any]?
         if functionExpression["_kind"] as? String == "constructor_ref_call_expr" {
@@ -1374,6 +1398,20 @@ extension FrontendReceipt.Adapter {
                     resultType,
                     physicalSpelling: physicalResult
                 )
+            }
+        }
+        if let physicalOwner = call.foreignOwnerType,
+           dispatch != .globalFunction {
+            ownerType = resolvedForeignOwnerSpelling(
+                logical: ownerType,
+                physical: physicalOwner
+            )
+            if dispatch == .instanceMethod,
+               let receiverIndex = parameterTypes.indices.last {
+                parameterTypes[receiverIndex] = ownerType
+                sourceInvocationParameterTypes[receiverIndex] = ownerType
+            } else if dispatch == .initializer {
+                resultType = ownerType
             }
         }
         let physicalParameters = physicalParameterSpellings(
@@ -2034,6 +2072,21 @@ extension FrontendReceipt.Adapter {
         return normalizeImportedTypeSpelling(physical)
     }
 
+    private func resolvedForeignOwnerSpelling(
+        logical: String,
+        physical: String
+    ) -> String {
+        // Clang's SIL member reference may erase Objective-C lightweight
+        // generic arguments even though the typed AST retained the concrete
+        // Swift specialization. Physical evidence can correct a renamed owner
+        // (for example NSFileManager -> FileManager), but it must never make a
+        // previously concrete generated type unnameable.
+        if logical.contains("<"), !physical.contains("<") {
+            return logical
+        }
+        return physical
+    }
+
     /// Keeps the source-level Objective-C protocol type only inside the
     /// generated Swift invoker. The artifact ABI remains AnyObject, while the
     /// typed decoder performs the dynamic conformance check before the call.
@@ -2267,7 +2320,11 @@ extension FrontendReceipt.Adapter {
                             call: .init(
                                 referenceToken: token,
                                 symbol: symbol,
-                                loweredType: loweredType
+                                loweredType: loweredType,
+                                foreignOwnerType: Self.foreignOwnerType(
+                                    in: reference,
+                                    baseName: baseName
+                                )
                             ),
                             location: location
                         )
@@ -3228,6 +3285,65 @@ extension FrontendReceipt.Adapter {
         )
     }
 
+    private struct ForeignMemberTypeEvidence: Hashable {
+        var ownerType: String
+        var loweredType: String
+    }
+
+    private func foreignMemberTypeEvidence(
+        in function: CanonicalSIL.Function,
+        baseName: String,
+        marker: String,
+        sourceLocation: Core.SourceLocation?
+    ) -> ForeignMemberTypeEvidence? {
+        struct Candidate: Hashable {
+            var evidence: ForeignMemberTypeEvidence
+            var location: Core.SourceLocation?
+        }
+
+        let candidates = Set(function.body
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .enumerated().compactMap { offset, rawLine -> Candidate? in
+                let line = String(rawLine)
+                guard line.contains("_method "),
+                      let hash = line.firstIndex(of: "#"),
+                      let separator = line[hash...].range(of: " : "),
+                      let loweredMarker = line.range(of: ", $", options: .backwards)
+                else { return nil }
+                let reference = String(line[hash..<separator.lowerBound])
+                guard Self.foreignReference(reference, hasBaseName: baseName),
+                      reference.contains("!\(marker)"),
+                      reference.hasSuffix(".foreign"),
+                      let owner = Self.foreignOwnerType(
+                          in: reference,
+                          baseName: baseName
+                      )
+                else { return nil }
+                return .init(
+                    evidence: .init(
+                        ownerType: owner,
+                        loweredType: debugMetadataStrippedSuffix(
+                            String(line[loweredMarker.upperBound...])
+                        )
+                    ),
+                    location: function.sourceLocation(atBodyLine: offset + 1)
+                )
+            })
+        if let sourceLocation {
+            let exact = Set(candidates.compactMap { candidate in
+                candidate.location == sourceLocation ? candidate.evidence : nil
+            })
+            if exact.count == 1 { return exact.first }
+            let lineMatches = Set(candidates.compactMap { candidate in
+                candidate.location?.line == sourceLocation.line
+                    ? candidate.evidence : nil
+            })
+            if lineMatches.count == 1 { return lineMatches.first }
+        }
+        let evidence = Set(candidates.map(\.evidence))
+        return evidence.count == 1 ? evidence.first : nil
+    }
+
     static func foreignMemberReferences(
         in body: String,
         ownerType: String,
@@ -3260,6 +3376,23 @@ extension FrontendReceipt.Adapter {
     ) -> Bool {
         reference.contains(".\(baseName)!")
             || reference.contains(".`\(baseName)`!")
+    }
+
+    private static func foreignOwnerType(
+        in reference: String,
+        baseName: String
+    ) -> String? {
+        guard reference.hasPrefix("#") else { return nil }
+        for marker in [".\(baseName)!", ".`\(baseName)`!"] {
+            guard let range = reference.range(of: marker) else { continue }
+            let start = reference.index(after: reference.startIndex)
+            let owner = String(reference[start..<range.lowerBound])
+            guard FrontendReceipt.SwiftTypeSpelling.isGeneratedType(owner) else {
+                return nil
+            }
+            return owner
+        }
+        return nil
     }
 
     private func renamedForeignMemberReferences(

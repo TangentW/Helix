@@ -155,7 +155,7 @@ public struct ShellInterface: Sendable {
         self.frozenValueTypes = try Self.uniqueDictionary(
             frozenValueTypes,
             key: \.key,
-            label: "frozen Shell value type"
+            label: "indexed Shell value type"
         )
         try validateBoundarySignatures()
     }
@@ -403,7 +403,7 @@ public struct ShellInterface: Sendable {
                   frozenValueTypes[key] != nil
             else {
                 throw Verification.Error.invalidShellInterface(
-                    "unfrozen local nominal \(key) cannot appear in \(owner) signature"
+                    "unindexed local nominal \(key) cannot appear in \(owner) signature"
                 )
             }
         case .address, .mutableCell, .nonOwningReference,
@@ -497,39 +497,39 @@ public struct ShellInterface: Sendable {
         if !frozenValueTypes.isEmpty,
            !capabilities.contains(.localNominalsV1) {
             throw Verification.Error.invalidShellInterface(
-                "frozen Shell values require \(Core.Capability.localNominalsV1)"
+                "indexed Shell values require \(Core.Capability.localNominalsV1)"
             )
         }
         var totalMembers = 0
         func validateStorage(_ type: Bytecode.ValueType, depth: Int) throws {
             guard depth <= 32 else {
                 throw Verification.Error.invalidShellInterface(
-                    "frozen Shell value storage exceeds 32 levels"
+                    "indexed Shell value storage exceeds 32 levels"
                 )
             }
             switch type {
             case let .local(key):
                 guard frozenValueTypes[key] != nil else {
                     throw Verification.Error.invalidShellInterface(
-                        "frozen Shell value references unknown \(key)"
+                        "indexed Shell value references unknown \(key)"
                     )
                 }
             case let .integer(width, _):
                 guard [8, 16, 32, 64].contains(width) else {
                     throw Verification.Error.invalidShellInterface(
-                        "frozen Shell value contains unsupported integer width"
+                        "indexed Shell value contains unsupported integer width"
                     )
                 }
             case let .float(width):
                 guard width == 32 || width == 64 else {
                     throw Verification.Error.invalidShellInterface(
-                        "frozen Shell value contains unsupported float width"
+                        "indexed Shell value contains unsupported float width"
                     )
                 }
             case let .array(element):
                 guard capabilities.contains(.collectionsV1) else {
                     throw Verification.Error.invalidShellInterface(
-                        "frozen Shell Array storage requires the collection capability"
+                        "indexed Shell Array storage requires the collection capability"
                     )
                 }
                 try validateStorage(element, depth: depth + 1)
@@ -539,7 +539,7 @@ public struct ShellInterface: Sendable {
                 guard capabilities.contains(.collectionsV1),
                       element.isVMHashable else {
                     throw Verification.Error.invalidShellInterface(
-                        "frozen Shell Set requires collection and VM-defined Hashable semantics"
+                        "indexed Shell Set requires collection and VM-defined Hashable semantics"
                     )
                 }
                 try validateStorage(element, depth: depth + 1)
@@ -547,7 +547,7 @@ public struct ShellInterface: Sendable {
                 guard capabilities.contains(.collectionsV1),
                       key.isVMHashable else {
                     throw Verification.Error.invalidShellInterface(
-                        "frozen Shell Dictionary requires collection and VM-defined Hashable semantics"
+                        "indexed Shell Dictionary requires collection and VM-defined Hashable semantics"
                     )
                 }
                 try validateStorage(key, depth: depth + 1)
@@ -555,7 +555,7 @@ public struct ShellInterface: Sendable {
             case let .tuple(elements):
                 guard elements.count <= 64 else {
                     throw Verification.Error.invalidShellInterface(
-                        "frozen Shell tuple contains too many elements"
+                        "indexed Shell tuple contains too many elements"
                     )
                 }
                 for element in elements {
@@ -564,18 +564,18 @@ public struct ShellInterface: Sendable {
             case .void, .never, .native, .error, .address, .mutableCell,
                  .nonOwningReference, .arrayState, .dictionaryState, .closure:
                 throw Verification.Error.invalidShellInterface(
-                    "frozen Shell value contains unsupported storage \(type)"
+                    "indexed Shell value contains unsupported storage \(type)"
                 )
             case .string:
                 guard capabilities.contains(.stringsV1) else {
                     throw Verification.Error.invalidShellInterface(
-                        "frozen Shell String storage requires the string capability"
+                        "indexed Shell String storage requires the string capability"
                     )
                 }
             case .any:
                 guard capabilities.contains(.anyValuesV1) else {
                     throw Verification.Error.invalidShellInterface(
-                        "frozen Shell Any storage requires the Any capability"
+                        "indexed Shell Any storage requires the Any capability"
                     )
                 }
             case .bool:
@@ -592,7 +592,7 @@ public struct ShellInterface: Sendable {
                   })
             else {
                 throw Verification.Error.invalidShellInterface(
-                    "frozen Shell value \(key) has an unsupported conformance or identity"
+                    "indexed Shell value \(key) has an unsupported conformance or identity"
                 )
             }
             let memberCount: Int
@@ -605,7 +605,7 @@ public struct ShellInterface: Sendable {
                       })
                 else {
                     throw Verification.Error.invalidShellInterface(
-                        "frozen Shell struct \(key) has duplicate or invalid fields"
+                        "indexed Shell struct \(key) has duplicate or invalid fields"
                     )
                 }
                 for field in fields {
@@ -619,7 +619,7 @@ public struct ShellInterface: Sendable {
                       })
                 else {
                     throw Verification.Error.invalidShellInterface(
-                        "frozen Shell enum \(key) has empty, duplicate, or invalid cases"
+                        "indexed Shell enum \(key) has empty, duplicate, or invalid cases"
                     )
                 }
                 var enumMemberCount = 0
@@ -638,7 +638,7 @@ public struct ShellInterface: Sendable {
                     guard !addition.overflow,
                           addition.partialValue <= 65_536 else {
                         throw Verification.Error.invalidShellInterface(
-                            "frozen Shell enum \(key) contains too many associated values"
+                            "indexed Shell enum \(key) contains too many associated values"
                         )
                     }
                     enumMemberCount = addition.partialValue
@@ -646,13 +646,13 @@ public struct ShellInterface: Sendable {
                 memberCount = enumMemberCount
             case .class:
                 throw Verification.Error.invalidShellInterface(
-                    "frozen Shell value \(key) cannot be a class"
+                    "indexed Shell value \(key) cannot be a class"
                 )
             }
             let addition = totalMembers.addingReportingOverflow(memberCount)
             guard !addition.overflow, addition.partialValue <= 65_536 else {
                 throw Verification.Error.invalidShellInterface(
-                    "frozen Shell values contain too many members"
+                    "indexed Shell values contain too many members"
                 )
             }
             totalMembers = addition.partialValue
@@ -667,7 +667,7 @@ public struct ShellInterface: Sendable {
         func checkedDepth(_ value: Int, owner: Bytecode.LocalTypeKey) throws -> Int {
             guard value <= 32 else {
                 throw Verification.Error.invalidShellInterface(
-                    "frozen Shell value graph exceeds 32 levels at \(owner)"
+                    "indexed Shell value graph exceeds 32 levels at \(owner)"
                 )
             }
             return value
@@ -709,7 +709,7 @@ public struct ShellInterface: Sendable {
                   let record = frozenValueTypes[key]
             else {
                 throw Verification.Error.invalidShellInterface(
-                    "frozen Shell value graph is recursive or incomplete at \(key)"
+                    "indexed Shell value graph is recursive or incomplete at \(key)"
                 )
             }
             defer { visiting.remove(key) }
@@ -721,7 +721,7 @@ public struct ShellInterface: Sendable {
                 members = cases.compactMap(\.payloadType)
             case .class:
                 throw Verification.Error.invalidShellInterface(
-                    "frozen Shell value \(key) cannot be a class"
+                    "indexed Shell value \(key) cannot be a class"
                 )
             }
             let memberDepth = try members.map {

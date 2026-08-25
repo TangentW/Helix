@@ -12,11 +12,12 @@
 		400000000000000000000004 /* LiveReloadE2EHost.Application.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000004 /* LiveReloadE2EHost.Application.swift */; };
 		400000000000000000000005 /* LiveReloadE2E.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 100000000000000000000006 /* LiveReloadE2E.framework */; };
 		400000000000000000000007 /* LiveReloadE2E.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 100000000000000000000006 /* LiveReloadE2E.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
-		40000000000000000000000A /* HelixDevAppRuntime in Frameworks */ = {isa = PBXBuildFile; productRef = 710000000000000000000001 /* HelixDevAppRuntime */; };
+		40000000000000000000000A /* HelixAppIntegration in Frameworks */ = {isa = PBXBuildFile; productRef = 710000000000000000000001 /* HelixAppIntegration */; };
 		40000000000000000000000B /* ReleaseRuntimeHost.Application.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000009 /* ReleaseRuntimeHost.Application.swift */; };
-		40000000000000000000000C /* HelixAppRuntime in Frameworks */ = {isa = PBXBuildFile; productRef = 710000000000000000000002 /* HelixAppRuntime */; };
+		40000000000000000000000C /* HelixAppIntegration in Frameworks */ = {isa = PBXBuildFile; productRef = 710000000000000000000002 /* HelixAppIntegration */; };
 		40000000000000000000000D /* DevRuntimeIOSTests.UIKit.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000000B /* DevRuntimeIOSTests.UIKit.swift */; };
-		40000000000000000000000E /* HelixDevAppRuntime in Frameworks */ = {isa = PBXBuildFile; productRef = 710000000000000000000001 /* HelixDevAppRuntime */; };
+		40000000000000000000000E /* HelixAppIntegration in Frameworks */ = {isa = PBXBuildFile; productRef = 710000000000000000000001 /* HelixAppIntegration */; };
+		3E2AA715D510D586A999DD7A = { fileRef = EC32AB1AF8C0463FB895017F; isa = PBXBuildFile; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -36,7 +37,6 @@
 			dstPath = "";
 			dstSubfolderSpec = 10;
 			files = (
-				400000000000000000000007 /* LiveReloadE2E.framework in Embed Frameworks */,
 			);
 			name = "Embed Frameworks";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -56,6 +56,8 @@
 		10000000000000000000000C /* LiveReloadUIKitTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LiveReloadUIKitTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		10000000000000000000000D /* Live Feature.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = .helix/xcode/Profiles/live/Feature.xcconfig; sourceTree = SOURCE_ROOT; };
 		10000000000000000000000E /* Live Application.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = .helix/xcode/Profiles/live/Application.xcconfig; sourceTree = SOURCE_ROOT; };
+		395BAFA23B49263A638BB341 = { isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = .helix/xcode/ProjectConfigurations/live-Target-Debug.xcconfig; sourceTree = SOURCE_ROOT; };
+		EC32AB1AF8C0463FB895017F = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = .helix/xcode/Compiler/Targets/HelixBuildTrigger_d1b43e0d1004a321d3b6a552.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -66,20 +68,12 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		300000000000000000000006 /* Frameworks */ = {
-			isa = PBXFrameworksBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				400000000000000000000005 /* LiveReloadE2E.framework in Frameworks */,
-				40000000000000000000000A /* HelixDevAppRuntime in Frameworks */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
+		300000000000000000000006 = { buildActionMask = 2147483647; files = (40000000000000000000000A, ); isa = PBXFrameworksBuildPhase; runOnlyForDeploymentPostprocessing = 0; };
 		300000000000000000000008 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				40000000000000000000000C /* HelixAppRuntime in Frameworks */,
+				40000000000000000000000C /* HelixAppIntegration in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -87,7 +81,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				40000000000000000000000E /* HelixDevAppRuntime in Frameworks */,
+				40000000000000000000000E /* HelixAppIntegration in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -153,85 +147,10 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		200000000000000000000001 /* LiveReloadE2E */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = 600000000000000000000002 /* Build configuration list for PBXNativeTarget "LiveReloadE2E" */;
-			buildPhases = (
-				300000000000000000000001 /* Sources */,
-				5748D160830FE75172F55B9E /* Helix Prepare (Generated) */,
-				300000000000000000000002 /* Frameworks */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-			);
-			name = LiveReloadE2E;
-			packageProductDependencies = (
-			);
-			productName = LiveReloadE2E;
-			productReference = 100000000000000000000006 /* LiveReloadE2E.framework */;
-			productType = "com.apple.product-type.framework";
-		};
-		200000000000000000000003 /* LiveReloadE2EHost */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = 600000000000000000000004 /* Build configuration list for PBXNativeTarget "LiveReloadE2EHost" */;
-			buildPhases = (
-				BA86DB73A54E70F639557FFD /* Helix Bridge (Generated) */,
-				300000000000000000000005 /* Sources */,
-				300000000000000000000006 /* Frameworks */,
-				300000000000000000000007 /* Embed Frameworks */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-				810000000000000000000001 /* PBXTargetDependency */,
-			);
-			name = LiveReloadE2EHost;
-			packageProductDependencies = (
-				710000000000000000000001 /* HelixDevAppRuntime */,
-			);
-			productName = LiveReloadE2EHost;
-			productReference = 100000000000000000000008 /* LiveReloadE2EHost.app */;
-			productType = "com.apple.product-type.application";
-		};
-		200000000000000000000004 /* ReleaseRuntimeHost */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = 600000000000000000000005 /* Build configuration list for PBXNativeTarget "ReleaseRuntimeHost" */;
-			buildPhases = (
-				300000000000000000000009 /* Sources */,
-				300000000000000000000008 /* Frameworks */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-			);
-			name = ReleaseRuntimeHost;
-			packageProductDependencies = (
-				710000000000000000000002 /* HelixAppRuntime */,
-			);
-			productName = ReleaseRuntimeHost;
-			productReference = 10000000000000000000000A /* ReleaseRuntimeHost.app */;
-			productType = "com.apple.product-type.application";
-		};
-		200000000000000000000005 /* LiveReloadUIKitTests */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = 600000000000000000000006 /* Build configuration list for PBXNativeTarget "LiveReloadUIKitTests" */;
-			buildPhases = (
-				30000000000000000000000B /* Sources */,
-				30000000000000000000000A /* Frameworks */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-			);
-			name = LiveReloadUIKitTests;
-			packageProductDependencies = (
-				710000000000000000000001 /* HelixDevAppRuntime */,
-			);
-			productName = LiveReloadUIKitTests;
-			productReference = 10000000000000000000000C /* LiveReloadUIKitTests.xctest */;
-			productType = "com.apple.product-type.bundle.unit-test";
-		};
+		200000000000000000000001 = { buildConfigurationList = 600000000000000000000002; buildPhases = (300000000000000000000001, 5748D160830FE75172F55B9E, 300000000000000000000002, ); buildRules = (); dependencies = (); isa = PBXNativeTarget; name = LiveReloadE2E; packageProductDependencies = (); productName = LiveReloadE2E; productReference = 100000000000000000000006; productType = com.apple.product-type.framework; };
+		200000000000000000000003 = { buildConfigurationList = 600000000000000000000004; buildPhases = (2F6BCED05D520342733663AB, 300000000000000000000005, B4DB999E861D51E9CBC69CDB, FC17224651506E983082E046, 300000000000000000000006, 300000000000000000000007, ); buildRules = (); dependencies = (); isa = PBXNativeTarget; name = LiveReloadE2EHost; packageProductDependencies = (710000000000000000000001, 1B80FC2F8C2C376290B7C42D, ); productName = LiveReloadE2EHost; productReference = 100000000000000000000008; productType = com.apple.product-type.application; };
+		200000000000000000000004 = { buildConfigurationList = 600000000000000000000005; buildPhases = (300000000000000000000009, 300000000000000000000008, ); buildRules = (); dependencies = (); isa = PBXNativeTarget; name = ReleaseRuntimeHost; packageProductDependencies = (710000000000000000000002, ); productName = ReleaseRuntimeHost; productReference = 10000000000000000000000A; productType = com.apple.product-type.application; };
+		200000000000000000000005 = { buildConfigurationList = 600000000000000000000006; buildPhases = (30000000000000000000000B, 30000000000000000000000A, ); buildRules = (); dependencies = (); isa = PBXNativeTarget; name = LiveReloadUIKitTests; packageProductDependencies = (710000000000000000000001, ); productName = LiveReloadUIKitTests; productReference = 10000000000000000000000C; productType = com.apple.product-type.bundle.unit-test; };
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -273,39 +192,9 @@
 /* End PBXProject section */
 
 /* Begin PBXShellScriptBuildPhase section */
-		5748D160830FE75172F55B9E /* Helix Prepare (Generated) */ = {
-			isa = PBXShellScriptBuildPhase;
-			alwaysOutOfDate = 1;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputPaths = (
-			);
-			name = "Helix Prepare (Generated)";
-			outputPaths = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "exec /bin/sh \"${HELIX_INTEGRATION_ROOT:?}/Profiles/${HELIX_PROFILE_ID:?}/prepare.sh\"";
-			showEnvVarsInLog = 0;
-		};
-		BA86DB73A54E70F639557FFD /* Helix Bridge (Generated) */ = {
-			isa = PBXShellScriptBuildPhase;
-			alwaysOutOfDate = 1;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputPaths = (
-			);
-			name = "Helix Bridge (Generated)";
-			outputPaths = (
-				"$(HELIX_BRIDGE_OBJECT)",
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "exec /bin/sh \"${HELIX_INTEGRATION_ROOT:?}/Profiles/${HELIX_PROFILE_ID:?}/bridge.sh\"";
-			showEnvVarsInLog = 0;
-		};
+		2F6BCED05D520342733663AB = { alwaysOutOfDate = 1; buildActionMask = 2147483647; files = (); inputPaths = (); isa = PBXShellScriptBuildPhase; name = "Helix Refresh (Generated)"; outputPaths = ("$(SRCROOT)/.helix/xcode/Compiler/Targets/HelixBuildTrigger_d1b43e0d1004a321d3b6a552.swift", ); runOnlyForDeploymentPostprocessing = 0; shellPath = /bin/sh; shellScript = "# Generated by Helix Hub. Do not edit.\nset -eu\nif [ \"${CONFIGURATION:-}\" != 'Debug' ]; then\n    exit 0\nfi\n/usr/bin/touch \"${SRCROOT:?}/.helix/xcode/Compiler/Targets/HelixBuildTrigger_d1b43e0d1004a321d3b6a552.swift\""; showEnvVarsInLog = 0; };
+		B4DB999E861D51E9CBC69CDB = { alwaysOutOfDate = 1; buildActionMask = 2147483647; files = (); inputPaths = ("$(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)", ); isa = PBXShellScriptBuildPhase; name = "Configure Helix Development Info.plist (Generated)"; outputPaths = (); runOnlyForDeploymentPostprocessing = 0; shellPath = /bin/sh; shellScript = "# Generated by Helix Hub. Do not edit.\nset -eu\nif [ \"${CONFIGURATION:-}\" != 'Debug' ]; then\n    exit 0\nfi\n\ninfo_plist=\"${TARGET_BUILD_DIR:?}/${INFOPLIST_PATH:?}\"\nbuild_root=$(CDPATH= cd -- \"${TARGET_BUILD_DIR:?}\" && pwd -P)\ninfo_directory=$(CDPATH= cd -- \"$(/usr/bin/dirname \"$info_plist\")\" && pwd -P)\ninfo_plist=\"$info_directory/$(/usr/bin/basename \"$info_plist\")\"\ncase \"$info_plist\" in\n    \"$build_root\"/*) ;;\n    *) echo \"error: Helix resolved an Info.plist outside the target build directory\" >&2; exit 1 ;;\nesac\nif [ ! -f \"$info_plist\" ] || [ -L \"$info_plist\" ]; then\n    echo \"error: Helix requires the processed App Info.plist before development setup\" >&2\n    exit 1\nfi\n\nservice_type=$(/usr/bin/plutil -type NSBonjourServices \"$info_plist\" 2>/dev/null || true)\ncase \"$service_type\" in\n    '')\n        /usr/bin/plutil -insert NSBonjourServices -json '[\"_helix._tcp\"]' \"$info_plist\"\n        ;;\n    array)\n        service_count=$(/usr/bin/plutil -extract NSBonjourServices raw -o - \"$info_plist\")\n        case \"$service_count\" in\n            ''|*[!0-9]*) echo \"error: malformed NSBonjourServices in processed Info.plist\" >&2; exit 1 ;;\n        esac\n        service_index=0\n        service_found=0\n        while [ \"$service_index\" -lt \"$service_count\" ]; do\n            current_service=$(/usr/bin/plutil -extract \"NSBonjourServices.$service_index\" raw -o - \"$info_plist\")\n            if [ \"$current_service\" = '_helix._tcp' ]; then\n                service_found=1\n            fi\n            service_index=$((service_index + 1))\n        done\n        if [ \"$service_found\" -eq 0 ]; then\n            /usr/bin/plutil -insert NSBonjourServices -string '_helix._tcp' -append \"$info_plist\"\n        fi\n        ;;\n    *)\n        echo \"error: NSBonjourServices must be an array in the processed Info.plist\" >&2\n        exit 1\n        ;;\nesac\n\ndescription_type=$(/usr/bin/plutil -type NSLocalNetworkUsageDescription \"$info_plist\" 2>/dev/null || true)\ncase \"$description_type\" in\n    '')\n        /usr/bin/plutil -insert NSLocalNetworkUsageDescription -string 'Helix connects this development build to the Mac on your local network.' \"$info_plist\"\n        ;;\n    string)\n        current_description=$(/usr/bin/plutil -extract NSLocalNetworkUsageDescription raw -o - \"$info_plist\")\n        if [ -z \"$current_description\" ]; then\n            /usr/bin/plutil -replace NSLocalNetworkUsageDescription -string 'Helix connects this development build to the Mac on your local network.' \"$info_plist\"\n        fi\n        ;;\n    *)\n        echo \"error: NSLocalNetworkUsageDescription must be a string in the processed Info.plist\" >&2\n        exit 1\n        ;;\nesac"; showEnvVarsInLog = 0; };
+		FC17224651506E983082E046 = { alwaysOutOfDate = 1; buildActionMask = 2147483647; files = (); inputPaths = ("$(BUILT_PRODUCTS_DIR)/PackageFrameworks/HelixDevSupport.framework", ); isa = PBXShellScriptBuildPhase; name = "Embed Helix Development Support (Generated)"; outputPaths = ("$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/HelixDevSupport.framework", ); runOnlyForDeploymentPostprocessing = 0; shellPath = /bin/sh; shellScript = "# Generated by Helix Hub. Do not edit.\nset -eu\nif [ \"${CONFIGURATION:-}\" != 'Debug' ]; then\n    exit 0\nfi\nsource_framework=\"${BUILT_PRODUCTS_DIR:?}/PackageFrameworks/HelixDevSupport.framework\"\ndestination_framework=\"${TARGET_BUILD_DIR:?}/${FRAMEWORKS_FOLDER_PATH:?}/HelixDevSupport.framework\"\nif [ ! -d \"$source_framework\" ]; then\n    echo \"error: Helix Debug support framework was not built\" >&2\n    exit 1\nfi\n/bin/mkdir -p \"${TARGET_BUILD_DIR:?}/${FRAMEWORKS_FOLDER_PATH:?}\"\ncase \"$destination_framework\" in\n    \"${TARGET_BUILD_DIR:?}/\"*) ;;\n    *) echo \"error: invalid Helix Debug support destination\" >&2; exit 1 ;;\nesac\n/usr/bin/rsync -a --delete \"$source_framework/\" \"$destination_framework/\"\nif [ \"${CODE_SIGNING_ALLOWED:-YES}\" != NO ] && [ -n \"${EXPANDED_CODE_SIGN_IDENTITY:-}\" ]; then\n    /usr/bin/codesign --force --sign \"$EXPANDED_CODE_SIGN_IDENTITY\"         --preserve-metadata=identifier,entitlements,flags \"$destination_framework\"\nfi"; showEnvVarsInLog = 0; };
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -318,14 +207,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		300000000000000000000005 /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				400000000000000000000004 /* LiveReloadE2EHost.Application.swift in Sources */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
+		300000000000000000000005 = { buildActionMask = 2147483647; files = (400000000000000000000001, 400000000000000000000002, 400000000000000000000004, 3E2AA715D510D586A999DD7A, ); isa = PBXSourcesBuildPhase; runOnlyForDeploymentPostprocessing = 0; };
 		300000000000000000000009 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -418,30 +300,9 @@
 			};
 			name = Release;
 		};
-		500000000000000000000007 /* Debug */ = {
-			isa = XCBuildConfiguration;
-			baseConfigurationReference = 10000000000000000000000E /* Live Application.xcconfig */;
-			buildSettings = {
-				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
-				ARCHS = arm64;
-				CODE_SIGNING_ALLOWED = NO;
-				CURRENT_PROJECT_VERSION = 1;
-				ENABLE_USER_SCRIPT_SANDBOXING = NO;
-				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = Host/Info.plist;
-				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
-				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = dev.helix.live-reload-e2e;
-				PRODUCT_MODULE_NAME = LiveReloadE2EHost;
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				SUPPORTED_PLATFORMS = iphonesimulator;
-				TARGETED_DEVICE_FAMILY = 1;
-			};
-			name = Debug;
-		};
+		500000000000000000000007 = { baseConfigurationReference = 395BAFA23B49263A638BB341; buildSettings = { ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES; ARCHS = arm64; CODE_SIGNING_ALLOWED = NO; CURRENT_PROJECT_VERSION = 1; ENABLE_USER_SCRIPT_SANDBOXING = NO; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Host/Info.plist; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 1.0; PRODUCT_BUNDLE_IDENTIFIER = dev.helix.live-reload-e2e; PRODUCT_MODULE_NAME = LiveReloadE2E; PRODUCT_NAME = "$(TARGET_NAME)"; SUPPORTED_PLATFORMS = iphonesimulator; TARGETED_DEVICE_FAMILY = 1; }; isa = XCBuildConfiguration; name = Debug; };
 		500000000000000000000008 /* Release */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 10000000000000000000000E /* Live Application.xcconfig */;
 			buildSettings = {
 				CODE_SIGNING_ALLOWED = NO;
 				CURRENT_PROJECT_VERSION = 1;
@@ -582,16 +443,13 @@
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
-		710000000000000000000001 /* HelixDevAppRuntime */ = {
+		710000000000000000000001 = { isa = XCSwiftPackageProductDependency; package = 700000000000000000000001; productName = HelixAppIntegration; };
+		710000000000000000000002 /* HelixAppIntegration */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = 700000000000000000000001 /* XCLocalSwiftPackageReference "../../.." */;
-			productName = HelixDevAppRuntime;
+			productName = HelixAppIntegration;
 		};
-		710000000000000000000002 /* HelixAppRuntime */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = 700000000000000000000001 /* XCLocalSwiftPackageReference "../../.." */;
-			productName = HelixAppRuntime;
-		};
+		1B80FC2F8C2C376290B7C42D = { isa = XCSwiftPackageProductDependency; package = 700000000000000000000001; productName = HelixDevSupport; };
 /* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 000000000000000000000001 /* Project object */;

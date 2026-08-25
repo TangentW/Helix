@@ -56,7 +56,7 @@ enum HostedClasses {
                   let superclass = operations.referenceClass?.metatype
             else {
                 throw VM.RuntimeTrap.nativeFailure(
-                    "hosted class \(definition.key) has no concrete frozen superclass TypeOps"
+                    "hosted class \(definition.key) has no concrete indexed superclass TypeOps"
                 )
             }
             try registry.validate(
@@ -81,7 +81,7 @@ enum HostedClasses {
               let superclass = operations.referenceClass?.metatype
         else {
             throw VM.RuntimeTrap.nativeFailure(
-                "hosted class \(definition.key) has no frozen superclass binding"
+                "hosted class \(definition.key) has no indexed superclass binding"
             )
         }
         guard !operations.requiresMainActor || Thread.isMainThread else {

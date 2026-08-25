@@ -137,7 +137,7 @@ struct BridgeInput {
         }
         #expect(
             throws: VM.RuntimeTrap.nativeFailure(
-                "frozen Shell struct field count does not match its verified definition"
+                "indexed Shell struct field count does not match its verified definition"
             )
         ) {
             _ = try Runtime.BridgeValueCodec.decodeStructure(
@@ -148,7 +148,7 @@ struct BridgeInput {
         }
         #expect(
             throws: VM.RuntimeTrap.nativeFailure(
-                "frozen Shell enum case index is outside its verified definition"
+                "indexed Shell enum case index is outside its verified definition"
             )
         ) {
             _ = try Runtime.BridgeValueCodec.decodeEnumeration(
@@ -159,7 +159,7 @@ struct BridgeInput {
         }
         #expect(
             throws: VM.RuntimeTrap.nativeFailure(
-                "frozen Shell enum payload presence does not match its verified case"
+                "indexed Shell enum payload presence does not match its verified case"
             )
         ) {
             _ = try Runtime.BridgeValueCodec.decodeEnumeration(

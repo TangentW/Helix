@@ -34,21 +34,8 @@ public struct ProjectFileParser: Sendable {
         guard targetIDs.count <= 4_096 else {
             throw Hub.Error.invalidProject("project declares too many targets")
         }
-        let cocoaPodsResolver = Hub.CocoaPodsRuntimeResolver(sourceRootURL: sourceRoot)
-        let parsedTargets: [Hub.XcodeTarget] = try targetIDs.compactMap {
+        let targets: [Hub.XcodeTarget] = try targetIDs.compactMap {
             try makeTarget(id: $0, objects: objects, resolver: resolver)
-        }
-        let targets: [Hub.XcodeTarget] = parsedTargets.map {
-            (value: Hub.XcodeTarget) -> Hub.XcodeTarget in
-            var target = value
-            target.cocoaPodsProductsByConfiguration = Dictionary(
-                uniqueKeysWithValues: target.baseConfigurationPaths.compactMap {
-                    configuration, path in
-                    let products = cocoaPodsResolver.products(referencedBy: [path])
-                    return products.isEmpty ? nil : (configuration, products)
-                }
-            )
-            return target
         }.sorted { (lhs: Hub.XcodeTarget, rhs: Hub.XcodeTarget) in
             lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
         }
@@ -88,25 +75,12 @@ public struct ProjectFileParser: Sendable {
             objects: objects,
             resolver: resolver
         )
-        var sourcePaths = Set<String>()
-        for phaseID in stringArray(object["buildPhases"]) {
-            guard let phase = objects[phaseID]?.dictionary,
-                  phase["isa"]?.string == "PBXSourcesBuildPhase"
-            else { continue }
-            for buildFileID in stringArray(phase["files"]) {
-                guard let buildFile = objects[buildFileID]?.dictionary,
-                      let fileReference = buildFile["fileRef"]?.string,
-                      let relative = resolver.relativeSourcePath(fileID: fileReference),
-                      relative.hasSuffix(".swift")
-                else { continue }
-                sourcePaths.insert(relative)
-            }
+        let hasSourcesPhase = stringArray(object["buildPhases"]).contains {
+            objects[$0]?.dictionary?["isa"]?.string == "PBXSourcesBuildPhase"
         }
-        for groupID in stringArray(object["fileSystemSynchronizedGroups"]) {
-            for relative in try resolver.synchronizedSwiftSources(groupID: groupID) {
-                sourcePaths.insert(relative)
-            }
-        }
+        let hasSynchronizedSourceGroup = !stringArray(
+            object["fileSystemSynchronizedGroups"]
+        ).isEmpty
         let products = stringArray(object["packageProductDependencies"]).compactMap {
             objects[$0]?.dictionary?["productName"]?.string
         }
@@ -118,7 +92,7 @@ public struct ProjectFileParser: Sendable {
             productType: productType,
             kind: targetKind(isa: isa, productType: productType),
             configurationNames: configurations.map(\.name),
-            sourceFiles: sourcePaths.sorted(),
+            supportsSourceCompilation: hasSourcesPhase || hasSynchronizedSourceGroup,
             packageProducts: Array(Set(products)).sorted(),
             baseConfigurationPaths: Dictionary(
                 uniqueKeysWithValues: configurations.compactMap {
@@ -250,64 +224,9 @@ private struct ProjectPathResolver {
         return object["path"]?.string ?? object["name"]?.string
     }
 
-    func relativeSourcePath(fileID: String) -> String? {
-        relativePath(fileID: fileID).flatMap {
-            safeRelativePath(for: sourceRootURL.appendingPathComponent($0))
-        }
-    }
-
     func relativePath(fileID: String) -> String? {
         guard let url = url(for: fileID, visiting: []) else { return nil }
         return safeRelativePath(for: url)
-    }
-
-    func synchronizedSwiftSources(groupID: String) throws -> [String] {
-        guard let root = url(for: groupID, visiting: []),
-              safeRelativePath(for: root) != nil
-        else { return [] }
-        let exceptions = synchronizedExceptions(groupID: groupID)
-        let keys: [URLResourceKey] = [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey]
-        guard let enumerator = FileManager.default.enumerator(
-            at: root,
-            includingPropertiesForKeys: keys,
-            options: [.skipsHiddenFiles, .skipsPackageDescendants],
-            errorHandler: { _, _ in false }
-        ) else { return [] }
-        var result: [String] = []
-        while let item = enumerator.nextObject() as? URL {
-            if result.count >= 100_000 {
-                throw Hub.Error.invalidProject("synchronized source group is too large")
-            }
-            let values = try? item.resourceValues(forKeys: Set(keys))
-            if values?.isSymbolicLink == true {
-                if values?.isDirectory == true { enumerator.skipDescendants() }
-                continue
-            }
-            if values?.isDirectory == true,
-               ["Pods", "Carthage", "DerivedData", ".build"]
-                .contains(item.lastPathComponent) {
-                enumerator.skipDescendants()
-                continue
-            }
-            guard values?.isRegularFile == true,
-                  item.pathExtension.lowercased() == "swift",
-                  let relativeToGroup = relative(item, to: root),
-                  !exceptions.contains(relativeToGroup),
-                  let relative = safeRelativePath(for: item)
-            else { continue }
-            result.append(relative)
-        }
-        return result.sorted()
-    }
-
-    private func synchronizedExceptions(groupID: String) -> Set<String> {
-        guard let group = objects[groupID]?.dictionary else { return [] }
-        return Set(stringArray(group["exceptions"]).flatMap { identifier in
-            guard let exception = objects[identifier]?.dictionary else {
-                return [String]()
-            }
-            return stringArray(exception["membershipExceptions"])
-        })
     }
 
     private func url(for identifier: String, visiting: Set<String>) -> URL? {
@@ -356,12 +275,5 @@ private struct ProjectPathResolver {
             return nil
         }
         return relative
-    }
-
-    private func relative(_ url: URL, to root: URL) -> String? {
-        let rootPath = root.standardizedFileURL.path
-        let path = url.standardizedFileURL.path
-        guard path.hasPrefix(rootPath + "/") else { return nil }
-        return String(path.dropFirst(rootPath.count + 1))
     }
 }

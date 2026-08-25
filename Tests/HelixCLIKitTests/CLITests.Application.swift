@@ -229,7 +229,7 @@ struct Application {
             at: project,
             withIntermediateDirectories: true
         )
-        try Data("name = LiveApp; product = HelixDevAppRuntime;\n".utf8).write(
+        try Data("name = LiveApp; product = HelixAppIntegration;\n".utf8).write(
             to: project.appendingPathComponent("project.pbxproj")
         )
         let schemes = project.appendingPathComponent("xcshareddata/xcschemes")
@@ -253,6 +253,7 @@ struct Application {
             features: [
                 .init(
                     id: "feature",
+                    targetName: "Feature",
                     moduleName: "Feature"
                 ),
             ],
@@ -286,7 +287,7 @@ struct Application {
             from: Data(validation.standardOutput.dropLast().utf8)
         )
         #expect(report.featureCount == 1)
-        #expect(report.profiles.first?.runtimePackageProduct == "HelixDevAppRuntime")
+        #expect(report.profiles.first?.runtimePackageProduct == "HelixAppIntegration")
 
         let generationArguments = [
             "xcode", "generate", "--plan", planURL.path,
@@ -397,6 +398,7 @@ struct Application {
             features: [
                 .init(
                     id: "feature",
+                    targetName: "Feature",
                     moduleName: "Feature"
                 ),
             ],
@@ -461,6 +463,7 @@ struct Application {
         let environment = [
             "SRCROOT": directory.path,
             "BUILD_DIR": buildDirectory.path,
+            "BUILT_PRODUCTS_DIR": buildDirectory.path,
             "OBJROOT": buildDirectory.appendingPathComponent("Intermediates").path,
             "TARGET_TEMP_DIR": buildDirectory.appendingPathComponent(
                 "Intermediates/patch"
@@ -482,7 +485,7 @@ struct Application {
                 + "-Xfrontend -enable-dynamic-replacement-chaining",
             "HELIX_PROFILE_ID": "patch",
             "HELIX_WORKFLOW": "hotPatch",
-            "HELIX_RUNTIME_PRODUCT": "HelixAppRuntime",
+            "HELIX_RUNTIME_PRODUCT": "HelixAppIntegration",
         ]
         let application = CLI.Application(
             currentDirectoryURL: directory,
@@ -551,7 +554,7 @@ struct Application {
         liveEnvironment["CONFIGURATION"] = "Debug"
         liveEnvironment["HELIX_PROFILE_ID"] = "live"
         liveEnvironment["HELIX_WORKFLOW"] = "liveReload"
-        liveEnvironment["HELIX_RUNTIME_PRODUCT"] = "HelixDevAppRuntime"
+        liveEnvironment["HELIX_RUNTIME_PRODUCT"] = "HelixAppIntegration"
         liveEnvironment["TARGET_TEMP_DIR"] = buildDirectory.appendingPathComponent(
             "Intermediates/live"
         ).path

@@ -31,10 +31,12 @@ App, performs an ordinary debugger launch without a custom LLDB init file,
 restores the Swift source byte-for-byte on every exit path, and leaves Hub,
 debugger, build, and scenario screenshot evidence under `.helix-e2e` for
 diagnosis. Generated Bridge Swift is compiled only into
-DerivedData; it is not referenced by the project. The host imports only
-`HelixDevRuntime`, creates one `ApplicationSession`, and has no `typeRegistry`
-or `LiveReload.Reloadable` hook. This makes the fixture an acceptance test for
-both low-cost integration and automatic UIKit instance discovery. The changed
+DerivedData; it is not referenced by the project. The host imports neither
+Helix product and contains no runtime initialization, `typeRegistry`, or
+`LiveReload.Reloadable` hook; the generated bootstrap object starts the
+configuration-scoped development support automatically. This makes the fixture
+an acceptance test for both zero-code integration and automatic UIKit instance
+discovery. The changed
 callback also executes an imported `NSTextAlignment` setter and interpolated
 `print`. It additionally calls QuartzCore's `CACurrentMediaTime`, covering
 an imported C global function outside UIKit. The same generation therefore
@@ -52,14 +54,12 @@ The fixture requires Xcode, an arm64 Mac, and an installed iOS Simulator
 runtime. It waits for the requested device to finish booting. No third-party
 test driver is required.
 
-The host links only the `HelixDevAppRuntime` Swift package product; the hidden
-Bridge object uses that same runtime image. Adding overlapping leaf products
-can load the same Swift metadata more than once, so Helix rejects that topology
-through the generated `RuntimeImageIdentity` contract. A Release target instead
-links only `HelixAppRuntime`, which excludes Dev transport, dynamic loading, and
-overlay code. It also excludes the Live Reload API contract module; that target
-is internal to the Dev graph and is not published as a standalone package
-product.
+The host links the production-safe `HelixAppIntegration` product. Its Live
+Reload configuration also makes dynamic `HelixDevSupport` available and embeds
+it automatically; the Release fixture contains only `HelixAppIntegration`.
+Application source imports neither product and does not initialize a runtime.
+The Live Reload API contract remains internal to the development graph and is
+not published as a standalone package product.
 
 Run the independent production-graph check from the repository root:
 
@@ -68,7 +68,7 @@ Tests/Fixtures/LiveReloadE2E/run-release-audit.sh
 ```
 
 It builds `ReleaseRuntimeHost` for the iOS 15 Simulator deployment target,
-links only `HelixAppRuntime`, and runs `helix shell audit-release` across every
+links only `HelixAppIntegration`, and runs `helix shell audit-release` across every
 Mach-O and `Info.plist` in the resulting App. The audit rejects Dev runtime,
 protocol, or Live Reload API images, launch-secret markers, and the Helix
 Bonjour service.

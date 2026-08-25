@@ -7,22 +7,22 @@ public enum Workflow: String, Codable, CaseIterable, Hashable, Sendable {
     case liveReload
 
     public var runtimePackageProduct: String {
-        switch self {
-        case .hotPatch: "HelixAppRuntime"
-        case .liveReload: "HelixDevAppRuntime"
-        }
+        "HelixAppIntegration"
     }
 }
 
 public struct Feature: Codable, Hashable, Sendable {
     public var id: String
+    public var targetName: String
     public var moduleName: String
 
     public init(
         id: String,
+        targetName: String,
         moduleName: String
     ) {
         self.id = id
+        self.targetName = targetName
         self.moduleName = moduleName
     }
 
@@ -162,6 +162,7 @@ public struct HostPlan: Codable, Hashable, Sendable {
         guard (1...128).contains(features.count),
               features == features.sorted(by: { $0.id < $1.id }),
               Set(features.map(\.id)).count == features.count,
+              Set(features.map(\.targetName)).count == features.count,
               Set(features.map(\.moduleName)).count == features.count
         else {
             throw XcodeIntegration.Error.invalidHostPlan(
@@ -172,11 +173,10 @@ public struct HostPlan: Codable, Hashable, Sendable {
 
         guard (1...256).contains(profiles.count),
               profiles == profiles.sorted(by: { $0.id < $1.id }),
-              Set(profiles.map(\.id)).count == profiles.count,
-              Set(profiles.map(\.schemeName)).count == profiles.count
+              Set(profiles.map(\.id)).count == profiles.count
         else {
             throw XcodeIntegration.Error.invalidHostPlan(
-                "profiles must be nonempty, sorted, and use unique schemes"
+                "profiles must be nonempty, sorted, and uniquely identified"
             )
         }
         let applicationSlots = profiles.map {
@@ -195,13 +195,22 @@ public struct HostPlan: Codable, Hashable, Sendable {
               Set(featureSlots).count == featureSlots.count
         else {
             throw XcodeIntegration.Error.invalidHostPlan(
-                "each App and Feature target configuration may belong to only one profile"
+                "each App and source target configuration may belong to only one profile"
             )
         }
         let featureIDs = Set(features.map(\.id))
+        let applicationTargetsByScheme = Dictionary(
+            grouping: profiles,
+            by: \.schemeName
+        ).mapValues { Set($0.map(\.applicationTargetName)) }
+        guard !applicationTargetsByScheme.values.contains(where: { $0.count != 1 }) else {
+            throw XcodeIntegration.Error.invalidHostPlan(
+                "profiles sharing a scheme must use the same App target"
+            )
+        }
         var allSchemeNames = Set(profiles.map(\.schemeName))
         let occupiedTargetNames = Set(
-            features.map(\.moduleName) + profiles.map(\.applicationTargetName)
+            features.map(\.targetName) + profiles.map(\.applicationTargetName)
         )
         var patchActionTargetNames = Set<String>()
         for profile in profiles {
@@ -257,10 +266,11 @@ public struct HostPlan: Codable, Hashable, Sendable {
 
     private static func validate(_ feature: XcodeIntegration.Feature) throws {
         guard isFileComponent(feature.id),
+              isDisplayName(feature.targetName),
               isSwiftIdentifier(feature.moduleName)
         else {
             throw XcodeIntegration.Error.invalidHostPlan(
-                "feature \(feature.id) has an invalid identifier or module name"
+                "feature \(feature.id) has an invalid identifier, target, or module name"
             )
         }
     }

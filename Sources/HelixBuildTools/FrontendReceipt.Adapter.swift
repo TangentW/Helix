@@ -894,7 +894,7 @@ extension FrontendReceipt.Adapter {
         guard allowed.isSubset(of: catalogNames) else {
             let missing = allowed.subtracting(catalogNames).sorted().joined(separator: ", ")
             throw FrontendReceipt.Error.invalidRequest(
-                "allowlisted NativeImport has no catalog factory: \(missing)"
+                "selected NativeImport has no catalog factory: \(missing)"
             )
         }
 
@@ -1106,7 +1106,7 @@ extension FrontendReceipt.Adapter {
             catalogByName[$0.canonicalName] != nil
         }) {
             throw FrontendReceipt.Error.invalidRequest(
-                "source value type \(collision.canonicalName) must use its frozen structural codec, not NativeImport TypeOps"
+                "source value type \(collision.canonicalName) must use its indexed structural codec, not NativeImport TypeOps"
             )
         }
         for source in sourceReferences {
@@ -1182,7 +1182,7 @@ extension FrontendReceipt.Adapter {
                     $0.canonicalName == catalogType.canonicalName
                 }) else {
                     throw FrontendReceipt.Error.invalidRequest(
-                        "cataloged imported type \(imported.canonicalName) has no frozen TypeRecord"
+                        "cataloged imported type \(imported.canonicalName) has no captured TypeRecord"
                     )
                 }
                 records[recordIndex].swiftTypeAliases = Array(Set(

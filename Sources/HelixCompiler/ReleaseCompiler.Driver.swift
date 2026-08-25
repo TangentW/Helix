@@ -125,7 +125,7 @@ extension ReleaseCompiler {
             case let .sourceSetMismatch(reason): "Patch Driver source set mismatch: \(reason)"
             case .mixedModules: "selected HLXI functions belong to more than one Swift module"
             case let .unknownFunction(key): "selected function \(key) is absent from HLXI"
-            case let .functionMissingFromSIL(key): "frozen function \(key) is missing from current canonical SIL"
+            case let .functionMissingFromSIL(key): "indexed function \(key) is missing from current canonical SIL"
             case let .changedIneligibleFunction(key, reason):
                 "changed function \(key) requires a full build: \(reason)"
             case let .loweredSignatureChanged(key, reason):
@@ -351,7 +351,7 @@ extension ReleaseCompiler {
                 )
             } catch {
                 throw DriverError.sourceSetMismatch(
-                    "frozen Shell value layout validation failed: \(error)"
+                    "indexed Shell value layout validation failed: \(error)"
                 )
             }
             let archivedSymbols = Set(request.archive.functions.map(\.mangledName))
@@ -527,7 +527,7 @@ extension ReleaseCompiler {
                 )
             } catch {
                 throw DriverError.sourceSetMismatch(
-                    "semantic SIL changed a frozen Shell value layout: \(error)"
+                    "semantic SIL changed an indexed Shell value layout: \(error)"
                 )
             }
 

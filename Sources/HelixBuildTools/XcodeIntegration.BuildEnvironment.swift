@@ -25,6 +25,46 @@ public struct BuildEnvironment: Hashable, Sendable {
     public var targetFrontendInvocationURL: URL?
     /// App-target module search paths needed to compile the hidden Bridge.
     public var bridgeModuleSearchArguments: [String]
+
+    public init(
+        sourceRootURL: URL,
+        buildDirectoryURL: URL,
+        profileOutputURL: URL,
+        configurationName: String,
+        architecture: String,
+        platformName: String,
+        sdkName: String,
+        sdkRootURL: URL,
+        generatedModuleMapDirectoryURL: URL,
+        sdkBuild: String,
+        xcodeBuild: String,
+        minimumOS: String,
+        buildNumber: String,
+        compilerURL: URL,
+        optimization: String,
+        semanticArguments: [String],
+        targetFrontendInvocationURL: URL?,
+        bridgeModuleSearchArguments: [String]
+    ) {
+        self.sourceRootURL = sourceRootURL
+        self.buildDirectoryURL = buildDirectoryURL
+        self.profileOutputURL = profileOutputURL
+        self.configurationName = configurationName
+        self.architecture = architecture
+        self.platformName = platformName
+        self.sdkName = sdkName
+        self.sdkRootURL = sdkRootURL
+        self.generatedModuleMapDirectoryURL = generatedModuleMapDirectoryURL
+        self.sdkBuild = sdkBuild
+        self.xcodeBuild = xcodeBuild
+        self.minimumOS = minimumOS
+        self.buildNumber = buildNumber
+        self.compilerURL = compilerURL
+        self.optimization = optimization
+        self.semanticArguments = semanticArguments
+        self.targetFrontendInvocationURL = targetFrontendInvocationURL
+        self.bridgeModuleSearchArguments = bridgeModuleSearchArguments
+    }
     public var shellOutputURL: URL {
         profileOutputURL.appendingPathComponent("Shell", isDirectory: true)
     }
@@ -53,6 +93,10 @@ public struct BuildEnvironment: Hashable, Sendable {
         bridgeOutputURL.appendingPathComponent("HelixBridge.o")
     }
 
+    public var bootstrapObjectURL: URL {
+        bridgeOutputURL.appendingPathComponent("HelixBootstrap.o")
+    }
+
     public var targetTriple: String {
         let suffix = sdkName == "iphonesimulator" ? "-simulator" : ""
         return "\(architecture)-apple-ios\(minimumOS)\(suffix)"
@@ -65,6 +109,20 @@ public struct BuildContext: Sendable {
     public var profile: XcodeIntegration.Profile
     public var feature: XcodeIntegration.Feature
     public var environment: XcodeIntegration.BuildEnvironment
+
+    public init(
+        planURL: URL,
+        plan: XcodeIntegration.HostPlan,
+        profile: XcodeIntegration.Profile,
+        feature: XcodeIntegration.Feature,
+        environment: XcodeIntegration.BuildEnvironment
+    ) {
+        self.planURL = planURL
+        self.plan = plan
+        self.profile = profile
+        self.feature = feature
+        self.environment = environment
+    }
 }
 
 public enum EnvironmentError: Swift.Error, Equatable, Sendable, CustomStringConvertible {
@@ -129,7 +187,9 @@ public struct EnvironmentResolver: Sendable {
                 actual: configuration
             )
         }
-        let buildDirectory = try path("BUILD_DIR", in: variables)
+        // Configuration-qualified products keep Debug and Release profiles
+        // isolated while matching the PBX file references linked by the App.
+        let buildDirectory = try path("BUILT_PRODUCTS_DIR", in: variables)
         let targetFrontendInvocation: URL?
         if requireTargetCompilerCapture {
             let objectRoot = try path("OBJROOT", in: variables)

@@ -62,7 +62,7 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
             "Mach-O architecture mismatch; expected \(expected.rawValue), got \(actual.rawValue)"
         case let .platformMismatch(expected, actual):
             "Mach-O platform mismatch; expected \(expected), got \(String(describing: actual))"
-        case let .dependencyDenied(name): "Mach-O dependency is not allowlisted: \(name)"
+        case let .dependencyDenied(name): "Mach-O dependency is not permitted by runtime policy: \(name)"
         case .installNameMismatch: "Mach-O install name does not match the generation manifest"
         }
     }

@@ -1,45 +1,23 @@
 # Helix Xcode integration
 
-This directory is owned by Helix Hub and generated from `HostPlan.json`.
-Reconfigure the project from Helix; do not edit individual files.
-
-The following target and Scheme edits are one-time project setup. After
-setup, developers use Xcode Run, Build, Archive, and the shared Patch
-scheme; no Helix command needs to be typed during ordinary work.
+This directory is owned by Helix Hub and generated automatically. It is
+an implementation record, not a setup checklist. Reapply integration
+from Helix instead of editing these files.
 
 ## `live` (`liveReload`)
 
-- Link `HelixDevAppRuntime` through SwiftPM or CocoaPods, and link the Feature framework into the App.
-- Use `Profiles/live/Feature.xcconfig` as the Feature target base configuration.
-  Keep the Feature's ordinary Swift files in its Sources phase; never add Helix
-  DerivedData output to the project.
-- Add one Run Script phase immediately after the Feature's Sources phase:
-  `exec /bin/sh "${HELIX_INTEGRATION_ROOT:?}/Profiles/${HELIX_PROFILE_ID:?}/prepare.sh"`.
-  Helix reads the exact successful Swift invocation, so adding, deleting, moving,
-  or generating a Swift source never requires updating a Helix file list.
-- Use `Profiles/live/Application.xcconfig` as the App target base configuration.
-- Add one Run Script phase before the App's Sources phase:
-  `exec /bin/sh "${HELIX_INTEGRATION_ROOT:?}/Profiles/${HELIX_PROFILE_ID:?}/bridge.sh"`.
-  Declare `$(HELIX_BRIDGE_OBJECT)` as its output. The script compiles the generated
-  Bridge privately in DerivedData before the App links.
-  Disable "Based on dependency analysis" for this phase: every Xcode Run must
-  embed the fresh one-time invitation reserved by the Feature prepare phase, even
-  when no project source changed.
-- Keep the Helix status-bar app open. The Feature prepare phase reserves a one-time
-  code and compiles only its code plus the persistent Host Identity pin into the
-  hidden Bridge in DerivedData.
-- Run `Profiles/live/live-register.sh` as the Scheme Run
-  pre-action, with build settings supplied by the App target. It verifies the
-  exact final executable, persists its Build Context in Helix, and activates the
-  pre-link reservation before Xcode launches the App.
-- Do not configure a custom LLDB init file, launch environment, service
-  post-action, host address, or session secret. A debugger-launched App detects
-  that launch once, discovers the single `_helix._tcp` service, pins the
-  generated Host Identity, and redeems the compiled invitation automatically.
-  Opening the same installed App later does not reuse Xcode mode; it remains
-  offline until a developer enters the current four-character Hub code.
+- App target: `LiveReloadE2EHost`
+- Source target: `LiveReloadE2EHost`
+- Scheme and configuration: `LiveReloadE2EHost` / `Debug`
+- App product: `HelixAppIntegration` (linked automatically)
 
-The application target must link exactly the runtime product recorded
-above. Release and Dev runtime products must never be linked together.
+Hub owns the target wrapper, compiler capture, generated trigger, runtime
+bootstrap, and Scheme action. Swift source membership is read from the successful
+Xcode compile, so adding, moving, deleting, or generating a source needs no Helix
+file list or policy update. Generated Bridge code remains in DerivedData.
+Keep Helix open and use Xcode Run. The installed Scheme action registers the
+finished App, while the automatic runtime discovers and authenticates the local
+Hub. No LLDB file, launch variable, host address, pairing secret, runtime import,
+or initialization call is required.
 
 Project: `LiveReloadE2EHost.xcodeproj`

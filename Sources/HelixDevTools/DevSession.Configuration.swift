@@ -330,9 +330,9 @@ public enum ConfigurationError: Swift.Error, Equatable, Sendable, CustomStringCo
         case .invalidFilesystemEntry:
             "a configured Dev Session input is missing, unsafe, or has the wrong file type"
         case .identityMismatch:
-            "Dev Manifest, Reload Index, and HLXI do not share one frozen build identity"
+            "Dev Manifest, Reload Index, and HLXI do not share one captured build identity"
         case .compilerIdentityMismatch:
-            "configured swiftc does not match the compiler frozen in the Dev Manifest"
+            "configured swiftc does not match the compiler recorded in the Dev Manifest"
         }
     }
 }

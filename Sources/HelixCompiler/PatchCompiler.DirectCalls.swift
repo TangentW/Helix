@@ -113,7 +113,7 @@ enum DirectCalls {
                 unavailableBySymbol[mangledName] = .init(
                     mangledName: mangledName,
                     canonicalCallee: item.canonicalCallee,
-                    reason: "the operation was cataloged but not allowlisted into this Shell; "
+                    reason: "the operation was cataloged but not selected for this Shell; "
                         + "add \(item.canonicalCallee) to nativeImports.allow and ship a new Shell"
                 )
             }

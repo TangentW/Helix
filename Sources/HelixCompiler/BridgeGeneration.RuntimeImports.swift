@@ -1,9 +1,9 @@
 extension BridgeGeneration {
 /// Runtime imports emitted into hidden Bridge sources.
 ///
-/// Swift Package Manager exposes Helix as leaf modules, while CocoaPods exposes
-/// one aggregate App-facing module. Generated source selects the available
-/// shape at compile time so the Bridge stays invisible to application code.
+/// Hub exposes one production module plus one configuration-scoped development
+/// module. The leaf-module form is used only by the compiler's isolated source
+/// validation; it is not an alternative application integration contract.
 package enum RuntimeImports {
     package static let production = """
     #if canImport(HelixBytecode) && canImport(HelixCore) && canImport(HelixPatch) && canImport(HelixRuntime) && canImport(HelixVerifier) && canImport(HelixVM)
@@ -13,12 +13,10 @@ package enum RuntimeImports {
     import HelixRuntime
     import HelixVerifier
     import HelixVM
-    #elseif canImport(HelixDevAppRuntime)
-    import HelixDevAppRuntime
-    #elseif canImport(HelixAppRuntime)
-    import HelixAppRuntime
+    #elseif canImport(HelixAppIntegration)
+    import HelixAppIntegration
     #else
-    #error("Link HelixAppRuntime or HelixDevAppRuntime before compiling the generated Helix Bridge")
+    #error("HelixAppIntegration is unavailable to the generated Helix Bridge")
     #endif
     """
 
@@ -27,10 +25,10 @@ package enum RuntimeImports {
     import HelixCore
     import HelixDevProtocol
     import HelixDevRuntime
-    #elseif canImport(HelixDevAppRuntime)
-    import HelixDevAppRuntime
+    #elseif canImport(HelixDevSupport)
+    import HelixDevSupport
     #else
-    #error("Link HelixDevAppRuntime before compiling the generated Helix development contract")
+    #error("Helix Debug support is unavailable to the generated development contract")
     #endif
     """
 

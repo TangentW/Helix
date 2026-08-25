@@ -48,6 +48,11 @@ public struct WorkflowSelection: Hashable, Sendable, Identifiable {
 public struct DraftResolver: Sendable {
     public var inspector: Hub.ProjectInspector
 
+    private struct SettingsIdentity: Hashable {
+        var targetName: String
+        var configurationName: String
+    }
+
     public init(inspector: Hub.ProjectInspector = .init()) {
         self.inspector = inspector
     }
@@ -65,17 +70,35 @@ public struct DraftResolver: Sendable {
                 "select each workflow at most once and give it a unique profile ID"
             )
         }
+        var settingsByIdentity: [SettingsIdentity: Hub.TargetSettings] = [:]
+        func settings(
+            targetName: String,
+            configurationName: String
+        ) throws -> Hub.TargetSettings {
+            let identity = SettingsIdentity(
+                targetName: targetName,
+                configurationName: configurationName
+            )
+            if let existing = settingsByIdentity[identity] {
+                return existing
+            }
+            let resolved = try inspector.settings(
+                project: project,
+                targetName: targetName,
+                configurationName: configurationName
+            )
+            settingsByIdentity[identity] = resolved
+            return resolved
+        }
         var profiles: [Hub.ProfileDraft] = []
         for selection in selections.sorted(by: {
             $0.capability.rawValue < $1.capability.rawValue
         }) {
-            let application = try inspector.settings(
-                project: project,
+            let application = try settings(
                 targetName: selection.applicationTargetName,
                 configurationName: selection.configurationName
             )
-            let feature = try inspector.settings(
-                project: project,
+            let feature = try settings(
                 targetName: selection.featureTargetName,
                 configurationName: selection.configurationName
             )
@@ -128,8 +151,8 @@ public struct DraftResolver: Sendable {
     }
 }
 
-/// Restores a GUI-editable draft from the canonical files and non-sensitive
-/// target mappings kept by the Hub project registry.
+/// Restores a GUI-editable draft from the generated Host Plan. The registry
+/// only locates that plan; target identity has one canonical source of truth.
 public struct DraftLoader: Sendable {
     public init() {}
 
@@ -154,11 +177,10 @@ public struct DraftLoader: Sendable {
         var profiles: [Hub.ProfileDraft] = []
         for profile in plan.profiles {
             let feature = try plan.feature(id: profile.featureID)
-            guard let featureTargetName = record.featureTargetNames[feature.id],
-                  project.target(named: featureTargetName) != nil
+            guard project.target(named: feature.targetName) != nil
             else {
                 throw Hub.Error.integrationConflict(
-                    "stored Feature target mapping for \(feature.id) is unavailable"
+                    "stored source target \(feature.targetName) is unavailable"
                 )
             }
             let capability: Hub.Capability = profile.workflow == .hotPatch
@@ -181,7 +203,7 @@ public struct DraftLoader: Sendable {
                 id: profile.id,
                 capability: capability,
                 applicationTargetName: profile.applicationTargetName,
-                featureTargetName: featureTargetName,
+                featureTargetName: feature.targetName,
                 featureModuleName: feature.moduleName,
                 schemeName: profile.schemeName,
                 configurationName: profile.configurationName,

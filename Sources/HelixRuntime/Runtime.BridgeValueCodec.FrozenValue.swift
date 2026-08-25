@@ -41,7 +41,7 @@ public static func decodeStructure(
     }
     guard fields.count == fieldTypes.count else {
         throw VM.RuntimeTrap.nativeFailure(
-            "frozen Shell struct field count does not match its verified definition"
+            "indexed Shell struct field count does not match its verified definition"
         )
     }
     for (field, expectedType) in zip(fields, fieldTypes) {
@@ -85,13 +85,13 @@ public static func decodeEnumeration(
     }
     guard let index = Int(exactly: caseIndex), index < payloadTypes.count else {
         throw VM.RuntimeTrap.nativeFailure(
-            "frozen Shell enum case index is outside its verified definition"
+            "indexed Shell enum case index is outside its verified definition"
         )
     }
     let expectedType = payloadTypes[index]
     guard (expectedType != nil) == (payload != nil) else {
         throw VM.RuntimeTrap.nativeFailure(
-            "frozen Shell enum payload presence does not match its verified case"
+            "indexed Shell enum payload presence does not match its verified case"
         )
     }
     if let expectedType, let payload, !payload.matches(expectedType) {

@@ -47,7 +47,7 @@ package final class NativeClosure: @unchecked Sendable, Hashable {
               })
         else {
             throw VM.RuntimeTrap.nativeFailure(
-                "native closure invocation disagrees with its frozen ABI"
+                "native closure invocation disagrees with its captured ABI"
             )
         }
         guard !signature.effects.requiresMainActor || Thread.isMainThread else {

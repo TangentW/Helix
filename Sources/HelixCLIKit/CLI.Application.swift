@@ -98,11 +98,14 @@ public struct Application: Sendable {
         outputHandler: @escaping @Sendable (CLI.Output) -> Void = { _ in }
     ) async -> CLI.Result {
         #if os(macOS)
-        if arguments.first == "xcode", arguments.dropFirst().first == "phase" {
+        if arguments.first == "xcode",
+           ["phase", "post-compile"].contains(arguments.dropFirst().first ?? "") {
             do {
-                return try await executeXcodePhase(
-                    Array(arguments.dropFirst(2))
-                )
+                let tail = Array(arguments.dropFirst(2))
+                if arguments.dropFirst().first == "post-compile" {
+                    return try await executeXcodePostCompile(tail)
+                }
+                return try await executeXcodePhase(tail)
             } catch {
                 return failure(error)
             }
@@ -676,6 +679,7 @@ Commands:
   validate      Validate the checked-in Host Plan and every referenced input
   doctor        Inspect the active Xcode build environment for one profile
   phase         Run one versioned Xcode prepare/finalize/audit/session phase
+  post-compile  Complete an automatically captured same-target Swift build
 """ + "\n"
 
 private static let patchHelp = """

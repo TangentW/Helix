@@ -20,7 +20,7 @@ current practical boundary.
 | Control plane | Client-side package and policy contracts | Production Registry, HSM operations, approval, rollout, telemetry, and fleet coordination services |
 
 The full SwiftPM suite, warnings-as-errors build, optimized Release build, iOS
-fixtures, and checked-in Demo flows are separate evidence gates. Passing them
+fixtures, and checked-in Demo flows are separate evidence stages. Passing them
 does not by itself certify a physical device or distribution channel.
 
 ## Production HLBC 1.0 Swift subset
@@ -185,7 +185,7 @@ does not by itself certify a physical device or distribution channel.
   path and Array element `_modify` share scoped frame storage and perform
   writeback on both `end_apply` and `abort_apply`, covering nested and throwing
   inout mutation without collection-API-specific bytecode.
-  Array append accepts represented copyable elements, including frozen imported
+  Array append accepts represented copyable elements, including captured imported
   reference values. Represented Array-backed integer-index collections also
   support `reverse()` and `removeAll(where:)` while retaining a view's logical
   base; predicate removal is available for any represented copyable element.
@@ -347,7 +347,7 @@ does not by itself certify a physical device or distribution channel.
   closure exactly once and constructs the same local enum from the verified
   normal/error continuations; it does not call the generic Swift implementation
   through NativeImport. Local nominal aggregates may contain managed `Error`
-  existentials. Their concrete local payloads remain capability-gated and are
+  existentials. Their concrete local payloads remain capability-validated and are
   depth- and fuel-checked when the existential is constructed and at VM
   boundaries. A local `Result` still cannot embed a native handle.
 - Structured branches, loops, switches, calls, recursion, checked business
@@ -394,15 +394,15 @@ does not by itself certify a physical device or distribution channel.
   summaries fail closed. Nested declarations keep their namespace-qualified identity. These
   are generation-local VM values, not newly loaded Swift metadata.
 - Existing current-module Shell structs and enums may cross an eligible Entry
-  through a frozen logical-value codec. The supported profile is copyable,
+  through a captured logical-value codec. The supported profile is copyable,
   nongeneric, nonrecursive, and source-reconstructible; it covers ordinary,
   `borrowing`, `consuming`, and `mutating` instance methods (including methods
   declared in extensions), global parameters/results, normal and throwing
   paths, nested declarations, private stored fields, `Error`-conforming enums,
   and recursively represented scalar, text, `Any`, Optional, Array,
-  Dictionary, Set, tuple, and other eligible frozen local values. Struct fields
+  Dictionary, Set, tuple, and other eligible captured local values. Struct fields
   and enum cases, labels, order, exact source type spelling, copyability, and
-  the supported conformance facts are frozen into the interface and device
+  the supported conformance facts are captured into the interface and device
   hash. Generated same-source construction hooks and streaming Bridge codecs
   reconstruct the logical value without reading Swift ABI layout, reflection,
   or runtime metadata. Patch compilation replays the exact source shape and
@@ -415,7 +415,7 @@ does not by itself certify a physical device or distribution channel.
   forms include shorthand/explicit getters, get/set pairs, custom setter value
   names, `mutating get`, `nonmutating set`, global/instance/static/class
   properties, instance/static subscripts, source extensions, and
-  accessor-specific visibility such as `private(set)`. A mutable frozen-value
+  accessor-specific visibility such as `private(set)`. A mutable captured-value
   receiver consumes the one logical `inout` region and writes back on both
   normal and declared-error exits, including an ordinary `throws` getter. The
   generated fallback keeps unselected sibling accessors on the previous
@@ -427,7 +427,7 @@ does not by itself certify a physical device or distribution channel.
   requiring a pre-existing Shell EntryIndex. A patch-local `final class` has
   HLVM-owned reference identity, field storage, and method dispatch; a pure
   HLVM class cannot cross the native boundary.
-- A new `final` class may name an HLXI-frozen, `NSObject`-compatible reference
+- A new `final` class may name an HLXI-captured, `NSObject`-compatible reference
   superclass. Runtime registers an Objective-C host per immutable image so the
   instance can cross into native code as that superclass, including a project
   base class or `UIViewController`. The current hosted profile permits only an
@@ -444,7 +444,7 @@ does not by itself certify a physical device or distribution channel.
   Error-conforming patch-local nominal across nonescaping calls, escaping
   storage, aggregates, concrete generic forwarding, concretely specialized
   standard-library higher-order calls, and error continuations.
-  The `typed-throws-1` capability gates this raw typed channel. A conversion to
+  The `typed-throws-1` capability identifies and validates this raw typed channel. A conversion to
   `throws(any Error)` must be represented by a concrete Swift reabstraction
   thunk; error-type covariance is not inferred by the VM. `throws(Never)` is
   normalized to nonthrowing, and an impossible `Never` normal continuation has
@@ -489,7 +489,7 @@ does not by itself certify a physical device or distribution channel.
   capture-free free/global functions, a bound instance method whose native
   receiver is copied into the ordinary closure context, and an initializer
   whose compiler-only metatype is validated and erased. Unified
-  `make_closure` freezes an image function, `EntryIndex`, or `NativeImportID`;
+  `make_closure` records an image function, `EntryIndex`, or `NativeImportID`;
   the callable ABI must be complete and representation-preserving, so a
   call-site default-argument projection or direct-call-only adapter is rejected;
   invocation parameters are the target ABI prefix and `partial_apply` captures
@@ -527,13 +527,13 @@ does not by itself certify a physical device or distribution channel.
   storage cannot hide a lexical scope.
   Other closure values must remain inside the same pinned HLVM
   invocation;
-  `escaping-closure-values-1` gates return and
-  nested-capture semantics, while `mutable-captures-1` gates managed cells.
+  `escaping-closure-values-1` identifies and validates return and
+  nested-capture semantics, while `mutable-captures-1` does the same for managed cells.
   Safe `weak` and checked `unowned` capture lists, plus captured weak local
   variables, use the same managed-capture ABI. The shared non-retaining handle
-  accepts patch-local classes and frozen native reference identities: weak
+  accepts patch-local classes and captured native reference identities: weak
   loads become `nil` after deallocation, while a dead checked-unowned load is a
-  controlled VM trap. `non-owning-references-1` gates this storage and every
+  controlled VM trap. `non-owning-references-1` identifies and validates this storage and every
   instruction that creates or accesses it.
   Compiler-emitted fully concrete specializations are supported when no
   archetype, metadata, or witness dependency remains. Source generic helpers
@@ -554,7 +554,7 @@ does not by itself certify a physical device or distribution channel.
   types and `Magnitude`/`Stride`/`Exponent` identities are solved concretely,
   and protocol operations compose through ordinary image-local closure values.
   Recursive `Hashable` evidence is constraint-only—direct Swift `Hasher`
-  execution is not synthesized. Imported conformers require a concrete frozen
+  execution is not synthesized. Imported conformers require a concrete captured
   NativeImport operation, and storage similarity alone is never conformance.
   Conditional conformances are accepted only when their
   concrete requirements recursively prove. Distinct argument lists
@@ -585,7 +585,7 @@ does not by itself certify a physical device or distribution channel.
   image-local: a protocol existential Shell root is ineligible, and a call
   carrying a Swift protocol value across Shell or an ordinary NativeImport is
   rejected before bytecode is emitted. A proven Objective-C `!foreign`
-  protocol erasure remains the existing frozen native `AnyObject` path.
+  protocol erasure remains the existing captured native `AnyObject` path.
   Conditional/retroactive/imported conformances, an open conformer universe,
   and mutable existential opening/writeback remain fail-closed.
 - Exact NativeImport callable crossings under one generated, framework-neutral
@@ -604,7 +604,7 @@ does not by itself certify a physical device or distribution channel.
   nonthrowing, and closure-free, and uses callback bridge values, including
   bounded `Error` proxies; the VM keeps its native identity, exact ownership
   and MainActor requirements, resource accounting, and a non-Sendable overlap
-  gate when invoking it.
+  overlap check when invoking it.
   A NativeImport itself may return a direct or Optional native-origin callable
   with the same signature profile. Returned callables are escaping by
   construction. The generated Bridge must create their identity-bearing target
@@ -643,7 +643,7 @@ does not by itself certify a physical device or distribution channel.
   represented by a checked physical-to-logical projection and are supplied by
   the generated Swift invocation after SIL provenance and ownership validation.
   An omitted Optional Objective-C block default is accepted only when the
-  compiler-emitted `Optional.none` has the exact frozen physical block spelling;
+  compiler-emitted `Optional.none` has the exact captured physical block spelling;
   it is projected away without materializing a VM closure.
   A representation-preserving `convert_closure` may only add MainActor to an
   otherwise ABI-identical closure. The Verifier rejects the reverse conversion,
@@ -697,7 +697,7 @@ does not by itself certify a physical device or distribution channel.
   implementation fingerprints. This covers eligible callers in one complete
   module source set; cross-module public/package defaults, an ineligible caller,
   or a remaining generic ABI require a full build.
-- Native Swift text rendering frozen into every new Shell: ordinary
+- Native Swift text rendering recorded automatically in every new Shell: ordinary
   `Swift.print`, `Swift.debugPrint`, `String(describing:)`, and
   `String(reflecting:)`. Print operations preserve variadic
   separator/terminator semantics; the generic String initializers are lowered
@@ -707,9 +707,9 @@ does not by itself certify a physical device or distribution channel.
   64 KiB output bound. No App catalog setup, generic metadata, witness table,
   new opcode, or contract version is required.
 - Managed Debug measurement of public members for every module contributing an
-  already-frozen imported native type. The captured toolchain's symbol graph
+  imported native type proven by the current App build. The captured toolchain's symbol graph
   nominates minimum-OS-valid, nondeprecated APIs, and the same typed
-  AST/canonical SIL pipeline freezes only unique, Bridge-compatible
+  AST/canonical SIL pipeline records only unique, Bridge-compatible
   initializers, synchronous instance or
   static methods, and readable or writable properties. The generic path covers
   Swift and Objective-C declarations, Swift-overlay/physical aliases, SDK
@@ -723,10 +723,10 @@ does not by itself certify a physical device or distribution channel.
   `Bundle.path(forResource:ofType:)`, and `FileManager.removeItem(atPath:)`.
   The full declaration recovers only omitted outer `@escaping`/`@autoclosure`
   parameter markers. Concrete generic owners are substituted and probed per
-  frozen specialization without ambiguous unspecialized aliases. Non-Sendable
+  proven specialization without ambiguous unspecialized aliases. Non-Sendable
   callbacks on MainActor declarations retain that inherited actor restriction;
   explicitly `@Sendable` callbacks retain their own declared executor contract.
-  An exact zero-argument `Type()` call is also nominated for each already-frozen
+  An exact zero-argument `Type()` call is also nominated for each represented
   imported SDK type and admitted only when the frontend proves that call, even
   if an inherited or importer-synthesized initializer is absent from the symbol
   graph. Symbol-graph implicitly unwrapped optionals such as
@@ -734,18 +734,18 @@ does not by itself certify a physical device or distribution channel.
   as their exact Optional ABI. Other frontend-synthesized inherited
   constructors, including project subclass constructors, do not expand the
   source-authored boundary. Proven
-  Objective-C protocol inputs retain the frozen `AnyObject`
+  Objective-C protocol inputs retain the exact `AnyObject`
   ABI while the generated invoker decodes the exact existential type, inside
   MainActor isolation when required.
   Production Shells do not receive this convenience surface, and it does not
   introduce a new boundary type by itself.
 - Objective-C superclass dispatch and address-form Optional control flow when
-  their exact native operations are frozen. Same-type receiver casts are
+  their exact native operations were generated for the App build. Same-type receiver casts are
   accepted only as aliases of one reference `TypeID`, and Optional payload takes
   require a dominating `.some` edge even after an exact address copy.
-- Calls to same-image helpers, eligible Shell entries, and exact allowlisted
+- Calls to same-image helpers, eligible Shell entries, and exact generated
   NativeImports already emitted in the target Shell. Baseline-used imported
-  APIs can be frozen automatically when Typed AST semantics and canonical SIL
+  APIs are captured automatically when Typed AST semantics and canonical SIL
   physical ABI agree; current coverage includes references, raw enums,
   OptionSets, opaque copyable values, accessors, methods, global values and
   functions and operators, simple imported C values, Selector, upcasts,
@@ -755,8 +755,9 @@ does not by itself certify a physical device or distribution channel.
 ### Synchronous closure capability matrix
 
 This matrix is the reviewed v1 closure baseline. Native rows still require an
-exact frozen or managed-Debug-generated NativeImport whose full callable
-contract passes the checks above; the examples do not form an API allowlist.
+exact build-captured or managed-Debug-generated NativeImport whose full callable
+contract passes the checks above; the examples are illustrative, not an
+exhaustive API list.
 
 | Area | Supported | Intentional boundary |
 | --- | --- | --- |
@@ -833,14 +834,14 @@ contract passes the checks above; the examples do not form an API allowlist.
   patch-local values inside one verified image.
 - Arbitrary new Swift metadata, a patch concrete class identity visible to
   native code, retroactive conformances, or changes to a Shell type's layout,
-  superclass, or enum cases. The hosted Objective-C subclass above is a frozen
+  superclass, or enum cases. The hosted Objective-C subclass above is a captured
   superclass projection, not arbitrary Swift metadata generation.
 - Swift protocol existential values at a Shell Entry or ordinary NativeImport
   boundary, conditional or imported conformers in an existential dispatch set,
   and mutable existential opening/writeback. The supported immutable profile is
   closed over complete current-module image-local conformers and cannot safely
   be widened at those boundaries without introducing runtime Swift metadata.
-  The separately proven Objective-C `!foreign` erasure is a frozen native
+  The separately proven Objective-C `!foreign` erasure is a captured native
   `AnyObject` value,
   not an exception that exports this image-local representation.
 - Generic Shell entries; noncopyable, recursive, imported/native-backed, or
@@ -855,13 +856,13 @@ contract passes the checks above; the examples do not form an API allowlist.
   accessors with an unnameable private nested receiver, and mutable existential
   opening remain fail-closed. The supported region does include nested
   projection and enum-state writeback, with no
-  writeback exposed after a VM trap. Frozen stored properties
+  writeback exposed after a VM trap. Captured stored properties
   may not contain closures, protocol existentials, `AnyObject`, native values,
   a private nested nominal that generated file-scope code cannot name,
   or another unsupported value. A `let`
   property with a declaration initializer is rejected because a safe
   same-source reconstruction initializer cannot assign it; a `var` declaration
-  initializer is allowed and the frozen payload remains authoritative.
+  initializer is allowed and the captured payload remains authoritative.
   Availability-attributed value declarations and enum cases are rejected
   because an unconditional codec cannot legally name them across the Shell's
   full deployment range.
@@ -873,10 +874,9 @@ contract passes the checks above; the examples do not form an API allowlist.
   `dlopen`/`dlsym`, Mirror-driven field mutation, and unknown builtins.
 - A native call that does not have an exact `NativeImportID` in the target
   Shell, even if a similarly named Swift function exists. A production patch
-  also cannot add a framework or use an SDK operation for the first time after
-  that Shell was released. The measured managed-Debug color palette above works
-  precisely because those individual IDs are frozen during the normal Debug
-  build.
+  also cannot add a framework or use an SDK operation absent from the App after
+  that build was released. The broad managed-Debug surface above works because
+  those concrete IDs are generated automatically during the normal Debug build.
 
 ## Development Live Reload boundary
 
@@ -891,10 +891,10 @@ machine code.
 | Change an indexed source-class instance method body | Supported; generated TypeOps carry the exact `self` reference into HLVM, and nonisolated/MainActor async methods use the permanent source-body Bridge |
 | Change an instance method on an eligible existing Shell struct or enum | Nonmutating ordinary, `borrowing`, and `consuming` receivers are supported; a synchronous `mutating` receiver is supported as the entry's one logical `inout` region. This includes extension methods, nested/COW mutation, enum transitions, and exact normal/declared-error writeback; a VM trap writes nothing |
 | Change an existing computed property or subscript | Supported for exact synchronous getter/setter roots when the receiver, parameters, result, effects, and body are representable. This includes `mutating get`, `nonmutating set`, static/class/global forms, source extensions, per-accessor access control, and normal/declared-error value writeback. Explicit `_read`/`_modify`, async, typed throws, availability-constrained or generic declarations/contexts, unnameable private nested receivers, and recursive Native accessor replacement remain fail-closed |
-| Change an existing stored-property `willSet` or `didSet` body | Directly declared synchronous global, eligible frozen struct, and source reference-class observers are independently patchable through an exact hashed in-place wrapper in the derived source. Implicit/custom old/new-value names, baseline fallback, private same-file access, direct value-storage mutation, and transactional value-receiver writeback are preserved. Static/class, inherited, lazy/wrapped, weak/unowned/Objective-C, availability/generic, actor/global-actor, baseline-magic-literal, old/new-value ABI-shape changes, and direct self-property assignment from a reference observer fail closed; observer Native replacement is never emitted |
+| Change an existing stored-property `willSet` or `didSet` body | Directly declared synchronous global, eligible captured struct, and source reference-class observers are independently patchable through an exact hashed in-place wrapper in the derived source. Implicit/custom old/new-value names, baseline fallback, private same-file access, direct value-storage mutation, and transactional value-receiver writeback are preserved. Static/class, inherited, lazy/wrapped, weak/unowned/Objective-C, availability/generic, actor/global-actor, baseline-magic-literal, old/new-value ABI-shape changes, and direct self-property assignment from a reference observer fail closed; observer Native replacement is never emitted |
 | Use explicit `inout`, mutate an actor root, or change an existing native static/class method | One synchronous eligible Shell `inout` parameter is supported. Multiple/async regions remain rejected; actor executors and native metatype ABI are not implemented |
 | Call an existing private/internal/public declaration from that body | Supported only when it resolves to a same-image function, eligible Shell Entry, or exact emitted NativeImport |
-| First use a public SDK member in a managed Debug body | Supported for a uniquely measured, nondeprecated synchronous initializer, instance/static method, or readable/writable property when every boundary type is already representable in the frozen imported/Bridge surface and the declaration is valid at the Shell minimum OS. This includes a separately compiler-proven zero-argument `Type()` construction and members of an already-frozen concrete SDK generic specialization; other inherited implicit constructors, project-subclass constructors, and open/unspecialized generic owners do not expand the source boundary. Closure-bearing members require the exact synchronous, nonthrowing bridge-and-failure-value profile above; declaration-level `@escaping`/`@autoclosure` and inherited MainActor restrictions are preserved. Async SDK declarations, completion-handler conversion, unfamiliar error bridges, subscripts, unsupported actor hops, and unrepresentable signatures require a full build; suspending NativeImports currently come from exact project-source discovery or an explicit catalog |
+| First use a public SDK member in a managed Debug body | Supported automatically for a uniquely measured, nondeprecated synchronous initializer, instance/static method, or readable/writable property when every boundary type is representable in the current generated Bridge and the declaration is valid at the App minimum OS. This includes a separately compiler-proven zero-argument `Type()` construction and members of a concrete SDK generic specialization already proven by the build; no project API list is edited. Other inherited implicit constructors, project-subclass constructors, and open/unspecialized generic owners do not expand the source boundary. Closure-bearing members require the exact synchronous, nonthrowing bridge-and-failure-value profile above; declaration-level `@escaping`/`@autoclosure` and inherited MainActor restrictions are preserved. Async SDK declarations, completion-handler conversion, unfamiliar error bridges, subscripts, unsupported actor hops, and unrepresentable signatures require a full build; suspending NativeImports currently come from exact project-source discovery or the lower-level explicit catalog |
 | Add an ordinary top-level helper, private class instance method, or computed accessor in an existing source file | Supported when reachable from a changed root and its concrete signature/body fit HLBC; it remains private to that image |
 | Ordinary direct recursion | Resolves to the function in the same immutable HLBC image |
 | Deliberately call the previous generation from source | Not supported by HLBC; save/activate a restoring generation instead |
@@ -904,7 +904,7 @@ machine code.
 | Use `String`, `Character`, or `Substring` in supported text/Sequence APIs | Supported through validated grapheme and normalized Character-sequence representations, including Shell bridge round trips; `String.Index`, index-sensitive mutation, UTF views, and unlisted Character/Foundation APIs remain rejected |
 | Declare a patch-local struct or enum | A newly introduced non-exported type is supported at file/module scope, including namespace nesting and supported computed accessors; a function-local nominal is rejected with an exact type diagnostic |
 | Declare a pure patch-local class | A final, nongeneric type used only inside one image supports reference identity, stored properties, private/ordinary methods, and computed accessors; it cannot cross into native code |
-| Declare a hosted class inheriting a project or system type | The superclass must be frozen as `NSObject`-compatible reference TypeOps; the current profile supports inherited no-argument initialization, no new stored properties, and no-argument/Bool `Void` overrides, and projects the instance to native code as its superclass |
+| Declare a hosted class inheriting a project or system type | The superclass must be captured as `NSObject`-compatible reference TypeOps; the current profile supports inherited no-argument initialization, no new stored properties, and no-argument/Bool `Void` overrides, and projects the instance to native code as its superclass |
 | Add an unrelated declaration, a new native ABI surface, or a new Swift file | Not collected merely by existence; a source-membership or native ABI change requires a full build |
 | Change a stored property, signature, generic constraint, actor isolation, superclass, conformance, or enum case | Rejected; full build required |
 | Change default-argument behavior | A fully concrete generator is patched with eligible archived callers in one complete module; cross-module public/package defaults, an ineligible caller, or a generic ABI require a full build |
@@ -987,7 +987,8 @@ allocation or execution.
 Development Live Reload bounds artifact bytes and retained generations. A
 synchronous Swift NativeImport cannot be forcibly preempted;
 only bounded/cooperative imports with deadlines and checkpoints should enter a
-production catalog. Real-device tail latency and memory pressure remain gates.
+production catalog. Real-device tail latency and memory pressure still require
+physical-device qualification.
 
 ## Compatibility and distribution
 

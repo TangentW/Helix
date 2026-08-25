@@ -2,255 +2,140 @@
 
 [English](Getting-Started.md)
 
-这份文档说明如何把一个 Swift Feature 模块接入 Helix。当前方案最重要的变化是：Helix 生成的 Swift 代码不会进入 Xcode 工程，也不需要开发者导入或引用。开发者始终修改原来的 Feature 源文件，Helix 只在 DerivedData 中生成并私下编译 Bridge。
+Helix 的默认接入路径只有三步：打开 Helix，选择 Xcode 工程，点击 **Enable Helix**。普通 iOS App 不需要拆 target、预先创建共享 Scheme、导入 Helix module、编写启动代码、维护源码列表、配置 API 白名单，或执行所谓“冻结”。
 
-## 1. 先选择工作流
+Helix 会在正常 Xcode 构建中自动读取编译器已经证明的事实，并在 DerivedData 里生成 Bridge。那些精确事实用于保证热重载和热补丁不会套用到错误的二进制；它们是自动生成的构建身份，不是项目接入时要维护的配置。
 
-| 需求 | Profile | App Runtime |
-| --- | --- | --- |
-| 保存已有 Swift 函数体，立即更新正在运行的 Debug 页面 | `liveReload` | `HelixDevAppRuntime` |
-| 为经过审计的 Release Shell 构建签名 HLBC 补丁 | `hotPatch` | `HelixAppRuntime` |
+## 环境要求
 
-两条路径共享编译器事实与稳定身份，但 Runtime、传输、信任材料和产物彼此隔离。同一个 App configuration 只能链接一个聚合 Runtime 产品。
+- macOS 14 或更高版本；
+- iOS 15 或更高版本；
+- 带 Swift 6 工具链的 Xcode；
+- 一个能由 Xcode 正常 Build/Run 的 iOS App target。
 
-## 2. 选择 Feature 模块
+项目可以使用单 target，也可以已有多个 framework。Helix 默认直接使用 App target 的 Swift 源码；独立源码 target 只是已有模块化工程的可选映射，不是接入前置条件。
 
-Helix 以 Swift module 为边界。建议先选一个职责清晰的 framework，包含需要热重载或热修复的实现。原 Feature target 仍然编译开发者手写的源文件。
+## 一键启用
 
-```mermaid
-flowchart LR
-    A["Application target"] --> F["Feature framework · 原始 Swift 源码"]
-    A --> R["唯一的 Helix 聚合 Runtime"]
-    F --> P["Helix prepare phase · 精确成功编译"]
-    P --> S["DerivedData 中的 Shell 元数据"]
-    S --> H["隐藏 Bridge object"]
-    H --> A
-    D["保存 Swift 函数体"] --> N["自动选择原生 Swift 或验证后 HLBC"]
-    N --> A
-```
-
-这里不再存在生成 Bridge framework、生成源码 target、生成源码 target membership 或生成模块 import。App 只会在 Sources phase 之前链接一个私下生成的 relocatable object；它导出稳定的 provider 符号，其余内容都属于 Helix 内部实现。
-
-## 3. 添加 App Runtime 依赖
-
-选择 SwiftPM 或 CocoaPods，并按 configuration 只给 App 链接一个 Runtime：
-
-- Debug Live Reload：`HelixDevAppRuntime`
-- Release Hot Patch：`HelixAppRuntime`
-
-SwiftPM 路径把 Helix 添加为 package，并链接同名 product；App 源码继续 import `HelixDevRuntime`、`HelixPatch` 等 leaf API module。CocoaPods 路径使用不同 App target：
-
-```ruby
-target 'HotPatchApp' do
-  pod 'HelixAppRuntime',
-      :git => 'https://github.com/TangentW/Helix.git',
-      :branch => 'main'
-end
-
-target 'LiveReloadApp' do
-  pod 'HelixDevAppRuntime',
-      :git => 'https://github.com/TangentW/Helix.git',
-      :branch => 'main'
-end
-```
-
-生产项目应固定 tag 或 commit。两份 podspec 以后也可放进私有 Specs 仓库，不要求发布到 CocoaPods trunk。CocoaPods 下的 App 源码 import `HelixAppRuntime` 或 `HelixDevAppRuntime`，因为每个 Pod 都是自包含的聚合 module。隐藏 Bridge 会在编译时自动选择 SwiftPM leaf module 或 CocoaPods 聚合 module，不增加业务配置。
-
-Feature target 不需要链接 Helix Runtime。Compiler、Build Tools、Dev Tools 与 `helix` CLI 只在 macOS 构建侧运行，不能进入 Release App bundle。Git、私有 spec 和本地 `:path` 都直接编译仓库中同一份 Runtime 源码，不再运行准备脚本或创建聚合源码目录；精确边界与验证命令见 [CocoaPods 说明](../CocoaPods/README.md)。
-
-## 4. 打开 Helix 并选择工程
-
-macOS 上给开发者看到的应用名是 **Helix**。在当前仓库中这样构建：
+在仓库中构建并打开 Helix：
 
 ```bash
 Hub/Scripts/build-app.sh release
 open Hub/.build/Helix.app
 ```
 
-菜单栏 UI 只是薄前端。工程解析、确定性计划、文件事务、Service ownership、配对与 Build Context 注册都在 `Sources`，所以 headless 工具不依赖 SwiftUI。
+然后：
 
-可以选择 `.xcodeproj`、`.xcworkspace` 或源码目录。Workspace 会先解析成具体 Project；如果存在多个候选，Helix 会让开发者明确选择。这一步只读，不会改工程。
+1. 选择 `.xcodeproj`、`.xcworkspace` 或包含它们的目录。
+2. 保留需要的 Hot Patch 和 Live Reload 工作流。
+3. 检查 Helix 自动识别的 App target、源码 target、Scheme 与 configuration。
+4. 点击 **Enable Helix**。
 
-## 5. 在 GUI 中配置能力
+对普通单 target App，Helix 默认选择同一个 App target 作为源码模块，Live Reload 使用 Debug，Hot Patch 使用 Release。没有共享 Scheme 时，Helix 会创建一份可运行、可归档的共享 Scheme。高级映射只用于自动识别不符合预期的特殊工程，不是正常接入步骤。
 
-新工程默认勾选 Hot Patch 与 Live Reload。每一项需要选择：
+## Helix 自动修改什么
 
-- App target；
-- 承载可修改实现的 Swift Feature target；
-- shared Scheme；
-- App 与 Feature 都存在的 configuration。
+所有修改会在一次可回滚事务中完成；任一步失败都不会留下半套工程状态。
 
-Helix 会从 Xcode 真实 Build Settings 解析 module name 与 bundle identifier。Profile identity、namespace、patch recipe、信任文件、输出目录和可选 Simulator inbox 放在高级配置中。首次没选的能力以后还能安装；已经安装的能力不能被静默关闭。第一次安装后，integration root 会锁定，避免重配置后留下旧目录和悬空 PBX 引用。
-
-Hot Patch 与 Live Reload 必须使用不同 App target。Release target 只能链接 `HelixAppRuntime`，开发 target 只能链接 `HelixDevAppRuntime`。Helix 会检查 SwiftPM product 与 App target 的 CocoaPods xcconfig，并列出缺失的代码层动作，但不会偷偷注入依赖链接或 App 启动代码。
-
-## 6. 应用并检查工程事务
-
-点击 **Configure Project** 后，Helix 会重新读取工程、解析精确 Build Settings、生成一份 canonical plan，再一次性提交全部受管修改。校验或写入失败时不会保留半套工程状态。
-
-事务会创建或更新：
-
-| 区域 | Helix 管理的内容 |
+| 区域 | 自动行为 |
 | --- | --- |
-| 生成的接入状态 | `.helix/xcode/HostPlan.json`、profile contract、manifest 与生成说明 |
-| 编译策略 | 根据所选 module 与 Swift 源码在内部自动生成；工程无需维护策略文件或 API 白名单 |
-| Xcode settings | 保留 target 原 Base Configuration 的 wrapper xcconfig |
-| Bridge | App Sources 前的一个 phase；生成 Swift 与 `HelixBridge.o` 只留在 DerivedData |
-| Scheme lifecycle | Build 准备、Release 审计、Live 最终 executable 注册与 Patch 构建动作 |
-| Hot Patch | 只作为 Patch Scheme 锚点的空 Aggregate target、recipe、输出路径和可选本地开发信任材料 |
-| Live Reload 网络 | App plist 中的 `_helix._tcp` 与本地网络用途说明 |
+| Package | 复用已有 Helix Swift package；没有时添加官方 package reference |
+| App product | 给 App target 链接统一的 `HelixAppIntegration` |
+| Debug 支持 | 让 App target 可用动态 `HelixDevSupport`，但只在 Live Reload configuration 中链接和嵌入 |
+| Swift 编译 | 用透明 compiler proxy 捕获所选 configuration 的真实成功编译；同一 App/源码 target 只使用一个空的 Hub-owned trigger 刷新增量 Run，并将它排除在业务 Shell 源码集合之外 |
+| Bridge | 在 DerivedData 中生成并编译 `HelixBridge.o` 与自动启动 object；不把生成 Bridge Swift 加进工程 |
+| Build settings | 用 configuration 级 wrapper 保留原 Base Configuration，再追加 Helix 设置 |
+| Scheme | 自动创建或更新 Run 注册与 Release 审计 action |
+| 本地网络 | 在签名前幂等补齐已处理的 Live Reload App plist；业务 plist、Xcode plist 设置与 Release 产物保持不变 |
+| Hot Patch | 自动生成 Patch action、初始 recipe、资源嵌入和可选本地开发签名材料 |
 
-显式 `Info.plist` 会保留业务 key 和已有非空用途说明，只补缺少的 Bonjour service。原来由 Xcode 自动生成 plist 的 target，会得到一份很小的 Hub-owned plist，并且只让对应 configuration 使用它。如果工程明确配置了 plist 路径但文件不存在，Helix 会报错，不会猜一份替代文件。
+Helix 不改业务 Swift 文件，不要求业务代码 import 或初始化 Runtime，也不要求维护 target 源码清单、Native API 清单、host、port、配对 secret、LLDB 脚本或 shell `PATH`。
 
-生成 Swift 永远不会进入 Project Navigator、target membership 或 Compile Sources。Bridge phase 会复用已捕获的 Feature 编译参数，在 DerivedData 中私下编译，校验平台与架构，再在 App link 前原子发布 object。Runtime 通过稳定 provider symbol 取得精确 Shell contract，无需业务 import 生成模块。
+## 随时修改或移除接入
 
-生成的 Xcode dispatcher 会从 owner-only Service rendezvous 文件找到正在运行的 Helix 发布的精确 `helix` helper；打包后的 App 把 helper 放在 `Contents/Helpers`。普通工程无需设置 `HELIX_EXECUTABLE`，也不依赖 shell `PATH`。
+首次识别出的映射不会被锁定。随时在 Helix 中重新打开工程，修改 App target、源码 target、Scheme 或 configuration，再点击 **Apply Changes**。Hub 会按原 PBX identity 恢复已不再使用的 Base Configuration 引用，移除旧 compiler trigger、product、phase、Patch target 与 Scheme action，然后幂等应用当前映射。已有 Scheme 的 Run/Archive configuration 和所有非 Helix action 都不会被改写。
 
-本地 Dev Protocol 与 Service rendezvous schema 统一使用版本 1。Helix 只接受这个版本，其他任何值都会统一 fail closed；不会根据历史版本号迁移、重新解释或选择性删除本地状态。预发布状态没有兼容契约；无效的本地产物必须移除，再由已配置的 Xcode 构建重新生成。
+生成的 Host Plan 是 target 与 module identity 的唯一事实来源。Hub registry 不再保存第二份可漂移的 target 映射，因此重新打开或重复应用工程时不会复活旧映射。
+owner-only registry 只保留最近一次接入计划作为自动移除快照，因此即使生成文件意外丢失，**Remove Helix** 仍能恢复工程；构建和重配置都不会把该快照作为输入。
 
-Service 与配对错误会直接显示在状态栏面板内，不再用独立告警弹窗抢走面板焦点。修正提示的问题后可点击 **Retry**；重试不会终止独立启动的 headless service。
+关闭其中一个工作流即可只移除该工作流；两个都关闭后点击 **Remove Helix**，工程会自动恢复。Hub 只删除生成文件所有权清单中记录的文件，独立放进接入目录的未知文件不会被认领或删除；业务源码、业务配置、Patch recipe 与签名材料都会保留。重配置和移除同样使用可回滚事务，并拒绝符号链接或越界路径。
 
-## 7. 理解生成的 Xcode 生命周期
+## Runtime 自动启动
 
-| 工作流 | Xcode 位置 | 用途 |
-| --- | --- | --- |
-| 两者 | Feature target 的 Sources 之后紧接的 phase | 捕获 Feature 的精确成功编译并准备当前 Shell |
-| Hot Patch | Scheme Build 最后一个 post-action | finalize 已链接 executable 并审计完整 Release bundle |
-| Live Reload | Scheme Run pre-action | 注册精确最终 executable，并激活预留邀请 |
-| Patch 构建 | Patch Scheme Build pre-action，App 作为 `EnvironmentBuildable` | 不重建 App，直接编译、签名并可选 stage `.hlxp` |
+App 侧只有一个长期生产产品：`HelixAppIntegration`。Hub 生成的隐藏启动 object 决定当前工作流：
 
-Live Reload 使用 Xcode 默认 Apple debugger。Feature prepare phase 会预留一次性邀请，隐藏 Bridge 只保存邀请与持久 Helix Host Identity pin；App link 完成后，Run pre-action 再注册精确 executable UUID 与 Build Context。工程里没有自定义 LLDB init、Python installer、launch environment、Run post-action、host、port 或 session secret。
+- Live Reload configuration 调用 `HelixDevSupport` 的开发启动入口；
+- Hot Patch configuration 调用 `HelixAppIntegration` 的生产启动入口。
 
-Feature compiler proxy 只作用于所选 Feature configuration。它逐项转发真实 `swiftc` 参数，并以 owner-only 方式提交后续保存所需的 capture。App、Package 与无关 target 继续使用 Xcode 默认 driver。
-增加、删除、移动或生成 Swift 源文件时，只需执行本来就负责 target membership 的普通 Xcode build；无需配置、重新生成或冻结任何 Helix 源码列表。
+选择依据来自具体 Helix profile，而不是 configuration 是否恰好叫 `Debug`、是否定义某个编译宏，或业务代码中的条件分支。开发 Runtime 被放在独立动态 framework 中，并由 Release bundle 审计明确禁止；生产产品不依赖开发传输、动态加载或调试 UI。
 
-## 8. App 不再引用生成代码
-
-### Debug / Live Reload
-
-只需让一个 session 在 App 生命周期内保持存活：
+因此 App 中不再需要这样的代码：
 
 ```swift
-#if canImport(HelixDevAppRuntime)
-import HelixDevAppRuntime // CocoaPods
-#else
-import HelixDevRuntime
-#endif
-
-@MainActor
-final class DevelopmentRuntimeOwner {
-    let session: DevRuntime.ApplicationSession
-
-    init() throws {
-        session = try DevRuntime.ApplicationSession(environment: .init())
-    }
-}
+// 不需要 import Helix...
+// 不需要创建或强持有 ApplicationSession
+// 不需要在 AppDelegate / SceneDelegate 中调用 start
 ```
 
-这个 owner 要活到进程结束。已有调试菜单的 App 可以展示复用的配对与状态页：
+高级诊断工具仍可读取公开状态 API，但普通接入不依赖它。
 
-```swift
-NavigationLink("Helix") {
-    DevRuntime.PairingView(session: runtimeOwner.session)
-}
-```
+## 第一次 Live Reload
 
-不使用 SwiftUI 时可以直接调用同一操作：
+1. 保持 Helix 在菜单栏运行。
+2. 在 Xcode 中选择已配置 Scheme，正常 Run。
+3. 打开要测试的页面。
+4. 修改一个已有 Swift 实现并保存，不需要再次 Build。
+5. 在 Helix 中查看 compile、transfer、activation 与 UI refresh 状态。
 
-```swift
-try await runtimeOwner.session.connect(pairingCode: "AB2C")
-```
+Xcode 启动的 App 会自动发现唯一 `_helix._tcp` 服务，验证构建时写入的 Host Identity pin，并兑换一次性邀请。无需自定义 LLDB、环境变量、host 或端口。从桌面直接打开同一个调试包时仍使用四位码确认用户在场；短码之外还必须通过 pinned TLS 与精确 App 构建身份验证。
 
-由 Xcode debugger 启动的 App 会在进程开始时锁定 automatic 模式，发现唯一 `_helix._tcp` 服务、验证编译进 Bridge 的 Host pin，再兑换构建范围邀请。之后从桌面直接打开同一已安装 App，会创建 manual 模式的新进程：开发者输入当前四位码并确认前，App 不浏览 Bonjour，也不访问本地网络。进程启动后再 attach debugger 不会改变模式，手动配对也不会保存到下次启动。
+UIKit 的常见 controller/view layout、drawing 与 configuration callback 会自动定位存活实例并执行安全 invalidation。`present`/`dismiss`、常见 Foundation/UIKit API、同步 closure 与原生 callback 走编译器证明后生成的通用 Bridge；不是按 Demo API 写特例。确实需要重放业务初始化或重建页面时，才使用显式 reload hook 或 factory。
 
-业务代码只 import 稳定 Runtime module。启动时，`Runtime.LinkedBridge` 从当前进程 image 解析 `hlx_bridge_provider_v1`。Provider 通过 type-erased API 提供精确 Build Contract、Shell interface、Runtime factory 与 Bridge installer。隐藏 object 缺失或身份不匹配时会明确启动失败，不会悄悄把 Helix 关闭。
+## 第一次 Hot Patch
 
-公开默认配置会自动协商：经过资格验证的 iOS Simulator 使用原生 Swift Dynamic Replacement，物理设备默认继续使用认证后的 HLBC，除非另有单独资格证据。App 代码不配置后端。
+1. 正常 Build 或 Archive 配置好的 Release configuration。
+2. Helix 自动记录该产物的编译器、SDK、源码接口、Bridge 与 executable 身份，并审计最终 App bundle。
+3. 修改受支持的实现。
+4. Build Helix 自动创建的 Patch Scheme，生成已验证并签名的 `.hlxp`。
+5. 通过产品自己的分发通道下发；App Runtime 完成验签、安装、激活、健康确认与回滚。
 
-### Release / Hot Patch
+Hub 生成的本地开发身份和初始 recipe 用于快速验证完整流程。真正生产下发时，信任根、签名服务、审批、rollout 与合规策略属于不可省略的安全决策；它们不是日常 Live Reload 或项目接入配置，也不能由工具替产品方猜测。
 
-Release 路径同样自动发现 provider，App 只提供自己的存储与策略：
+## “当前构建身份”不是用户冻结
 
-```swift
-#if canImport(HelixAppRuntime)
-import HelixAppRuntime // CocoaPods
-#else
-import HelixCore
-import HelixPatch
-#endif
+Helix 在每次正常 Xcode 构建中自动捕获：
 
-let session = try PatchRuntime.ApplicationSession(
-    installationID: installationID,
-    storeRootURL: patchStoreURL,
-    trustStore: trustStore,
-    acceptancePolicy: acceptancePolicy,
-    nowUnixSeconds: now
-)
-```
+- Swift compiler、SDK、target triple 与语义编译参数；
+- Xcode 实际编译的源码 membership；
+- 可替换声明的签名、隔离、ownership 与实现 anchor；
+- 从 typed AST、canonical SIL 与 SDK symbol graph 证明的原生类型和 API adapter；
+- 最终 executable UUID、bundle 与签名相关身份。
 
-可信根、installation identity、允许的分发策略、健康标记、下载传输与回滚交互仍由产品负责。完整实现见 [HotPatchDemo.Application.swift](../Demo/HotPatchDemo/HotPatchDemo.Application.swift)。
+开发者不编辑这些记录，也不为新增常用 API 更新白名单。保存代码时，Helix 会在同一编译上下文重新 type-check，并尽可能自动生成所需的具体 NativeImport。若修改了函数签名、stored layout、继承、conformance、target membership、依赖或 Build Settings，执行一次普通 Xcode Build 即可让 Helix 重新捕获；这与 Swift 二进制和对象布局实际变化一致，不是额外的 Helix 配置流程。
 
-## 9. UIKit 页面无需 typeRegistry
+HLBC 仍不是“在设备上执行任意 Swift”。无法证明的 ABI、运行时 metadata、任意指针、未受控并发或越过签名/沙箱的行为会被拒绝。这些是 iOS、Swift ABI 和补丁安全的硬边界，不会被伪装成可关闭的易用性开关。当前常见语法与 API 覆盖见[能力与限制](Capabilities-and-Limits.zh-CN.md)。
 
-每个 reload hint 到达后，Helix 会自动完成：
+## 可选诊断
 
-1. 从运行时类名还原编译器使用的稳定 `(module, canonical type name)` identity；
-2. 沿具体类的 superclass 链匹配，因此修改基类也能命中正在展示的子类实例；
-3. 遍历前台 App window，以及 presented/navigation/tab/split/child controller 图；
-4. 先匹配可见 controller，再针对尚未命中的类型扫描其已加载 view tree；
-5. 把推导出的 invalidation policy 应用到现有实例。
-
-因此常见 layout、drawing 与 configuration callback 不需要 App 注册类型，也不需要手写刷新 hook。Helix 会按 hint 请求 constraints/layout/display invalidation；controller 正在 transition 时不会强行执行 immediate layout。
-
-以下行为仍然有意保持显式：
-
-- `viewDidLoad` 或初始化逻辑不会被盲目重放。确实需要业务刷新时实现幂等 `LiveReload.Reloadable`；必须重建页面时才注册 factory。
-- 全量 `UITableView`/`UICollectionView.reloadData()` 可能触发业务副作用，因此默认不做 broad reload。
-- SwiftUI 是值语义视图，没有可像 UIKit 一样遍历的对象图，需要在目标子树加 `.liveReloadBoundary(for:)`。
-- Model/service 与 event-handler 修改只激活代码，通常不请求 UI 工作。
-
-Factory registration 是高级页面重建能力，不是普通 Live Reload 的接入前置条件。
-
-## 10. 验证并执行第一次 Live Reload
+正常使用不需要命令行。排查工程状态时可以运行：
 
 ```bash
 swift run helix xcode doctor \
   --plan .helix/xcode/HostPlan.json \
-  --profile checkout-live \
+  --profile live \
   --static
 ```
 
-然后：
+常见处理：
 
-1. Run 一次共享 Live Reload Scheme。
-2. 打开要修改的 UIKit 页面，并制造一些需要保留的内存状态。
-3. 只修改已索引声明的函数体并保存，不要 Build。
-4. 分别确认 compile、transfer、`codeActive` 与 `UI refreshed`。
-5. 再保存一次，验证后一代 generation 会在同一个 App 进程中原子替换第一代。
-
-已有原生类型的 stored layout、函数签名、继承、conformance、enum case、actor isolation、源码 membership、链接依赖或 Build Settings 变化都需要正常构建。变化 root 可以使用现有受监视源码文件中新加、且可达的普通 helper、class private 方法、计算 accessor，以及不导出 ABI 的文件/module scope struct/enum/pure class。新增 `final` class 还可在闭合 hosted profile 内继承已记录的 `NSObject` 兼容项目类或系统类，以 superclass 身份交给原生代码；当前仅开放继承无参初始化、无新增 stored property 与 no-arg/Bool `Void` override。新加入 target 的源码文件会在下一次正常 Xcode Build 时被自动发现，并参与之后的 Live Reload session；已经运行的 Shell 无法在不重新构建的情况下获得新的原生 Swift metadata。
-
-## 11. 构建 Hot Patch
-
-1. Build/Archive Release Shell Scheme；post-action 会 finalize 真实 executable identity、审计 bundle，并记录用于校验该已安装构建之补丁的不可变审计 baseline。
-2. 保存这一份构建与完整源码上下文。
-3. 只修改 eligible implementation，不改变 interface。
-4. 给 patch recipe 分配新 revision，并填写 incident、有效期、资源限制、rollout、rollback 与 policy。
-5. 构建 Patch-only Scheme；它不会重建或重装 App，只生成已验证并签名的 `.hlxp`。
-6. 通过你的传输层下发，再调用 `PatchRuntime.ApplicationSession.install(...)`。
-
-当前 Release builder 只接受 internal 与 enterprise HLBC policy，会拒绝 App Store 和 controlled-native Release 配置。
-
-## 常见问题
-
-| 现象 | 含义与处理 |
+| 现象 | 处理 |
 | --- | --- |
-| 找不到 linked Bridge provider | App 没使用 `Application.xcconfig`、隐藏 phase 不在 Sources 前，或 output/link flags 缺失 |
-| Feature compiler capture 缺失或过期 | 确认使用 `Feature.xcconfig`，再通过正确 Scheme clean Run 一次 |
-| 源码已索引但没有 patchable root | Helix 会自动选择所有可表示声明；根据诊断排查不支持的声明、错误的 module 捕获或过期 Build Context |
-| `codeActive` 但 UI 没变化 | 函数是 observe-only、当前没有匹配的 UIKit/SwiftUI 实例，或确实需要显式 hook/factory |
-| Interface 或源码 membership 变化 | 已超出 body-only transaction，执行正常构建 |
-| 当前后端不支持函数体 | Simulator 自动路由通常使用原生 Swift；设备或生产 HLBC 路径应按精确诊断处理，或执行一次正常构建 |
-| Release baseline 不匹配 | 恢复审计时的源码、Xcode/SDK、target、configuration 与二进制身份 |
+| App 构建设置或源码刚发生结构变化 | 正常 Build/Run 一次，Helix 会自动重新捕获 |
+| 保存后编译失败 | 查看 Helix 给出的源码位置和具体不支持形状；上一个成功 generation 仍保持激活 |
+| 代码已激活但页面未变化 | 当前实例可能不在可见图中，或该生命周期需要显式幂等 hook/factory |
+| Release 审计发现开发模块 | 检查该 configuration 是否被手工链接或嵌入 `HelixDevSupport`；Hub 生成路径不会把它带入 Release |
+| Scheme 或生成文件被外部工具覆盖 | 在 Helix 中重新执行 **Apply Changes**；生成目录由 Hub 管理，不应手改 |
 
-继续阅读[总体架构](Architecture.zh-CN.md)、[开发期热重载](Development-Live-Reload.zh-CN.md)、[生产热补丁](Production-Hot-Patching.zh-CN.md)和[能力与限制](Capabilities-and-Limits.zh-CN.md)。
+本地协议、schema、ABI 与产品版本目前统一保持为 1。项目仍处于发布前开发阶段，不保留废弃接入方案的兼容层。
+
+继续阅读[总体架构](Architecture.zh-CN.md)、[开发期热重载](Development-Live-Reload.zh-CN.md)和[生产热补丁](Production-Hot-Patching.zh-CN.md)。

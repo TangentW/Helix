@@ -419,7 +419,7 @@ public struct Document: Codable, Hashable, Sendable {
               })
         else {
             throw ShellBuildReceipt.Error.invalid(
-                "frozen Shell value types are duplicated, unordered, or reference unknown sources"
+                "indexed Shell value types are duplicated, unordered, or reference unknown sources"
             )
         }
         guard declarations == declarations.sorted(by: { $0.mangledName < $1.mangledName }),

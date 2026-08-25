@@ -9,26 +9,17 @@ let package = Package(
         .iOS(.v15),
     ],
     products: [
-        // Release targets link only this aggregate product. Dev transport,
-        // dynamic loading, and the debug overlay are intentionally absent.
+        // Hub links this single production product to the application target.
         .library(
-            name: "HelixAppRuntime",
-            targets: [
-                "HelixCore", "HelixBytecode", "HelixInterface", "HelixVerifier",
-                "HelixVM", "HelixRuntimeSupport", "HelixRuntime",
-                "HelixPatch",
-            ]
+            name: "HelixAppIntegration",
+            targets: ["HelixAppIntegration"]
         ),
-        // A dedicated Debug/Dev target links this product instead of combining
-        // HelixAppRuntime with leaf products that repeat the same Swift modules.
+        // Hub links and embeds this dynamic product only for configured Debug
+        // Live Reload builds. It never enters a Release App bundle.
         .library(
-            name: "HelixDevAppRuntime",
-            targets: [
-                "HelixCore", "HelixBytecode", "HelixInterface", "HelixVerifier",
-                "HelixVM", "HelixRuntimeSupport", "HelixRuntime", "HelixPatch",
-                "HelixLiveReloadAPI", "HelixDevProtocol",
-                "HelixDevRuntime",
-            ]
+            name: "HelixDevSupport",
+            type: .dynamic,
+            targets: ["HelixDevSupport"]
         ),
         .library(name: "HelixCore", targets: ["HelixCore"]),
         .library(name: "HelixBytecode", targets: ["HelixBytecode"]),
@@ -76,7 +67,7 @@ let package = Package(
             ]
         ),
         // Shared only inside the Dev graph. It is intentionally not a
-        // standalone product and must never enter HelixAppRuntime.
+        // standalone product and must never enter HelixAppIntegration.
         .target(name: "HelixLiveReloadAPI", dependencies: ["HelixCore"]),
         .target(name: "HelixDevProtocol", dependencies: ["HelixCore", "HelixLiveReloadAPI"]),
         .target(
@@ -98,6 +89,20 @@ let package = Package(
             dependencies: [
                 "HelixCore", "HelixBytecode", "HelixVerifier", "HelixVM", "HelixRuntime",
                 "HelixDevProtocol", "HelixLiveReloadAPI",
+            ]
+        ),
+        .target(
+            name: "HelixAppIntegration",
+            dependencies: [
+                "HelixCore", "HelixBytecode", "HelixVerifier", "HelixVM",
+                "HelixRuntime",
+                "HelixPatch",
+            ]
+        ),
+        .target(
+            name: "HelixDevSupport",
+            dependencies: [
+                "HelixCore", "HelixDevProtocol", "HelixDevRuntime",
             ]
         ),
         .target(

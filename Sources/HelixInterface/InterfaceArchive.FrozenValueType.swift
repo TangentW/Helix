@@ -233,13 +233,13 @@ extension InterfaceArchive.Archive {
               Set(frozenValueTypes.map(\.canonicalName)).count == frozenValueTypes.count
         else {
             throw InterfaceArchive.Error.invalidArchive(
-                "frozen Shell value types are duplicated or unordered"
+                "indexed Shell value types are duplicated or unordered"
             )
         }
         if !frozenValueTypes.isEmpty,
            !capabilities.contains(.localNominalsV1) {
             throw InterfaceArchive.Error.invalidArchive(
-                "frozen Shell value types require the local-nominals capability"
+                "indexed Shell value types require the local-nominals capability"
             )
         }
 
@@ -257,7 +257,7 @@ extension InterfaceArchive.Archive {
                   record.hasSafeSourceCodecShape
             else {
                 throw InterfaceArchive.Error.invalidArchive(
-                    "frozen Shell value type \(record.key) has invalid identity, source, conformance, copyability, or layout"
+                    "indexed Shell value type \(record.key) has invalid identity, source, conformance, copyability, or layout"
                 )
             }
             let memberCount: Int
@@ -266,7 +266,7 @@ extension InterfaceArchive.Archive {
                 memberCount = fields.count
                 guard Set(fields.map(\.name)).count == fields.count else {
                     throw InterfaceArchive.Error.invalidArchive(
-                        "frozen Shell struct \(record.key) has duplicate fields"
+                        "indexed Shell struct \(record.key) has duplicate fields"
                     )
                 }
                 for field in fields {
@@ -274,7 +274,7 @@ extension InterfaceArchive.Archive {
                           Self.isSafeSwiftTypeSpelling(field.swiftType)
                     else {
                         throw InterfaceArchive.Error.invalidArchive(
-                            "frozen Shell struct \(record.key) has an unsafe field spelling"
+                            "indexed Shell struct \(record.key) has an unsafe field spelling"
                         )
                     }
                 }
@@ -283,7 +283,7 @@ extension InterfaceArchive.Archive {
                       Set(cases.map(\.name)).count == cases.count
                 else {
                     throw InterfaceArchive.Error.invalidArchive(
-                        "frozen Shell enum \(record.key) has empty or duplicate cases"
+                        "indexed Shell enum \(record.key) has empty or duplicate cases"
                     )
                 }
                 var enumMemberCount = 0
@@ -292,7 +292,7 @@ extension InterfaceArchive.Archive {
                           item.associatedValues.count <= 64
                     else {
                         throw InterfaceArchive.Error.invalidArchive(
-                            "frozen Shell enum \(record.key) has an invalid case"
+                            "indexed Shell enum \(record.key) has an invalid case"
                         )
                     }
                     for associated in item.associatedValues {
@@ -302,7 +302,7 @@ extension InterfaceArchive.Archive {
                         Self.isSafeSwiftTypeSpelling(associated.swiftType)
                         else {
                             throw InterfaceArchive.Error.invalidArchive(
-                                "frozen Shell enum \(record.key) has an unsafe associated-value spelling"
+                                "indexed Shell enum \(record.key) has an unsafe associated-value spelling"
                             )
                         }
                     }
@@ -312,7 +312,7 @@ extension InterfaceArchive.Archive {
                     guard !addition.overflow,
                           addition.partialValue <= 65_536 else {
                         throw InterfaceArchive.Error.invalidArchive(
-                            "frozen Shell enum \(record.key) contains too many associated values"
+                            "indexed Shell enum \(record.key) contains too many associated values"
                         )
                     }
                     enumMemberCount = addition.partialValue
@@ -322,7 +322,7 @@ extension InterfaceArchive.Archive {
             let addition = totalMembers.addingReportingOverflow(memberCount)
             guard !addition.overflow, addition.partialValue <= 65_536 else {
                 throw InterfaceArchive.Error.invalidArchive(
-                    "frozen Shell value types contain too many members"
+                    "indexed Shell value types contain too many members"
                 )
             }
             totalMembers = addition.partialValue
@@ -334,37 +334,37 @@ extension InterfaceArchive.Archive {
         ) throws {
             guard depth <= 32 else {
                 throw InterfaceArchive.Error.invalidArchive(
-                    "frozen Shell value type nesting exceeds 32 levels"
+                    "indexed Shell value type nesting exceeds 32 levels"
                 )
             }
             switch type {
             case .void, .never, .native, .error, .address, .mutableCell,
                  .nonOwningReference, .arrayState, .dictionaryState, .closure:
                 throw InterfaceArchive.Error.invalidArchive(
-                    "frozen Shell value type contains unsupported storage \(type)"
+                    "indexed Shell value type contains unsupported storage \(type)"
                 )
             case let .integer(width, _):
                 guard [8, 16, 32, 64].contains(width) else {
                     throw InterfaceArchive.Error.invalidArchive(
-                        "frozen Shell value type contains unsupported integer width"
+                        "indexed Shell value type contains unsupported integer width"
                     )
                 }
             case let .float(width):
                 guard width == 32 || width == 64 else {
                     throw InterfaceArchive.Error.invalidArchive(
-                        "frozen Shell value type contains unsupported float width"
+                        "indexed Shell value type contains unsupported float width"
                     )
                 }
             case let .local(key):
                 guard byKey[key] != nil else {
                     throw InterfaceArchive.Error.invalidArchive(
-                        "frozen Shell value type references unknown \(key)"
+                        "indexed Shell value type references unknown \(key)"
                     )
                 }
             case let .array(element):
                 guard capabilities.contains(.collectionsV1) else {
                     throw InterfaceArchive.Error.invalidArchive(
-                        "frozen Shell Array storage requires the collection capability"
+                        "indexed Shell Array storage requires the collection capability"
                     )
                 }
                 try validateMemberType(element, depth: depth + 1)
@@ -374,7 +374,7 @@ extension InterfaceArchive.Archive {
                 guard capabilities.contains(.collectionsV1),
                       element.isVMHashable else {
                     throw InterfaceArchive.Error.invalidArchive(
-                        "frozen Shell Set requires collection and VM-defined Hashable semantics"
+                        "indexed Shell Set requires collection and VM-defined Hashable semantics"
                     )
                 }
                 try validateMemberType(element, depth: depth + 1)
@@ -382,7 +382,7 @@ extension InterfaceArchive.Archive {
                 guard capabilities.contains(.collectionsV1),
                       key.isVMHashable else {
                     throw InterfaceArchive.Error.invalidArchive(
-                        "frozen Shell Dictionary requires collection and VM-defined Hashable semantics"
+                        "indexed Shell Dictionary requires collection and VM-defined Hashable semantics"
                     )
                 }
                 try validateMemberType(key, depth: depth + 1)
@@ -390,7 +390,7 @@ extension InterfaceArchive.Archive {
             case let .tuple(elements):
                 guard elements.count <= 64 else {
                     throw InterfaceArchive.Error.invalidArchive(
-                        "frozen Shell tuple contains too many elements"
+                        "indexed Shell tuple contains too many elements"
                     )
                 }
                 for element in elements {
@@ -399,13 +399,13 @@ extension InterfaceArchive.Archive {
             case .string:
                 guard capabilities.contains(.stringsV1) else {
                     throw InterfaceArchive.Error.invalidArchive(
-                        "frozen Shell String storage requires the string capability"
+                        "indexed Shell String storage requires the string capability"
                     )
                 }
             case .any:
                 guard capabilities.contains(.anyValuesV1) else {
                     throw InterfaceArchive.Error.invalidArchive(
-                        "frozen Shell Any storage requires the Any capability"
+                        "indexed Shell Any storage requires the Any capability"
                     )
                 }
             case .bool:
@@ -437,7 +437,7 @@ extension InterfaceArchive.Archive {
         func checkedDepth(_ value: Int, owner: Bytecode.LocalTypeKey) throws -> Int {
             guard value <= 32 else {
                 throw InterfaceArchive.Error.invalidArchive(
-                    "frozen Shell value type graph exceeds 32 levels at \(owner)"
+                    "indexed Shell value type graph exceeds 32 levels at \(owner)"
                 )
             }
             return value
@@ -477,7 +477,7 @@ extension InterfaceArchive.Archive {
             if let depth = depthByKey[key] { return depth }
             guard visiting.insert(key).inserted, let record = byKey[key] else {
                 throw InterfaceArchive.Error.invalidArchive(
-                    "frozen Shell value type graph is recursive or incomplete at \(key)"
+                    "indexed Shell value type graph is recursive or incomplete at \(key)"
                 )
             }
             defer { visiting.remove(key) }

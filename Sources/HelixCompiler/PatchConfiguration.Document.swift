@@ -148,7 +148,7 @@ public struct NativeImports: Codable, Hashable, Sendable {
         }
         guard allow.allSatisfy({ !$0.isEmpty }), Set(allow).count == allow.count else {
             throw PatchConfiguration.Error.invalid(
-                "module \(moduleName) NativeImport allowlist contains an empty or duplicate entry"
+                "module \(moduleName) NativeImport selection contains an empty or duplicate entry"
             )
         }
     }

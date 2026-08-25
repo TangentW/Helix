@@ -340,7 +340,7 @@ public enum BootstrapError: Swift.Error, Equatable, Sendable, CustomStringConver
         case .executableUUIDMissing:
             "the App executable has no LC_UUID"
         case let .buildMismatch(field):
-            "the running App does not match the frozen Helix \(field)"
+            "the running App does not match the captured Helix \(field)"
         case .runtimeShellMismatch:
             "Runtime.Engine and the generated Shell interface do not match"
         case .bridgeNotInstalled:

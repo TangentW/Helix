@@ -7,7 +7,7 @@ The app provides:
 - a menu-bar service with one four-character, case-insensitive manual pairing code;
 - automatic adoption of an already-running `helix hub run` service, or an embedded service otherwise;
 - project/workspace discovery and a SwiftUI onboarding flow for Hot Patch and Live Reload;
-- transactional PBX project and shared-scheme configuration without adding generated Swift to the Xcode navigator;
+- transactional PBX project, package, configuration, and shared-scheme setup without adding generated Bridge Swift to the Xcode navigator;
 - a signed, bundled build-tool helper whose exact path is published by the
   running service, so generated Xcode phases need no PATH or project
   environment setting;
@@ -18,13 +18,13 @@ The app provides:
 1. Open Helix and choose an Xcode project, workspace, or source directory.
 2. Leave Hot Patch and Live Reload selected, or turn off the workflow that this
    project does not need yet.
-3. For each workflow, choose an App target, Swift Feature target, shared Scheme,
-   and configuration. Helix resolves the module and bundle identity from
-   Xcode's real build settings.
-4. Apply the configuration. PBX, shared-Scheme, xcconfig, generated integration
-   metadata, local-network plist, Patch action, and Integration Kit changes
-   commit as one transaction. Package linkage and runtime startup remain
-   visible code-level actions.
+3. Review the App target, source target, scheme, and configuration detected by
+   Helix. A normal single-target App needs no choices; Helix creates a shared
+   scheme when one does not exist.
+4. Click **Enable Helix**. Package linkage, configuration wrappers, compiler
+   capture, hidden Bridge/bootstrap objects, build-product network setup, Patch
+   action, and Scheme lifecycle changes commit as one transaction. No application
+   source import or runtime initialization is required.
 5. Keep Helix open while using Live Reload. A normal Xcode debugger launch
    connects automatically. A directly opened test build stays offline until its
    debug page submits the four-character code shown by Helix.
@@ -40,6 +40,24 @@ it, the GUI adopts the same control plane and never terminates that external
 process. Generated Xcode phases discover the exact CLI through an owner-only
 rendezvous record; normal projects do not configure `HELIX_EXECUTABLE` or
 depend on shell `PATH`.
+
+The same App target can host Debug Live Reload and Release Hot Patch. Hub links
+the production-safe `HelixAppIntegration` once, while dynamic
+`HelixDevSupport` is linked and embedded only by the Live Reload configuration.
+The compiler, SDK, sources, native adapters, and executable identity are
+captured automatically from ordinary Xcode builds; users do not maintain a
+Helix source list, API allowlist, or manual freeze step.
+
+Configured mappings remain editable. **Apply Changes** automatically restores
+the original PBX configuration references and removes obsolete target, scheme,
+phase, product, and compiler-trigger state before applying the new mapping.
+Turning off both workflows exposes **Remove Helix**, which transactionally
+restores the Xcode project while preserving application source, recipes, and
+signing material. A generated-file ownership manifest removes obsolete files
+on reconfiguration and all owned files on removal without claiming unknown
+files. The owner-only registry retains a non-editable last-applied plan solely
+as removal recovery state; builds and reconfiguration always use the generated
+Host Plan.
 
 The local Dev Protocol and service-rendezvous schema are both version 1. Helix
 accepts exactly that version and fails closed on every other value. It does not

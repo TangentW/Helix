@@ -1,177 +1,91 @@
 #if os(macOS)
 import Foundation
-import HelixBuildTools
 
 extension Hub {
-/// Plans the Info.plist changes required by authenticated local development.
+/// Adds local-development discovery declarations to the processed App plist.
 ///
-/// Existing plists are merged in place so business Bonjour services survive.
-/// Targets that rely on Xcode's generated plist receive a minimal Hub-owned
-/// input; Xcode continues to add the target's ordinary `INFOPLIST_KEY_*` values.
+/// Xcode's source plist and generated-plist settings remain authoritative. The
+/// generated phase declares the processed plist as its input, runs before
+/// signing, and is scoped to the selected configuration. Helix's generated
+/// xcconfig grants the dynamic phase its required script access.
 struct DevelopmentNetworkConfiguration {
-    struct Plan: Sendable {
-        var mutations: [Hub.FileMutation]
-        var applicationBuildSettings: String?
-    }
-
     static let serviceType = "_helix._tcp"
     static let usageDescription =
         "Helix connects this development build to the Mac on your local network."
 
-    private let fileManager: FileManager
+    func script(configurationName: String) -> String {
+        let configuration = shellLiteral(configurationName)
+        let service = shellLiteral(Self.serviceType)
+        let description = shellLiteral(Self.usageDescription)
+        return """
+        set -eu
+        if [ "${CONFIGURATION:-}" != \(configuration) ]; then
+            exit 0
+        fi
 
-    init(fileManager: FileManager = .default) {
-        self.fileManager = fileManager
+        info_plist="${TARGET_BUILD_DIR:?}/${INFOPLIST_PATH:?}"
+        build_root=$(CDPATH= cd -- "${TARGET_BUILD_DIR:?}" && pwd -P)
+        info_directory=$(CDPATH= cd -- "$(/usr/bin/dirname "$info_plist")" && pwd -P)
+        info_plist="$info_directory/$(/usr/bin/basename "$info_plist")"
+        case "$info_plist" in
+            "$build_root"/*) ;;
+            *) echo "error: Helix resolved an Info.plist outside the target build directory" >&2; exit 1 ;;
+        esac
+        if [ ! -f "$info_plist" ] || [ -L "$info_plist" ]; then
+            echo "error: Helix requires the processed App Info.plist before development setup" >&2
+            exit 1
+        fi
+
+        service_type=$(/usr/bin/plutil -type NSBonjourServices "$info_plist" 2>/dev/null || true)
+        case "$service_type" in
+            '')
+                /usr/bin/plutil -insert NSBonjourServices -json '["\(Self.serviceType)"]' "$info_plist"
+                ;;
+            array)
+                service_count=$(/usr/bin/plutil -extract NSBonjourServices raw -o - "$info_plist")
+                case "$service_count" in
+                    ''|*[!0-9]*) echo "error: malformed NSBonjourServices in processed Info.plist" >&2; exit 1 ;;
+                esac
+                service_index=0
+                service_found=0
+                while [ "$service_index" -lt "$service_count" ]; do
+                    current_service=$(/usr/bin/plutil -extract "NSBonjourServices.$service_index" raw -o - "$info_plist")
+                    if [ "$current_service" = \(service) ]; then
+                        service_found=1
+                    fi
+                    service_index=$((service_index + 1))
+                done
+                if [ "$service_found" -eq 0 ]; then
+                    /usr/bin/plutil -insert NSBonjourServices -string \(service) -append "$info_plist"
+                fi
+                ;;
+            *)
+                echo "error: NSBonjourServices must be an array in the processed Info.plist" >&2
+                exit 1
+                ;;
+        esac
+
+        description_type=$(/usr/bin/plutil -type NSLocalNetworkUsageDescription "$info_plist" 2>/dev/null || true)
+        case "$description_type" in
+            '')
+                /usr/bin/plutil -insert NSLocalNetworkUsageDescription -string \(description) "$info_plist"
+                ;;
+            string)
+                current_description=$(/usr/bin/plutil -extract NSLocalNetworkUsageDescription raw -o - "$info_plist")
+                if [ -z "$current_description" ]; then
+                    /usr/bin/plutil -replace NSLocalNetworkUsageDescription -string \(description) "$info_plist"
+                fi
+                ;;
+            *)
+                echo "error: NSLocalNetworkUsageDescription must be a string in the processed Info.plist" >&2
+                exit 1
+                ;;
+        esac
+        """
     }
 
-    func plan(
-        profile: XcodeIntegration.Profile,
-        project: Hub.XcodeProject,
-        settings: Hub.TargetSettings,
-        integrationRoot: String
-    ) throws -> Plan {
-        guard profile.workflow == .liveReload else {
-            return .init(mutations: [], applicationBuildSettings: nil)
-        }
-        if let url = settings.informationPropertyListURL {
-            guard fileManager.fileExists(atPath: url.path) else {
-                throw Hub.Error.projectInspectionFailed(
-                    "configured Info.plist does not exist: `\(url.path)`"
-                )
-            }
-            let path = try relative(url, to: project.sourceRootURL)
-            let propertyList = try mergingExistingPropertyList(at: url)
-            return .init(
-                mutations: [
-                    .init(
-                        relativePath: path,
-                        data: propertyList.data,
-                        permissions: propertyList.permissions
-                    ),
-                ],
-                applicationBuildSettings: nil
-            )
-        }
-        guard settings.generatesInformationPropertyList else {
-            throw Hub.Error.projectInspectionFailed(
-                "`\(profile.applicationTargetName)` has no readable Info.plist and "
-                    + "does not enable GENERATE_INFOPLIST_FILE"
-            )
-        }
-        let relativePath = profileInfoPlistPath(
-            profile: profile,
-            integrationRoot: integrationRoot
-        )
-        return .init(
-            mutations: [
-                .init(
-                    relativePath: relativePath,
-                    data: try encodedPropertyList([:]),
-                    permissions: 0o644
-                ),
-            ],
-            applicationBuildSettings: """
-            // Helix owns the local-development network declarations.
-            GENERATE_INFOPLIST_FILE = NO
-            INFOPLIST_FILE = $(SRCROOT)/\(relativePath)
-            """
-        )
-    }
-
-    private func mergingExistingPropertyList(
-        at url: URL
-    ) throws -> (data: Data, permissions: Int) {
-        let attributes = try fileManager.attributesOfItem(atPath: url.path)
-        guard (attributes[.type] as? FileAttributeType) == .typeRegular,
-              let size = (attributes[.size] as? NSNumber)?.intValue,
-              size > 0, size <= 8 * 1_024 * 1_024,
-              let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue,
-              (0...0o777).contains(permissions)
-        else {
-            throw Hub.Error.projectInspectionFailed(
-                "Info.plist is not a bounded regular file: `\(url.path)`"
-            )
-        }
-        let data = try Data(contentsOf: url, options: .mappedIfSafe)
-        let value: Any
-        do {
-            value = try PropertyListSerialization.propertyList(
-                from: data,
-                options: [],
-                format: nil
-            )
-        } catch {
-            throw Hub.Error.projectInspectionFailed(
-                "Info.plist is malformed: `\(url.path)`"
-            )
-        }
-        guard let dictionary = value as? [String: Any] else {
-            throw Hub.Error.projectInspectionFailed("Info.plist root must be a dictionary")
-        }
-        return (try encodedPropertyList(dictionary), permissions)
-    }
-
-    private func encodedPropertyList(_ original: [String: Any]) throws -> Data {
-        var dictionary = original
-        var services: [String]
-        switch dictionary["NSBonjourServices"] {
-        case nil:
-            services = []
-        case let value as [String]:
-            services = value
-        default:
-            throw Hub.Error.projectInspectionFailed(
-                "NSBonjourServices must be an array of strings"
-            )
-        }
-        var seen: Set<String> = []
-        services = services.filter { !$0.isEmpty && seen.insert($0).inserted }
-        if seen.insert(Self.serviceType).inserted {
-            services.append(Self.serviceType)
-        }
-        dictionary["NSBonjourServices"] = services
-
-        if let description = dictionary["NSLocalNetworkUsageDescription"] {
-            guard let value = description as? String,
-                  !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            else {
-                throw Hub.Error.projectInspectionFailed(
-                    "NSLocalNetworkUsageDescription must be a nonempty string"
-                )
-            }
-        } else {
-            dictionary["NSLocalNetworkUsageDescription"] = Self.usageDescription
-        }
-        do {
-            return try PropertyListSerialization.data(
-                fromPropertyList: dictionary,
-                format: .xml,
-                options: 0
-            )
-        } catch {
-            throw Hub.Error.projectInspectionFailed(
-                "Info.plist contains a value that cannot be serialized"
-            )
-        }
-    }
-
-    private func relative(_ url: URL, to root: URL) throws -> String {
-        let root = root.standardizedFileURL
-        let url = url.standardizedFileURL
-        guard url.path.hasPrefix(root.path + "/") else {
-            throw Hub.Error.projectInspectionFailed(
-                "Info.plist resolves outside the selected source root"
-            )
-        }
-        return String(url.path.dropFirst(root.path.count + 1))
-    }
-
-    private func profileInfoPlistPath(
-        profile: XcodeIntegration.Profile,
-        integrationRoot: String
-    ) -> String {
-        "\(integrationRoot)/ProjectConfigurations/"
-            + "\(profile.id)-Application-Info.plist"
+    private func shellLiteral(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
     }
 }
 }

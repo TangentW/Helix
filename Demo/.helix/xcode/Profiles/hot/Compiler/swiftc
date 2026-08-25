@@ -1,0 +1,104 @@
+#!/bin/sh
+set -eu
+umask 077
+
+# XCBuild queries a custom SWIFT_EXEC before it creates a target
+# build environment. Forward those discovery calls through xcrun;
+# real target compilation supplies the exact selected toolchain.
+real_compiler="${HELIX_REAL_SWIFT_EXEC:-}"
+if [ -z "$real_compiler" ]; then
+    real_compiler=$(/usr/bin/xcrun --find swiftc)
+fi
+case "$real_compiler" in
+    /*/swiftc|/*/swift-driver) ;;
+    *)
+        echo "error: HELIX_REAL_SWIFT_EXEC is not an absolute Swift compiler" >&2
+        exit 2
+        ;;
+esac
+if [ ! -x "$real_compiler" ]; then
+    echo "error: Helix cannot execute the selected Swift compiler" >&2
+    exit 2
+fi
+temporary=
+
+cleanup() {
+    if [ -n "$temporary" ]; then
+        /bin/rm -f "$temporary"
+    fi
+}
+trap cleanup 0 1 2 15
+
+has_module=false
+has_target=false
+has_sdk=false
+next_output=
+output_file_map=
+module_output=
+for argument in "$@"; do
+    if [ -n "$next_output" ]; then
+        if [ "$next_output" = map ]; then
+            output_file_map="$argument"
+        else
+            module_output="$argument"
+        fi
+        next_output=
+        continue
+    fi
+    case "$argument" in
+        -module-name) has_module=true ;;
+        -target) has_target=true ;;
+        -sdk) has_sdk=true ;;
+        -output-file-map) next_output=map ;;
+        -output-file-map=*) output_file_map="${argument#*=}" ;;
+        -emit-module-path) next_output=module ;;
+        -emit-module-path=*) module_output="${argument#*=}" ;;
+    esac
+done
+should_capture=false
+if [ "$has_module" = true ] && [ "$has_target" = true ] && [ "$has_sdk" = true ]; then
+    compiler_output="${output_file_map:-$module_output}"
+    case "$compiler_output" in
+        /*) ;;
+        *)
+            echo "error: Helix cannot locate the Xcode Swift object directory" >&2
+            exit 2
+            ;;
+    esac
+    architecture_directory=$(/usr/bin/dirname "$compiler_output")
+    objects_directory=$(/usr/bin/dirname "$architecture_directory")
+    case $(/usr/bin/basename "$objects_directory") in
+        Objects-*) ;;
+        *)
+            echo "error: Helix received an unexpected Xcode Swift output path" >&2
+            exit 2
+            ;;
+    esac
+    should_capture=true
+    proxy_directory="$(/usr/bin/dirname "$objects_directory")/Helix"
+    capture_file="$proxy_directory/FrontendInvocation.hlxswiftc"
+    /bin/mkdir -p "$proxy_directory"
+fi
+set +e
+"$real_compiler" "$@"
+compiler_status=$?
+set -e
+if [ "$compiler_status" -ne 0 ]; then
+    exit "$compiler_status"
+fi
+
+if [ "$should_capture" = true ]; then
+    temporary=$(/usr/bin/mktemp "$proxy_directory/.FrontendInvocation.XXXXXX")
+    {
+        /usr/bin/printf '%s\0' 'HLX.SwiftInvocation.v1' "$real_compiler"
+        for argument in "$@"; do
+            /usr/bin/printf '%s\0' "$argument"
+        done
+    } > "$temporary"
+    /bin/mv -f "$temporary" "$capture_file"
+    script_directory=$(CDPATH= cd -- "$(/usr/bin/dirname -- "$0")" && pwd -P)
+    /bin/sh "$script_directory/post-compile.sh" "$capture_file"
+fi
+temporary=
+trap - 0 1 2 15
+exit 0

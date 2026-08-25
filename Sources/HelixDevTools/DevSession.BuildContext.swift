@@ -150,9 +150,9 @@ public enum ContextError: Swift.Error, Equatable, Sendable, CustomStringConverti
         case .invalidValue:
             "Build Context contains invalid or unsafe metadata"
         case .workspaceMismatch:
-            "Build Context workspace does not match the frozen manifest"
+            "Build Context workspace does not match the captured Dev Manifest"
         case .buildIdentityMismatch:
-            "Build Context no longer resolves to its frozen Shell identity"
+            "Build Context no longer resolves to its registered Shell identity"
         case .shellIdentityCollision:
             "one Shell ID was registered with conflicting build identities"
         case .buildIdentityCollision:

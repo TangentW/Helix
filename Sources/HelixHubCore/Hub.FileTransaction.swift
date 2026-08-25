@@ -1,5 +1,11 @@
 import Foundation
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
 extension Hub {
 struct FileMutation: Sendable {
     var relativePath: String
@@ -29,16 +35,26 @@ struct FileTransaction {
     func commit(
         root: URL,
         mutations: [Hub.FileMutation],
+        deletions: [String] = [],
         privateDirectories: [String] = []
     ) throws -> [String] {
         let root = root.standardizedFileURL
-        guard !mutations.isEmpty else { return [] }
+        guard !mutations.isEmpty || !deletions.isEmpty else { return [] }
         let uniquePaths = Set(mutations.map(\.relativePath))
-        guard uniquePaths.count == mutations.count else {
-            throw Hub.Error.transactionFailed("the write set contains duplicate paths")
+        let uniqueDeletions = Set(deletions)
+        guard uniquePaths.count == mutations.count,
+              uniqueDeletions.count == deletions.count,
+              uniquePaths.isDisjoint(with: uniqueDeletions)
+        else {
+            throw Hub.Error.transactionFailed(
+                "the transaction contains duplicate or conflicting paths"
+            )
         }
         let ordered = try mutations.sorted { $0.relativePath < $1.relativePath }.map {
             try validated($0, root: root)
+        }
+        let orderedDeletions = try deletions.sorted().map { relativePath in
+            (relativePath, try safeURL(relativePath: relativePath, root: root))
         }
         var directorySnapshots: [DirectorySnapshot] = []
         var written: [Snapshot] = []
@@ -63,6 +79,13 @@ struct FileTransaction {
                     ofItemAtPath: item.url.path
                 )
             }
+            for (_, url) in orderedDeletions {
+                let snapshot = try snapshot(url)
+                try ensureSafeParents(of: url, beneath: root)
+                guard try entryStatus(at: url) != nil else { continue }
+                written.append(snapshot)
+                try fileManager.removeItem(at: url)
+            }
             return ordered.map { $0.mutation.relativePath }
         } catch {
             let original = error
@@ -77,7 +100,7 @@ struct FileTransaction {
                                 ofItemAtPath: snapshot.url.path
                             )
                         }
-                    } else if fileManager.fileExists(atPath: snapshot.url.path) {
+                    } else if try entryStatus(at: snapshot.url) != nil {
                         try fileManager.removeItem(at: snapshot.url)
                     }
                 } catch {
@@ -91,7 +114,7 @@ struct FileTransaction {
                             [.posixPermissions: permissions],
                             ofItemAtPath: snapshot.url.path
                         )
-                    } else if fileManager.fileExists(atPath: snapshot.url.path),
+                    } else if try entryStatus(at: snapshot.url) != nil,
                               try fileManager.contentsOfDirectory(
                                 atPath: snapshot.url.path
                               ).isEmpty {
@@ -116,16 +139,16 @@ struct FileTransaction {
     ) throws -> DirectorySnapshot {
         let directory = try safeURL(relativePath: relativePath, root: root)
         try ensureSafeParents(of: directory, beneath: root)
-        let existed = fileManager.fileExists(atPath: directory.path)
+        let status = try entryStatus(at: directory)
+        let existed = status != nil
         let permissions: Int?
-        if existed {
-            let attributes = try fileManager.attributesOfItem(atPath: directory.path)
-            guard (attributes[.type] as? FileAttributeType) == .typeDirectory else {
+        if let status {
+            guard status.st_mode & S_IFMT == S_IFDIR else {
                 throw Hub.Error.transactionFailed(
                     "private destination is not a real directory"
                 )
             }
-            permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue
+            permissions = Int(status.st_mode & 0o777)
         } else {
             permissions = nil
             try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -171,20 +194,19 @@ struct FileTransaction {
     }
 
     private func snapshot(_ url: URL) throws -> Snapshot {
-        guard fileManager.fileExists(atPath: url.path) else {
+        guard let status = try entryStatus(at: url) else {
             return .init(url: url, data: nil, permissions: nil)
         }
-        let attributes = try fileManager.attributesOfItem(atPath: url.path)
-        guard (attributes[.type] as? FileAttributeType) == .typeRegular,
-              let size = (attributes[.size] as? NSNumber)?.intValue,
-              size <= 64 * 1_024 * 1_024
+        guard status.st_mode & S_IFMT == S_IFREG,
+              status.st_size >= 0,
+              status.st_size <= 64 * 1_024 * 1_024
         else {
             throw Hub.Error.transactionFailed("destination is not a bounded regular file")
         }
         return .init(
             url: url,
             data: try Data(contentsOf: url),
-            permissions: (attributes[.posixPermissions] as? NSNumber)?.intValue
+            permissions: Int(status.st_mode & 0o777)
         )
     }
 
@@ -198,14 +220,27 @@ struct FileTransaction {
             paths.append(cursor)
             cursor.deleteLastPathComponent()
         }
-        for directory in paths.reversed() where fileManager.fileExists(atPath: directory.path) {
-            let attributes = try fileManager.attributesOfItem(atPath: directory.path)
-            guard (attributes[.type] as? FileAttributeType) == .typeDirectory else {
+        for directory in paths.reversed() {
+            guard let status = try entryStatus(at: directory) else { continue }
+            guard status.st_mode & S_IFMT == S_IFDIR else {
                 throw Hub.Error.transactionFailed(
                     "destination parent is not a real directory: \(directory.path)"
                 )
             }
         }
+    }
+
+    /// `FileManager.fileExists` follows links and therefore reports a dangling
+    /// symlink as absent. Transactions need the directory entry itself so both
+    /// live and dangling links are rejected consistently.
+    private func entryStatus(at url: URL) throws -> stat? {
+        var status = stat()
+        let result = url.path.withCString { lstat($0, &status) }
+        if result == 0 { return status }
+        if errno == ENOENT || errno == ENOTDIR { return nil }
+        throw Hub.Error.transactionFailed(
+            "destination cannot be inspected safely: \(url.path)"
+        )
     }
 }
 }

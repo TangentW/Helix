@@ -53,4 +53,9 @@ if [ -z "$helix_executable" ] || ! command -v "$helix_executable" >/dev/null 2>&
     exit 1
 fi
 
+if [ "$phase" = post-compile ]; then
+    capture="${2:?missing Swift compiler capture}"
+    exec "$helix_executable" xcode post-compile         --plan "$HELIX_HOST_PLAN"         --profile "$HELIX_PROFILE_ID"         --capture "$capture"
+fi
+
 exec "$helix_executable" xcode phase     --plan "$HELIX_HOST_PLAN"     --profile "$HELIX_PROFILE_ID"     --phase "$phase"

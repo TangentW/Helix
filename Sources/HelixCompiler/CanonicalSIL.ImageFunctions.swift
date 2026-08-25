@@ -230,7 +230,7 @@ enum ImageFunctions {
             case let .globalActor(actor):
                 throw DiscoveryError.unsupported(
                     symbol: symbol,
-                    reason: "global actor \(actor) has no frozen executor contract"
+                    reason: "global actor \(actor) has no captured executor contract"
                 )
             case let .unknown(description):
                 throw DiscoveryError.unsupported(
@@ -242,7 +242,7 @@ enum ImageFunctions {
                     symbol: symbol,
                     reason: "actor-instance isolation"
                         + (name.map { " (\($0))" } ?? "")
-                        + " has no frozen executor contract"
+                        + " has no captured executor contract"
                 )
             case .unspecified, .nonisolated, .actorInstance:
                 break

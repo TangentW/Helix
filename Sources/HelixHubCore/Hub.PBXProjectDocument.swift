@@ -66,7 +66,11 @@ struct PBXProjectDocument {
                 )
             }
             objects[identifier] = value
-            replacements[identifier] = value
+            if additions[identifier] != nil {
+                additions[identifier] = value
+            } else {
+                replacements[identifier] = value
+            }
             return
         }
         objects[identifier] = value
@@ -170,14 +174,26 @@ struct PBXProjectDocument {
         identifier: String,
         in text: String
     ) throws -> Range<String.Index> {
+        let objects = try objectsDictionaryBounds(in: text)
         let escaped = NSRegularExpression.escapedPattern(for: identifier)
         let expression = try NSRegularExpression(
             pattern: "(?m)^[\\t ]*\(escaped)(?:[\\t ]*/\\*[^\\r\\n]*?\\*/)?[\\t ]*=[\\t ]*"
         )
-        let full = NSRange(text.startIndex..<text.endIndex, in: text)
-        let matches = expression.matches(in: text, range: full)
-        guard matches.count == 1, let match = matches.first,
-              let prefixRange = Range(match.range, in: text)
+        let searchRange = text.index(after: objects.openingBrace)..<objects.closingBrace
+        let matches = expression.matches(
+            in: text,
+            range: NSRange(searchRange, in: text)
+        ).compactMap { match -> Range<String.Index>? in
+            guard let range = Range(match.range, in: text),
+                  lexicalCurlyDepth(
+                    in: text,
+                    from: objects.openingBrace,
+                    to: range.lowerBound
+                  ) == 1
+            else { return nil }
+            return range
+        }
+        guard matches.count == 1, let prefixRange = matches.first
         else {
             throw Hub.Error.invalidProject(
                 "cannot uniquely locate PBX object \(identifier) for editing"
@@ -190,6 +206,97 @@ struct PBXProjectDocument {
         let end = try dictionaryRecordEnd(from: brace, in: text)
         let start = prefixRange.lowerBound
         return start..<end
+    }
+
+    private static func objectsDictionaryBounds(
+        in text: String
+    ) throws -> (openingBrace: String.Index, closingBrace: String.Index) {
+        let expression = try NSRegularExpression(
+            pattern: "(?m)^[\\t ]*objects[\\t ]*=[\\t ]*"
+        )
+        let full = NSRange(text.startIndex..<text.endIndex, in: text)
+        let candidates = expression.matches(in: text, range: full).compactMap {
+            match -> String.Index? in
+            guard let range = Range(match.range, in: text),
+                  lexicalCurlyDepth(
+                    in: text,
+                    from: text.startIndex,
+                    to: range.lowerBound
+                  ) == 1,
+                  range.upperBound < text.endIndex,
+                  text[range.upperBound] == "{"
+            else { return nil }
+            return range.upperBound
+        }
+        guard candidates.count == 1, let openingBrace = candidates.first else {
+            throw Hub.Error.invalidProject(
+                "cannot uniquely locate the PBX objects dictionary"
+            )
+        }
+        let end = try dictionaryRecordEnd(from: openingBrace, in: text)
+        let semicolon = text.index(before: end)
+        guard text[semicolon] == ";" else {
+            throw Hub.Error.invalidProject("PBX objects dictionary lacks a semicolon")
+        }
+        var closingBrace = text.index(before: semicolon)
+        while closingBrace > openingBrace, text[closingBrace].isWhitespace {
+            closingBrace = text.index(before: closingBrace)
+        }
+        guard text[closingBrace] == "}" else {
+            throw Hub.Error.invalidProject("PBX objects dictionary is malformed")
+        }
+        return (openingBrace, closingBrace)
+    }
+
+    /// Returns the dictionary nesting depth at `limit` only when that point is
+    /// ordinary OpenStep syntax rather than a string or comment.
+    private static func lexicalCurlyDepth(
+        in text: String,
+        from start: String.Index,
+        to limit: String.Index
+    ) -> Int? {
+        var index = start
+        var depth = 0
+        var quoted = false
+        var escaped = false
+        var lineComment = false
+        var blockComment = false
+        while index < limit {
+            let next = text.index(after: index)
+            let character = text[index]
+            let following = next < limit ? text[next] : "\0"
+            if lineComment {
+                if character == "\n" { lineComment = false }
+            } else if blockComment {
+                if character == "*", following == "/" {
+                    blockComment = false
+                    index = next
+                }
+            } else if quoted {
+                if escaped {
+                    escaped = false
+                } else if character == "\\" {
+                    escaped = true
+                } else if character == "\"" {
+                    quoted = false
+                }
+            } else if character == "/", following == "/" {
+                lineComment = true
+                index = next
+            } else if character == "/", following == "*" {
+                blockComment = true
+                index = next
+            } else if character == "\"" {
+                quoted = true
+            } else if character == "{" {
+                depth += 1
+            } else if character == "}" {
+                depth -= 1
+                if depth < 0 { return nil }
+            }
+            index = text.index(after: index)
+        }
+        return quoted || escaped || lineComment || blockComment ? nil : depth
     }
 
     private static func dictionaryRecordEnd(
@@ -268,7 +375,12 @@ struct PBXProjectDocument {
         guard let match = expression.matches(in: text, range: full).last,
               let objectsEnd = Range(match.range, in: text)
         else {
-            throw Hub.Error.invalidProject("cannot locate PBX objects dictionary terminator")
+            let objects = try objectsDictionaryBounds(in: text)
+            let block = "\n/* Begin \(section) section */\n\(records)\n/* End \(section) section */\n"
+            return text.replacingCharacters(
+                in: objects.closingBrace..<objects.closingBrace,
+                with: block
+            )
         }
         let block = "\n/* Begin \(section) section */\n\(records)\n/* End \(section) section */\n"
         return text.replacingCharacters(

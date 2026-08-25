@@ -124,7 +124,6 @@ public struct Requirement: Codable, Hashable, Sendable, Identifiable {
 public struct OnboardingPlan: Sendable {
     public var project: Hub.XcodeProject
     public var hostPlan: XcodeIntegration.HostPlan
-    public var featureTargetNames: [String: String]
     public var artifacts: [String: Data]
     public var requirements: [Hub.Requirement]
     public var developmentIdentityProfiles: [String]
@@ -132,14 +131,12 @@ public struct OnboardingPlan: Sendable {
     public init(
         project: Hub.XcodeProject,
         hostPlan: XcodeIntegration.HostPlan,
-        featureTargetNames: [String: String],
         artifacts: [String: Data],
         requirements: [Hub.Requirement],
         developmentIdentityProfiles: [String]
     ) {
         self.project = project
         self.hostPlan = hostPlan
-        self.featureTargetNames = featureTargetNames
         self.artifacts = artifacts
         self.requirements = requirements
         self.developmentIdentityProfiles = developmentIdentityProfiles
@@ -163,12 +160,10 @@ public struct OnboardingPlanner: Sendable {
         }
         var featuresByTarget: [String: XcodeIntegration.Feature] = [:]
         var featureTargetNames: [String: String] = [:]
-        var requirements: [Hub.Requirement] = []
+        let requirements: [Hub.Requirement] = []
         var artifacts: [String: Data] = [:]
         var profiles: [XcodeIntegration.Profile] = []
         var developmentIdentityProfiles: [String] = []
-        var applicationTargetsByCapability: [Hub.Capability: String] = [:]
-
         for profile in draft.profiles.sorted(by: { $0.id < $1.id }) {
             guard let app = draft.project.target(named: profile.applicationTargetName),
                   let featureTarget = draft.project.target(named: profile.featureTargetName)
@@ -182,47 +177,33 @@ public struct OnboardingPlanner: Sendable {
                     "\(profile.applicationTargetName) is not an application target"
                 )
             }
-            guard draft.project.sharedSchemes.contains(where: {
-                $0.name == profile.schemeName
-            }) else {
+            guard !profile.schemeName.isEmpty else {
                 throw Hub.Error.invalidOnboarding(
-                    "scheme \(profile.schemeName) must be shared before Helix can configure it"
-                )
-            }
-            guard app.id != featureTarget.id else {
-                throw Hub.Error.invalidOnboarding(
-                    "the App and reloadable Feature must be separate targets so their "
-                        + "compiler and linker configurations remain isolated"
+                    "profile \(profile.id) needs an Xcode scheme name"
                 )
             }
             guard app.configurationNames.contains(profile.configurationName),
                   featureTarget.configurationNames.contains(profile.configurationName)
             else {
                 throw Hub.Error.invalidOnboarding(
-                    "\(profile.configurationName) must exist on both App and Feature targets"
+                    "\(profile.configurationName) must exist on both App and source targets"
                 )
             }
-            if let prior = applicationTargetsByCapability[profile.capability], prior != app.name {
-                throw Hub.Error.invalidOnboarding(
-                    "one capability cannot span multiple App targets in one profile"
-                )
-            }
-            applicationTargetsByCapability[profile.capability] = app.name
-
             let featureID = Self.slug(featureTarget.name)
             let feature = XcodeIntegration.Feature(
                 id: featureID,
+                targetName: featureTarget.name,
                 moduleName: profile.featureModuleName
             )
             if let existing = featuresByTarget[featureTarget.id], existing != feature {
                 throw Hub.Error.invalidOnboarding(
-                    "Feature target \(featureTarget.name) has conflicting module settings"
+                    "source target \(featureTarget.name) has conflicting module settings"
                 )
             }
             featuresByTarget[featureTarget.id] = feature
             if let existing = featureTargetNames[featureID], existing != featureTarget.name {
                 throw Hub.Error.invalidOnboarding(
-                    "Feature target names produce the same Helix identifier: \(featureID)"
+                    "source target names produce the same Helix identifier: \(featureID)"
                 )
             }
             featureTargetNames[featureID] = featureTarget.name
@@ -273,21 +254,6 @@ public struct OnboardingPlanner: Sendable {
                 featureID: featureID,
                 patch: patchSettings
             ))
-            requirements.append(contentsOf: Self.runtimeRequirements(
-                app: app,
-                workflow: workflow,
-                configurationName: profile.configurationName
-            ))
-        }
-
-        if selected.count == 2,
-           let hot = applicationTargetsByCapability[.hotPatch],
-           let live = applicationTargetsByCapability[.liveReload],
-           hot == live {
-            throw Hub.Error.invalidOnboarding(
-                "Hot Patch and Live Reload must use distinct App targets: Release must link "
-                    + "only HelixAppRuntime while Debug must link only HelixDevAppRuntime"
-            )
         }
         let relativeProject = try Self.relative(
             draft.project.projectURL,
@@ -307,7 +273,6 @@ public struct OnboardingPlanner: Sendable {
         return .init(
             project: draft.project,
             hostPlan: hostPlan,
-            featureTargetNames: featureTargetNames,
             artifacts: artifacts,
             requirements: requirements.sorted { $0.code < $1.code },
             developmentIdentityProfiles: developmentIdentityProfiles.sorted()
@@ -336,36 +301,6 @@ public struct OnboardingPlanner: Sendable {
         )
         try recipe.validate()
         return try Core.CanonicalJSON.encode(recipe)
-    }
-
-    private static func runtimeRequirements(
-        app: Hub.XcodeTarget,
-        workflow: XcodeIntegration.Workflow,
-        configurationName: String
-    ) -> [Hub.Requirement] {
-        let expected = workflow.runtimePackageProduct
-        let opposite = workflow == .liveReload ? "HelixAppRuntime" : "HelixDevAppRuntime"
-        var result: [Hub.Requirement] = []
-        if !app.linksRuntimeProduct(expected, configurationName: configurationName) {
-            result.append(.init(
-                code: "HLXHUB101-\(Self.slug(app.name))-\(workflow.rawValue)",
-                severity: .actionRequired,
-                summary: "Link \(expected) to \(app.name)",
-                detail: "This is the only code-level Xcode step Hub does not infer: add the "
-                    + "Helix Swift package product or CocoaPod to the App target, then initialize the matching "
-                    + "runtime API in application code."
-            ))
-        }
-        if app.linksRuntimeProduct(opposite, configurationName: configurationName) {
-            result.append(.init(
-                code: "HLXHUB102-\(Self.slug(app.name))-\(workflow.rawValue)",
-                severity: .actionRequired,
-                summary: "Remove \(opposite) from \(app.name)",
-                detail: "Release and development runtime products cannot coexist in one App "
-                    + "image; doing so duplicates modules and leaks development capabilities."
-            ))
-        }
-        return result
     }
 
     private static func slug(_ value: String) -> String {

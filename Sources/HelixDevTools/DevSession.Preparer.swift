@@ -576,7 +576,7 @@ public struct Preparer<Probe: BuildCapture.Probing>: Sendable {
         )
         guard mismatches.isEmpty else {
             throw DevSession.PrepareError.identityMismatch(
-                "frozen fields differ: \(mismatches.joined(separator: ", "))"
+                "captured build fields differ: \(mismatches.joined(separator: ", "))"
             )
         }
     }
@@ -621,7 +621,7 @@ public struct Preparer<Probe: BuildCapture.Probing>: Sendable {
               })
         else {
             throw DevSession.PrepareError.identityMismatch(
-                "Reload Index contains a source or function outside the frozen HLXI"
+                "Reload Index contains a source or function outside the captured HLXI"
             )
         }
     }

@@ -56,8 +56,7 @@ struct ShellBuildPipeline {
         )
         #expect(bridge.contains("public static func makePatchBuildContract()"))
         #expect(bridge.contains("runtimeImageIdentity: .current"))
-        #expect(bridge.contains("#elseif canImport(HelixDevAppRuntime)"))
-        #expect(bridge.contains("#elseif canImport(HelixAppRuntime)"))
+        #expect(bridge.contains("#elseif canImport(HelixAppIntegration)"))
         let devContract = String(
             decoding: try #require(
                 artifacts["Generated/FixtureBridge.DevBuildContract.swift"]
@@ -73,8 +72,7 @@ struct ShellBuildPipeline {
         #expect(devContract.contains("platform: .iOS"))
         #expect(devContract.contains("runtimeImageIdentity: .current"))
         #expect(devContract.contains(output.report.reloadIndexHash.hex))
-        #expect(devContract.contains("#elseif canImport(HelixDevAppRuntime)"))
-        #expect(!devContract.contains("#elseif canImport(HelixAppRuntime)"))
+        #expect(devContract.contains("#elseif canImport(HelixDevSupport)"))
         let provider = String(
             decoding: try #require(
                 artifacts["Generated/FixtureBridge.Provider.swift"]
@@ -88,14 +86,14 @@ struct ShellBuildPipeline {
         #expect(provider.contains("try FixtureBridge.makeShellInterface()"))
         #expect(provider.contains("install: { runtime in"))
         #expect(provider.contains("try FixtureBridge.bootstrap(using: runtime)"))
-        #expect(provider.contains("#elseif canImport(HelixAppRuntime)"))
+        #expect(provider.contains("#elseif canImport(HelixAppIntegration)"))
         let planBytes = try #require(artifacts["Xcode/IntegrationPlan.json"])
         let plan = try JSONDecoder().decode(XcodeIntegration.Plan.self, from: planBytes)
         try plan.validate()
         #expect(plan.featureModuleName == "Fixture")
         #expect(plan.bridgeModuleName == "FixtureHelixBridge")
-        #expect(plan.releaseRuntimePackageProduct == "HelixAppRuntime")
-        #expect(plan.developmentRuntimePackageProduct == "HelixDevAppRuntime")
+        #expect(plan.releaseRuntimePackageProduct == "HelixAppIntegration")
+        #expect(plan.developmentRuntimePackageProduct == "HelixDevSupport")
         #expect(try Core.CanonicalJSON.encode(plan) == planBytes)
         let featureList = String(
             decoding: try #require(artifacts[plan.featureSourceList]),
@@ -116,8 +114,8 @@ struct ShellBuildPipeline {
             decoding: try #require(artifacts["Xcode/HelixShell.xcconfig"]),
             as: UTF8.self
         )
-        #expect(xcconfig.contains("HELIX_RELEASE_RUNTIME_PRODUCT = HelixAppRuntime"))
-        #expect(xcconfig.contains("HELIX_DEV_RUNTIME_PRODUCT = HelixDevAppRuntime"))
+        #expect(xcconfig.contains("HELIX_RELEASE_RUNTIME_PRODUCT = HelixAppIntegration"))
+        #expect(xcconfig.contains("HELIX_DEV_RUNTIME_PRODUCT = HelixDevSupport"))
         #expect(
             output.report.generatedSources.map(\.path)
                 == output.report.generatedSources.map(\.path).sorted()

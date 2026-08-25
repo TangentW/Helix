@@ -63,16 +63,17 @@ public struct XcodeTarget: Hashable, Sendable, Identifiable {
     public var productType: String?
     public var kind: Kind
     public var configurationNames: [String]
-    public var sourceFiles: [String]
+    /// Whether Xcode can schedule a source compilation for this target.
+    ///
+    /// This is deliberately capability-level metadata. Source membership is
+    /// learned from Xcode's successful Swift frontend invocation instead of
+    /// being guessed from the project file or a synchronized directory.
+    public var supportsSourceCompilation: Bool
     public var packageProducts: [String]
     public var baseConfigurationPaths: [String: String]
-    public var cocoaPodsProductsByConfiguration: [String: [String]]
 
-    /// App-facing Helix runtime products linked through any supported manager.
-    public var linkedRuntimeProducts: [String] {
-        Array(Set(packageProducts).union(cocoaPodsProductsByConfiguration.values.flatMap { $0 }))
-            .sorted()
-    }
+    /// Swift package products linked to this target.
+    public var linkedRuntimeProducts: [String] { packageProducts }
 
     public init(
         id: String,
@@ -82,10 +83,9 @@ public struct XcodeTarget: Hashable, Sendable, Identifiable {
         productType: String?,
         kind: Kind,
         configurationNames: [String],
-        sourceFiles: [String],
+        supportsSourceCompilation: Bool,
         packageProducts: [String],
-        baseConfigurationPaths: [String: String],
-        cocoaPodsProductsByConfiguration: [String: [String]] = [:]
+        baseConfigurationPaths: [String: String]
     ) {
         self.id = id
         self.name = name
@@ -94,21 +94,13 @@ public struct XcodeTarget: Hashable, Sendable, Identifiable {
         self.productType = productType
         self.kind = kind
         self.configurationNames = configurationNames
-        self.sourceFiles = sourceFiles
+        self.supportsSourceCompilation = supportsSourceCompilation
         self.packageProducts = packageProducts
         self.baseConfigurationPaths = baseConfigurationPaths
-        self.cocoaPodsProductsByConfiguration = cocoaPodsProductsByConfiguration
     }
 
-    public func linksRuntimeProduct(
-        _ product: String,
-        configurationName: String? = nil
-    ) -> Bool {
-        if packageProducts.contains(product) { return true }
-        if let configurationName {
-            return cocoaPodsProductsByConfiguration[configurationName]?.contains(product) == true
-        }
-        return cocoaPodsProductsByConfiguration.values.contains { $0.contains(product) }
+    public func linksRuntimeProduct(_ product: String) -> Bool {
+        packageProducts.contains(product)
     }
 }
 }

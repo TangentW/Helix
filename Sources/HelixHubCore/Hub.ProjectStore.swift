@@ -1,6 +1,7 @@
 #if os(macOS)
 import Darwin
 import Foundation
+import HelixBuildTools
 import HelixCore
 
 extension Hub {
@@ -9,9 +10,11 @@ public struct ProjectRecord: Codable, Hashable, Sendable, Identifiable {
     public var name: String
     public var projectURL: URL
     public var hostPlanURL: URL
+    /// Last applied routing retained only so removal can recover when generated
+    /// files are missing. Builds and reconfiguration still use the Host Plan.
+    public var removalPlan: XcodeIntegration.HostPlan
     public var capabilities: [Hub.Capability]
     public var requirements: [Hub.Requirement]
-    public var featureTargetNames: [String: String]
     public var developmentIdentityProfiles: [String]
     public var configuredAt: Date
 
@@ -19,18 +22,18 @@ public struct ProjectRecord: Codable, Hashable, Sendable, Identifiable {
         name: String,
         projectURL: URL,
         hostPlanURL: URL,
+        removalPlan: XcodeIntegration.HostPlan,
         capabilities: [Hub.Capability],
         requirements: [Hub.Requirement],
-        featureTargetNames: [String: String],
         developmentIdentityProfiles: [String],
         configuredAt: Date = Date()
     ) throws {
         self.name = name
         self.projectURL = projectURL.standardizedFileURL
         self.hostPlanURL = hostPlanURL.standardizedFileURL
+        self.removalPlan = removalPlan
         self.capabilities = Array(Set(capabilities)).sorted { $0.rawValue < $1.rawValue }
         self.requirements = requirements.sorted { $0.code < $1.code }
-        self.featureTargetNames = featureTargetNames
         self.developmentIdentityProfiles = Array(Set(developmentIdentityProfiles)).sorted()
         self.configuredAt = configuredAt
         id = Self.identifier(for: self.projectURL)
@@ -38,6 +41,11 @@ public struct ProjectRecord: Codable, Hashable, Sendable, Identifiable {
     }
 
     public func validate() throws {
+        do {
+            try removalPlan.validate()
+        } catch {
+            throw Hub.Error.storageFailure("project record Host Plan is malformed")
+        }
         let projectPath = projectURL.standardizedFileURL.path
         let sourceRoot = projectURL.deletingLastPathComponent().standardizedFileURL.path
         let planPath = hostPlanURL.standardizedFileURL.path
@@ -47,13 +55,14 @@ public struct ProjectRecord: Codable, Hashable, Sendable, Identifiable {
               hostPlanURL == hostPlanURL.standardizedFileURL,
               projectPath.hasPrefix("/"), planPath.hasPrefix(sourceRoot + "/"),
               projectURL.pathExtension.lowercased() == "xcodeproj",
+              projectURL.deletingLastPathComponent()
+                .appendingPathComponent(removalPlan.projectPath)
+                .standardizedFileURL == projectURL,
               !name.isEmpty, name.utf8.count <= 1_024,
               !capabilities.isEmpty,
               capabilities == Array(Set(capabilities)).sorted(by: { $0.rawValue < $1.rawValue }),
               requirements.count <= 1_024,
               requirements == requirements.sorted(by: { $0.code < $1.code }),
-              featureTargetNames.count <= 128,
-              !featureTargetNames.isEmpty,
               developmentIdentityProfiles.count <= 128,
               developmentIdentityProfiles == Array(Set(developmentIdentityProfiles)).sorted(),
               configuredAt.timeIntervalSinceReferenceDate.isFinite
@@ -68,14 +77,6 @@ public struct ProjectRecord: Codable, Hashable, Sendable, Identifiable {
                     .contains(where: { $0.contains("\0") })
             else {
                 throw Hub.Error.storageFailure("project requirement is malformed")
-            }
-        }
-        for (featureID, targetName) in featureTargetNames {
-            guard !featureID.isEmpty, featureID.utf8.count <= 1_024,
-                  !targetName.isEmpty, targetName.utf8.count <= 1_024,
-                  !featureID.contains("\0"), !targetName.contains("\0")
-            else {
-                throw Hub.Error.storageFailure("Feature target mapping is malformed")
             }
         }
     }
@@ -127,9 +128,9 @@ public actor ProjectStore {
             name: name,
             projectURL: installation.projectURL,
             hostPlanURL: installation.hostPlanURL,
+            removalPlan: installation.hostPlan,
             capabilities: installation.capabilities,
             requirements: installation.requirements,
-            featureTargetNames: installation.featureTargetNames,
             developmentIdentityProfiles: installation.developmentIdentityProfiles,
             configuredAt: configuredAt
         )

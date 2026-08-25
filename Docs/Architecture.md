@@ -9,7 +9,7 @@ share compiler facts and identity contracts; they do not share a delivery
 channel.
 
 This document describes the implementation available in the repository as of
-August 24, 2026. It does not turn unfinished qualification work into a product
+August 26, 2026. It does not turn unfinished qualification work into a product
 claim.
 
 ## The two workflows
@@ -26,18 +26,18 @@ distinction is structural, not a runtime configuration toggle.
 
 ```mermaid
 flowchart TB
-    S["Ordinary Swift source"] --> I["Frozen source and declaration identities"]
+    S["Ordinary Swift source"] --> I["Automatically captured build identities"]
     I --> R["Release body-only diff"]
     I --> D["Development save transaction"]
 
     R --> SIL1["Exact-toolchain canonical SIL"]
     SIL1 --> HLBC["HLIR → HLBC → verifier"]
     HLBC --> PKG["Signed Shell-bound .hlxp"]
-    PKG --> PR["HelixAppRuntime"]
+    PKG --> PR["HelixAppIntegration · production path"]
 
     D --> DSIL["Exact-toolchain canonical SIL"]
     DSIL --> DHLBC["HLIR → authenticated development HLBC"]
-    DHLBC --> DR["HelixDevAppRuntime verifier + HLVM"]
+    DHLBC --> DR["HelixDevSupport · development path"]
     DR --> UI["Automatic UIKit instance invalidation or SwiftUI pulse"]
 ```
 
@@ -52,7 +52,7 @@ Both workflows depend on stable, build-specific identities:
   native capabilities without embedding process pointers in a patch.
 - Interface and transitive implementation fingerprints distinguish a body
   edit from an ABI, layout, source-membership, or dependency change.
-- Eligible existing Shell structs and enums use a frozen logical-value
+- Eligible existing Shell structs and enums use a captured logical-value
   contract, not their private Swift ABI layout. The archive records exact
   source-qualified identity, stored fields or enum cases, labels and order,
   recursive Bridge types, copyability, supported conformance facts, and a
@@ -74,12 +74,12 @@ Both workflows depend on stable, build-specific identities:
 - Toolchain, SDK, target triple, compiler arguments, module source set, and
   binary identity bind every artifact to the Shell for which it was built.
 - Version 1 Shells advertise pure-VM String and Collection capabilities even
-  when an eligible entry's frozen native signature does not mention those
+  when an eligible entry's captured native signature does not mention those
   types, so a later body-only patch can use represented local text and
   collections. Native types and imports remain limited to the exact generated
   Shell surface. Exact native type names are authoritative; a derived
   module-relative shorthand is installed only when it resolves to one unique
-  frozen identity, so sibling nested types cannot overwrite each other.
+  captured identity, so sibling nested types cannot overwrite each other.
 - Canonical SIL parsing inventories the captured frontend's protocol witness
   tables as bounded, deterministic compiler-only evidence. It retains the
   conforming type pattern, protocol identity, conditional generic clause,
@@ -134,7 +134,7 @@ Both workflows depend on stable, build-specific identities:
   Closure-bearing async imports and completion-handler-to-async inference stay
   fail-closed.
 - One `make_closure` instruction carries a typed static target: an image
-  function, a frozen Shell `EntryIndex`, or a declared `NativeImportID`.
+  function, an indexed Shell `EntryIndex`, or a declared `NativeImportID`.
   Unchanged Swift callables therefore do not copy archived bodies. Imported
   free/global functions, bound instance methods, and initializers also use this
   route: an ordinary capture suffix binds a native receiver, while a
@@ -152,7 +152,7 @@ Both workflows depend on stable, build-specific identities:
 - Closure captures and collection transforms use verifier-private storage
   values rather than Swift runtime layout. Mutable captures share managed cells;
   `weak` and checked `unowned` captures share non-retaining handles whose
-  referent is a patch-local class or frozen native reference identity. Weak
+  referent is a patch-local class or captured native reference identity. Weak
   loads produce Optional and zero after deallocation. Unowned loads use the
   same safe zeroing primitive internally but turn a dead referent into a
   controlled VM trap instead of a process-level Swift abort. Array builders and
@@ -160,7 +160,7 @@ Both workflows depend on stable, build-specific identities:
   every control-flow path. These internal storage values cannot enter a stack
   slot, Shell/Native boundary, local value layout, or function result.
   Immutable closure contexts may also copy a represented linear capture when
-  its frozen TypeOps are copyable. `make_closure` charges the context copy;
+  its captured TypeOps are copyable. `make_closure` charges the context copy;
   every invocation reuses a borrowed capture or materializes a fresh,
   resource-charged copy for an owned target parameter. This keeps multi-shot
   closures reusable even for imported value types. For an on-stack
@@ -182,7 +182,7 @@ Both workflows depend on stable, build-specific identities:
   scope from the boundary.
 - Native callable boundary crossings use explicit contracts rather than making
   closure values part of the ordinary boundary codec. Each callback-bearing
-  NativeImport identity freezes its parameter index and `nonescaping` or
+  NativeImport identity records its parameter index and `nonescaping` or
   `escaping` lifetime. A nonescaping handle shares the importing invocation's
   budget and is invalidated when that call returns. An escaping handle retains
   the immutable generation lease and closure context, reuses an enclosing
@@ -212,7 +212,7 @@ Both workflows depend on stable, build-specific identities:
   generated Bridge rather than substituted with an image-local closure, and is
   encoded before the synchronous import context closes. Creation and every
   later invocation retain the exact signature, generation identity, MainActor
-  requirement, deadline, resource limits, and non-Sendable overlap gate. The
+  requirement, deadline, resource limits, and non-Sendable overlap protection. The
   same one-layer and closure-free-component restrictions apply, so this is one
   typed callable boundary model rather than a special case for each SDK API.
   A Swift `Error` callback argument is reduced to a bounded textual dynamic-type
@@ -275,7 +275,7 @@ Both workflows depend on stable, build-specific identities:
   ordinary source factory. Shell entry signatures and every other native value
   slot remain closure-free. These are v1 contract fields and do not introduce
   a compatibility version split.
-- Foreign ABI normalization preserves the frozen logical Swift type while
+- Foreign ABI normalization preserves the captured logical Swift type while
   accepting proven compiler representations: Foundation value overlays may
   use their Objective-C bridge classes inside block thunks, Objective-C
   protocol existentials erase to the existing `AnyObject` identity only at a
@@ -289,7 +289,7 @@ Both workflows depend on stable, build-specific identities:
   decoding and the native call occur within the same actor-isolated closure so
   a non-Sendable existential is never transferred across that boundary.
   Compiler-proven Swift/SIL spellings for one imported nominal are persisted as
-  server-side aliases of its frozen native identity. Ambiguous aliases are not
+  server-side aliases of its captured native identity. Ambiguous aliases are not
   resolved, and aliases never enter the device interface projection. Imported
   trivial values remain borrowed in physical SIL even though their HLBC native
   handles are managed owners; the compiler materializes and retires those
@@ -488,10 +488,10 @@ Both workflows depend on stable, build-specific identities:
   NativeImport. Any real element, key, value, or reference-type conversion
   remains a distinct unsupported operation rather than being mistaken for an
   identity cast.
-- Textual declaration summaries are collected before frozen Shell type aliases
+- Textual declaration summaries are collected before captured Shell type aliases
   are available. Local factory tables therefore resolve in two phases: an
   initial pass admits already-complete local graphs, then native-type injection
-  removes frozen declarations and rebuilds the tables strictly. Imported field
+  removes captured declarations and rebuilds the tables strictly. Imported field
   types are never guessed to be patch-local merely because Swift emitted their
   storage attributes in the declaration summary.
 - Enum declaration parsing treats comma-separated cases as independent
@@ -660,7 +660,7 @@ Both workflows depend on stable, build-specific identities:
   description, and lossless parsing.
   Compiler-only literal payloads are validated and eliminated before HLBC.
   Direct `Hasher` execution is not synthesized, and imported native conformers
-  still require a separately frozen concrete NativeImport operation. Similar
+  still require a separately captured concrete NativeImport operation. Similar
   storage never creates a custom or imported conformance. A conditional
   conformance is usable only when its instantiated requirements recursively
   prove in the same closed environment. Each argument list receives
@@ -699,7 +699,7 @@ Both workflows depend on stable, build-specific identities:
   identities are image-local compiler facts, so the Indexer and lowerer reject
   Swift protocol values at Shell and ordinary NativeImport boundaries. A
   separately proven Objective-C `!foreign` protocol erasure still crosses as
-  its frozen native `AnyObject` reference, not as this existential value.
+  its captured native `AnyObject` reference, not as this existential value.
   Mutable existential opening and writeback remain fail-closed until the
   storage model can preserve mutation.
 - Frame-local and heap-promoted storage share one field-sensitive aggregate
@@ -775,12 +775,12 @@ single-expression returns. Its permanent wrapper prepares routing before the
 first suspension and dispatches only the resulting opaque one-shot plan. Async
 OriginalCatalog entries call a uniquely named thunk emitted in the same source
 file. The thunk copies the exact body, preserves private lookup and `super`,
-freezes outer `#function` identity, retains logical line/byte-column mapping,
+records outer `#function` identity, retains logical line/byte-column mapping,
 and is statically dispatched even for a subclass receiver. It needs no scoped
 bypass, so legitimate recursion inside the original remains routable; fallback
 after suspension also never jumps back into a stale lexical frame.
 Existing async computed accessors are not Shell roots in this profile; an exact
-async getter may still be frozen as a NativeImport when its boundary is fully
+async getter may still be captured as a NativeImport when its boundary is fully
 representable.
 
 When a defect is fixed, the patch builder type-checks the complete module in
@@ -798,20 +798,54 @@ See [Production Hot Patching](Production-Hot-Patching.md) for the full flow.
 
 ## Development architecture
 
-The Xcode project contains only the original Feature sources and stable App
-runtime imports. The selected Feature's ordinary Sources phase runs through a
-transparent target-scoped compiler proxy. The Helix phase immediately after it
-validates that exact successful invocation and materializes the current Shell
-under DerivedData. An App phase reconstructs the captured Feature invocation and
-compiles all generated Bridge sources into one validated relocatable object. App
-linking retains its stable C provider symbol, so `ApplicationSession` discovers
-the generated contract without a Bridge framework, generated source target, or
-generated Swift import. Xcode remains the sole owner of source membership:
-adding, deleting, moving, or generating a Swift source requires no Helix list or
-reconfiguration. Large generated descriptor and invoker collections are emitted
-as deterministic, explicitly typed bounded chunks; this preserves ordering and
-the single-object contract while bounding Swift constraint-solver memory during
-the hidden compilation.
+Hub defaults to the existing App target as both the application and source
+module; an existing framework can be selected without becoming a prerequisite.
+Target discovery checks only whether Xcode can schedule source compilation; it
+does not inventory `.swift` files or enumerate filesystem-synchronized groups.
+The successful Swift frontend invocation remains authoritative for membership.
+It reuses or installs the Swift package, links `HelixAppIntegration`, makes
+dynamic `HelixDevSupport` available to the development configuration, and
+creates or updates the shared scheme. Application source contains no stable
+runtime import or startup call.
+
+The Live Reload phase declares the processed App plist as its build input and
+idempotently augments that product after Xcode's normal generation and
+processing, before signing. It neither copies nor overrides the source plist,
+so the project's plist settings remain authoritative on every build. Helix's
+configuration wrapper disables Xcode user-script sandboxing only for the
+selected configuration because compiler captures, generated artifacts, and
+the processed product cannot be represented by a static input set; removing
+the integration restores the original build setting automatically.
+
+The integration is reconciled, not locked. Each Apply first restores every
+unselected original PBX configuration reference, removes obsolete owned
+phases, triggers, products, Patch targets, and scheme actions, and then emits
+the desired graph. Existing scheme build configurations and unrelated actions
+are never rewritten. The same ownership model supports transactional removal
+without deleting application source, recipes, or signing material. A canonical
+generated-file manifest removes obsolete owned files while preserving unknown
+files in the integration directory; the registry's last-applied plan is used
+only to recover removal when generated files are missing.
+
+For a same-target integration, a Hub-owned empty Swift trigger ensures that the
+normal Sources phase invokes a transparent configuration-scoped compiler proxy.
+After the real compile succeeds, the proxy validates that exact invocation,
+materializes the current Shell, compiles the generated Bridge and runtime
+bootstrap into validated relocatable objects under DerivedData, and publishes
+them before linking. Existing separate-module projects use the equivalent
+captured-source phase. Hub reuses an existing App-to-source target dependency
+or adds a deterministic removable one, so Xcode cannot race source preparation
+against App Bridge compilation. App linking retains the stable C provider and the
+profile-selected bootstrap symbol; no Bridge framework, generated source
+target, generated Swift import, or application session owner is required.
+
+Xcode remains the sole owner of business source membership. Adding, deleting,
+moving, or generating a Swift source needs one ordinary build so the compiler
+can publish the new membership, but no Helix list or reconfiguration. Large
+generated descriptor and invoker collections are emitted as deterministic,
+explicitly typed bounded chunks; this preserves ordering and the single-object
+contract while bounding Swift constraint-solver memory during hidden
+compilation.
 
 The Xcode integration captures the frontend, link, SDK, module, source, and
 target facts from a real Debug build. A source monitor turns editor writes and
@@ -842,12 +876,13 @@ sequence and replacement semantics.
 
 ## Build and runtime isolation
 
-Apps link one aggregate product:
+Apps link one production-safe product. Development support is a separate
+dynamic framework selected only by the generated Live Reload configuration:
 
-| App configuration | Product | Contains development loader and transport? |
+| Build role | Product | Contains development loader and transport? |
 | --- | --- | --- |
-| Release / Production | `HelixAppRuntime` | No |
-| Debug / Dev Shell | `HelixDevAppRuntime` | Yes |
+| Every configured App target | `HelixAppIntegration` | No |
+| Live Reload configuration | `HelixDevSupport` | Yes; linked and embedded only for that configuration |
 
 Release auditing scans the built bundle rather than trusting target names. The
 production runtime rejects development artifacts, and the development protocol

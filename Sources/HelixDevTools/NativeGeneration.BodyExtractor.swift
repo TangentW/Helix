@@ -10,8 +10,8 @@ public enum BodyExtractionError: Swift.Error, Equatable, Sendable, CustomStringC
     public var description: String {
         switch self {
         case .invalidUTF8: "saved Swift source is not valid UTF-8"
-        case .anchorNotFound: "the frozen declaration header changed or disappeared"
-        case .ambiguousAnchor: "the frozen declaration header is not unique in its source file"
+        case .anchorNotFound: "the indexed declaration header changed or disappeared"
+        case .ambiguousAnchor: "the indexed declaration header is not unique in its source file"
         case .unterminatedBody: "the Swift declaration body is not lexically complete"
         }
     }
@@ -27,7 +27,7 @@ public struct ExtractedBody: Hashable, Sendable {
     }
 }
 
-/// Extracts the source body following a frozen declaration header. Braces in
+/// Extracts the source body following an indexed declaration header. Braces in
 /// comments, strings, interpolation, and regular-expression literals do not
 /// participate in declaration balancing.
 public struct BodyExtractor: Sendable {

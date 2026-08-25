@@ -936,7 +936,7 @@ struct SequenceQuerySemanticsMatrix {
                 values.capacity
             }
             """,
-            diagnostic: "is not frozen in the target HLXI"
+            diagnostic: "is absent from the target HLXI"
         )
         expectUnsupported(
             name: "randomElement",
@@ -945,7 +945,7 @@ struct SequenceQuerySemanticsMatrix {
                 values.randomElement()
             }
             """,
-            diagnostic: "is not frozen in the target HLXI"
+            diagnostic: "is absent from the target HLXI"
         )
     }
 

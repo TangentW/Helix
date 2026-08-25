@@ -23,24 +23,32 @@ production hot patching.
 | Goal | Guide |
 | --- | --- |
 | Run the checked-in UIKit Demo and see production Hot Patch and development Live Reload work end to end | [UIKit Demo](Demo/README.md) |
-| Add the correct App runtime, Xcode integration, and project configuration to an existing App | [Getting Started](Docs/Getting-Started.md) |
+| Enable Helix in an existing App with automatic target, scheme, package, compiler, Bridge, and runtime setup | [Getting Started](Docs/Getting-Started.md) |
 | See which Swift code changes Helix supports today and which changes still require a normal rebuild | [Capabilities and Limits](Docs/Capabilities-and-Limits.md) |
 | Understand how Swift compilation, HLBC, HLVM, activation, and workflow isolation fit together | [Architecture](Docs/Architecture.md) |
 | Prepare a Release Shell, build and sign a `.hlxp` patch, then install, activate, and roll it back | [Production Hot Patching](Docs/Production-Hot-Patching.md) |
 | Trace a saved Swift change through compilation, authenticated delivery, runtime activation, and UIKit/SwiftUI refresh | [Development Live Reload](Docs/Development-Live-Reload.md) |
-| Add the aggregate App runtime products to a project with CocoaPods | [CocoaPods integration](CocoaPods/README.md) |
 | Use the Helix Mac assistant to discover a project, configure both workflows, and manage development sessions | [Helix Hub](Hub/README.md) |
 
-## App modules
+## App integration
 
-Helix provides a separate App-facing product for each workflow. Link only one
-to each App target. To use both workflows in one project, configure separate
-Release and Debug App targets.
+Helix Hub links one production-safe product, `HelixAppIntegration`, and starts
+it through a generated hidden bootstrap. Application source does not import or
+initialize Helix. The same App target can use both workflows through different
+configurations.
 
-| Use case | Module to import | What it provides |
+| Build role | Product | Behavior |
 | --- | --- | --- |
-| Production Hot Patch (Release) | `HelixAppRuntime` | Verifies and runs HLBC patches; manages installation, activation, recovery, revocation, and rollback |
-| Live Reload (Debug) | `HelixDevAppRuntime` | Receives and verifies development updates; reports diagnostics and refreshes UIKit or SwiftUI, with changes limited to the current Debug process |
+| Every configured App target | `HelixAppIntegration` | Production verifier, HLVM, patch installation, recovery, and rollback; no development transport or loader |
+| Live Reload configuration only | dynamic `HelixDevSupport` | Authenticated development updates, Simulator native loading, diagnostics, and UI refresh; linked and embedded only by the generated development configuration |
+
+Hub discovers or creates the scheme, reuses or adds the Swift package, captures
+the real Xcode compile, generates the Bridge under DerivedData, and starts the
+selected runtime automatically. There is no user-maintained source list, API
+allowlist, or manual build-freezing step.
+Mappings remain editable after setup, and Hub can transactionally reconfigure
+or remove its Xcode integration while preserving application source and the
+project's original settings.
 
 The compiler, Helix Hub, and CLI run on the Mac. Do not link these build-side
 tools into an iOS Release App.

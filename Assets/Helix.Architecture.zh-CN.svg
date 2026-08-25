@@ -119,8 +119,8 @@
 
   <line x1="82" y1="408" x2="668" y2="408" class="divider"/>
   <text x="84" y="438" class="label">APP 模块</text>
-  <text x="225" y="434" class="value">HelixAppRuntime</text>
-  <text x="225" y="453" class="detail">随已发布 App 交付的生产客户端</text>
+  <text x="225" y="434" class="value">HelixAppIntegration</text>
+  <text x="225" y="453" class="detail">随 App 交付的统一生产安全产品</text>
 
   <!-- Development Live Reload -->
   <rect x="740" y="150" width="650" height="350" rx="22" class="panel"/>
@@ -147,8 +147,8 @@
 
   <line x1="772" y1="408" x2="1358" y2="408" class="divider"/>
   <text x="774" y="438" class="label">APP 模块</text>
-  <text x="915" y="434" class="value">HelixDevAppRuntime</text>
-  <text x="915" y="453" class="detail">认证 Dev 传输、诊断与 UI 刷新</text>
+  <text x="915" y="434" class="value">HelixDevSupport</text>
+  <text x="915" y="453" class="detail">仅 Debug 的传输、诊断与 UI 刷新</text>
 
   <!-- Built-on connectors -->
   <path d="M 375 500 L 375 535 L 512 535 L 512 558" fill="none" class="coral-line dash" stroke-width="2.25" marker-end="url(#arrowCoral)"/>

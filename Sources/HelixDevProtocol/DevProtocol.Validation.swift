@@ -13,7 +13,7 @@ extension DevProtocol.BuildIdentity {
                   !$0.isEmpty && $0.utf8.count <= 4_096
               })
         else {
-            throw DevProtocol.Error.malformedMessage("frozen build identity is invalid")
+            throw DevProtocol.Error.malformedMessage("captured build identity is invalid")
         }
     }
 

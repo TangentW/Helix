@@ -65,8 +65,8 @@ struct OnboardingPlannerTests {
         #expect(recipeData == canonicalRecipe)
     }
 
-    @Test("Missing runtime product is an explicit code-level action")
-    func reportsRuntimeRequirement() throws {
+    @Test("Runtime linkage is owned by Hub rather than exposed as an action")
+    func ownsRuntimeLinkage() throws {
         var project = try demoProject()
         let index = try #require(project.targets.firstIndex { $0.name == "LiveReloadDemo" })
         project.targets[index].packageProducts = []
@@ -77,26 +77,46 @@ struct OnboardingPlannerTests {
         )
 
         let result = try Hub.OnboardingPlanner().plan(draft)
-        #expect(result.requirements.count == 1)
-        #expect(result.requirements[0].severity == .actionRequired)
-        #expect(result.requirements[0].summary.contains("HelixDevAppRuntime"))
+        #expect(result.requirements.isEmpty)
+        #expect(result.hostPlan.profiles[0].runtimePackageProduct
+            == "HelixAppIntegration")
     }
 
-    @Test("Release and development workflows cannot share one App image")
-    func rejectsSharedAppTarget() throws {
+    @Test("Debug Live Reload and Release Hot Patch share one App target")
+    func acceptsSharedAppTarget() throws {
         let project = try demoProject()
         var hot = liveProfile(capability: .hotPatch)
         hot.id = "hot"
-        hot.schemeName = "Hot Patch"
+        hot.configurationName = "Release"
         hot.patch = .init()
         let draft = Hub.OnboardingDraft(
             project: project,
             capabilities: try .init([.hotPatch, .liveReload]),
             profiles: [hot, liveProfile()]
         )
-        #expect(throws: Hub.Error.self) {
-            _ = try Hub.OnboardingPlanner().plan(draft)
-        }
+        let plan = try Hub.OnboardingPlanner().plan(draft).hostPlan
+        #expect(plan.profiles.map(\.applicationTargetName)
+            == ["LiveReloadDemo", "LiveReloadDemo"])
+        #expect(plan.profiles.map(\.schemeName)
+            == ["Helix Live Reload Demo", "Helix Live Reload Demo"])
+        try plan.validate()
+    }
+
+    @Test("A missing shared scheme is generated during installation")
+    func acceptsAutomaticScheme() throws {
+        var project = try demoProject()
+        project.sharedSchemes = []
+        var profile = liveProfile()
+        profile.schemeName = profile.applicationTargetName
+        let draft = Hub.OnboardingDraft(
+            project: project,
+            capabilities: try .init([.liveReload]),
+            profiles: [profile]
+        )
+
+        let plan = try Hub.OnboardingPlanner().plan(draft).hostPlan
+        #expect(plan.profiles[0].schemeName == "LiveReloadDemo")
+        try plan.validate()
     }
 
     @Test("Feature source membership is delegated to the successful Swift compile")
@@ -105,10 +125,9 @@ struct OnboardingPlannerTests {
             id: "APP",
             name: "ExampleApp",
             kind: .application,
-            products: ["HelixDevAppRuntime"]
+            products: ["HelixAppIntegration", "HelixDevSupport"]
         )
-        var feature = target(id: "FEATURE", name: "Feature", kind: .framework)
-        feature.sourceFiles = []
+        let feature = target(id: "FEATURE", name: "Feature", kind: .framework)
         let root = URL(fileURLWithPath: "/tmp/helix-hub-root")
         let project = Hub.XcodeProject(
             projectURL: root.appendingPathComponent("Example.xcodeproj"),
@@ -175,8 +194,60 @@ struct OnboardingPlannerTests {
         #expect(draft.profiles[0].bundleIdentifier == "dev.example.HotPatchDemo")
         #expect(draft.profiles[1].featureModuleName == "LiveReloadFeatureResolved")
         let plan = try Hub.OnboardingPlanner().plan(draft)
-        #expect(plan.featureTargetNames["hotpatchfeature"] == "HotPatchFeature")
+        #expect(try plan.hostPlan.feature(id: "hotpatchfeature").targetName
+            == "HotPatchFeature")
         #expect(plan.developmentIdentityProfiles == ["hot-patch"])
+    }
+
+    @Test("GUI resolution queries each target configuration once per resolution")
+    func deduplicatesBuildSettingsQueries() throws {
+        let recorder = SettingsCallRecorder()
+        let project = try demoProject()
+        let resolver = Hub.DraftResolver(
+            inspector: .init(runner: SettingsRunner(recorder: recorder))
+        )
+
+        let draft = try resolver.resolve(
+            project: project,
+            selections: [
+                .init(
+                    capability: .hotPatch,
+                    applicationTargetName: "LiveReloadDemo",
+                    featureTargetName: "LiveReloadDemo",
+                    schemeName: "Helix Live Reload Demo",
+                    configurationName: "Release"
+                ),
+                .init(
+                    capability: .liveReload,
+                    applicationTargetName: "LiveReloadDemo",
+                    featureTargetName: "LiveReloadDemo",
+                    schemeName: "Helix Live Reload Demo",
+                    configurationName: "Debug"
+                ),
+            ]
+        )
+
+        #expect(draft.profiles[0].featureModuleName == "LiveReloadDemoResolved")
+        #expect(recorder.calls == [
+            .init(targetName: "LiveReloadDemo", configurationName: "Release"),
+            .init(targetName: "LiveReloadDemo", configurationName: "Debug"),
+        ])
+
+        _ = try resolver.resolve(
+            project: project,
+            selections: [.init(
+                capability: .liveReload,
+                applicationTargetName: "LiveReloadDemo",
+                featureTargetName: "LiveReloadDemo",
+                schemeName: "Helix Live Reload Demo",
+                configurationName: "Debug"
+            )]
+        )
+        #expect(recorder.calls == [
+            .init(targetName: "LiveReloadDemo", configurationName: "Release"),
+            .init(targetName: "LiveReloadDemo", configurationName: "Debug"),
+            .init(targetName: "LiveReloadDemo", configurationName: "Debug"),
+        ])
     }
 
     private func demoProject() throws -> Hub.XcodeProject {
@@ -219,14 +290,42 @@ struct OnboardingPlannerTests {
             productType: nil,
             kind: kind,
             configurationNames: ["Debug"],
-            sourceFiles: [],
+            supportsSourceCompilation: true,
             packageProducts: products,
             baseConfigurationPaths: [:]
         )
     }
 }
 
+private struct SettingsCall: Hashable, Sendable {
+    var targetName: String
+    var configurationName: String
+}
+
+private final class SettingsCallRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedCalls: [SettingsCall] = []
+
+    var calls: [SettingsCall] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedCalls
+    }
+
+    func record(_ call: SettingsCall) {
+        lock.lock()
+        defer { lock.unlock() }
+        recordedCalls.append(call)
+    }
+}
+
 private struct SettingsRunner: ProcessExecution.Running {
+    var recorder: SettingsCallRecorder?
+
+    init(recorder: SettingsCallRecorder? = nil) {
+        self.recorder = recorder
+    }
+
     func run(
         executable _: URL,
         arguments: [String],
@@ -239,6 +338,16 @@ private struct SettingsRunner: ProcessExecution.Running {
             throw Hub.Error.projectInspectionFailed("missing target argument")
         }
         let target = arguments[option + 1]
+        let configuration = arguments.firstIndex(of: "-configuration").flatMap { option in
+            arguments.indices.contains(option + 1) ? arguments[option + 1] : nil
+        }
+        guard let configuration else {
+            throw Hub.Error.projectInspectionFailed("missing configuration argument")
+        }
+        recorder?.record(.init(
+            targetName: target,
+            configurationName: configuration
+        ))
         let settings: [String: String] = [
             "PRODUCT_MODULE_NAME": "\(target)Resolved",
             "PRODUCT_BUNDLE_IDENTIFIER": "dev.example.\(target)",

@@ -22,7 +22,7 @@ struct WorkflowForm: Hashable, Sendable, Identifiable {
     var id: Hub.Capability { capability }
 
     var expectedRuntimeProduct: String {
-        capability == .hotPatch ? "HelixAppRuntime" : "HelixDevAppRuntime"
+        "HelixAppIntegration"
     }
 
     func selection() -> Hub.WorkflowSelection {
@@ -77,8 +77,7 @@ struct Editor: Hashable, Sendable, Identifiable {
         })
         let missing = Self.recommendedForms(
             project: project,
-            enabled: [],
-            applicationTargetsToAvoid: Set(installed.values.map(\.applicationTargetName))
+            enabled: []
         )
         let missingByCapability = Dictionary(uniqueKeysWithValues: missing.map {
             ($0.capability, $0)
@@ -94,8 +93,8 @@ struct Editor: Hashable, Sendable, Identifiable {
 
     var featureTargets: [Hub.XcodeTarget] {
         project.targets.filter {
-            !$0.sourceFiles.isEmpty
-                && ![.application, .testBundle, .aggregate].contains($0.kind)
+            $0.supportsSourceCompilation
+                && ![.testBundle, .aggregate].contains($0.kind)
         }
     }
 
@@ -110,7 +109,7 @@ struct Editor: Hashable, Sendable, Identifiable {
     var validationMessages: [String] {
         var result: [String] = []
         let selected = selectedForms
-        if selected.isEmpty {
+        if selected.isEmpty, !hasInstalledCapabilities {
             result.append("Select Hot Patch, Live Reload, or both.")
         }
         for form in selected {
@@ -118,28 +117,19 @@ struct Editor: Hashable, Sendable, Identifiable {
                 result.append("\(form.capability.displayName) needs an App target.")
             }
             if !featureTargets.contains(where: { $0.name == form.featureTargetName }) {
-                result.append("\(form.capability.displayName) needs a Swift Feature target.")
+                result.append("\(form.capability.displayName) needs a Swift source target.")
             }
-            if !project.sharedSchemes.contains(where: { $0.name == form.schemeName }) {
-                result.append("\(form.capability.displayName) needs a shared Xcode scheme.")
+            if form.schemeName.isEmpty {
+                result.append("\(form.capability.displayName) needs an Xcode scheme name.")
             }
             if !configurationNames(for: form).contains(form.configurationName) {
                 result.append(
-                    "\(form.capability.displayName) needs one configuration shared by its App and Feature targets."
+                    "\(form.capability.displayName) needs one configuration shared by its App and source targets."
                 )
             }
             if form.profileID.isEmpty || form.namespaceSeed.isEmpty {
                 result.append("\(form.capability.displayName) has incomplete identity settings.")
             }
-        }
-        if selected.count == 2,
-           Set(selected.map(\.applicationTargetName)).count != selected.count {
-            result.append(
-                "Hot Patch and Live Reload need distinct App targets so development code never enters the release image."
-            )
-        }
-        if Set(selected.map(\.schemeName)).count != selected.count {
-            result.append("Each workflow needs its own shared scheme.")
         }
         return Array(Set(result)).sorted()
     }
@@ -155,8 +145,7 @@ struct Editor: Hashable, Sendable, Identifiable {
     }
 
     mutating func setEnabled(_ enabled: Bool, capability: Hub.Capability) {
-        guard let index = forms.firstIndex(where: { $0.capability == capability }),
-              !forms[index].isInstalled || enabled
+        guard let index = forms.firstIndex(where: { $0.capability == capability })
         else { return }
         forms[index].isEnabled = enabled
     }
@@ -167,7 +156,10 @@ struct Editor: Hashable, Sendable, Identifiable {
         }
         let options = configurationNames(for: forms[index])
         if !options.contains(forms[index].configurationName) {
-            forms[index].configurationName = Self.preferredConfiguration(options)
+            forms[index].configurationName = Self.preferredConfiguration(
+                options,
+                capability: capability
+            )
         }
     }
 
@@ -180,27 +172,27 @@ struct Editor: Hashable, Sendable, Identifiable {
 
     private static func recommendedForms(
         project: Hub.XcodeProject,
-        enabled: Set<Hub.Capability>,
-        applicationTargetsToAvoid: Set<String> = []
+        enabled: Set<Hub.Capability>
     ) -> [WorkflowForm] {
         let applications = project.targets.filter { $0.kind == .application }
         let features = project.targets.filter {
-            !$0.sourceFiles.isEmpty
-                && ![.application, .testBundle, .aggregate].contains($0.kind)
+            $0.supportsSourceCompilation
+                && ![.testBundle, .aggregate].contains($0.kind)
         }
-        var usedApplications = applicationTargetsToAvoid
         return Hub.Capability.allCases.map { capability in
             let app = rankedTargets(
                 applications,
                 capability: capability,
-                expectedProduct: capability == .hotPatch
-                    ? "HelixAppRuntime" : "HelixDevAppRuntime",
-                avoiding: usedApplications
+                expectedProduct: "HelixAppIntegration",
+                avoiding: []
             ).first ?? applications.first
-            if let app { usedApplications.insert(app.name) }
-            let feature = rankedTargets(features, capability: capability).first
+            let feature = app.flatMap { app in
+                features.first(where: { $0.id == app.id })
+            } ?? rankedTargets(features, capability: capability).first
                 ?? features.first
-            let scheme = rankedSchemes(project.sharedSchemes, capability: capability).first
+            let scheme = app.flatMap { app in
+                project.sharedSchemes.first(where: { $0.name == app.name })
+            } ?? rankedSchemes(project.sharedSchemes, capability: capability).first
                 ?? project.sharedSchemes.first
             let configurations = app.map { app in
                 feature.map {
@@ -215,8 +207,11 @@ struct Editor: Hashable, Sendable, Identifiable {
                 profileID: profileID,
                 applicationTargetName: app?.name ?? "",
                 featureTargetName: feature?.name ?? "",
-                schemeName: scheme?.name ?? "",
-                configurationName: preferredConfiguration(configurations),
+                schemeName: scheme?.name ?? app?.name ?? "",
+                configurationName: preferredConfiguration(
+                    configurations,
+                    capability: capability
+                ),
                 featureModuleName: "",
                 bundleIdentifier: "",
                 namespaceSeed: "\(project.name)-\(profileID)",
@@ -287,9 +282,14 @@ struct Editor: Hashable, Sendable, Identifiable {
         return words.reduce(0) { $0 + (normalized.contains($1) ? 10 : 0) }
     }
 
-    private static func preferredConfiguration(_ values: [String]) -> String {
-        values.first(where: { $0.caseInsensitiveCompare("Debug") == .orderedSame })
-            ?? values.first ?? ""
+    private static func preferredConfiguration(
+        _ values: [String],
+        capability: Hub.Capability? = nil
+    ) -> String {
+        let preferred = capability == .hotPatch ? "Release" : "Debug"
+        return values.first(where: {
+            $0.caseInsensitiveCompare(preferred) == .orderedSame
+        }) ?? values.first ?? ""
     }
 }
 }

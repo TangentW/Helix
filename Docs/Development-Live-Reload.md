@@ -2,20 +2,21 @@
 
 [简体中文](Development-Live-Reload.zh-CN.md)
 
-Helix Live Reload shortens the edit–run loop for an already running Debug App.
-After the one-time Xcode integration and Dev Shell build, saving the body of an
-eligible Swift declaration can compile a new generation, transfer it to a
+Helix Live Reload shortens the edit–run loop for an already running development
+App. After Hub enables the project and Xcode completes one normal Run, saving a
+supported Swift implementation can compile a new generation, transfer it to a
 Simulator or development device, activate it in the same process, and refresh
 the affected UI.
 
 This is a development feature. It is isolated from production packages, keys,
 storage, and lifecycle.
 
-The App does not compile or import generated Swift. The Feature target keeps
-its original sources; an App build phase compiles Helix's generated Bridge into
-a validated object under DerivedData and links it into the executable. A stable
-C provider symbol lets `DevRuntime.ApplicationSession` discover the Build
-Contract, Shell interface, Runtime factory, and Bridge installer automatically.
+The App target keeps its original sources. It may also be the source target;
+extracting a Feature framework is unnecessary. Hub links the package, installs
+a configuration-scoped compiler proxy, compiles generated Bridge and bootstrap
+objects under DerivedData, and starts dynamic `HelixDevSupport` automatically.
+Application source imports no generated Swift and creates no
+`ApplicationSession`.
 
 ## Unified Helix service and launch modes
 
@@ -27,27 +28,28 @@ control interface; the GUI never terminates a service it does not own.
 
 The Xcode lifecycle carries identity instead of credentials:
 
-1. The Feature's ordinary Sources phase compiles its current membership through
-   a transparent target-scoped proxy. The immediately following Helix prepare
-   phase validates that exact successful invocation and asks the service to
-   reserve a one-time invitation for this profile. Adding, deleting, moving, or
-   generating a Swift source requires no Helix file-list update.
+1. The selected source target's ordinary Sources phase compiles its current
+   membership through a transparent configuration-scoped proxy. After the real
+   compiler succeeds, Helix validates that exact invocation, generates the
+   Shell and Bridge, and asks the service to reserve a one-time invitation.
+   Adding, deleting, moving, or generating a Swift source requires no Helix
+   file-list update.
 2. The hidden Bridge object embeds that invitation plus the public pin of the
    persistent Helix Host Identity. No session secret is written to the project
    or App environment.
 3. After the App is linked, the Scheme Run pre-action registers the exact
    executable UUID and complete Build Context, then binds the reservation to
    that final Shell.
-4. Xcode launches the App with the normal Apple debugger. At process startup,
-   `DevRuntime.LaunchMode.current()` uses Darwin `sysctl` and `P_TRACED` once.
-   A traced launch enters `automaticXcode`; failure to inspect the process
-   fails closed into `manual`.
+4. Xcode launches the App with the normal Apple debugger. The hidden bootstrap
+   starts `HelixDevSupport`; at process startup, `DevRuntime.LaunchMode.current()`
+   uses Darwin `sysctl` and `P_TRACED` once. A traced launch enters
+   `automaticXcode`; failure to inspect the process fails closed into `manual`.
 5. Automatic mode browses the single service, verifies the compiled Host pin,
    proves the exact App/Shell identity, and redeems the invitation over pinned
    TLS. The authenticated channel then carries source diagnostics, HLBC
    generations, activation results, and reconnect leases.
 
-The decision is locked for the process lifetime. If the developer stops Xcode
+The decision is fixed for the process lifetime. If the developer stops Xcode
 and later opens the same installed build from the Home Screen, the new process
 is manual: it does no Bonjour browsing and requests no local-network access
 until the developer enters the four-character code shown by Helix and confirms.
@@ -60,10 +62,12 @@ code is only a user-presence signal: the connection still requires the pinned
 P-256 Host Identity, exact registered Build Context, TLS transcript, and App
 process identity. A code cannot select a vaguely matching bundle ID.
 
-Apps may present `DevRuntime.PairingView(session:)` from an existing debug menu
-or call `ApplicationSession.connect(pairingCode:)` directly. Keep the
-`ApplicationSession` strongly owned for the App process lifetime. A successful
-manual pairing is intentionally not persisted across launches.
+The automatically installed development overlay provides the manual pairing
+surface and process-lifetime session ownership. Advanced products may still
+present `DevRuntime.PairingView(session:)` or call
+`ApplicationSession.connect(pairingCode:)` from a custom debug UI, but ordinary
+integration does neither. A successful manual pairing is intentionally not
+persisted across launches.
 
 ## Save-to-screen sequence
 
@@ -160,31 +164,15 @@ declared errors, and deterministic cleanup are preserved. Task creation,
 TaskLocal, custom actors/global actors, and live `inout`/address access across a
 suspension remain fail-closed.
 
-Source-discovered NativeImports use one access profile but separate execution
-deadlines for synchronous and suspending calls. For example:
-
-```yaml
-nativeImports:
-  candidateIndex: source-and-catalog
-  emit: scoped
-  sourceScope:
-    include:
-      - Sources/App/Services/**
-    declarations:
-      - App.*
-    visibility: public
-    profile: read
-    maximumBoundedDurationMicroseconds: 750
-    maximumSuspendingDurationMicroseconds: 5000000
-    allowsMainThread: true
-```
-
-The profile is exactly `pure`, `read`, or `read-write`. When main-thread
-execution is forbidden, bounded deadlines must be 1...2,000 microseconds. When
-it is allowed, the configured range is 1...16,000 microseconds, but only an
-exact MainActor declaration receives the portion above 2,000; every other
-synchronous declaration is clamped to 2 ms. Suspending deadlines remain
-1...60,000,000 microseconds. No deadline authorizes a broader access effect.
+Hub derives NativeImport discovery scope, access effects, actor restrictions,
+and synchronous/suspending deadlines from the selected workflow and the exact
+compiler evidence. Normal projects do not write a NativeImport YAML document
+or declaration allowlist. Internally the generated contract still distinguishes
+`pure`, `read`, and `read-write`, clamps non-MainActor synchronous calls to the
+short bounded deadline, and gives suspending calls a separate continuous
+deadline. A larger deadline never authorizes a broader effect. Explicit policy
+documents remain a lower-level standalone compiler interface, not Xcode
+onboarding.
 
 A Swift generic collection method is not a safe NativeImport shortcut. Its
 physical ABI may carry concrete-type metadata, protocol witness tables,
@@ -293,7 +281,7 @@ writable/reference-writable mutation remain fail-closed; no KeyPath metadata
 object enters the artifact.
 For an imported Objective-C property descriptor, the generated concrete
 accessor remains in the image while its physical framework call resolves to the
-exact frozen NativeImport. Physical `NSString`/`Optional<NSString>` results are
+exact captured NativeImport. Physical `NSString`/`Optional<NSString>` results are
 accepted as `String` only when that Swift-typed boundary proves and performs the
 bridge. When the compiler carries that physical bridge through a basic-block
 parameter, Helix derives the logical parameter type from every incoming edge,
@@ -307,7 +295,7 @@ dataflow across aliases and control-flow joins. It does not treat
 default-initialized field is assigned, and mutually exclusive initializer
 branches are each classified from their incoming state.
 
-When a new `final` class inherits an HLXI-frozen, `NSObject`-compatible project
+When a new `final` class inherits an HLXI-captured, `NSObject`-compatible project
 or system type, Helix can register an Objective-C host under the closed hosted
 profile and pass the object to UIKit as that superclass. The initial profile is
 limited to inherited no-argument initialization, no new stored properties, and
@@ -328,7 +316,7 @@ public/package default changes also require a normal build because one module
 receipt cannot prove that every precompiled caller was replaced.
 
 A managed Debug Shell also audits public members for every module that
-contributes an already-frozen imported native type. Helix reads the symbol graph
+contributes an imported native type proven by the current App build. Helix reads the symbol graph
 from the captured Swift toolchain and exact SDK. The extractor receives only
 the captured module-loading/search arguments it supports; source-only flags
 such as compilation conditions and frontend transforms remain on the typed
@@ -342,9 +330,9 @@ NativeImports.
 The symbol-graph function signature is aligned with the full declaration before
 probing. Helix recovers only declaration-level `@escaping` and `@autoclosure`
 markers that the signature view is permitted to omit; any other missing
-attribute remains ineligible. For a frozen concrete specialization of an SDK
-generic owner, the probe substitutes the owner's generic parameters and freezes
-only that concrete member ABI. The unspecialized owner spelling is deliberately
+attribute remains ineligible. For a concrete SDK generic specialization already
+proven by the build, the probe substitutes the owner's generic parameters and
+records only that concrete member ABI. The unspecialized owner spelling is deliberately
 not installed as an alias of multiple specializations.
 This covers Swift and Objective-C APIs through one path, including
 `UIColor.black`, `UIColor.init(white:alpha:)`, `UIView.isHidden`,
@@ -354,7 +342,7 @@ This covers Swift and Objective-C APIs through one path, including
 `UIButton.configurationUpdateHandler`, concrete
 `NSLayoutAnchor<NSLayoutXAxisAnchor>`/`NSLayoutAnchor<NSLayoutYAxisAnchor>`
 members, `URLCache.shared`, `Bundle.main`, and
-`Bundle.path(forResource:ofType:)` when every boundary type is already frozen.
+`Bundle.path(forResource:ofType:)` when every boundary type is already represented.
 For a MainActor-isolated measured declaration, a non-Sendable callback retains
 the enclosing MainActor restriction even when the printed SDK typealias omits
 it; an explicitly `@Sendable` callback keeps its own declared executor
@@ -371,15 +359,15 @@ error-conversion shape fails closed. Swift-overlay names such as `Bundle` and
 physical aliases such as `CGFloat` are resolved from compiler identity and
 source evidence instead of guessed from Objective-C runtime spelling. Those
 compiler-proven Swift/SIL spellings are retained as server-side aliases of the
-same frozen native identity for later patch compilation; ambiguous aliases are
+same compiler-proven native identity for later patch compilation; ambiguous aliases are
 omitted and none enter the device interface. Symbol-graph implicitly unwrapped
 optionals such as `UIViewController.view: UIView!` remain valid probe syntax
 and are measured by the frontend as their exact Optional ABI instead of being
 dropped before compilation. This
 source boundary still ignores inherited implicit constructors that the frontend
 synthesizes for a project subclass; beyond the separately proven zero-argument
-SDK-type construction above, inherited `Bundle`/`Coder` parameters do not become
-frozen merely because a superclass declares them. A compiler-proven
+SDK-type construction above, inherited `Bundle`/`Coder` parameters do not enter
+the generated interface merely because a superclass declares them. A compiler-proven
 Objective-C protocol parameter keeps the v1 `AnyObject` boundary identity but
 records its exact Swift existential spelling for the generated invoker. The
 invoker performs that conformance-checked decode inside `MainActor` when the
@@ -389,7 +377,7 @@ does not introduce a new boundary type by itself, and never performs runtime
 selector or symbol lookup.
 
 For a supported source `class` instance method, the hidden Bridge carries
-`self` as a frozen reference `TypeID`. Generated `NativeTypeOperations` retain,
+`self` as the build-captured reference `TypeID`. Generated `NativeTypeOperations` retain,
 identify, and validate the object without exposing a process pointer in HLBC.
 This establishes the receiver path for class methods; individual property and
 method operations still need a supported Shell entry or exact NativeImport.
@@ -397,14 +385,14 @@ The measured member path above supplies those exact imports for its proven
 shapes. Async or unspecialized/open generic SDK members, closure-bearing members
 outside the exact synchronous callback profile, subscripts, unsupported actor
 executor hops, and any
-parameter/result shape outside the frozen Bridge surface are not silently
+parameter/result shape outside the captured Bridge surface are not silently
 approximated and currently require a normal build. Suspending NativeImports in
 this stage come from exact project-source discovery or an explicit catalog;
 the managed SDK measurement path does not infer async declarations or convert
 completion handlers.
 
 Swift commonly spells a class receiver as `@guaranteed self` in SIL. Each
-frozen Entry or NativeImport descriptor independently records whether a value
+captured Entry or NativeImport descriptor independently records whether a value
 crosses that boundary as owned or borrowed. Helix preserves the physical SIL
 convention for call validation: borrowed-to-borrowed values pass through,
 while borrowed-to-owned values receive one typed VM copy. An owned physical
@@ -416,8 +404,8 @@ checks.
 
 The frontend may encode an Objective-C `super` dispatch with both an upcast for
 the call ABI and a same-type `unchecked_ref_cast` as its lookup token. Helix
-treats that second spelling as an alias only when both sides are the same frozen
-reference `TypeID`; a cast between different frozen types remains rejected.
+treats that second spelling as an alias only when both sides are the same captured
+reference `TypeID`; a cast between different captured types remains rejected.
 
 Imported Optional properties also produce address-form SIL when source code
 compares or copies them. Helix tests such storage without consuming it, carries
@@ -464,8 +452,8 @@ The checked-in soak activates 128 real verified HLBC generations, exercises a
 failed save without changing the active generation, validates rollback and
 invocation, and proves that only the active/direct-predecessor snapshots remain
 strongly retained after compaction. This is deterministic in-process evidence;
-long-duration real-device memory pressure and foreground/background cycling are
-still qualification gates.
+long-duration real-device memory pressure and foreground/background cycling
+still require qualification.
 
 ## Backend policy
 
@@ -559,7 +547,7 @@ parameters, internal closure returns, nested closure captures, and synchronous
 throwing paths. Concrete `throws(Failure)` channels remain exact through
 nonescaping and escaping closure values, stored aggregates, concrete generic
 forwarding, supported higher-order standard-library specializations, and catch
-continuations; `typed-throws-1` gates the patch-local
+  continuations; `typed-throws-1` identifies and validates the patch-local
 Error nominal, and only a concrete Swift reabstraction thunk may erase it to
 `any Error`. This does not make typed-throws roots or throwing NativeImport
 callbacks valid. Closure values may also flow through Optional, tuple, Array,
@@ -583,7 +571,7 @@ receivers are ordinary captured suffixes and compiler-only metatypes are
 erased. This is a target-category rule rather than an API-specific adapter. The
 function-value route requires an identity argument
 projection and a representation-preserving ABI adapter; default-argument call
-variants remain direct-call-only. Copyable linear captures such as frozen imported
+variants remain direct-call-only. Copyable linear captures such as captured imported
 references are copied into the managed context. Borrowed target parameters
 reuse that value and owned target parameters receive a fresh, resource-charged
 copy on every invocation; fully concrete
@@ -604,7 +592,7 @@ compiler-only literal payloads are validated and erased before HLBC. Recursive
 values contribute `Hashable` only as a closed
 constraint for VM-defined hashing—Helix does not synthesize Swift `Hasher`
 execution. Imported conformers are not inferred from native storage and still
-need a concrete operation already frozen as an exact NativeImport. Custom
+need a concrete operation already captured as an exact NativeImport. Custom
 values likewise do not inherit protocols from their storage shape. This also
 covers constrained generic
 extension methods, reachable concrete instances of file/module-scope generic
@@ -624,12 +612,12 @@ type sets and finite image-function tables. No Swift metadata or witness table
 enters HLBC; the Verifier bounds each set to 4,096 cases and HLVM meters exact
 lookup work. Such Swift existential values remain image-local and cannot cross
 a Shell or ordinary NativeImport boundary; proven Objective-C `!foreign`
-protocol erasure continues to cross as a frozen native `AnyObject` reference.
+protocol erasure continues to cross as a captured native `AnyObject` reference.
 Mutable existential opening/writeback remains rejected. Mutable captures use
 the same VM-managed cell for scalar,
 collection, tuple, and patch-local struct storage, including Swift escape
 boxes. Safe `weak` and checked `unowned` capture lists and captured weak locals
-use a second managed storage kind shared by patch-local and frozen native
+use a second managed storage kind shared by patch-local and captured native
 reference identities. Weak loads become `nil` after release; dead checked
 unowned loads produce a controlled VM trap. The compiler's
 `[inferred_immutable]` capture-box decoration is accepted only in its exact
@@ -789,7 +777,7 @@ may contain supported stored fields, instance/static computed accessors, and
 mutating helpers. A pure `final class` supports reference identity, stored
 fields, private/ordinary methods, and computed accessors. These types cannot
 cross a Shell Entry, NativeImport, generation, or native-storage boundary; the
-one exception is a verifier-approved hosted-class projection to its frozen
+one exception is a verifier-approved hosted-class projection to its captured
 superclass. A type declared inside a function has
 no stable declaration identity in Helix's current textual SIL contract and is
 rejected with its exact type name; move it to file/module scope instead.
@@ -821,14 +809,14 @@ properties are indexed independently. The Shell build replaces each exact,
 hashed body in the derived source with a permanent dispatch wrapper and keeps
 the lexical baseline body as fallback; it does not depend on an observer
 dynamic replacement or synthesize a callable original. This covers globals,
-eligible frozen struct receivers, and source reference classes, including
-implicit/custom old/new-value names and private same-file access. Frozen value
+eligible captured struct receivers, and source reference classes, including
+implicit/custom old/new-value names and private same-file access. Captured value
 receivers receive transactional self writeback. Static/class, inherited,
 lazy/wrapped, weak/unowned/Objective-C, availability/generic, actor/global-actor,
 baseline-magic-literal, and old/new-value ABI-shape changes fail closed. A
 patched reference observer also cannot directly assign its own observed
 property because an ordinary setter NativeImport would incorrectly re-enter
-the observer; sibling property access remains available under the frozen
+the observer; sibling property access remains available under the captured
 source policy.
 
 An unrelated declaration is not collected merely because it exists, and this

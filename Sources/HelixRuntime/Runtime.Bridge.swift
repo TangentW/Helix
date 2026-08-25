@@ -136,9 +136,10 @@ public final class Bridge: @unchecked Sendable {
         arguments: (Runtime.BridgeValueCodec.Encoder) throws -> [VM.Value]
     ) throws -> Runtime.PreparedAsyncBridgeDispatch? {
         _ = isolation
-        guard let runtime = installation.loadAcquire()?.runtime else {
-            throw Runtime.BridgeDispatchError.notInstalled
-        }
+        // Automatic App startup is intentionally scheduled onto the main
+        // actor. A wrapper may run before that task, in which case no patch can
+        // be active and the lexical original is the only valid route.
+        guard let runtime = installation.loadAcquire()?.runtime else { return nil }
         guard runtime.originals[entry]?.effects.isAsync == true else {
             throw VM.RuntimeTrap.nativeFailure(
                 "synchronous entry reached the generated async Bridge"
@@ -213,9 +214,11 @@ public final class Bridge: @unchecked Sendable {
         applyWritebacks: ([VM.EntryWriteback]) throws -> Void
     ) throws -> Runtime.BridgeDispatchResult<Result> {
         _ = isolation
-        let runtime = installation.loadAcquire()?.runtime
-        guard let runtime else {
-            throw Runtime.BridgeDispatchError.notInstalled
+        // Fail open only to the compiled lexical original while automatic
+        // bootstrap is pending. Installation itself remains permanent and all
+        // incompatible runtime or interface attempts still fail closed.
+        guard let runtime = installation.loadAcquire()?.runtime else {
+            return .originalRequired
         }
         if !acceptsWritebacks,
            runtime.originals[entry]?.parameterConventions.contains(.inout) == true {
@@ -357,7 +360,7 @@ public enum BridgeBootstrapError: Error, Equatable, Sendable, CustomStringConver
     public var description: String {
         switch self {
         case .runtimeHasNoShellIdentity:
-            "Runtime.Engine was created without a frozen Shell interface hash"
+            "Runtime.Engine was created without a captured Shell interface hash"
         case .interfaceHashMismatch:
             "generated Bridge and Runtime.Engine target different Shell interfaces"
         case let .registrationCountMismatch(expected, actual):

@@ -236,7 +236,7 @@ public actor BytecodeBuilder {
         case .changedIneligibleFunction, .functionMissingFromSIL,
              .loweredSignatureChanged, .generatedFunctionUnsupported:
             code = "HLXLR303"
-            action = "rebuild the Dev Shell because a frozen Swift interface or layout changed"
+            action = "rebuild the Dev Shell because its captured Swift interface or value layout changed"
         case .toolchainMismatch, .compilerIdentityFailed:
             code = "HLXLR304"
             action = "select the exact Xcode toolchain used by the Dev Shell, then rebuild if unavailable"

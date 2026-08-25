@@ -9,21 +9,23 @@ JIT, downloaded Swift source, or downloaded native dylib in this path.
 
 ## What must exist before an incident
 
-Hot patching is prepared during the normal Release build. It cannot be added to
-an arbitrary binary after it has shipped.
+Hot patching is prepared automatically during the normal Release build. It
+cannot be added to an arbitrary binary after it has shipped, but developers do
+not perform a separate freeze or maintain a patchability/API list.
 
-The Release pipeline must:
+The Hub-installed Release pipeline:
 
-1. Freeze a Shell namespace, App identity, compiler, SDK, target, source set,
-   and semantic compiler arguments.
-2. Index declarations with the exact Swift frontend and decide which existing
-   roots are patchable.
-3. Generate Derived Sources containing permanent declaration bridges, exact
+1. Captures the Shell namespace, App identity, compiler, SDK, target, source
+   membership, and semantic compiler arguments from the successful Xcode build.
+2. Indexes eligible declarations and native adapters with that exact Swift
+   frontend.
+3. Generates Derived Sources containing permanent declaration bridges, exact
    hashed source-body wrappers where lexical execution is required, and allowed
    native invokers. Handwritten source files are not changed; Shell compilation
    uses derived copies for observer and async source-body transformation.
-4. Build and sign the App with `HelixAppRuntime`.
-5. Finalize an HLXI archive with the linked Mach-O UUID and preserve the exact
+4. Links the production-safe `HelixAppIntegration` and its hidden automatic
+   bootstrap; application source imports and starts nothing.
+5. Finalizes an HLXI archive with the linked Mach-O UUID and preserves the exact
    release source baseline and toolchain artifacts for future patch builds.
 
 The App contains compact route, type, and native-import tables. Sensitive build
@@ -63,12 +65,13 @@ the patch compiler.
 ## Calling existing Swift from a patch
 
 A patch cannot call arbitrary code merely because a Swift declaration exists
-in the App. Calls cross one of these frozen boundaries:
+in the App. Calls resolve through one of the exact interfaces captured for that
+App build:
 
 - another function included in the same HLBC image;
 - an eligible Shell entry identified by `FunctionKey` and `EntryIndex`;
-- an allowlisted `NativeImportID` backed by a generated, exact-signature Swift
-  factory in the installed App.
+- a `NativeImportID` backed by a generated, exact-signature Swift factory in
+  the installed App.
 
 The patch compiler closes over reachable same-module implementation functions.
 Consequently, a patch may add an ordinary top-level helper or a private class
@@ -80,11 +83,12 @@ body is included in the root's transitive implementation fingerprint, so a
 later change produces a distinct generation even when the root call site stays
 textually unchanged.
 
-Native imports may be listed explicitly or discovered at build time from a
-file, module, or project scope. Project scope expands into individual canonical
-descriptors and generated invokers; it is never a wildcard interpreted on the
-device. Adding a call in a patch works only when the released Shell already
-contains the matching capability and its effects are allowed by policy.
+Hub discovers native imports automatically from the successful build and
+expands them into individual canonical descriptors and generated invokers; the
+device never interprets a project-wide wildcard. An explicit list remains only
+as a lower-level standalone compiler input. Adding a call in a patch works only
+when the released App already contains the matching generated capability and
+its effects are allowed by policy.
 
 This design avoids relying on unstable Swift symbol lookup, metadata guessing,
 or an unrestricted `dlsym` API. It also means that expanding the callable
@@ -315,7 +319,7 @@ bounds, bit/query operations, wrapping/reporting-overflow arithmetic, and
 full-width multiplication. Exact witness references become verifier-visible
 operations and compiler-only literal payloads are removed before serialization.
 Recursive `Hashable` evidence does not synthesize
-Swift `Hasher`, and imported native conformers still require separately frozen
+Swift `Hasher`, and imported native conformers still require separately captured
 concrete NativeImports; matching storage is never treated as a custom or
 imported conformance. Reachable generic
 helpers and constrained extension methods are monomorphized; file/module-scope
@@ -336,11 +340,11 @@ Verifier requires one common callable ABI and concrete image targets, with at
 most 4,096 cases; HLVM exact-matches and meters the full lookup. Swift protocol
 metadata and witness tables still never enter HLBC. These Swift existentials
 are image-local and cannot cross a Shell or ordinary NativeImport boundary; a
-proven Objective-C `!foreign` protocol erasure remains a frozen native
+proven Objective-C `!foreign` protocol erasure remains a captured native
 `AnyObject` reference. Conditional, imported, open-world, and mutable
 existential dispatch remains rejected.
 
-Existing current-module Shell structs and enums use a separate frozen
+Existing current-module Shell structs and enums use a separate captured
 logical-value boundary. Eligible copyable, nongeneric, nonrecursive values can
 be parameters, results, or instance receivers—including extension methods and
 ordinary, `borrowing`, `consuming`, or `mutating` ownership—on normal and
@@ -378,7 +382,7 @@ availability-constrained declarations, generic accessor declarations or
 accessors in generic nominal/extension contexts, accessors whose private nested
 receiver cannot be named by generated file-scope code,
 multiple/async `inout`, and mutable-existential writeback remain fail-closed.
-An exact, fully concrete async getter may instead be frozen as an async
+An exact, fully concrete async getter may instead be captured as an async
 NativeImport; it is never selected as a Shell accessor root.
 This extends the same v1 contracts and does not introduce a compatibility
 version.
@@ -393,11 +397,11 @@ HLBC dispatch wrapper. The lexical baseline body remains the wrapper's normal
 fallback, so private/fileprivate access, implicit or custom `newValue`/
 `oldValue` names, direct observed-storage access, and Swift's observer
 recursion rules stay in their original context. Global observers, eligible
-frozen struct receivers, and source reference-class receivers are
+captured struct receivers, and source reference-class receivers are
 independently selectable. A mutable value receiver uses the same single
 transactional `inout` region and exact writeback as other Shell value entries;
-transitive frozen-value codecs stay in each defining source file. Reference
-observers may use source-property NativeImports only when the normal frozen
+transitive captured-value codecs stay in each defining source file. Reference
+observers may use source-property NativeImports only when the normal captured
 source scope and policy explicitly admit those fields. A patched reference
 observer cannot directly assign its own observed property: routing that access
 through its ordinary setter would recursively re-enter the observer, unlike
@@ -417,7 +421,7 @@ standard-library APIs inside HLVM. The compiler recognizes the generic
 scalar/text/Optional/Array/Dictionary/Set value can cross the Swift codec, and
 converts it to the fixed `Any -> String` Shell ABI; generic metadata and witness
 tables never cross. `Swift.print` and `Swift.debugPrint` use their concrete
-`[Any], String, String -> Void` ABI. All four imports are frozen into current
+`[Any], String, String -> Void` ABI. All four imports are captured into current
 Shells and enforce a 64 KiB rendering bound. Branch-local existential writes
 are merged through typed HLBC block parameters before an Array literal is
 finalized. ArraySlice, tuple, patch-local, native-object, and closure values
@@ -449,11 +453,11 @@ contextually typed operator/overload and unbound-method references,
 synchronous `@MainActor` closure values, common lazy/mutable/conditional
 closure variables, and recursively direct local helpers that also form closure
 values,
-automatically frozen `Swift.print`, `Swift.debugPrint`, and fixed
+automatically captured `Swift.print`, `Swift.debugPrint`, and fixed
 String-description NativeImports, and fully concrete sequential `async`,
 `async throws`, and `@MainActor async` entries with multiple suspension points,
 exact patch-local async calls, and exact async NativeImports. A new `final` class may
-also inherit an HLXI-frozen, `NSObject`-compatible project or system type under
+also inherit an HLXI-captured, `NSObject`-compatible project or system type under
 the closed hosted profile and cross into native code as that superclass. The
 current profile is limited to inherited no-argument initialization, no stored
 properties, and no-argument/Bool `Void` overrides.
@@ -474,7 +478,7 @@ Within one verified image, a concrete `throws(Failure)` callable preserves the
 exact Error-conforming patch-local nominal through direct and closure calls,
 escaping aggregate storage, concrete generic forwarding, supported concrete
 higher-order standard-library calls, and catch continuations. This current v1
-ABI is gated by `typed-throws-1`; its thrown payload is not reduced to a String,
+ABI requires the `typed-throws-1` capability; its thrown payload is not reduced to a String,
 and conversion to `throws(any Error)` is
 accepted only through a concrete compiler reabstraction thunk. Typed-throws
 Shell roots and throwing NativeImport callbacks remain outside the profile.
@@ -516,7 +520,7 @@ of legal `@escaping` property syntax, and retains expression actor isolation.
 This includes `UIAction`/`UIAlertAction`, `UIViewController.present`, cell and
 operation completion handlers, `NSPredicate`, and `FileManager` enumeration.
 Swift `Any` boxing, Objective-C protocol erasure,
-and Foundation value-overlay bridges are likewise frozen as exact generic
+and Foundation value-overlay bridges are likewise captured as exact generic
 NativeImport adapters rather than API-specific runtime behavior. All ABI,
 schema, capability, and product versions remain 1/1.0.
 
@@ -606,4 +610,5 @@ not an authorization to bypass platform policy. The App Store channel is
 explicitly `policyBlocked`. A real deployment still needs a documented target
 distribution, legal and security approval, device and business-corpus
 qualification, operational control-plane design, and an emergency disable
-process. Technical success in the Simulator does not close those gates.
+process. Technical success in the Simulator does not complete those approvals
+or qualification steps.

@@ -1,5 +1,11 @@
 #!/bin/sh
 set -eu
+
+# Target phases exist at the target level, while one Helix profile owns
+# only one build configuration. Unconfigured configurations are normal.
+if [ "${CONFIGURATION:-}" != 'Release' ]; then
+    exit 0
+fi
 script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 integration_root=$(CDPATH= cd -- "$script_directory/../.." && pwd -P)
 

@@ -714,7 +714,7 @@ public struct Lowerer: Sendable {
                   expected.isMainActorRestriction(of: physical)
             else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "frozen result type disagrees with the lowered function convention"
+                    "captured result type disagrees with the lowered function convention"
                 )
             }
             signature.result = expectedResultType
@@ -727,7 +727,7 @@ public struct Lowerer: Sendable {
               effectiveEffects.isAsync == signature.effects.isAsync
         else {
             throw CanonicalSIL.LoweringError.malformedSIL(
-                "frozen throwing/async effects disagree with the lowered function convention"
+                "captured throwing/async effects disagree with the lowered function convention"
             )
         }
         let usesRuntimeAddresses = signature.parameterConventions.contains(.inout)
@@ -2224,7 +2224,7 @@ public struct Lowerer: Sendable {
                 }
                 throw CanonicalSIL.LoweringError.unsupportedInstruction(
                     line: line,
-                    text: "stored property getter is absent from the frozen Shell"
+                    text: "stored property getter is absent from the indexed Shell"
                 )
             }
             guard case let .nativeImport(requirement) = binding.target else {
@@ -5764,7 +5764,7 @@ public struct Lowerer: Sendable {
                   physicalRange.count == tokens.count
             else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "\(context) physical argument count does not match its frozen ABI"
+                    "\(context) physical argument count does not match its captured ABI"
                 )
             }
             var physicalValues: [String] = []
@@ -5862,7 +5862,7 @@ public struct Lowerer: Sendable {
             guard physicalTokens.count == Int(projection.physicalParameterCount)
             else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "NativeImport physical argument count does not match its frozen projection"
+                    "NativeImport physical argument count does not match its captured projection"
                 )
             }
             guard case .nativeImport = binding.target else {
@@ -5957,7 +5957,7 @@ public struct Lowerer: Sendable {
                         continue
                     }
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "NativeImport omitted physical parameter is not the frozen default generator"
+                        "NativeImport omitted physical parameter is not the captured default generator"
                     )
                 case .optionalNone:
                     guard inlineOptionalNoneValues.remove(token) != nil else {
@@ -6076,7 +6076,7 @@ public struct Lowerer: Sendable {
             guard references.variants.count > 1 else {
                 guard let reference = references.sole else {
                     throw CanonicalSIL.LoweringError.invalidCallTable(
-                        "function reference has no frozen call variant"
+                        "function reference has no captured call variant"
                     )
                 }
                 return reference
@@ -6119,7 +6119,7 @@ public struct Lowerer: Sendable {
                 throw CanonicalSIL.LoweringError.callSignatureMismatch(
                     line: line,
                     mangledName: references.variants[0].binding.mangledName,
-                    detail: "no frozen source-call variant matches the physical default arguments; "
+                    detail: "no captured source-call variant matches the physical default arguments; "
                         + "evidence \(evidence); variants \(variants)"
                 )
             }
@@ -6135,7 +6135,7 @@ public struct Lowerer: Sendable {
                 throw CanonicalSIL.LoweringError.callSignatureMismatch(
                     line: line,
                     mangledName: references.variants[0].binding.mangledName,
-                    detail: "physical default arguments match multiple equally canonical frozen source-call variants"
+                    detail: "physical default arguments match multiple equally canonical captured source-call variants"
                 )
             }
             return selected
@@ -7565,7 +7565,7 @@ public struct Lowerer: Sendable {
                   reference.physicalParameterConventions.last == .inout
             else {
                 throw CanonicalSIL.LoweringError.invalidCallTable(
-                    "mutating value-receiver call has an invalid frozen ABI"
+                    "mutating value-receiver call has an invalid captured ABI"
                 )
             }
             let receiverToken = argumentTokens[argumentTokens.count - 1]
@@ -20456,7 +20456,7 @@ public struct Lowerer: Sendable {
                       requirement.requiredCapability == descriptor.capability
                 else {
                     throw CanonicalSIL.LoweringError.invalidCallTable(
-                        "Swift native text rendering has an invalid frozen binding"
+                        "Swift native text rendering has an invalid captured binding"
                     )
                 }
                 let result = try allocate(type: .string)
@@ -22126,7 +22126,7 @@ public struct Lowerer: Sendable {
                 let source = try resolve(arguments[0], line: line)
                 guard case .native = registerTypes[Int(source.rawValue)] else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "native-value-to-Objective-C bridge payload is not a frozen native value"
+                        "native-value-to-Objective-C bridge payload is not a captured native value"
                     )
                 }
                 let type = registerTypes[Int(source.rawValue)]
@@ -22224,7 +22224,7 @@ public struct Lowerer: Sendable {
                     source = payload
                 } else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Objective-C-to-String bridge is not proven by its frozen boundary"
+                        "Objective-C-to-String bridge is not proven by its captured boundary"
                     )
                 }
             case .arrayToObjectiveC, .arrayFromObjectiveC,
@@ -22272,7 +22272,7 @@ public struct Lowerer: Sendable {
             guard case let .native(targetType) = try parseType("Swift.AnyObject")
             else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "\(context) has no frozen Swift.AnyObject type"
+                    "\(context) has no captured Swift.AnyObject type"
                 )
             }
             let symbol = CanonicalSIL.NativeBridgeSymbols
@@ -22287,7 +22287,7 @@ public struct Lowerer: Sendable {
                   case let .nativeImport(requirement) = binding.target
             else {
                 throw CanonicalSIL.LoweringError.invalidCallTable(
-                    "\(context) has no exact frozen NativeImport"
+                    "\(context) has no exact captured NativeImport"
                 )
             }
             let result = try allocate(type: .native(targetType))
@@ -24847,7 +24847,7 @@ public struct Lowerer: Sendable {
                 let receiverType = registerTypes[Int(receiver.rawValue)]
                 guard case .native = receiverType else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "native property receiver is not a frozen native reference"
+                        "native property receiver is not a captured native reference"
                     )
                 }
                 let getterType = getter?.resultType
@@ -25153,7 +25153,7 @@ public struct Lowerer: Sendable {
                       case let .nativeImport(requirement) = binding.target
                 else {
                     throw CanonicalSIL.LoweringError.invalidCallTable(
-                        "Selector construction has no exact frozen initializer"
+                        "Selector construction has no exact captured initializer"
                     )
                 }
                 let string = try allocate(type: .string)
@@ -25317,7 +25317,7 @@ public struct Lowerer: Sendable {
                       case let .nativeImport(requirement) = binding.target
                 else {
                     throw CanonicalSIL.LoweringError.invalidCallTable(
-                        "native raw-value construction has no exact frozen initializer"
+                        "native raw-value construction has no exact captured initializer"
                     )
                 }
                 let result = try allocate(type: .native(typeID))
@@ -25410,7 +25410,7 @@ public struct Lowerer: Sendable {
                           sourceType != targetType
                     else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
-                            "AnyObject erasure source is not an exact frozen reference"
+                            "AnyObject erasure source is not an exact captured reference"
                         )
                     }
                     let symbol = CanonicalSIL.NativeBridgeSymbols.upcast(
@@ -25426,7 +25426,7 @@ public struct Lowerer: Sendable {
                           case let .nativeImport(requirement) = binding.target
                     else {
                         throw CanonicalSIL.LoweringError.invalidCallTable(
-                            "AnyObject erasure has no exact frozen bridge"
+                            "AnyObject erasure has no exact captured bridge"
                         )
                     }
                     let conversion = try prepareNativeReferenceConversion(
@@ -25522,7 +25522,7 @@ public struct Lowerer: Sendable {
                       sourceType != targetType
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "native upcast source or destination is not an exact frozen reference"
+                        "native upcast source or destination is not an exact captured reference"
                     )
                 }
                 let symbol = CanonicalSIL.NativeBridgeSymbols.upcast(
@@ -25538,7 +25538,7 @@ public struct Lowerer: Sendable {
                       case let .nativeImport(requirement) = binding.target
                 else {
                     throw CanonicalSIL.LoweringError.invalidCallTable(
-                        "native upcast has no exact frozen bridge"
+                        "native upcast has no exact captured bridge"
                     )
                 }
                 let conversion = try prepareNativeReferenceConversion(
@@ -26992,7 +26992,7 @@ public struct Lowerer: Sendable {
                 }
                 guard let physicalReference = references.variants.first else {
                     throw CanonicalSIL.LoweringError.invalidCallTable(
-                        "function reference has no frozen call variant"
+                        "function reference has no captured call variant"
                     )
                 }
                 let physicalBinding = physicalReference.binding
@@ -27282,7 +27282,7 @@ public struct Lowerer: Sendable {
                     // reference; its frozen NativeImport handles that path.
                     guard functionReferences[call[1]] != nil else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
-                            "unfrozen native allocator is not applied to a hosted metatype"
+                            "uncaptured native allocator is not applied to a hosted metatype"
                         )
                     }
                 }
@@ -27607,7 +27607,7 @@ public struct Lowerer: Sendable {
                     else {
                         throw CanonicalSIL.LoweringError.unsupportedInstruction(
                             line: sourceLine,
-                            text: "OptionSet array literal without one frozen concrete type"
+                            text: "OptionSet array literal without one captured concrete type"
                         )
                     }
                     let symbol = CanonicalSIL.NativeBridgeSymbols
@@ -27700,7 +27700,7 @@ public struct Lowerer: Sendable {
                 }
                 guard let physicalReference = references.variants.first else {
                     throw CanonicalSIL.LoweringError.invalidCallTable(
-                        "function reference has no frozen call variant"
+                        "function reference has no captured call variant"
                     )
                 }
                 let physicalBinding = physicalReference.binding
@@ -28049,7 +28049,7 @@ public struct Lowerer: Sendable {
                       try parsePhysicalType(cast[2], bridgedTo: sourceType) == sourceType
                 else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "unchecked reference-to-Optional cast changes its frozen VM type"
+                        "unchecked reference-to-Optional cast changes its captured VM type"
                     )
                 }
                 let payload = try prepareOwnedValue(
@@ -28951,7 +28951,7 @@ public struct Lowerer: Sendable {
                     }
                     throw CanonicalSIL.LoweringError.unsupportedInstruction(
                         line: sourceLine,
-                        text: "stored property is read-only in the frozen Shell"
+                        text: "stored property is read-only in the indexed Shell"
                     )
                 }
                 guard case let .nativeImport(requirement) = binding.target else {
@@ -32041,7 +32041,7 @@ public struct Lowerer: Sendable {
                     allowingForeignABIRepresentation
             ) else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "foreign physical type \(raw) cannot bridge to frozen logical type \(expected)"
+                    "foreign physical type \(raw) cannot bridge to captured logical type \(expected)"
                 )
             }
             return expected

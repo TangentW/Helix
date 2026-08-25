@@ -18,23 +18,28 @@ Helix 让 Swift 真正拥有线上热修复与实时热重载能力。开发阶�
 | 目标 | 指南 |
 | --- | --- |
 | 运行仓库内的 UIKit Demo，完整体验线上热修复与实时热重载 | [UIKit Demo](Demo/README.md) |
-| 为现有 App 添加对应的 App 端模块、Xcode 集成与项目配置 | [使用入门](Docs/Getting-Started.zh-CN.md) |
+| 为现有 App 自动完成 target、Scheme、Package、编译器、Bridge 与 Runtime 接入 | [使用入门](Docs/Getting-Started.zh-CN.md) |
 | 确认当前支持哪些 Swift 代码修改，以及哪些修改仍需正常重新构建 | [能力与限制](Docs/Capabilities-and-Limits.zh-CN.md) |
 | 理解 Swift 编译、HLBC、HLVM、补丁激活与两条工作流的隔离设计 | [总体架构](Docs/Architecture.zh-CN.md) |
 | 准备 Release Shell，构建并签名 `.hlxp` 补丁，然后完成安装、激活与回滚 | [生产热补丁](Docs/Production-Hot-Patching.zh-CN.md) |
 | 跟踪一次 Swift 代码保存如何经过编译、认证传输、运行时激活与 UIKit/SwiftUI 刷新 | [开发期热重载](Docs/Development-Live-Reload.zh-CN.md) |
-| 使用 CocoaPods 把聚合 App 端模块接入项目 | [CocoaPods 接入](CocoaPods/README.md) |
 | 使用 Helix Mac 助手发现项目、配置两条工作流并管理开发会话 | [Helix Hub](Hub/README.md) |
 
-## App 端模块
+## App 接入
 
-Helix 为线上热修复和实时热重载提供两套独立的 App 端产品。每个 App target 只
-链接其中一个；同一工程需要两项能力时，请分别配置 Release 和 Debug App target。
+Helix Hub 只给 App 链接一个生产安全产品 `HelixAppIntegration`，再由生成的隐藏
+bootstrap 自动启动。业务源码无需 import 或初始化 Helix；同一个 App target 可以
+通过不同 configuration 同时使用两条工作流。
 
-| 使用场景 | 引入模块 | 提供的能力 |
+| 构建角色 | 产品 | 行为 |
 | --- | --- | --- |
-| 线上热修复（Release） | `HelixAppRuntime` | 验证并执行 HLBC 补丁，管理安装、激活、恢复、吊销和回滚 |
-| 实时热重载（Debug） | `HelixDevAppRuntime` | 接收并验证开发期更新，提供诊断并刷新 UIKit 或 SwiftUI；改动仅对当前 Debug 进程生效 |
+| 每个已配置 App target | `HelixAppIntegration` | 生产 Verifier、HLVM、补丁安装、恢复与回滚；不含开发传输和加载器 |
+| 仅 Live Reload configuration | 动态 `HelixDevSupport` | 认证开发更新、Simulator 原生加载、诊断与 UI 刷新；只由生成的开发 configuration 链接和嵌入 |
+
+Hub 会自动发现或创建 Scheme、复用或添加 Swift package、捕获真实 Xcode 编译、
+在 DerivedData 生成 Bridge，并启动所选 Runtime。开发者不维护源码列表、API 白名单，
+也不执行额外的构建“冻结”。
+接入后的映射仍可随时修改；Hub 能以事务方式重配置或移除 Xcode 接入，同时保留业务源码与工程原始设置。
 
 编译器、Helix Hub 和 CLI 只在 Mac 上运行，不要把这些构建工具链接进 iOS
 Release App。

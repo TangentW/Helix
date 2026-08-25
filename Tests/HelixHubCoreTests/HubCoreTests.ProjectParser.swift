@@ -5,7 +5,7 @@ import Testing
 
 @Suite("Helix Hub project discovery")
 struct ProjectParserTests {
-    @Test("Checked-in Demo project exposes targets, sources, products, and schemes")
+    @Test("Checked-in Demo project exposes target capabilities, products, and schemes")
     func parsesDemo() throws {
         let repository = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -20,9 +20,7 @@ struct ProjectParserTests {
 
         let liveFeature = try #require(project.target(named: "LiveReloadFeature"))
         #expect(liveFeature.kind == .framework)
-        #expect(liveFeature.sourceFiles == [
-            "LiveReloadFeature/Sources/LiveReloadFeature.Screen.swift",
-        ])
+        #expect(liveFeature.supportsSourceCompilation)
         #expect(
             liveFeature.baseConfigurationPaths["Debug"]
                 == ".helix/xcode/ProjectConfigurations/live-Feature-Debug.xcconfig"
@@ -31,7 +29,87 @@ struct ProjectParserTests {
         let liveApp = try #require(project.target(named: "LiveReloadDemo"))
         #expect(liveApp.kind == .application)
         #expect(liveApp.buildableName == "LiveReloadDemo.app")
-        #expect(liveApp.packageProducts == ["HelixDevAppRuntime"])
+        #expect(liveApp.packageProducts == [
+            "HelixAppIntegration", "HelixDevSupport",
+        ])
+    }
+
+    @Test("A filesystem-synchronized target is eligible without enumerating its files")
+    func recognizesSynchronizedSourceTarget() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-hub-synchronized-project-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let project = root.appendingPathComponent("Example.xcodeproj", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: project,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("Example", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let document = """
+        {
+          archiveVersion = 1;
+          objectVersion = 77;
+          objects = {
+            PROJECT = {
+              isa = PBXProject;
+              buildConfigurationList = PROJECT_CONFIG_LIST;
+              mainGroup = MAIN_GROUP;
+              targets = (APP_TARGET, );
+            };
+            MAIN_GROUP = {
+              isa = PBXGroup;
+              children = (SYNC_GROUP, );
+              sourceTree = "<group>";
+            };
+            SYNC_GROUP = {
+              isa = PBXFileSystemSynchronizedRootGroup;
+              path = Example;
+              sourceTree = "<group>";
+            };
+            APP_TARGET = {
+              isa = PBXNativeTarget;
+              buildConfigurationList = TARGET_CONFIG_LIST;
+              buildPhases = ( );
+              fileSystemSynchronizedGroups = (SYNC_GROUP, );
+              name = Example;
+              packageProductDependencies = ( );
+              productName = Example;
+              productType = "com.apple.product-type.application";
+            };
+            PROJECT_CONFIG_LIST = {
+              isa = XCConfigurationList;
+              buildConfigurations = (PROJECT_DEBUG, );
+            };
+            PROJECT_DEBUG = {
+              isa = XCBuildConfiguration;
+              buildSettings = { };
+              name = Debug;
+            };
+            TARGET_CONFIG_LIST = {
+              isa = XCConfigurationList;
+              buildConfigurations = (TARGET_DEBUG, );
+            };
+            TARGET_DEBUG = {
+              isa = XCBuildConfiguration;
+              buildSettings = { };
+              name = Debug;
+            };
+          };
+          rootObject = PROJECT;
+        }
+        """
+        try Data(document.utf8).write(
+            to: project.appendingPathComponent("project.pbxproj")
+        )
+
+        let parsed = try Hub.ProjectFileParser().parse(projectURL: project)
+        let target = try #require(parsed.target(named: "Example"))
+        #expect(target.supportsSourceCompilation)
     }
 
     @Test("Capability selection is canonical and nonempty")

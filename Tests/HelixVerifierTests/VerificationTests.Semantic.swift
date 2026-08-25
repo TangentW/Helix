@@ -33,7 +33,7 @@ struct SemanticVerifier {
 
         #expect(
             throws: Verification.Error.invalidShellInterface(
-                "unfrozen local nominal Fixture.Local cannot appear in entry 0 signature"
+                "unindexed local nominal Fixture.Local cannot appear in entry 0 signature"
             )
         ) {
             try Verification.ShellInterface(
@@ -105,7 +105,7 @@ struct SemanticVerifier {
         ])
         #expect(
             throws: Verification.Error.invalidModule(
-                "local type \(key) disagrees with its frozen Shell value layout"
+                "local type \(key) disagrees with its indexed Shell value layout"
             )
         ) {
             try Verification.Engine().verify(

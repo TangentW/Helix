@@ -1,6 +1,7 @@
 #if os(macOS)
 import Foundation
 @testable import HelixHubCore
+import HelixBuildTools
 import Testing
 
 @Suite("Helix Hub project registry", .serialized)
@@ -56,9 +57,41 @@ struct ProjectStoreTests {
         capability: Hub.Capability
     ) -> Hub.InstallationResult {
         let project = root.appendingPathComponent("\(name).xcodeproj")
+        let profileID = capability == .hotPatch ? "hot-patch" : "live-reload"
+        let feature = XcodeIntegration.Feature(
+            id: "feature",
+            targetName: name,
+            moduleName: name
+        )
+        let patch = capability == .hotPatch
+            ? XcodeIntegration.PatchSettings(
+                actionTargetName: "HelixPatchAction",
+                actionSchemeName: "Helix Build Patch",
+                recipePath: "Configurations/Helix/QuickPatchRecipe.json",
+                signingCertificatePath: ".helix/private/SigningCertificate.json",
+                trustedRootPath: ".helix/private/TrustedRoot.json"
+            )
+            : nil
+        let hostPlan = XcodeIntegration.HostPlan(
+            projectPath: "\(name).xcodeproj",
+            integrationRoot: ".helix/\(name)",
+            features: [feature],
+            profiles: [.init(
+                id: profileID,
+                workflow: capability == .hotPatch ? .hotPatch : .liveReload,
+                schemeName: name,
+                applicationTargetName: name,
+                configurationName: "Debug",
+                bundleIdentifier: "dev.example.\(name.lowercased())",
+                namespaceSeed: name,
+                featureID: feature.id,
+                patch: patch
+            )]
+        )
         return .init(
             projectURL: project,
             hostPlanURL: root.appendingPathComponent(".helix/\(name)/HostPlan.json"),
+            hostPlan: hostPlan,
             capabilities: [capability],
             requirements: [.init(
                 code: "REQ-\(name)",
@@ -66,8 +99,7 @@ struct ProjectStoreTests {
                 summary: "Example requirement",
                 detail: "Example detail"
             )],
-            featureTargetNames: ["feature": "Feature"],
-            developmentIdentityProfiles: capability == .hotPatch ? ["hot-patch"] : [],
+            developmentIdentityProfiles: capability == .hotPatch ? [profileID] : [],
             writtenRelativePaths: []
         )
     }

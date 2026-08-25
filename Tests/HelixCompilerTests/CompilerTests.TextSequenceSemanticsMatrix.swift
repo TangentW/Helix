@@ -526,7 +526,7 @@ struct TextSequenceSemanticsMatrix {
                 value.utf8.count
             }
             """,
-            diagnostic: "is not frozen in the target HLXI"
+            diagnostic: "is absent from the target HLXI"
         )
         expectUnsupported(
             name: "stringUTF16Count",
@@ -535,7 +535,7 @@ struct TextSequenceSemanticsMatrix {
                 value.utf16.count
             }
             """,
-            diagnostic: "is not frozen in the target HLXI"
+            diagnostic: "is absent from the target HLXI"
         )
         expectUnsupported(
             name: "stringUnicodeScalarCount",
@@ -544,7 +544,7 @@ struct TextSequenceSemanticsMatrix {
                 value.unicodeScalars.count
             }
             """,
-            diagnostic: "is not frozen in the target HLXI"
+            diagnostic: "is absent from the target HLXI"
         )
         expectUnsupported(
             name: "stringIndexedElement",
@@ -553,7 +553,7 @@ struct TextSequenceSemanticsMatrix {
                 value[value.index(after: value.startIndex)]
             }
             """,
-            diagnostic: "is not frozen in the target HLXI"
+            diagnostic: "is absent from the target HLXI"
         )
     }
 

@@ -32,7 +32,7 @@ private struct WorkspaceScanner: Sendable {
                 source.absolutePath,
                 maximumSourceBytes: maximumSourceBytes
             )
-            // The frozen Shell, rather than connection time, is the source
+            // The captured Shell build, rather than connection time, is the source
             // baseline. This lets an installed test build catch up when it
             // pairs after the developer has already edited a file.
             fingerprint.contentHash = source.contentHash

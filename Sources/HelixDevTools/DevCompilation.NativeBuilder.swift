@@ -85,7 +85,7 @@ public actor NativeBuilder {
                 return .rebuildRequired(
                     diagnostic(
                         code: "HLXLR502",
-                        message: "one or more changed roots lack frozen Native replacement metadata",
+                        message: "one or more changed roots lack indexed Native replacement metadata",
                         request: request,
                         nextAction: "use HLBC for these roots or rebuild the Dev Shell with Native indexing enabled"
                     )
@@ -109,7 +109,7 @@ public actor NativeBuilder {
                     return .rebuildRequired(
                         diagnostic(
                             code: "HLXLR303",
-                            message: "a frozen Native root is missing from the current SIL module",
+                            message: "an indexed Native root is missing from the current SIL module",
                             request: request,
                             nextAction: "restore the declaration or rebuild the Dev Shell"
                         )
@@ -597,7 +597,7 @@ private enum ContractError: Swift.Error, CustomStringConvertible {
     var description: String {
         switch self {
         case .identityMismatch:
-            "Dev Manifest, HLXI, and Reload Index do not share one frozen build identity"
+            "Dev Manifest, HLXI, and Reload Index do not share one captured build identity"
         case let .sourceBaselineMismatch(path):
             "Dev Manifest and HLXI disagree on the baseline identity of \(path)"
         case .invalidActiveFunctionState:

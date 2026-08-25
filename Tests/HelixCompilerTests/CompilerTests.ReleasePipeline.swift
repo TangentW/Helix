@@ -776,7 +776,10 @@ struct ReleasePipeline {
                 nativeImports: [importBinding]
             )
         }
-        #expect(throws: BridgeGeneration.Error.nativeImportBindingMismatch(nativeImportID)) {
+        #expect(throws: BridgeGeneration.Error.generatedNativeImportBindingMismatch(
+            nativeImportID,
+            "native call identity"
+        )) {
             try BridgeGeneration.Generator().generate(
                 archive: decoded,
                 moduleName: "Fixture",

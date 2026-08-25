@@ -1224,7 +1224,7 @@ public final class Engine: @unchecked Sendable {
                       let original = originals[entry.entryIndex]
                 else {
                     throw Runtime.ActivationError.invalidGeneration(
-                        "entry \(entry.entryIndex) has no frozen Shell/original descriptor"
+                        "entry \(entry.entryIndex) has no indexed Shell/original descriptor"
                     )
                 }
                 guard original.parameterTypes == shellEntry.parameterTypes,

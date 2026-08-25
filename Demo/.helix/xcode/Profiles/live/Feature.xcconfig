@@ -2,7 +2,7 @@
 #include "Profile.xcconfig"
 PRODUCT_MODULE_NAME = LiveReloadFeature
 LD_DYLIB_INSTALL_NAME = @rpath/$(EXECUTABLE_PATH)
-OTHER_SWIFT_FLAGS = $(inherited) -Xfrontend -enable-private-imports -Xfrontend -enable-implicit-dynamic -Xfrontend -enable-dynamic-replacement-chaining
+OTHER_SWIFT_FLAGS = $(inherited) -Xfrontend -enable-private-imports -Xfrontend -enable-implicit-dynamic -Xfrontend -enable-dynamic-replacement-chaining -user-module-version "$(CURRENT_PROJECT_VERSION)"
 HELIX_REAL_SWIFT_EXEC = $(TOOLCHAIN_DIR)/usr/bin/swiftc
 SWIFT_EXEC = $(HELIX_INTEGRATION_ROOT)/Scripts/Compiler/swiftc
 SWIFT_USE_INTEGRATED_DRIVER = NO

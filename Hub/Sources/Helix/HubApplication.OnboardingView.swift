@@ -15,7 +15,6 @@ struct OnboardingView: View {
                 ForEach($editor.forms) { $form in
                     WorkflowEditor(form: $form, project: editor.project)
                 }
-                integrationSettings
                 validation
                 if !editor.requirements.isEmpty {
                     VStack(alignment: .leading, spacing: 10) {
@@ -35,7 +34,7 @@ struct OnboardingView: View {
     private var header: some View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 5) {
-                Text("Configure \(editor.project.name)")
+                Text("Enable Helix for \(editor.project.name)")
                     .font(.largeTitle.bold())
                 Text(editor.project.projectURL.path)
                     .font(.caption.monospaced())
@@ -49,36 +48,20 @@ struct OnboardingView: View {
 
     private var introduction: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label("Generated Swift stays out of the project navigator", systemImage: "eye.slash")
+            Label("Ready without project setup", systemImage: "wand.and.stars")
                 .font(.headline)
             Text(
-                "Helix writes only owned build settings, build actions, generated integration metadata, and the optional Hot Patch recipe to the source tree. Compiler policy and API discovery are automatic; Bridge Swift is materialized inside DerivedData during the active Xcode build."
+                "Choose the workflows and click Enable Helix. Hub detects the App, sources, scheme, configurations, module, and bundle identity; links one integration product; and starts the runtime automatically."
             )
             .foregroundStyle(.secondary)
             Text(
-                "Both workflows are selected for a new project. Existing workflows remain enabled so reconfiguration cannot silently remove a working integration; a skipped workflow can be added later."
+                "Generated Bridge code and build artifacts stay in DerivedData. Existing project settings are wrapped and preserved."
             )
             .font(.caption)
             .foregroundStyle(.secondary)
         }
         .padding(14)
         .background(Color.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
-    }
-
-    private var integrationSettings: some View {
-        GroupBox("Integration location") {
-            VStack(alignment: .leading, spacing: 6) {
-                TextField("Project-relative generated-kit directory", text: $editor.integrationRoot)
-                    .textFieldStyle(.roundedBorder)
-                    .disabled(editor.hasInstalledCapabilities)
-                Text(editor.hasInstalledCapabilities
-                    ? "This Hub-owned location is locked after the first capability is installed."
-                    : "Generated and Hub-owned")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.vertical, 4)
-        }
     }
 
     @ViewBuilder
@@ -107,13 +90,19 @@ struct OnboardingView: View {
             }
             Spacer()
             Button("Cancel") { model.closeEditor() }
-            Button(editor.forms.contains(where: { $0.isInstalled })
-                ? "Apply / Add Capability" : "Configure Project") {
+            Button(actionLabel) {
                 model.install()
             }
             .buttonStyle(.borderedProminent)
             .disabled(!editor.canInstall || model.isWorking)
         }
+    }
+
+    private var actionLabel: String {
+        if editor.selectedForms.isEmpty, editor.hasInstalledCapabilities {
+            return "Remove Helix"
+        }
+        return editor.hasInstalledCapabilities ? "Apply Changes" : "Enable Helix"
     }
 }
 
@@ -127,8 +116,8 @@ private struct WorkflowEditor: View {
 
     private var featureTargets: [Hub.XcodeTarget] {
         project.targets.filter {
-            !$0.sourceFiles.isEmpty
-                && ![.application, .testBundle, .aggregate].contains($0.kind)
+            $0.supportsSourceCompilation
+                && ![.testBundle, .aggregate].contains($0.kind)
         }
     }
 
@@ -140,14 +129,19 @@ private struct WorkflowEditor: View {
             .sorted()
     }
 
+    private var schemeNames: [String] {
+        Array(Set(
+            project.sharedSchemes.map(\.name)
+                + [form.schemeName, form.applicationTargetName]
+                    .filter { !$0.isEmpty }
+        )).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+
     var body: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
-                    Toggle(isOn: Binding(
-                        get: { form.isEnabled },
-                        set: { if !form.isInstalled { form.isEnabled = $0 } }
-                    )) {
+                    Toggle(isOn: $form.isEnabled) {
                         Label(
                             form.capability.displayName,
                             systemImage: form.capability == .hotPatch
@@ -156,10 +150,9 @@ private struct WorkflowEditor: View {
                         .font(.title3.bold())
                     }
                     .toggleStyle(.switch)
-                    .disabled(form.isInstalled)
                     Spacer()
                     if form.isInstalled {
-                        Label("Installed", systemImage: "checkmark.seal.fill")
+                        Label("Currently configured", systemImage: "checkmark.seal.fill")
                             .font(.caption.weight(.medium))
                             .foregroundStyle(.green)
                     }
@@ -169,11 +162,26 @@ private struct WorkflowEditor: View {
                     .foregroundStyle(.secondary)
                 if form.isEnabled {
                     Divider()
-                    selectionGrid
+                    detectedMapping
                     runtimeStatus
-                    DisclosureGroup("Advanced identity and paths") {
-                        advancedSettings
+                    DisclosureGroup("Review or change detected Xcode mapping") {
+                        selectionGrid
                             .padding(.top, 8)
+                    }
+                    if form.capability == .hotPatch {
+                        DisclosureGroup("Advanced Hot Patch option") {
+                            Toggle(
+                                "Create a local development signing identity",
+                                isOn: Binding(
+                                    get: { form.patch?.createDevelopmentIdentity ?? true },
+                                    set: {
+                                        if form.patch == nil { form.patch = .init() }
+                                        form.patch?.createDevelopmentIdentity = $0
+                                    }
+                                )
+                            )
+                            .padding(.top, 8)
+                        }
                     }
                 }
             }
@@ -181,76 +189,53 @@ private struct WorkflowEditor: View {
         }
     }
 
+    private var detectedMapping: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label("Detected automatically", systemImage: "checkmark.circle.fill")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.green)
+            Text(
+                "\(form.applicationTargetName) · \(form.configurationName) · \(form.schemeName)"
+            )
+            .font(.caption.monospaced())
+            .foregroundStyle(.secondary)
+        }
+    }
+
     private var selectionGrid: some View {
         Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 12) {
             pickerRow("App target", selection: $form.applicationTargetName, values: appTargets.map(\.name))
-            pickerRow("Feature target", selection: $form.featureTargetName, values: featureTargets.map(\.name))
-            pickerRow("Shared scheme", selection: $form.schemeName, values: project.sharedSchemes.map(\.name))
+            pickerRow("Source target", selection: $form.featureTargetName, values: featureTargets.map(\.name))
+            pickerRow("Run scheme", selection: $form.schemeName, values: schemeNames)
             pickerRow("Configuration", selection: $form.configurationName, values: configurations)
         }
-        .disabled(form.isInstalled)
         .onChange(of: form.applicationTargetName) { normalizeConfiguration() }
         .onChange(of: form.featureTargetName) { normalizeConfiguration() }
     }
 
     private var runtimeStatus: some View {
         let linked = project.target(named: form.applicationTargetName)?
-            .linksRuntimeProduct(
-                form.expectedRuntimeProduct,
-                configurationName: form.configurationName
-            ) == true
+            .linksRuntimeProduct(form.expectedRuntimeProduct) == true
+        let color: Color = linked ? .green : .blue
         return HStack(alignment: .top, spacing: 9) {
-            Image(systemName: linked ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                .foregroundStyle(linked ? Color.green : Color.orange)
+            Image(systemName: linked ? "checkmark.circle.fill" : "plus.circle.fill")
+                .foregroundStyle(color)
             VStack(alignment: .leading, spacing: 2) {
                 Text(linked
                     ? "\(form.expectedRuntimeProduct) is linked"
-                    : "Add \(form.expectedRuntimeProduct) to \(form.applicationTargetName)")
+                    : "\(form.expectedRuntimeProduct) will be linked automatically")
                     .font(.subheadline.weight(.semibold))
                 Text(
                     linked
                         ? "Hub will preserve the current dependency linkage."
-                        : "Add the Swift package product or CocoaPod, then initialize its runtime API; Hub never injects hidden application code."
+                        : "Hub owns the package linkage; no App source import or initialization is required."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
             }
         }
         .padding(10)
-        .background((linked ? Color.green : Color.orange).opacity(0.07), in: RoundedRectangle(cornerRadius: 9))
-    }
-
-    private var advancedSettings: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            LabeledContent("Profile ID") {
-                TextField("Profile ID", text: $form.profileID)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 360)
-                    .disabled(form.isInstalled)
-            }
-            LabeledContent("Swift module override") {
-                TextField("Automatic from Xcode", text: $form.featureModuleName)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 360)
-            }
-            LabeledContent("Bundle ID override") {
-                TextField("Automatic from Xcode", text: $form.bundleIdentifier)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 360)
-            }
-            LabeledContent("Namespace seed") {
-                TextField("Stable namespace seed", text: $form.namespaceSeed)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 360)
-            }
-            if form.capability == .hotPatch {
-                Divider()
-                PatchSettings(patch: Binding(
-                    get: { form.patch ?? .init() },
-                    set: { form.patch = $0 }
-                ))
-            }
-        }
+        .background(color.opacity(0.07), in: RoundedRectangle(cornerRadius: 9))
     }
 
     @ViewBuilder
@@ -273,46 +258,18 @@ private struct WorkflowEditor: View {
     private var description: String {
         switch form.capability {
         case .hotPatch:
-            "Build signed HLBC packages against an exact archived Shell for controlled production repair."
+            "Build signed patches for a specific App build; Hub captures its compiler and binary identity automatically."
         case .liveReload:
-            "Watch saved Swift sources, compile HLBC on the Mac, transfer it over the authenticated session, and refresh matching UI instances."
+            "Save Swift code and see the running Debug App update through the authenticated local session."
         }
     }
 
     private func normalizeConfiguration() {
         if !configurations.contains(form.configurationName) {
+            let preferred = form.capability == .hotPatch ? "Release" : "Debug"
             form.configurationName = configurations.first(where: {
-                $0.caseInsensitiveCompare("Debug") == .orderedSame
+                $0.caseInsensitiveCompare(preferred) == .orderedSame
             }) ?? configurations.first ?? ""
-        }
-    }
-}
-
-private struct PatchSettings: View {
-    @Binding var patch: Hub.PatchDraft
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Toggle("Create and protect a local development signing identity", isOn: $patch.createDevelopmentIdentity)
-            field("Patch action target", text: $patch.actionTargetName)
-            field("Patch action scheme", text: $patch.actionSchemeName)
-            field("Recipe", text: $patch.recipePath)
-            field("Trusted root", text: $patch.trustedRootPath)
-            field("Signing certificate", text: $patch.signingCertificatePath)
-            field("Private key", text: $patch.privateKeyPath)
-            field("Output directory", text: $patch.outputRoot)
-            field("Simulator inbox", text: Binding(
-                get: { patch.simulatorInboxPath ?? "" },
-                set: { patch.simulatorInboxPath = $0.isEmpty ? nil : $0 }
-            ))
-        }
-    }
-
-    private func field(_ title: String, text: Binding<String>) -> some View {
-        LabeledContent(title) {
-            TextField(title, text: text)
-                .textFieldStyle(.roundedBorder)
-                .frame(maxWidth: 440)
         }
     }
 }

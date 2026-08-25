@@ -1934,7 +1934,7 @@ public struct TypeEnvironment: Sendable {
         }
         guard !raw.hasUnparsedInstanceStorage else {
             throw CanonicalSIL.LoweringError.unsupportedType(
-                "frozen Shell value \(key) contains unmodeled instance storage"
+                "indexed Shell value \(key) contains unmodeled instance storage"
             )
         }
         let definition = try definition(for: key)
@@ -1943,20 +1943,20 @@ public struct TypeEnvironment: Sendable {
         case let (.structure(rawFields), .structure(fields)):
             guard rawFields.count == fields.count else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "frozen struct \(key) changed field arity while materializing"
+                    "indexed struct \(key) changed field arity while materializing"
                 )
             }
             guard !rawFields.contains(where: \.hasImmutableDeclarationInitializer)
             else {
                 throw CanonicalSIL.LoweringError.unsupportedType(
-                    "frozen struct \(key) has a let property with a declaration initializer"
+                    "indexed struct \(key) has a let property with a declaration initializer"
                 )
             }
             guard !rawFields.contains(where: {
                 Self.hasUnsupportedFrozenExistential(in: $0.type)
             }) else {
                 throw CanonicalSIL.LoweringError.unsupportedType(
-                    "frozen struct \(key) stores a protocol existential"
+                    "indexed struct \(key) stores a protocol existential"
                 )
             }
             kind = .structure(
@@ -1971,12 +1971,12 @@ public struct TypeEnvironment: Sendable {
         case let (.enumeration(rawCases), .enumeration(cases)):
             guard rawCases.count == cases.count else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "frozen enum \(key) changed case arity while materializing"
+                    "indexed enum \(key) changed case arity while materializing"
                 )
             }
             guard !rawCases.contains(where: \.hasAvailabilityConstraint) else {
                 throw CanonicalSIL.LoweringError.unsupportedType(
-                    "frozen enum \(key) has an availability-constrained case"
+                    "indexed enum \(key) has an availability-constrained case"
                 )
             }
             kind = .enumeration(
@@ -1985,7 +1985,7 @@ public struct TypeEnvironment: Sendable {
                         Self.hasUnsupportedFrozenExistential(in: $0)
                     }) else {
                         throw CanonicalSIL.LoweringError.unsupportedType(
-                            "frozen enum \(key).\(item.name) stores a protocol existential"
+                            "indexed enum \(key).\(item.name) stores a protocol existential"
                         )
                     }
                     let associatedValues = try rawCase.associatedTypes.map { spelling in
@@ -2009,7 +2009,7 @@ public struct TypeEnvironment: Sendable {
                     )
                     guard result.payloadType == item.payloadType else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
-                            "frozen enum \(key).\(item.name) payload changed while materializing"
+                            "indexed enum \(key).\(item.name) payload changed while materializing"
                         )
                     }
                     return result
@@ -2017,7 +2017,7 @@ public struct TypeEnvironment: Sendable {
             )
         default:
             throw CanonicalSIL.LoweringError.unsupportedType(
-                "frozen Shell value \(key) is not a concrete struct or enum"
+                "indexed Shell value \(key) is not a concrete struct or enum"
             )
         }
         let record = try InterfaceArchive.FrozenValueTypeRecord(
@@ -2030,7 +2030,7 @@ public struct TypeEnvironment: Sendable {
         )
         guard record.definition == definition else {
             throw CanonicalSIL.LoweringError.malformedSIL(
-                "frozen value codec shape disagrees with \(key)"
+                "indexed value codec shape disagrees with \(key)"
             )
         }
         return record
@@ -2050,7 +2050,7 @@ public struct TypeEnvironment: Sendable {
             )
             guard current == frozen else {
                 throw CanonicalSIL.LoweringError.unsupportedType(
-                    "frozen Shell value layout changed for \(frozen.key)"
+                    "indexed Shell value layout changed for \(frozen.key)"
                 )
             }
         }

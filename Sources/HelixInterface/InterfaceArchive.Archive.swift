@@ -861,7 +861,7 @@ public struct Archive: Codable, Hashable, Sendable {
                       frozenValueTypeKeys.contains(key)
                 else {
                     throw InterfaceArchive.Error.invalidArchive(
-                        "device signature references an unfrozen Shell value type"
+                        "device signature references a Shell value type absent from the index"
                     )
                 }
             case .address, .mutableCell, .nonOwningReference, .arrayState,

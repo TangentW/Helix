@@ -118,6 +118,94 @@ struct Tooling {
         #expect(!normalized.arguments.contains("-primary-filelist"))
     }
 
+    @Test("A captured job can project out integration-owned scheduling sources")
+    func projectsCapturedSourceMembership() throws {
+        let directory = try temporaryDirectory("helix-source-projection")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let feature = directory.appendingPathComponent("Feature.swift")
+        let support = directory.appendingPathComponent("Support.swift")
+        let trigger = directory.appendingPathComponent("HelixBuildTrigger.swift")
+        for source in [feature, support, trigger] {
+            try Data("// \(source.lastPathComponent)\n".utf8).write(to: source)
+        }
+        let captured = BuildCapture.CapturedFrontendJob(
+            executable: "/usr/bin/swiftc",
+            arguments: [
+                "-module-name", "Fixture",
+                "-target", "arm64-apple-ios18.0-simulator",
+                "-sdk", "/SDK/iPhoneSimulator.sdk",
+                "-primary-file", trigger.lastPathComponent,
+                feature.lastPathComponent,
+                support.path,
+                "-DDEBUG",
+            ],
+            sourceLine: "fixture"
+        )
+        let normalizer = BuildCapture.FrontendJobNormalizer()
+        let normalized = try normalizer.normalize(
+            captured,
+            workingDirectory: directory
+        )
+
+        let projected = try BuildCapture.SourceProjection().project(
+            normalized,
+            onto: [feature.path, support.path],
+            workingDirectory: directory
+        )
+        let result = try normalizer.normalize(
+            projected,
+            workingDirectory: directory
+        )
+
+        #expect(result.sourcePaths == [feature.path, support.path].sorted())
+        #expect(!result.arguments.contains(trigger.path))
+        #expect(result.arguments.contains("-DDEBUG"))
+    }
+
+    @Test("Source projection rejects empty, duplicate, and foreign source sets")
+    func rejectsInvalidSourceProjection() throws {
+        let directory = try temporaryDirectory("helix-source-projection-invalid")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("Feature.swift")
+        try Data("func value() {}\n".utf8).write(to: source)
+        let normalized = try BuildCapture.FrontendJobNormalizer().normalize(
+            .init(
+                executable: "/usr/bin/swiftc",
+                arguments: [
+                    "-module-name", "Fixture",
+                    "-target", "arm64-apple-ios18.0-simulator",
+                    "-sdk", "/SDK/iPhoneSimulator.sdk",
+                    source.path,
+                ],
+                sourceLine: "fixture"
+            ),
+            workingDirectory: directory
+        )
+        let projection = BuildCapture.SourceProjection()
+
+        #expect(throws: BuildCapture.Error.self) {
+            try projection.project(
+                normalized,
+                onto: [],
+                workingDirectory: directory
+            )
+        }
+        #expect(throws: BuildCapture.Error.self) {
+            try projection.project(
+                normalized,
+                onto: [source.path, source.path],
+                workingDirectory: directory
+            )
+        }
+        #expect(throws: BuildCapture.Error.self) {
+            try projection.project(
+                normalized,
+                onto: [directory.appendingPathComponent("Foreign.swift").path],
+                workingDirectory: directory
+            )
+        }
+    }
+
     @Test("Captured sources map project and generated files without leaking host paths")
     func mapsCapturedSourceMembership() throws {
         let workspace = try temporaryDirectory("helix-source-mapping")
@@ -749,7 +837,7 @@ struct Tooling {
         var devImage = Data([0xcf, 0xfa, 0xed, 0xfe])
         devImage.append(Data("HelixDevRuntime HLX_DEV_SESSION_SECRET".utf8))
         try devImage.write(
-            to: frameworks.appendingPathComponent("HelixDevAppRuntime.framework")
+            to: frameworks.appendingPathComponent("HelixDevSupport.framework")
         )
 
         let report = try ReleaseLeakage.AppBundleAuditor().audit(appURL: app)
@@ -758,7 +846,7 @@ struct Tooling {
         #expect(report.findings.contains { $0.code == "HLXREL002" })
 
         try FileManager.default.removeItem(
-            at: frameworks.appendingPathComponent("HelixDevAppRuntime.framework")
+            at: frameworks.appendingPathComponent("HelixDevSupport.framework")
         )
         let link = frameworks.appendingPathComponent("Hidden")
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: app)

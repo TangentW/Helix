@@ -12,7 +12,7 @@ extension RuntimeTests {
 @Suite("Generation registry and Runtime routing")
 struct Routing {
     @Test("Bridge bootstrap binds the generated entry table to one Shell interface")
-    func bridgeBootstrapChecksFrozenContract() throws {
+    func bridgeBootstrapChecksCapturedContract() throws {
         let interfaceHash = Core.Digest.sha256("bridge-shell")
         let originals = try Runtime.OriginalCatalog([
             .init(
@@ -48,6 +48,35 @@ struct Routing {
         }
     }
 
+    @Test("Wrappers use their lexical original while automatic bootstrap is pending")
+    func bridgeFallsBackBeforeBootstrap() throws {
+        let bridge = Runtime.Bridge()
+        var encoded = false
+
+        let decision: Runtime.BridgeDispatchResult<Int64> = try bridge.dispatch(
+            entry: .init(rawValue: 0),
+            arguments: { _ in
+                encoded = true
+                return []
+            },
+            decodeResult: { _ in 0 }
+        )
+        let prepared = try bridge.prepareAsyncDispatch(
+            entry: .init(rawValue: 0),
+            arguments: { _ in
+                encoded = true
+                return []
+            }
+        )
+
+        guard case .originalRequired = decision else {
+            Issue.record("an uninstalled Bridge did not select the lexical original")
+            return
+        }
+        #expect(prepared == nil)
+        #expect(!encoded)
+    }
+
     @Test("Bridge installation is atomically published under concurrent access")
     func concurrentBridgePublication() throws {
         let fixture = try RuntimeFixture(entry: .init(rawValue: 0))
@@ -78,9 +107,6 @@ struct Routing {
                         return
                     }
                 }
-            } catch let error as Runtime.BridgeDispatchError where error == .notInstalled {
-                // A reader that wins the race before release publication must
-                // observe a complete absence, never a partial Installation.
             } catch {
                 failures.record(String(describing: error))
             }

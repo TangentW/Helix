@@ -251,8 +251,13 @@ final class Model: ObservableObject {
             present(error, title: "Configuration Is Incomplete")
             return
         }
+        if selections.isEmpty {
+            uninstall(editor)
+            return
+        }
         isWorking = true
         operationLabel = "Inspecting exact Xcode build settings…"
+        var projectWasConfigured = false
         Task {
             defer { isWorking = false }
             do {
@@ -266,6 +271,7 @@ final class Model: ObservableObject {
                     let installation = try Hub.ProjectInstaller().install(plan)
                     return (draft, installation)
                 }.value
+                projectWasConfigured = true
                 operationLabel = "Saving project registration…"
                 guard let store else {
                     throw Hub.Error.storageFailure("project registry is unavailable")
@@ -285,8 +291,69 @@ final class Model: ObservableObject {
                     message: completionMessage(result.1)
                 )
             } catch {
-                operationLabel = "Configuration failed. No partial project write was kept."
-                present(error, title: "Helix Configuration Failed")
+                if projectWasConfigured {
+                    operationLabel = "Xcode integration was applied; Hub registration needs retry."
+                    present(
+                        error,
+                        title: "Project Configured, Registration Not Saved"
+                    )
+                } else {
+                    operationLabel = "Configuration failed. No partial project write was kept."
+                    present(error, title: "Helix Configuration Failed")
+                }
+            }
+        }
+    }
+
+    private func uninstall(_ editor: Editor) {
+        guard let record = projects.first(where: {
+            $0.projectURL == editor.project.projectURL.standardizedFileURL
+        }) else {
+            present(
+                Hub.Error.storageFailure("project registration is unavailable"),
+                title: "Helix Could Not Be Removed"
+            )
+            return
+        }
+        isWorking = true
+        operationLabel = "Removing generated Xcode integration…"
+        var projectWasCleaned = false
+        Task {
+            defer { isWorking = false }
+            do {
+                try await Task.detached(priority: .userInitiated) {
+                    try Hub.ProjectInstaller().uninstall(
+                        project: editor.project,
+                        record: record
+                    )
+                }.value
+                projectWasCleaned = true
+                guard let store else {
+                    throw Hub.Error.storageFailure(
+                        "project registry is unavailable"
+                    )
+                }
+                try await store.remove(id: record.id)
+                self.editor = nil
+                await reloadProjects()
+                rotatePairingCode()
+                operationLabel = "Helix was removed from the project."
+                notice = .init(
+                    kind: .information,
+                    title: "Helix Removed",
+                    message: "Generated Xcode integration was removed and the project's original settings were restored. Application source and signing materials were preserved."
+                )
+            } catch {
+                if projectWasCleaned {
+                    operationLabel = "Xcode integration was removed; registry cleanup needs retry."
+                    present(
+                        error,
+                        title: "Project Cleaned, Registration Still Present"
+                    )
+                } else {
+                    operationLabel = "Removal failed. No partial project write was kept."
+                    present(error, title: "Helix Could Not Be Removed")
+                }
             }
         }
     }
@@ -407,7 +474,7 @@ final class Model: ObservableObject {
             selectedProjectID = record?.id
             operationLabel = record == nil
                 ? "Both capabilities are selected by default."
-                : "Existing capabilities are locked on; skipped capabilities can be added."
+                : "Existing mappings are loaded and can be changed or removed."
         } catch {
             present(error, title: "Project Could Not Be Opened")
         }

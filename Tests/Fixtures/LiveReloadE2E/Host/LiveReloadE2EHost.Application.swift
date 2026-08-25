@@ -1,26 +1,10 @@
-import HelixDevRuntime
-import LiveReloadE2E
 import UIKit
 
 enum LiveReloadE2EHost {}
 
-extension LiveReloadE2EHost {
-@MainActor
-final class RuntimeOwner {
-    let session: DevRuntime.ApplicationSession
-
-    init() throws {
-        session = try DevRuntime.ApplicationSession(
-            environment: .init(overlayConfiguration: .init(startsExpanded: false))
-        )
-    }
-}
-}
-
 @main
 @MainActor
 final class LiveReloadE2EHostApplication: UIResponder, UIApplicationDelegate {
-    private var runtimeOwner: LiveReloadE2EHost.RuntimeOwner?
     private weak var scenarioController: LiveReloadE2E.HostViewController?
     private var scenarioTimer: Timer?
     private var nextScenarioRevision = 3
@@ -31,11 +15,6 @@ final class LiveReloadE2EHostApplication: UIResponder, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
     ) -> Bool {
-        do {
-            runtimeOwner = try LiveReloadE2EHost.RuntimeOwner()
-        } catch {
-            fatalError("Helix E2E bootstrap failed: \(error)")
-        }
         let window = UIWindow(frame: UIScreen.main.bounds)
         let controller = LiveReloadE2E.HostViewController()
         window.rootViewController = controller

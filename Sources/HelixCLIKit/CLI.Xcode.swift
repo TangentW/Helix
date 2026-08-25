@@ -76,6 +76,13 @@ func executeXcode(_ arguments: [String]) throws -> CLI.Result {
             )
         }
         return .init(exitCode: 0, standardOutput: Self.xcodePhaseHelp)
+    case "post-compile":
+        guard tail == ["--help"] else {
+            throw CLI.Error.usage(
+                "xcode post-compile must run through the asynchronous CLI entry point"
+            )
+        }
+        return .init(exitCode: 0, standardOutput: Self.xcodePostCompileHelp)
     case "doctor": return try doctorXcodeIntegration(tail)
     default:
         throw CLI.Error.usage("unknown xcode command \(command)")
@@ -424,6 +431,45 @@ func executeXcodePhase(_ arguments: [String]) async throws -> CLI.Result {
     case .patch:
         return try buildXcodePatch(context)
     }
+}
+
+func executeXcodePostCompile(_ arguments: [String]) async throws -> CLI.Result {
+    if arguments == ["--help"] {
+        return .init(exitCode: 0, standardOutput: Self.xcodePostCompileHelp)
+    }
+    let options = try CLI.Arguments(
+        arguments,
+        valueOptions: ["plan", "profile", "capture"],
+        flagOptions: []
+    )
+    try requireNoXcodePositionals(options, command: "xcode post-compile")
+    let planURL = files.resolve(try options.require("plan"))
+    let plan = try loadHostPlan(at: planURL)
+    let captureURL = files.resolve(try options.require("capture"))
+    let context: XcodeIntegration.BuildContext
+    do {
+        context = try CLI.XcodePostCompileResolver().resolve(
+            plan: plan,
+            planURL: planURL,
+            profileID: try options.require("profile"),
+            captureURL: captureURL,
+            environment: environment
+        )
+    } catch let error as CLI.XcodePostCompileError {
+        throw CLI.Error.input(error.description)
+    } catch let error as BuildCapture.Error {
+        throw CLI.Error.input(error.description)
+    }
+    let phaseLock = try XcodePhaseLock(
+        directoryURL: context.environment.profileOutputURL
+    )
+    defer { phaseLock.unlock() }
+    let prepared = try await prepareXcodeShell(context)
+    let bridge = try compileXcodeBridge(context)
+    return .init(
+        exitCode: 0,
+        standardOutput: prepared.standardOutput + bridge.standardOutput
+    )
 }
 
 private func auditXcodeProduct(
@@ -792,7 +838,7 @@ private func registerXcodeLiveSession(
         probe: BuildCapture.DefaultFrontendReplayProbe(runner: .init())
     ).prepare(
         .init(
-            capturedFrontendJobs: [capture.rawJob],
+            capturedFrontendJobs: [capture.analysisJob],
             workingDirectory: context.environment.sourceRootURL,
             workspaceURL: product.projectURL,
             scheme: context.profile.schemeName,
@@ -956,7 +1002,7 @@ private final class XcodePhaseLock {
 
 private struct XcodeFeatureCapture {
     var recordBytes: Data
-    var rawJob: BuildCapture.CapturedFrontendJob
+    var analysisJob: BuildCapture.CapturedFrontendJob
     var frontendSources: [FrontendReceipt.Source]
     var sourceMappings: [String: URL]
 }
@@ -1000,16 +1046,32 @@ private func capturedXcodeFeature(
                     + "compiler, module, SDK, target, or optimization settings"
             )
         }
-        let mappings = try BuildCapture.SourceMapper().map(
+        let capturedMappings = try BuildCapture.SourceMapper().map(
             normalized,
             workspaceRoot: context.environment.sourceRootURL
         )
+        let mappings = capturedMappings.filter {
+            !XcodeIntegration.CompilerCapture.isTargetTriggerLogicalPath(
+                $0.logicalPath,
+                integrationRoot: context.plan.integrationRoot
+            )
+        }
+        guard !mappings.isEmpty else {
+            throw CLI.Error.input(
+                "captured target contains no Swift application sources"
+            )
+        }
         let sourceMappings = Dictionary(
             uniqueKeysWithValues: mappings.map { ($0.logicalPath, $0.url) }
         )
+        let analysisJob = try BuildCapture.SourceProjection().project(
+            normalized,
+            onto: mappings.map(\.url.path),
+            workingDirectory: context.environment.sourceRootURL
+        )
         return .init(
             recordBytes: recordBytes,
-            rawJob: rawJob,
+            analysisJob: analysisJob,
             frontendSources: mappings.map {
                 FrontendReceipt.Source(logicalPath: $0.logicalPath, url: $0.url)
             },
@@ -1209,7 +1271,7 @@ private func compileXcodeBridge(
         }
         return resolved
     }
-    let captured = try capturedXcodeFeature(context).rawJob
+    let captured = try capturedXcodeFeature(context).analysisJob
     let moduleMapNames = ["HelixRuntimeSupport"]
     let runtimeModuleMaps = try moduleMapNames.compactMap { name -> URL? in
         let url = context.environment.generatedModuleMapDirectoryURL
@@ -1248,7 +1310,17 @@ private func compileXcodeBridge(
     let temporary = context.environment.bridgeOutputURL.appendingPathComponent(
         ".HelixBridge.\(UUID().uuidString).o"
     )
-    defer { try? manager.removeItem(at: temporary) }
+    let bootstrapSource = context.environment.bridgeOutputURL.appendingPathComponent(
+        ".HelixBootstrap.\(UUID().uuidString).c"
+    )
+    let bootstrapObject = context.environment.bridgeOutputURL.appendingPathComponent(
+        ".HelixBootstrap.\(UUID().uuidString).o"
+    )
+    defer {
+        try? manager.removeItem(at: temporary)
+        try? manager.removeItem(at: bootstrapSource)
+        try? manager.removeItem(at: bootstrapObject)
+    }
     let moduleSuffix = Core.Digest.sha256(context.profile.id).hex.prefix(16)
     let plan: XcodeIntegration.BridgeCompilationPlan
     do {
@@ -1284,35 +1356,59 @@ private func compileXcodeBridge(
                 : diagnostics
         )
     }
-    guard let attributes = try? manager.attributesOfItem(atPath: temporary.path),
-          (attributes[.type] as? FileAttributeType) == .typeRegular,
-          let byteCount = (attributes[.size] as? NSNumber)?.uint64Value,
-          byteCount > 0,
-          byteCount <= 512 * 1_024 * 1_024
-    else {
-        throw CLI.Error.input("hidden Bridge compiler produced an invalid object file")
-    }
-    let objectBytes = try readRegularFile(
+    try validateXcodeObject(
         temporary,
-        maximumBytes: 512 * 1_024 * 1_024,
-        label: "hidden Bridge object"
+        context: context,
+        label: "hidden Bridge"
     )
-    let descriptor: MachO.Descriptor
-    do {
-        descriptor = try MachO.Inspector().inspect(objectBytes)
-    } catch {
-        throw CLI.Error.input("hidden Bridge compiler produced malformed Mach-O: \(error)")
+    let autostartSymbol = context.profile.workflow == .liveReload
+        ? "hlx_dev_runtime_autostart_v1" : "hlx_runtime_autostart_v1"
+    let constructor = """
+    extern void \(autostartSymbol)(void);
+
+    __attribute__((constructor))
+    static void helix_runtime_autostart(void) {
+        \(autostartSymbol)();
     }
-    let expectedArchitecture = MachO.Architecture(rawValue: context.environment.architecture)
-    let expectedPlatform: MachO.Platform = context.environment.platformName == "iphonesimulator"
-        ? .iOSSimulator
-        : .iOS
-    guard descriptor.fileType == 1,
-          descriptor.architecture == expectedArchitecture,
-          descriptor.platform == expectedPlatform
-    else {
+
+    """
+    try Data(constructor.utf8).write(to: bootstrapSource, options: .atomic)
+    let clangURL = context.environment.compilerURL.deletingLastPathComponent()
+        .appendingPathComponent("clang")
+    let bootstrapCompilation = try ProcessExecution.Runner().run(
+        executable: clangURL,
+        arguments: [
+            "-c", bootstrapSource.path,
+            "-o", bootstrapObject.path,
+            "-target", context.environment.targetTriple,
+            "-isysroot", context.environment.sdkRootURL.path,
+            "-fvisibility=hidden",
+        ],
+        environment: environment,
+        workingDirectory: context.environment.bridgeOutputURL
+    )
+    guard bootstrapCompilation.status == 0 else {
+        let diagnostics = String(
+            bootstrapCompilation.standardError.prefix(512 * 1_024)
+        )
         throw CLI.Error.input(
-            "hidden Bridge compiler produced an incompatible Mach-O object"
+            diagnostics.isEmpty
+                ? "hidden bootstrap compiler exited with status \(bootstrapCompilation.status)"
+                : diagnostics
+        )
+    }
+    try validateXcodeObject(
+        bootstrapObject,
+        context: context,
+        label: "hidden bootstrap"
+    )
+    guard Darwin.rename(
+        bootstrapObject.path,
+        context.environment.bootstrapObjectURL.path
+    ) == 0 else {
+        throw CLI.Error.input(
+            "cannot atomically publish the hidden bootstrap object: "
+                + String(cString: strerror(errno))
         )
     }
     guard Darwin.rename(temporary.path, context.environment.bridgeObjectURL.path) == 0 else {
@@ -1325,8 +1421,47 @@ private func compileXcodeBridge(
         exitCode: 0,
         standardOutput: "Compiled hidden Helix Bridge at "
             + "\(context.environment.bridgeObjectURL.path)\n"
+            + "Compiled automatic runtime bootstrap at "
+            + "\(context.environment.bootstrapObjectURL.path)\n"
             + (compilation.standardError.isEmpty ? "" : compilation.standardError)
     )
+}
+
+private func validateXcodeObject(
+    _ url: URL,
+    context: XcodeIntegration.BuildContext,
+    label: String
+) throws {
+    guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+          (attributes[.type] as? FileAttributeType) == .typeRegular,
+          let byteCount = (attributes[.size] as? NSNumber)?.uint64Value,
+          byteCount > 0,
+          byteCount <= 512 * 1_024 * 1_024
+    else {
+        throw CLI.Error.input("\(label) compiler produced an invalid object file")
+    }
+    let objectBytes = try readRegularFile(
+        url,
+        maximumBytes: 512 * 1_024 * 1_024,
+        label: "\(label) object"
+    )
+    let descriptor: MachO.Descriptor
+    do {
+        descriptor = try MachO.Inspector().inspect(objectBytes)
+    } catch {
+        throw CLI.Error.input("\(label) compiler produced malformed Mach-O: \(error)")
+    }
+    let expectedArchitecture = MachO.Architecture(
+        rawValue: context.environment.architecture
+    )
+    let expectedPlatform: MachO.Platform =
+        context.environment.platformName == "iphonesimulator" ? .iOSSimulator : .iOS
+    guard descriptor.fileType == 1,
+          descriptor.architecture == expectedArchitecture,
+          descriptor.platform == expectedPlatform
+    else {
+        throw CLI.Error.input("\(label) compiler produced an incompatible Mach-O object")
+    }
 }
 
 private func readRegularFile(
@@ -1744,6 +1879,14 @@ Usage: helix xcode phase --plan HostPlan.json --profile ID --phase PHASE
 Phases: prepare, bridge, finalize, audit, patch, live-register. This command is
 designed for generated Xcode scripts and reads volatile build facts only from
 the active Xcode environment.
+""" + "\n"
+
+static let xcodePostCompileHelp = """
+Usage: helix xcode post-compile --plan HostPlan.json --profile ID --capture FILE
+
+This internal command is invoked by the generated Swift compiler proxy after a
+successful same-target compile. It derives the active Xcode identity from the
+captured invocation and publishes the Shell and Bridge before linking begins.
 """ + "\n"
 
 static let xcodeDoctorHelp = """

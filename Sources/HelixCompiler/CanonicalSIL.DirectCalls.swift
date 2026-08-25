@@ -361,7 +361,7 @@ public struct DirectCallTable: Sendable {
         }
         guard Set(byID.keys) == referencedIDs else {
             throw CanonicalSIL.LoweringError.invalidCallTable(
-                "a lowered native call has no frozen import requirement"
+                "a lowered native call has no captured import requirement"
             )
         }
         return byID.values.sorted { $0.id < $1.id }
@@ -401,7 +401,7 @@ public struct DirectCallTable: Sendable {
         }
         guard Set(byEntry.keys) == referencedEntries else {
             throw CanonicalSIL.LoweringError.invalidCallTable(
-                "a lowered Shell entry call has no frozen ownership ABI"
+                "a lowered Shell entry call has no captured ownership ABI"
             )
         }
         return byEntry

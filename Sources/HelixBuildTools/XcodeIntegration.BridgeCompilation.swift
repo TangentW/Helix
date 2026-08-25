@@ -94,8 +94,16 @@ public struct BridgeCompilationPlanner: Sendable {
         let additionalModuleSearchArguments = try validatedModuleSearchArguments(
             additionalModuleSearchArguments
         )
+        let semanticArguments: [String]
+        do {
+            semanticArguments = try XcodeIntegration.CompilerArguments
+                .semanticArguments(from: capturedArguments)
+        } catch let error as XcodeIntegration.CompilerArgumentError {
+            throw XcodeIntegration.BridgeCompilationError
+                .invalidSemanticArguments(error.description)
+        }
         var arguments = [
-            "-emit-object", "-whole-module-optimization", "-parse-as-library",
+            "-emit-object", "-whole-module-optimization",
             optimization,
             "-target", target,
             "-sdk", sdk,
@@ -104,10 +112,8 @@ public struct BridgeCompilationPlanner: Sendable {
             "-disable-autolinking-runtime-compatibility",
             "-disable-autolinking-runtime-compatibility-concurrency",
             "-disable-autolinking-runtime-compatibility-dynamic-replacements",
-            "-Xfrontend", "-enable-private-imports",
-            "-Xfrontend", "-enable-dynamic-replacement-chaining",
         ]
-        arguments.append(contentsOf: preservedArguments(capturedArguments))
+        arguments.append(contentsOf: semanticArguments)
         arguments.append(contentsOf: additionalModuleSearchArguments)
         for moduleMap in clangModuleMapURLs.map(\.standardizedFileURL).sorted(by: {
             $0.path < $1.path
@@ -125,55 +131,6 @@ public struct BridgeCompilationPlanner: Sendable {
             arguments: arguments,
             outputURL: outputURL
         )
-    }
-
-    private func preservedArguments(_ arguments: [String]) -> [String] {
-        let paired: Set<String> = [
-            "-I", "-F", "-Fsystem", "-D", "-Xcc",
-            "-module-cache-path", "-sdk-module-cache-path",
-            "-plugin-path", "-external-plugin-path",
-            "-swift-version", "-strict-concurrency", "-package-name",
-            "-module-alias", "-enable-upcoming-feature",
-            "-enable-experimental-feature", "-clang-target", "-resource-dir",
-            "-vfsoverlay",
-        ]
-        let standalone: Set<String> = [
-            "-enable-library-evolution", "-enable-testing", "-warnings-as-errors",
-            "-suppress-warnings", "-enable-bare-slash-regex", "-application-extension",
-        ]
-        let frontend: Set<String> = [
-            "-disable-availability-checking", "-warn-concurrency",
-            "-enable-actor-data-race-checks", "-enable-experimental-concurrency",
-        ]
-        var result: [String] = []
-        var index = 0
-        while index < arguments.count {
-            let argument = arguments[index]
-            if paired.contains(argument), index + 1 < arguments.count {
-                result.append(argument)
-                result.append(arguments[index + 1])
-                index += 2
-                continue
-            }
-            if argument == "-Xfrontend", index + 1 < arguments.count {
-                let value = arguments[index + 1]
-                if frontend.contains(value) {
-                    result.append(argument)
-                    result.append(value)
-                }
-                index += 2
-                continue
-            }
-            if standalone.contains(argument)
-                || argument.hasPrefix("-I/")
-                || argument.hasPrefix("-F/")
-                || (argument.hasPrefix("-D") && argument.count > 2)
-            {
-                result.append(argument)
-            }
-            index += 1
-        }
-        return result
     }
 
     private func validatedModuleSearchArguments(
@@ -234,6 +191,7 @@ public enum BridgeCompilationError: Swift.Error, Equatable, Sendable, CustomStri
     case invalidCompiler
     case invalidInput
     case malformedCapture(String)
+    case invalidSemanticArguments(String)
     case captureMismatch
 
     public var description: String {
@@ -242,6 +200,8 @@ public enum BridgeCompilationError: Swift.Error, Equatable, Sendable, CustomStri
         case .invalidInput: "hidden Bridge compilation input is invalid"
         case let .malformedCapture(option):
             "captured Feature Swift invocation is missing or has an invalid \(option)"
+        case let .invalidSemanticArguments(reason):
+            "captured Feature Swift invocation has invalid semantic arguments: \(reason)"
         case .captureMismatch:
             "captured Feature Swift invocation does not match the active Helix profile"
         }

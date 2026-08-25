@@ -84,6 +84,7 @@ public struct Scanner: Sendable {
     public init(
         forbiddenBinaryMarkers: [String] = [
             "HelixDevRuntime",
+            "HelixDevSupport",
             "HelixDevProtocol",
             "HelixDevTools",
             "HelixLiveReloadAPI",
@@ -93,7 +94,7 @@ public struct Scanner: Sendable {
             "_helix._tcp",
         ],
         forbiddenImageNameFragments: [String] = [
-            "HelixDevAppRuntime",
+            "HelixDevSupport",
             "HelixDevRuntime",
             "HelixDevProtocol",
             "HelixDevTools",

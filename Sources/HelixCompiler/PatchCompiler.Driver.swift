@@ -296,7 +296,7 @@ public enum ArchiveError: Error, Equatable, Sendable, CustomStringConvertible {
         switch self {
         case let .unknownFunction(key): "function \(key) is absent from HLXI"
         case let .ineligibleFunction(key, reason): "function \(key) is not patchable: \(reason)"
-        case let .interfaceChanged(key): "function \(key) changed its frozen HLXI interface"
+        case let .interfaceChanged(key): "function \(key) changed its captured HLXI interface"
         }
     }
 }

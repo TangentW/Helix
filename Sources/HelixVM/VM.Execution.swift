@@ -107,7 +107,7 @@ public enum RuntimeTrap: Error, Equatable, Sendable, CustomStringConvertible {
         case let .unknownEntry(entry): "unknown Shell entry \(entry)"
         case let .unknownNativeImport(importID): "unknown native import \(importID)"
         case let .nativeImportDescriptorMismatch(importID):
-            "native invoker descriptor does not match the frozen Shell import \(importID)"
+            "native invoker descriptor does not match the captured Shell import \(importID)"
         case let .nativeImportThreadViolation(importID):
             "native import \(importID) is not qualified for main-thread execution"
         case let .nativeImportDeadlineExceeded(importID):
@@ -116,7 +116,7 @@ public enum RuntimeTrap: Error, Equatable, Sendable, CustomStringConvertible {
             "cooperative native import \(importID) returned without a deadline checkpoint"
         case let .unknownNativeType(typeID): "unknown native type \(typeID)"
         case let .nativeTypeDescriptorMismatch(typeID):
-            "native TypeOps descriptor does not match the frozen Shell type \(typeID)"
+            "native TypeOps descriptor does not match the captured Shell type \(typeID)"
         case let .nativeTypeMismatch(typeID): "native value does not match type \(typeID)"
         case let .nativeValueIsNotCopyable(typeID): "native value \(typeID) is not copyable"
         case .mainActorViolation: "MainActor HLBC entry ran off the main thread"
