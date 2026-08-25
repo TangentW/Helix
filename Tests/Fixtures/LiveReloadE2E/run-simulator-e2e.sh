@@ -199,9 +199,10 @@ setting() {
 mkdir -p "$generated_directory"
 cd "$repository_root"
 swift build --product helix
-"$helix" xcode generate \
-    --plan "$script_directory/HostPlan.json" \
-    --force
+"$helix" xcode doctor \
+    --plan "$script_directory/.helix/xcode/HostPlan.json" \
+    --profile live \
+    --static
 : > "$hub_log"
 "$helix" hub run > "$hub_log" 2>&1 &
 hub_pid=$!

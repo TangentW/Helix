@@ -145,9 +145,10 @@ struct ProjectInstallationTests {
         #expect(phaseNames(targetID: "LIVEAPP") == [
             "Helix Bridge (Generated)",
             "PBXSourcesBuildPhase",
-            "Configure Helix Development Info.plist (Generated)",
-            "Embed Helix Development Support (Generated)",
             "PBXFrameworksBuildPhase",
+            "Embed App Content",
+            "Embed Helix Development Support (Generated)",
+            "Configure Helix Development Info.plist (Generated)",
         ])
         let patchSchemeURL = projectURL.appendingPathComponent(
             "xcshareddata/xcschemes/Helix Build Patch.xcscheme"
@@ -1515,6 +1516,9 @@ struct ProjectInstallationTests {
             BFHOT = {isa = PBXBuildFile; fileRef = FRHOT; };
             BFLIVE = {isa = PBXBuildFile; fileRef = FRLIVE; };
         /* End PBXBuildFile section */
+        /* Begin PBXCopyFilesBuildPhase section */
+            USEREMBED = {isa = PBXCopyFilesBuildPhase; buildActionMask = 2147483647; dstPath = ""; dstSubfolderSpec = 10; files = (); name = "Embed App Content"; runOnlyForDeploymentPostprocessing = 0; };
+        /* End PBXCopyFilesBuildPhase section */
         /* Begin PBXFileReference section */
             FRHOT = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Hot/Sources/Hot.swift; sourceTree = SOURCE_ROOT; };
             FRLIVE = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Live/Sources/Live.swift; sourceTree = SOURCE_ROOT; };
@@ -1532,7 +1536,7 @@ struct ProjectInstallationTests {
             HOTFEATURE = {isa = PBXNativeTarget; buildConfigurationList = CLHF; buildPhases = (SPHOT, ); buildRules = (); dependencies = (); name = HotFeature; productName = HotFeature; productType = "com.apple.product-type.framework"; };
             HOTAPP = {isa = PBXNativeTarget; buildConfigurationList = CLHA; buildPhases = (SPHA, ); buildRules = (); dependencies = (); name = HotApp; packageProductDependencies = (); productName = HotApp; productType = "com.apple.product-type.application"; };
             LIVEFEATURE = {isa = PBXNativeTarget; buildConfigurationList = CLLF; buildPhases = (SPLIVE, ); buildRules = (); dependencies = (); name = LiveFeature; productName = LiveFeature; productType = "com.apple.product-type.framework"; };
-            LIVEAPP = {isa = PBXNativeTarget; buildConfigurationList = CLLA; buildPhases = (SPLA, ); buildRules = (); dependencies = (); name = LiveApp; productName = LiveApp; productType = "com.apple.product-type.application"; };
+            LIVEAPP = {isa = PBXNativeTarget; buildConfigurationList = CLLA; buildPhases = (SPLA, USEREMBED, ); buildRules = (); dependencies = (); name = LiveApp; productName = LiveApp; productType = "com.apple.product-type.application"; };
         /* End PBXNativeTarget section */
         /* Begin PBXProject section */
             PROJECT = {isa = PBXProject; buildConfigurationList = CLPROJECT; mainGroup = MAIN; packageReferences = (HELIXPACKAGE, ); targets = (HOTFEATURE, HOTAPP, LIVEFEATURE, LIVEAPP, ); };

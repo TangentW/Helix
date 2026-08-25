@@ -261,10 +261,12 @@ struct PBXIntegration {
                         alwaysOutOfDate: true
                     )
                 )
+                // The processed plist may depend on embedded App content. Keep
+                // both finalizers after every existing embed and copy phase.
                 try installPhases(
-                    [networkPhaseID, supportPhaseID],
+                    [supportPhaseID, networkPhaseID],
                     targetID: appTarget.id,
-                    placement: .afterSources,
+                    placement: .endOfTarget,
                     document: &document
                 )
             }
@@ -1442,6 +1444,7 @@ struct PBXIntegration {
     private enum PhasePlacement {
         case beforeSources
         case afterSources
+        case endOfTarget
     }
 
     private func removeOwnedIntegrationPhases(
@@ -1510,6 +1513,8 @@ struct PBXIntegration {
             case .afterSources:
                 insertion = phases.lastIndex { sources.contains($0) }
                     .map { phases.index(after: $0) } ?? phases.endIndex
+            case .endOfTarget:
+                insertion = phases.endIndex
             }
             phases.insert(contentsOf: phaseIDs, at: insertion)
             target["buildPhases"] = .strings(phases)

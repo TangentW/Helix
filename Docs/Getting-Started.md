@@ -58,7 +58,7 @@ half an integration in the project.
 | Bridge | Generate and compile `HelixBridge.o` plus the automatic bootstrap object under DerivedData; generated Bridge Swift never enters the project |
 | Build settings | Preserve the original Base Configuration through a configuration-scoped wrapper, then append Helix settings |
 | Scheme | Create or update Run registration and Release audit actions |
-| Local network | Idempotently augment the processed Live Reload App plist before signing; keep the source plist, Xcode plist settings, and Release output unchanged |
+| Local network | After existing App embed/copy phases, idempotently augment the processed Live Reload plist before signing; keep the source plist, Xcode plist settings, and Release output unchanged |
 | Hot Patch | Generate the Patch action, starter recipe, runtime resources, and optional local development signing material |
 
 Helix does not edit business Swift files. Application code does not import or

@@ -94,7 +94,7 @@ Tests/Fixtures/LiveReloadE2E/run-simulator-e2e.sh <SIMULATOR_UDID>
 - Helix 自动添加或复用 Swift package，并只给 App 链接统一的 `HelixAppIntegration`；
 - Live Reload configuration 额外链接并嵌入动态 `HelixDevSupport`，Release configuration 不包含它；
 - 没有共享 Scheme 时自动创建；已有 Scheme 的非 Helix action、Run/Archive configuration 与 build graph 保持不变；
-- 本地网络声明在 Xcode 正常生成并处理 App plist 后、签名前幂等补齐；不持久化副本、不覆盖 plist 构建设置，也不修改业务 plist；
+- 本地网络声明在 Xcode 正常生成并处理 App plist 后、签名前幂等补齐；相关 Helix 收尾 phase 必须位于已有 Embed Frameworks/extension/copy phase 之后，不形成 target 内依赖环；不持久化副本、不覆盖 plist 构建设置，也不修改业务 plist；
 - 用户无需执行任何代码层动作。
 
 ### XR-02：重复应用、重配置与移除

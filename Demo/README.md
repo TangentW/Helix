@@ -30,11 +30,12 @@ Live Reload also has no UIKit type registry or page-owned reload hook; Helix
 finds the displayed controller from the compiler-emitted nominal identity and
 invalidates it in place.
 
-The Live Reload Demo keeps one `DevRuntime.ApplicationSession` for the process
-and exposes a **Helix** button in its navigation bar. A normal Xcode debugger
-launch connects automatically. If the same build is opened directly, the page
-keeps networking off until the four-character code shown by the Mac Helix app
-is entered and confirmed.
+The Live Reload Demo contains no Helix import, runtime owner, or startup call.
+The generated development support owns the process session and presents the
+standard status overlay. A normal Xcode debugger launch connects automatically.
+If the same build is opened directly, the page keeps networking off until the
+four-character code shown by the Mac Helix app is entered through that overlay
+and confirmed.
 
 See [Getting Started](../Docs/Getting-Started.md) for the complete existing-App
 integration, target/Scheme wiring, runtime bootstrap, and first-run checklist.

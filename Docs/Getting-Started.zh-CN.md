@@ -46,7 +46,7 @@ open Hub/.build/Helix.app
 | Bridge | 在 DerivedData 中生成并编译 `HelixBridge.o` 与自动启动 object；不把生成 Bridge Swift 加进工程 |
 | Build settings | 用 configuration 级 wrapper 保留原 Base Configuration，再追加 Helix 设置 |
 | Scheme | 自动创建或更新 Run 注册与 Release 审计 action |
-| 本地网络 | 在签名前幂等补齐已处理的 Live Reload App plist；业务 plist、Xcode plist 设置与 Release 产物保持不变 |
+| 本地网络 | 在 App 已有 embed/copy phase 之后、签名前幂等补齐已处理的 Live Reload plist；业务 plist、Xcode plist 设置与 Release 产物保持不变 |
 | Hot Patch | 自动生成 Patch action、初始 recipe、资源嵌入和可选本地开发签名材料 |
 
 Helix 不改业务 Swift 文件，不要求业务代码 import 或初始化 Runtime，也不要求维护 target 源码清单、Native API 清单、host、port、配对 secret、LLDB 脚本或 shell `PATH`。

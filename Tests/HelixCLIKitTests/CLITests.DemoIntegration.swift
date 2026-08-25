@@ -152,6 +152,19 @@ struct DemoIntegration {
         #expect(!project.contains("Build Helix Patch (Generated)"))
     }
 
+    @Test("Live Reload Demo relies exclusively on automatic runtime bootstrap")
+    func liveReloadAppHasNoManualRuntimeBootstrap() throws {
+        let demo = repositoryRoot().appendingPathComponent("Demo", isDirectory: true)
+        let application = try text(
+            demo.appendingPathComponent(
+                "LiveReloadDemo/LiveReloadDemo.Application.swift"
+            )
+        )
+        #expect(!application.contains("import Helix"))
+        #expect(!application.contains("DevRuntime.ApplicationSession"))
+        #expect(!application.contains("RuntimeOwner"))
+    }
+
     @Test("Shared schemes keep ordinary work inside Xcode")
     func schemesOwnTheCompleteWorkflow() throws {
         let schemes = repositoryRoot()

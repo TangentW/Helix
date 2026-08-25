@@ -810,12 +810,17 @@ runtime import or startup call.
 
 The Live Reload phase declares the processed App plist as its build input and
 idempotently augments that product after Xcode's normal generation and
-processing, before signing. It neither copies nor overrides the source plist,
-so the project's plist settings remain authoritative on every build. Helix's
-configuration wrapper disables Xcode user-script sandboxing only for the
-selected configuration because compiler captures, generated artifacts, and
-the processed product cannot be represented by a static input set; removing
-the integration restores the original build setting automatically.
+processing, before signing. Bundle-finalization phases are appended after the
+App target's existing link, resource, Embed Frameworks, extension, and other
+copy phases. This preserves Xcode's product dependency order: a processed plist
+may itself wait for embedded content, so placing its consumer before an embed
+phase would create a target cycle. Helix neither copies nor overrides the
+source plist, so the project's plist settings remain authoritative on every
+build. Helix's configuration wrapper disables Xcode user-script sandboxing
+only for the selected configuration because compiler captures, generated
+artifacts, and the processed product cannot be represented by a static input
+set; removing the integration restores the original build setting
+automatically.
 
 The integration is reconciled, not locked. Each Apply first restores every
 unselected original PBX configuration reference, removes obsolete owned

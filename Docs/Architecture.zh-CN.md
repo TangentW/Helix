@@ -107,7 +107,7 @@ Async function root 出于不同原因复用同一套精确 range 源码 body �
 
 Hub 默认直接使用现有 App target 作为 application 与源码 module；已有 framework 可以选择，但不是接入前置条件。Target 发现只判断 Xcode 是否能调度源码编译，不会盘点 `.swift` 文件或枚举 filesystem-synchronized group；实际 membership 始终以成功的 Swift frontend invocation 为准。它会复用或安装 Swift package、链接 `HelixAppIntegration`、让动态 `HelixDevSupport` 仅对开发 configuration 可用，并创建或更新共享 Scheme。业务源码没有稳定 Runtime import 或启动调用。
 
-Live Reload phase 把已处理的 App plist 声明为构建输入，在 Xcode 正常生成和处理之后、签名之前幂等补齐本地网络声明。它既不复制也不覆盖业务 plist，因此每次构建仍以项目自身的 plist 设置为准。Compiler capture、生成 artifact 与处理后的构建产物无法完全表达为静态输入集合，因此 Helix 的 configuration wrapper 只对所选 configuration 自动关闭 Xcode user-script sandbox；移除接入后原 build setting 会自动恢复。
+Live Reload phase 把已处理的 App plist 声明为构建输入，在 Xcode 正常生成和处理之后、签名之前幂等补齐本地网络声明。修改 App bundle 的 Helix 收尾 phase 会追加在该 target 已有的 link、资源、Embed Frameworks、extension 与其他 copy phase 之后；已处理 plist 本身可能需要等待嵌入内容，因此不能让它的消费者反过来位于 embed phase 之前，否则 Xcode 会形成 target 内依赖环。Helix 既不复制也不覆盖业务 plist，因此每次构建仍以项目自身的 plist 设置为准。Compiler capture、生成 artifact 与处理后的构建产物无法完全表达为静态输入集合，因此 Helix 的 configuration wrapper 只对所选 configuration 自动关闭 Xcode user-script sandbox；移除接入后原 build setting 会自动恢复。
 
 这套接入采用状态归一而不是锁定。每次 Apply 都会先按原 PBX identity 恢复未再选择的 configuration 引用，移除过期的 Hub-owned phase、trigger、product、Patch target 和 Scheme action，再生成期望的当前工程图。已有 Scheme 的 build configuration 与无关 action 不会被改写；canonical 生成文件清单只清理过期的 owned 文件并保留接入目录中的未知文件，registry 的最近接入计划也只在生成文件丢失时用于恢复移除。同一套 ownership 能事务性移除接入，并保留业务源码、recipe 与签名材料。
 
