@@ -1650,6 +1650,54 @@ struct NativeImportDiscoveryTests {
         )
     }
 
+    @Test("Unsupported incidental imports do not reject supported operations")
+    func skipsUnbridgeableImportedOperations() throws {
+        let supported = FrontendReceipt.Adapter.ImportedOperation(
+            silReferences: ["$s8Fixture9supportedyS2iF"],
+            sourceFileLogicalID: "Sources/Fixture.swift",
+            importedModules: ["Foundation"],
+            dispatch: .globalFunction,
+            ownerType: "Foundation",
+            baseName: "supported",
+            argumentLabels: ["_"],
+            parameterSwiftTypes: ["Swift.Int"],
+            resultSwiftType: "Swift.Int",
+            requiresMainActor: false
+        )
+        let incidental = FrontendReceipt.Adapter.ImportedOperation(
+            silReferences: ["$sSnySiG12makeIterator"],
+            sourceFileLogicalID: "Sources/Fixture.swift",
+            importedModules: ["Swift"],
+            dispatch: .instanceMethod,
+            ownerType: "Swift.ClosedRange<Swift.Int>",
+            baseName: "makeIterator",
+            argumentLabels: [],
+            parameterSwiftTypes: ["Swift.ClosedRange<Swift.Int>"],
+            resultSwiftType: "Swift.IndexingIterator<Swift.ClosedRange<Swift.Int>>",
+            requiresMainActor: false
+        )
+
+        let declarations = try FrontendReceipt.Adapter()
+            .makeImportedOperationDeclarations(
+                [supported, incidental],
+                moduleName: "Fixture",
+                nativeTypes: [:]
+            )
+        #expect(declarations.count == 1)
+        #expect(declarations.first?.baseName == "supported")
+
+        var required = incidental
+        required.compilerOperation = .nativeUpcast
+        #expect(throws: FrontendReceipt.Error.self) {
+            _ = try FrontendReceipt.Adapter()
+                .makeImportedOperationDeclarations(
+                    [required],
+                    moduleName: "Fixture",
+                    nativeTypes: [:]
+                )
+        }
+    }
+
     @Test("Physical SIL aliases reject conflicting logical ABIs")
     func rejectsConflictingPhysicalOperationAliases() {
         let common = FrontendReceipt.Adapter.ImportedOperation(
@@ -3187,6 +3235,10 @@ struct NativeImportDiscoveryTests {
         )
         #expect(!importedNativeNames.contains("NSBundle"))
         #expect(!importedNativeNames.contains("NSCoder"))
+        #expect(!importedNativeNames.contains("NSTimer"))
+        #expect(!importedNativeNames.contains("NSFileManager"))
+        #expect(importedNativeNames.contains("Timer"))
+        #expect(importedNativeNames.contains("FileManager"))
         let generatedOperations = output.receipt.nativeImportBindings
             .compactMap(\.generated)
         let controllerInitializer = try #require(generatedOperations.first {
@@ -3314,6 +3366,8 @@ struct NativeImportDiscoveryTests {
         #expect(generatedBridge.contains("callbackEncoder.encodeError("))
         #expect(generatedBridge.contains("NSPredicate"))
         #expect(generatedBridge.contains("enumerator"))
+        #expect(!generatedBridge.contains("NSTimer"))
+        #expect(!generatedBridge.contains("NSFileManager"))
         #expect(generatedBridge.contains(".invokeResult("))
         #expect(generatedBridge.contains("failureResult: {"))
         #expect(generatedBridge.contains("let argument0: any UIInteraction"))

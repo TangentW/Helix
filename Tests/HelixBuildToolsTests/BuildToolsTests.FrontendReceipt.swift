@@ -13,6 +13,18 @@ import Testing
 extension BuildToolsTests {
 @Suite("Real Swift frontend receipt adapter")
 struct FrontendReceiptPipeline {
+    @Test("Typed AST accepts empty source documents but rejects malformed items")
+    func acceptsEmptyTypedASTDocuments() throws {
+        #expect(try FrontendReceipt.TypedAST.items(in: ["filename": "/tmp/Empty.swift"])
+            .isEmpty)
+        #expect(throws: FrontendReceipt.Error.self) {
+            _ = try FrontendReceipt.TypedAST.items(in: [
+                "filename": "/tmp/Malformed.swift",
+                "items": ["not": "an array"],
+            ])
+        }
+    }
+
     @Test("Source locations use UTF-8 columns and all Swift line endings")
     func mapsExactUTF8SourceLocations() throws {
         let source = Data("é{\r\n  #column\rnext".utf8)

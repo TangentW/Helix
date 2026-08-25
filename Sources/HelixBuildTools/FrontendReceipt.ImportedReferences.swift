@@ -32,13 +32,13 @@ extension FrontendReceipt.Adapter {
                   let source = sourcesByPhysicalPath[
                       URL(fileURLWithPath: filename)
                         .resolvingSymlinksInPath().standardizedFileURL.path
-                  ],
-                  let items = document["items"] as? [Any]
+                  ]
             else {
                 throw FrontendReceipt.Error.malformedAST(
                     "imported reference discovery source does not map to the requested source set"
                 )
             }
+            let items = try FrontendReceipt.TypedAST.items(in: document)
             let modules = imports(in: items).filter { $0 != moduleName }
             guard !modules.isEmpty else { continue }
             uses += sourceOverlayTypes(
@@ -417,41 +417,48 @@ extension FrontendReceipt.Adapter {
     private func normalizeClangTypealiasIdentities(
         _ uses: [ImportedNativeType]
     ) throws -> [ImportedNativeType] {
-        let runtimeNames = Set(uses.compactMap { use -> String? in
-            use.aliases.contains("__C.\(use.canonicalName)")
-                ? use.canonicalName : nil
-        })
         var overlaysByRuntime: [String: Set<String>] = [:]
-        for runtimeName in runtimeNames {
-            overlaysByRuntime[runtimeName] = Set(uses.compactMap { use in
-                use.canonicalName != runtimeName
-                    && use.aliases.contains(runtimeName)
-                    ? use.canonicalName : nil
-            })
+        for use in uses {
+            for alias in use.aliases where alias.hasPrefix("__C.") {
+                let runtimeName = String(alias.dropFirst("__C.".count))
+                if runtimeName != use.canonicalName {
+                    overlaysByRuntime[runtimeName, default: []]
+                        .insert(use.canonicalName)
+                }
+            }
+        }
+        let runtimeUses = Dictionary(grouping: uses, by: \.canonicalName)
+        for (runtimeName, records) in runtimeUses
+        where runtimeName.hasPrefix("NS") && runtimeName.count > 2 {
+            let overlayName = String(runtimeName.dropFirst(2))
+            let runtimeRepresentations = Set(records.map(\.representation))
+            let exactOverlay = uses.filter { $0.canonicalName == overlayName }
+            if !exactOverlay.isEmpty {
+                let overlayRepresentations = Set(exactOverlay.map(\.representation))
+                if !runtimeRepresentations.isDisjoint(with: overlayRepresentations) {
+                    overlaysByRuntime[runtimeName, default: []].insert(overlayName)
+                }
+            } else if uses.contains(where: {
+                runtimeRepresentations.contains($0.representation)
+                    && ($0.canonicalName.hasPrefix(overlayName + ".")
+                        || $0.swiftType.hasPrefix(overlayName + "."))
+            }) {
+                overlaysByRuntime[runtimeName, default: []].insert(overlayName)
+            }
         }
 
         var normalized = uses
-        for runtimeName in runtimeNames.sorted() {
+        for runtimeName in overlaysByRuntime.keys.sorted() {
             guard let overlayNames = overlaysByRuntime[runtimeName],
                   !overlayNames.isEmpty
             else { continue }
-            guard overlayNames.count == 1,
-                  let overlayName = overlayNames.first
-            else {
-                throw FrontendReceipt.Error.invalidRequest(
-                    "Clang typealias \(runtimeName) has ambiguous Swift overlay identities"
-                )
-            }
+            guard overlayNames.count == 1, let overlayName = overlayNames.first
+            else { continue }
             let overlaySwiftTypes = Set(uses.compactMap { use in
                 use.canonicalName == overlayName ? use.swiftType : nil
             })
-            guard overlaySwiftTypes.count == 1,
-                  let overlaySwiftType = overlaySwiftTypes.first
-            else {
-                throw FrontendReceipt.Error.invalidRequest(
-                    "Clang typealias \(runtimeName) has ambiguous Swift overlay identities"
-                )
-            }
+            let overlaySwiftType = overlaySwiftTypes.count == 1
+                ? overlaySwiftTypes.first! : overlayName
             for index in normalized.indices
             where normalized[index].canonicalName == runtimeName {
                 normalized[index].aliases = Array(Set(
@@ -650,7 +657,17 @@ extension FrontendReceipt.Adapter {
         var result = Dictionary(uniqueKeysWithValues: records.map {
             ($0.canonicalName, $0.id)
         })
+        var inferredAliases: [String: Set<Core.TypeID>] = [:]
         let sourceTypeNames = Set(sourceNominals.map(\.canonicalName))
+        for source in sourceNominals where source.kind == .reference {
+            guard let record = records.first(where: {
+                $0.canonicalName == source.canonicalName
+            }) else { continue }
+            // Generated Swift is compiled inside the current module, where a
+            // source class is spelled without the leading module component.
+            inferredAliases[source.localTypeKey.rawValue, default: []]
+                .insert(record.id)
+        }
         for imported in importedTypes {
             let exactMatches = records.filter {
                 $0.canonicalName == imported.canonicalName
@@ -663,7 +680,7 @@ extension FrontendReceipt.Adapter {
             let matches = exactMatches.isEmpty ? qualifiedMatches : exactMatches
             guard matches.count == 1, let record = matches.first else {
                 throw FrontendReceipt.Error.invalidRequest(
-                    "imported type \(imported.canonicalName) has no unique frozen TypeID"
+                    "imported type \(imported.canonicalName) has no unique TypeID"
                 )
             }
             let aliases = Set([
@@ -671,14 +688,13 @@ extension FrontendReceipt.Adapter {
                 imported.swiftType,
                 "__C.\(imported.canonicalName)",
             ] + imported.aliases)
-            for alias in aliases.sorted() {
-                if let existing = result[alias], existing != record.id {
-                    throw FrontendReceipt.Error.invalidRequest(
-                        "native type alias \(alias) resolves to multiple TypeIDs"
-                    )
-                }
-                result[alias] = record.id
+            for alias in aliases {
+                inferredAliases[alias, default: []].insert(record.id)
             }
+        }
+        for (alias, typeIDs) in inferredAliases
+        where result[alias] == nil && typeIDs.count == 1 {
+            result[alias] = typeIDs.first
         }
         return result
     }
@@ -686,7 +702,11 @@ extension FrontendReceipt.Adapter {
     func makeImportedSwiftTypeAliases(
         _ importedTypes: [ImportedNativeType]
     ) throws -> [String: String] {
-        var result: [String: String] = [:]
+        struct Candidate {
+            var swiftType: String
+            var isExact: Bool
+        }
+        var candidates: [String: [Candidate]] = [:]
         for imported in importedTypes {
             guard FrontendReceipt.SwiftTypeSpelling.isGeneratedType(
                 imported.swiftType
@@ -700,14 +720,21 @@ extension FrontendReceipt.Adapter {
                  "__C.\(imported.canonicalName)"] + imported.aliases
             )
             for alias in aliases {
-                if let existing = result[alias], existing != imported.swiftType {
-                    throw FrontendReceipt.Error.invalidRequest(
-                        "imported Swift type alias \(alias) is ambiguous"
+                candidates[alias, default: []].append(
+                    .init(
+                        swiftType: imported.swiftType,
+                        isExact: alias == imported.canonicalName
+                            || alias == imported.swiftType
                     )
-                }
-                result[alias] = imported.swiftType
+                )
             }
         }
-        return result
+        return candidates.compactMapValues { values in
+            let exact = Set(values.filter(\.isExact).map(\.swiftType))
+            if exact.count == 1 { return exact.first }
+            guard exact.isEmpty else { return nil }
+            let inferred = Set(values.map(\.swiftType))
+            return inferred.count == 1 ? inferred.first : nil
+        }
     }
 }

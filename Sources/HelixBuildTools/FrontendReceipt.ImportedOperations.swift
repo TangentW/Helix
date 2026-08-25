@@ -130,13 +130,13 @@ extension FrontendReceipt.Adapter {
                   let source = sourcesByPhysicalPath[
                       URL(fileURLWithPath: filename)
                         .resolvingSymlinksInPath().standardizedFileURL.path
-                  ],
-                  let items = document["items"] as? [Any]
+                  ]
             else {
                 throw FrontendReceipt.Error.malformedAST(
                     "imported operation discovery source does not map to the requested source set"
                 )
             }
+            let items = try FrontendReceipt.TypedAST.items(in: document)
             let modules = imports(in: items).filter { $0 != moduleName }
             types += sourceOverlayTypes(
                 in: items,
@@ -173,30 +173,32 @@ extension FrontendReceipt.Adapter {
         moduleName: String,
         nativeTypes: [String: Core.TypeID]
     ) throws -> [NativeImportDiscovery.Declaration] {
-        try canonicalizePhysicalOperations(operations).map { operation in
-            let parameterTypes = try operation.parameterSwiftTypes.map { spelling in
-                guard let type = FrontendReceipt.ValueTypeParser.parse(
-                    spelling,
-                    allowVoid: false,
-                    nativeTypes: nativeTypes
-                ) else {
+        try canonicalizePhysicalOperations(operations).compactMap {
+            operation -> NativeImportDiscovery.Declaration? in
+            func omit(_ reason: String) throws -> NativeImportDiscovery.Declaration? {
+                guard operation.compilerOperation == nil else {
                     throw FrontendReceipt.Error.invalidRequest(
-                        "imported operation \(operation.ownerType).\(operation.baseName) "
-                            + "has unsupported parameter type \(spelling)"
+                        "compiler bridge \(operation.ownerType).\(operation.baseName) "
+                            + "cannot be represented: \(reason)"
                     )
                 }
-                return type
+                return nil
+            }
+            let parameterTypes = operation.parameterSwiftTypes.compactMap {
+                FrontendReceipt.ValueTypeParser.parse(
+                    $0,
+                    allowVoid: false,
+                    nativeTypes: nativeTypes
+                )
+            }
+            guard parameterTypes.count == operation.parameterSwiftTypes.count else {
+                return try omit("unsupported parameter type")
             }
             guard let resultType = FrontendReceipt.ValueTypeParser.parse(
                 operation.resultSwiftType,
                 allowVoid: true,
                 nativeTypes: nativeTypes
-            ) else {
-                throw FrontendReceipt.Error.invalidRequest(
-                    "imported operation \(operation.ownerType).\(operation.baseName) "
-                        + "has unsupported result type \(operation.resultSwiftType)"
-                )
-            }
+            ) else { return try omit("unsupported result type") }
             let silSymbols: [String]
             switch operation.compilerOperation {
             case nil:
@@ -204,22 +206,14 @@ extension FrontendReceipt.Adapter {
             case .rawValueInitializer:
                 guard parameterTypes.count == 1,
                       case let .native(typeID) = resultType
-                else {
-                    throw FrontendReceipt.Error.invalidRequest(
-                        "imported raw-value initializer has an invalid frozen signature"
-                    )
-                }
+                else { return try omit("raw-value initializer shape mismatch") }
                 silSymbols = [CanonicalSIL.NativeBridgeSymbols.rawValueInitializer(for: typeID)]
             case .optionSetArrayLiteralInitializer:
                 guard parameterTypes.count == 1,
                       case let .array(element) = parameterTypes[0],
                       case let .native(elementType) = element,
                       resultType == .native(elementType)
-                else {
-                    throw FrontendReceipt.Error.invalidRequest(
-                        "imported OptionSet array-literal initializer has an invalid frozen signature"
-                    )
-                }
+                else { return try omit("option-set initializer shape mismatch") }
                 silSymbols = [
                     CanonicalSIL.NativeBridgeSymbols.optionSetArrayLiteralInitializer(
                         for: elementType
@@ -228,24 +222,14 @@ extension FrontendReceipt.Adapter {
             case .selectorInitializer:
                 guard parameterTypes == [.string],
                       case let .native(typeID) = resultType
-                else {
-                    throw FrontendReceipt.Error.invalidRequest(
-                        "imported Selector initializer has an invalid frozen signature"
-                    )
-                }
+                else { return try omit("selector initializer shape mismatch") }
                 silSymbols = [CanonicalSIL.NativeBridgeSymbols.selectorInitializer(for: typeID)]
             case .nativeUpcast:
                 guard parameterTypes.count == 1,
                       case let .native(sourceType) = parameterTypes[0],
                       case let .native(targetType) = resultType,
                       sourceType != targetType
-                else {
-                    throw FrontendReceipt.Error.invalidRequest(
-                        "imported native upcast \(operation.ownerType)."
-                            + "\(operation.baseName) has an invalid frozen signature: "
-                            + "\(parameterTypes) -> \(resultType)"
-                    )
-                }
+                else { return try omit("native upcast shape mismatch") }
                 silSymbols = [CanonicalSIL.NativeBridgeSymbols.upcast(
                     from: sourceType,
                     to: targetType
@@ -253,11 +237,7 @@ extension FrontendReceipt.Adapter {
             case .anyObjectBridge:
                 guard parameterTypes == [.any],
                       case let .native(targetType) = resultType
-                else {
-                    throw FrontendReceipt.Error.invalidRequest(
-                        "imported AnyObject bridge has an invalid frozen signature"
-                    )
-                }
+                else { return try omit("AnyObject bridge shape mismatch") }
                 silSymbols = [
                     CanonicalSIL.NativeBridgeSymbols.anyObjectBridge(
                         to: targetType
@@ -265,9 +245,7 @@ extension FrontendReceipt.Adapter {
                 ]
             }
             guard let primarySymbol = silSymbols.first else {
-                throw FrontendReceipt.Error.invalidRequest(
-                    "imported operation has no exact SIL or compiler-operation symbol"
-                )
+                return try omit("no physical SIL symbol")
             }
             let isolation = operation.requiresMainActor ? "MainActor" : nil
             let signature = Core.LoweredSignature(
@@ -299,12 +277,7 @@ extension FrontendReceipt.Adapter {
                         operation.parameterSwiftTypes,
                         parameterTypes: parameterTypes
                     )
-            else {
-                throw FrontendReceipt.Error.invalidRequest(
-                    "imported operation \(operation.ownerType).\(operation.baseName) "
-                        + "cannot use the generated NativeImport bridge profile"
-                )
-            }
+            else { return try omit("unsupported native bridge profile") }
             let modulePrefix = moduleName + "."
             func generatedSpelling(_ canonical: String) -> String {
                 canonical.hasPrefix(modulePrefix)
@@ -317,12 +290,7 @@ extension FrontendReceipt.Adapter {
                 .invocationParameterSwiftTypes ?? operation.parameterSwiftTypes
             guard logicalInvocationParameterTypes.count
                     == operation.parameterSwiftTypes.count
-            else {
-                throw FrontendReceipt.Error.invalidRequest(
-                    "imported operation \(operation.ownerType).\(operation.baseName) "
-                        + "has an invalid invocation parameter adapter"
-                )
-            }
+            else { return try omit("invocation arity mismatch") }
             var generatedInvocationParameterTypes = generatedParameterTypes
             for index in logicalInvocationParameterTypes.indices
             where logicalInvocationParameterTypes[index]

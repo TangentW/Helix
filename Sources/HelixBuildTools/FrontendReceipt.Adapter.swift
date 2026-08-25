@@ -147,9 +147,14 @@ public struct Adapter: Sendable {
             })
         )
         let localValueTypes = makeLocalValueTypeLookup(sourceNominals)
-        let importedSwiftTypeAliases = try makeImportedSwiftTypeAliases(
+        var importedSwiftTypeAliases = try makeImportedSwiftTypeAliases(
             importedTypes
         )
+        let modulePrefix = moduleName + "."
+        for (qualified, relative) in sourceNominalAliasIndex.exact
+        where qualified.hasPrefix(modulePrefix) {
+            importedSwiftTypeAliases[qualified] = relative
+        }
         importedOperationSurface.operations = try mergeImportedOperations(
             importedOperationSurface.operations.map {
                 applyingSwiftTypeAliases($0, aliases: importedSwiftTypeAliases)
@@ -166,13 +171,13 @@ public struct Adapter: Sendable {
                   let source = sourceByPhysicalPath[
                       URL(fileURLWithPath: filename)
                         .resolvingSymlinksInPath().standardizedFileURL.path
-                  ],
-                  let items = document["items"] as? [Any]
+                  ]
             else {
                 throw FrontendReceipt.Error.malformedAST(
                     "source document does not map to the requested source set"
                 )
             }
+            let items = try FrontendReceipt.TypedAST.items(in: document)
             let imports = imports(in: items)
             let locationMap = SourceTransform.LocationMap(source.contents)
             try walk(
@@ -650,17 +655,20 @@ extension FrontendReceipt.Adapter {
     ) throws -> [SourceNominal] {
         var byName: [String: SourceNominal] = [:]
         for document in documents {
-            guard let filename = document["filename"] as? String,
-                  let source = sourcesByPhysicalPath[
-                      URL(fileURLWithPath: filename)
-                        .resolvingSymlinksInPath().standardizedFileURL.path
-                  ],
-                  let items = document["items"] as? [Any]
-            else {
+            guard let filename = document["filename"] as? String else {
                 throw FrontendReceipt.Error.malformedAST(
-                    "nominal discovery source does not map to the requested source set"
+                    "nominal discovery document has no source filename"
                 )
             }
+            let resolvedFilename = URL(fileURLWithPath: filename)
+                .resolvingSymlinksInPath().standardizedFileURL.path
+            guard let source = sourcesByPhysicalPath[resolvedFilename] else {
+                throw FrontendReceipt.Error.malformedAST(
+                    "nominal discovery source does not map to the requested source set: "
+                        + filename
+                )
+            }
+            let items = try FrontendReceipt.TypedAST.items(in: document)
             try collectSourceNominals(
                 items: items,
                 parentCanonicalName: nil,

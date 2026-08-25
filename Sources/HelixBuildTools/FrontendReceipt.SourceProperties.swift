@@ -158,16 +158,11 @@ extension FrontendReceipt.Adapter {
         silFile: CanonicalSIL.File
     ) throws -> Draft? {
         guard let usr = accessor["usr"] as? String, usr.hasPrefix("s:") else {
-            throw FrontendReceipt.Error.malformedAST(
-                "source property \(canonicalCallee) has no Swift accessor identity"
-            )
+            return nil
         }
-        let astMangledName = "$s" + usr.dropFirst(2)
         guard let sil = try FrontendReceipt.SILFunctionResolver(file: silFile)
             .function(for: accessor, source: source, baseName: name)
-        else {
-            throw FrontendReceipt.Error.missingSILFunction(astMangledName)
-        }
+        else { return nil }
         // Async and throwing accessors require a different invocation ABI.
         // Canonical SIL is authoritative here; checking its complete lowered
         // type also excludes async/throwing callable property shapes, which are

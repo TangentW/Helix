@@ -18,6 +18,18 @@ enum TypedAST {
     static func mangledTypes(in documents: [Object]) -> Set<String> {
         SwiftFrontend.TypedAST.mangledTypes(in: documents)
     }
+
+    /// Swift omits `items` for a valid source file that contains no
+    /// declarations (for example a comment-only build trigger).
+    static func items(in document: Object) throws -> [Any] {
+        guard let value = document["items"] else { return [] }
+        guard let items = value as? [Any] else {
+            throw FrontendReceipt.Error.malformedAST(
+                "source document items are not an array"
+            )
+        }
+        return items
+    }
 }
 
 struct Demangler {
