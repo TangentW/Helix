@@ -21,7 +21,8 @@ Helix 以 Swift module 为边界。建议先选一个职责清晰的 framework�
 flowchart LR
     A["Application target"] --> F["Feature framework · 原始 Swift 源码"]
     A --> R["唯一的 Helix 聚合 Runtime"]
-    P["Build pre-action"] --> S["DerivedData 中的 Shell 元数据"]
+    F --> P["Helix prepare phase · 精确成功编译"]
+    P --> S["DerivedData 中的 Shell 元数据"]
     S --> H["隐藏 Bridge object"]
     H --> A
     D["保存 Swift 函数体"] --> N["自动选择原生 Swift 或验证后 HLBC"]
@@ -113,14 +114,15 @@ Service 与配对错误会直接显示在状态栏面板内，不再用独立告
 
 | 工作流 | Xcode 位置 | 用途 |
 | --- | --- | --- |
-| 两者 | Scheme Build 第一个 pre-action | 准备精确 Feature Shell 与捕获合同 |
+| 两者 | Feature target 的 Sources 之后紧接的 phase | 捕获 Feature 的精确成功编译并准备当前 Shell |
 | Hot Patch | Scheme Build 最后一个 post-action | finalize 已链接 executable 并审计完整 Release bundle |
 | Live Reload | Scheme Run pre-action | 注册精确最终 executable，并激活预留邀请 |
 | Patch 构建 | Patch Scheme Build pre-action，App 作为 `EnvironmentBuildable` | 不重建 App，直接编译、签名并可选 stage `.hlxp` |
 
-Live Reload 使用 Xcode 默认 Apple debugger。Build pre-action 会预留一次性邀请，隐藏 Bridge 只保存邀请与持久 Helix Host Identity pin；App link 完成后，Run pre-action 再注册精确 executable UUID 与 Build Context。工程里没有自定义 LLDB init、Python installer、launch environment、Run post-action、host、port 或 session secret。
+Live Reload 使用 Xcode 默认 Apple debugger。Feature prepare phase 会预留一次性邀请，隐藏 Bridge 只保存邀请与持久 Helix Host Identity pin；App link 完成后，Run pre-action 再注册精确 executable UUID 与 Build Context。工程里没有自定义 LLDB init、Python installer、launch environment、Run post-action、host、port 或 session secret。
 
 Feature compiler proxy 只作用于所选 Feature configuration。它逐项转发真实 `swiftc` 参数，并以 owner-only 方式提交后续保存所需的 capture。App、Package 与无关 target 继续使用 Xcode 默认 driver。
+增加、删除、移动或生成 Swift 源文件时，只需执行本来就负责 target membership 的普通 Xcode build；无需配置、重新生成或冻结任何 Helix 源码列表。
 
 ## 8. App 不再引用生成代码
 
@@ -226,11 +228,11 @@ swift run helix xcode doctor \
 4. 分别确认 compile、transfer、`codeActive` 与 `UI refreshed`。
 5. 再保存一次，验证后一代 generation 会在同一个 App 进程中原子替换第一代。
 
-已有原生类型的 stored layout、函数签名、继承、conformance、enum case、actor isolation、源码 membership、链接依赖或 Build Settings 变化都需要正常构建。变化 root 可以使用现有受监视源码文件中新加、且可达的普通 helper、class private 方法、计算 accessor，以及不导出 ABI 的文件/module scope struct/enum/pure class。新增 `final` class 还可在闭合 hosted profile 内继承已冻结的 `NSObject` 兼容项目类或系统类，以 superclass 身份交给原生代码；当前仅开放继承无参初始化、无新增 stored property 与 no-arg/Bool `Void` override。新增文件或任意新原生 Swift metadata 仍不属于这条工作流。
+已有原生类型的 stored layout、函数签名、继承、conformance、enum case、actor isolation、源码 membership、链接依赖或 Build Settings 变化都需要正常构建。变化 root 可以使用现有受监视源码文件中新加、且可达的普通 helper、class private 方法、计算 accessor，以及不导出 ABI 的文件/module scope struct/enum/pure class。新增 `final` class 还可在闭合 hosted profile 内继承已记录的 `NSObject` 兼容项目类或系统类，以 superclass 身份交给原生代码；当前仅开放继承无参初始化、无新增 stored property 与 no-arg/Bool `Void` override。新加入 target 的源码文件会在下一次正常 Xcode Build 时被自动发现，并参与之后的 Live Reload session；已经运行的 Shell 无法在不重新构建的情况下获得新的原生 Swift metadata。
 
 ## 11. 构建 Hot Patch
 
-1. Build/Archive Release Shell Scheme；post-action 会 finalize 真实 executable identity、审计 bundle 并冻结 baseline。
+1. Build/Archive Release Shell Scheme；post-action 会 finalize 真实 executable identity、审计 bundle，并记录用于校验该已安装构建之补丁的不可变审计 baseline。
 2. 保存这一份构建与完整源码上下文。
 3. 只修改 eligible implementation，不改变 interface。
 4. 给 patch recipe 分配新 revision，并填写 incident、有效期、资源限制、rollout、rollback 与 policy。

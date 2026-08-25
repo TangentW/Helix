@@ -27,8 +27,11 @@ control interface; the GUI never terminates a service it does not own.
 
 The Xcode lifecycle carries identity instead of credentials:
 
-1. The Scheme Build pre-action asks the service to reserve a one-time
-   invitation for this profile.
+1. The Feature's ordinary Sources phase compiles its current membership through
+   a transparent target-scoped proxy. The immediately following Helix prepare
+   phase validates that exact successful invocation and asks the service to
+   reserve a one-time invitation for this profile. Adding, deleting, moving, or
+   generating a Swift source requires no Helix file-list update.
 2. The hidden Bridge object embeds that invitation plus the public pin of the
    persistent Helix Host Identity. No session secret is written to the project
    or App environment.
@@ -85,7 +88,10 @@ sequenceDiagram
     U-->>E: "Refreshed or manual-refresh-required status"
 ```
 
-The monitor watches only source files frozen into the Dev Build Manifest.
+The monitor watches the exact source membership that Xcode captured
+automatically in the current Dev Build Manifest. Adding, deleting, moving, or
+generating a target source needs an ordinary Xcode build so Xcode can publish
+the new membership; it never requires a Helix source list or configuration.
 Editor safe-save renames and in-place writes are debounced, and the snapshotter
 requires two matching inode, size, modification-time, and content-hash reads.
 Every transaction has a monotonically increasing `sourceRevision`; a slower old
@@ -105,7 +111,7 @@ not approximate the project's build settings.
 
 For an accepted save transaction, Helix:
 
-1. Captures one stable revision of every source in the frozen module context.
+1. Captures one stable revision of every source in the current module build context.
 2. Re-type-checks that complete module and rejects interface, stored-layout,
    source-membership, dependency, or build-setting changes.
 3. Uses declaration identities and implementation fingerprints to determine

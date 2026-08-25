@@ -20,6 +20,9 @@ public struct BuildEnvironment: Hashable, Sendable {
     public var compilerURL: URL
     public var optimization: String
     public var semanticArguments: [String]
+    /// Capture written beside this target's Xcode intermediate objects. Only
+    /// the Feature prepare phase consumes it directly.
+    public var targetFrontendInvocationURL: URL?
     /// App-target module search paths needed to compile the hidden Bridge.
     public var bridgeModuleSearchArguments: [String]
     public var shellOutputURL: URL {
@@ -34,19 +37,11 @@ public struct BuildEnvironment: Hashable, Sendable {
         profileOutputURL.appendingPathComponent("HelixDev.json")
     }
 
-    public var featureCompilerDirectoryURL: URL {
-        profileOutputURL.appendingPathComponent("Compiler/Feature", isDirectory: true)
-    }
-
-    public var compilerProxyURL: URL {
-        featureCompilerDirectoryURL.appendingPathComponent(
-            XcodeIntegration.CompilerCapture.proxyFileName
-        )
-    }
-
+    /// Validated capture published atomically with the prepared Shell for App
+    /// phases and Scheme actions that run outside the Feature target.
     public var frontendInvocationURL: URL {
-        featureCompilerDirectoryURL.appendingPathComponent(
-            XcodeIntegration.CompilerCapture.invocationFileName
+        shellOutputURL.appendingPathComponent(
+            XcodeIntegration.CompilerCapture.shellRelativeInvocationPath
         )
     }
 
@@ -70,8 +65,6 @@ public struct BuildContext: Sendable {
     public var profile: XcodeIntegration.Profile
     public var feature: XcodeIntegration.Feature
     public var environment: XcodeIntegration.BuildEnvironment
-    public var sourceRootURL: URL
-    public var sourceURLs: [URL]
 }
 
 public enum EnvironmentError: Swift.Error, Equatable, Sendable, CustomStringConvertible {
@@ -105,7 +98,8 @@ public struct EnvironmentResolver: Sendable {
         planURL: URL,
         profileID: String,
         variables: [String: String] = ProcessInfo.processInfo.environment,
-        requireFeatureCompilerSettings: Bool = true
+        requireFeatureCompilerSettings: Bool = true,
+        requireTargetCompilerCapture: Bool = false
     ) throws -> XcodeIntegration.BuildContext {
         try plan.validate()
         let profile = try plan.profile(id: profileID)
@@ -115,22 +109,6 @@ public struct EnvironmentResolver: Sendable {
         guard Self.contains(resolvedPlanURL, in: xcodeSourceRoot) else {
             throw XcodeIntegration.EnvironmentError.unsafePath(planURL.path)
         }
-        let sourceRoot = xcodeSourceRoot.appendingPathComponent(
-            feature.sourceRoot,
-            isDirectory: true
-        ).standardizedFileURL
-        let resolvedSourceRoot = sourceRoot.resolvingSymlinksInPath()
-        guard Self.contains(resolvedSourceRoot, in: xcodeSourceRoot) else {
-            throw XcodeIntegration.EnvironmentError.unsafePath(sourceRoot.path)
-        }
-        let sources = try feature.sourceFiles.map { logicalPath -> URL in
-            let source = sourceRoot.appendingPathComponent(logicalPath).standardizedFileURL
-            guard Self.contains(source.resolvingSymlinksInPath(), in: resolvedSourceRoot) else {
-                throw XcodeIntegration.EnvironmentError.unsafePath(source.path)
-            }
-            return source
-        }
-
         try matchIfPresent("HELIX_PROFILE_ID", expected: profile.id, variables: variables)
         try matchIfPresent(
             "HELIX_WORKFLOW",
@@ -152,6 +130,28 @@ public struct EnvironmentResolver: Sendable {
             )
         }
         let buildDirectory = try path("BUILD_DIR", in: variables)
+        let targetFrontendInvocation: URL?
+        if requireTargetCompilerCapture {
+            let objectRoot = try path("OBJROOT", in: variables)
+            let targetTemporaryDirectory = try path("TARGET_TEMP_DIR", in: variables)
+            guard Self.contains(targetTemporaryDirectory, in: objectRoot),
+                  Self.contains(
+                      targetTemporaryDirectory.resolvingSymlinksInPath(),
+                      in: objectRoot.resolvingSymlinksInPath()
+                  )
+            else {
+                throw XcodeIntegration.EnvironmentError.unsafePath(
+                    targetTemporaryDirectory.path
+                )
+            }
+            targetFrontendInvocation = targetTemporaryDirectory
+                .appendingPathComponent("Helix", isDirectory: true)
+                .appendingPathComponent(
+                    XcodeIntegration.CompilerCapture.invocationFileName
+                )
+        } else {
+            targetFrontendInvocation = nil
+        }
         let expectedProfileOutput = buildDirectory
             .appendingPathComponent("HelixGenerated", isDirectory: true)
             .appendingPathComponent(profile.id, isDirectory: true)
@@ -243,6 +243,7 @@ public struct EnvironmentResolver: Sendable {
             compilerURL: compiler,
             optimization: optimization,
             semanticArguments: semanticArguments,
+            targetFrontendInvocationURL: targetFrontendInvocation,
             bridgeModuleSearchArguments: bridgeModuleSearchArguments
         )
         return .init(
@@ -250,9 +251,7 @@ public struct EnvironmentResolver: Sendable {
             plan: plan,
             profile: profile,
             feature: feature,
-            environment: environment,
-            sourceRootURL: sourceRoot,
-            sourceURLs: sources
+            environment: environment
         )
     }
 

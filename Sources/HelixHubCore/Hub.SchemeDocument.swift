@@ -22,24 +22,14 @@ struct SchemeDocument {
 
     func configure(
         profile: XcodeIntegration.Profile,
-        featureTarget: Hub.XcodeTarget,
         applicationTarget: Hub.XcodeTarget,
         projectName: String,
         integrationRoot: String
     ) throws -> Data {
         let buildAction = try requiredElement("BuildAction")
-        setAction(
-            owner: buildAction,
-            containerName: "PreActions",
-            title: "Helix Hub: Prepare \(profile.id)",
-            script: phaseScript(
-                profile: profile,
-                phase: "prepare",
-                integrationRoot: integrationRoot
-            ),
-            target: featureTarget,
-            projectName: projectName
-        )
+        // Prepare is a Feature target phase after Sources so it always consumes
+        // the exact successful Swift compile, including membership changes.
+        removeOwnedAction(from: buildAction, containerName: "PreActions")
         switch profile.workflow {
         case .hotPatch:
             setAction(

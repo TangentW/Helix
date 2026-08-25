@@ -13,17 +13,19 @@ scheme; no Helix command needs to be typed during ordinary work.
 - Use `Profiles/live/Feature.xcconfig` as the Feature target base configuration.
   Keep the Feature's ordinary Swift files in its Sources phase; never add Helix
   DerivedData output to the project.
+- Add one Run Script phase immediately after the Feature's Sources phase:
+  `exec /bin/sh "${HELIX_INTEGRATION_ROOT:?}/Profiles/${HELIX_PROFILE_ID:?}/prepare.sh"`.
+  Helix reads the exact successful Swift invocation, so adding, deleting, moving,
+  or generating a Swift source never requires updating a Helix file list.
 - Use `Profiles/live/Application.xcconfig` as the App target base configuration.
 - Add one Run Script phase before the App's Sources phase:
-  `exec /bin/sh "${HELIX_INTEGRATION_ROOT:?}/Profiles/live/bridge.sh"`.
+  `exec /bin/sh "${HELIX_INTEGRATION_ROOT:?}/Profiles/${HELIX_PROFILE_ID:?}/bridge.sh"`.
   Declare `$(HELIX_BRIDGE_OBJECT)` as its output. The script compiles the generated
   Bridge privately in DerivedData before the App links.
   Disable "Based on dependency analysis" for this phase: every Xcode Run must
-  embed the fresh one-time invitation reserved by the Build pre-action, even
+  embed the fresh one-time invitation reserved by the Feature prepare phase, even
   when no project source changed.
-- Run `Profiles/live/prepare.sh` as the first Scheme Build
-  pre-action, with build settings supplied by the Feature target.
-- Keep the Helix status-bar app open. The Build pre-action reserves a one-time
+- Keep the Helix status-bar app open. The Feature prepare phase reserves a one-time
   code and compiles only its code plus the persistent Host Identity pin into the
   hidden Bridge in DerivedData.
 - Run `Profiles/live/live-register.sh` as the Scheme Run

@@ -582,16 +582,19 @@ swift run helix patch build \
   Sources/Feature/A.swift Sources/Feature/B.swift
 ```
 
-The source list must represent the complete module required by the frozen
-archive. Production signing can be provided by an injected signing service so
-the builder does not need direct access to a long-lived private key.
+This explicit source list belongs only to the low-level standalone CLI. It must
+cover the complete module represented by that audited archive. Normal Xcode
+projects do not maintain this list: Helix Hub reuses the exact source mapping
+captured automatically by the Shell build. Production signing can be provided
+by an injected signing service so the builder does not need direct access to a
+long-lived private key.
 
 Helix Hub creates an empty Patch Aggregate target that supports both `iphoneos`
 and `iphonesimulator`; it is only the shared Scheme's build anchor. The actual
 `patch.sh` action is a Scheme Build pre-action whose `EnvironmentBuildable` is
 the App target, so it receives the App's exact version and platform without
 copying those settings or rebuilding the App. Select the same destination
-family used to build and audit the frozen Release Shell: a device archive
+family used to build and audit the Release Shell baseline: a device archive
 produces an iOS/arm64 package, while a Simulator baseline produces an iOS
 Simulator package. The action never converts one platform's baseline into the
 other.

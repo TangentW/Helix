@@ -5,9 +5,9 @@ phase="${1:?missing Helix Xcode phase}"
 : "${HELIX_HOST_PLAN:?HELIX_HOST_PLAN is not configured}"
 : "${HELIX_PROFILE_ID:?HELIX_PROFILE_ID is not configured}"
 
-# Scheme Build pre/post-actions are also invoked by `xcodebuild clean`
-# and some non-product actions. Those actions have no linked App to
-# finalize or audit and must not materialize a new Shell baseline.
+# Xcode can invoke target phases and Scheme post-actions for non-product
+# actions. They have no linked App to finalize or audit and must not
+# materialize a new Shell baseline.
 case "${ACTION:-}" in
     clean|analyze|installhdrs|installsrc)
         exit 0

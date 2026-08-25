@@ -202,11 +202,6 @@ public struct OnboardingPlanner: Sendable {
                     "\(profile.configurationName) must exist on both App and Feature targets"
                 )
             }
-            guard !featureTarget.sourceFiles.isEmpty else {
-                throw Hub.Error.invalidOnboarding(
-                    "Feature target \(featureTarget.name) has no discoverable Swift sources"
-                )
-            }
             if let prior = applicationTargetsByCapability[profile.capability], prior != app.name {
                 throw Hub.Error.invalidOnboarding(
                     "one capability cannot span multiple App targets in one profile"
@@ -215,12 +210,9 @@ public struct OnboardingPlanner: Sendable {
             applicationTargetsByCapability[profile.capability] = app.name
 
             let featureID = Self.slug(featureTarget.name)
-            let sourceLayout = try Self.sourceLayout(featureTarget.sourceFiles)
             let feature = XcodeIntegration.Feature(
                 id: featureID,
-                moduleName: profile.featureModuleName,
-                sourceRoot: sourceLayout.root,
-                sourceFiles: sourceLayout.files
+                moduleName: profile.featureModuleName
             )
             if let existing = featuresByTarget[featureTarget.id], existing != feature {
                 throw Hub.Error.invalidOnboarding(
@@ -320,28 +312,6 @@ public struct OnboardingPlanner: Sendable {
             requirements: requirements.sorted { $0.code < $1.code },
             developmentIdentityProfiles: developmentIdentityProfiles.sorted()
         )
-    }
-
-    private static func sourceLayout(_ paths: [String]) throws -> (root: String, files: [String]) {
-        let components = paths.map { $0.split(separator: "/").map(String.init) }
-        guard !components.isEmpty, components.allSatisfy({ !$0.isEmpty }) else {
-            throw Hub.Error.invalidOnboarding("Feature source paths are malformed")
-        }
-        var common = Array(components[0].dropLast())
-        for path in components.dropFirst() {
-            let directory = Array(path.dropLast())
-            while !common.isEmpty && !directory.starts(with: common) {
-                common.removeLast()
-            }
-        }
-        let root = common.isEmpty ? "." : common.joined(separator: "/")
-        let files = components.map { path in
-            path.dropFirst(common.count).joined(separator: "/")
-        }.sorted()
-        guard files.allSatisfy({ !$0.isEmpty && $0.hasSuffix(".swift") }) else {
-            throw Hub.Error.invalidOnboarding("Feature source layout is invalid")
-        }
-        return (root, files)
     }
 
     private static func recipe(

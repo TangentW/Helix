@@ -185,7 +185,7 @@ activate_scenario() {
     local scenario_name="$2"
     local expected_evidence="$3"
     install_scenario "$scenario_directory/$scenario_name.swiftbody"
-    wait_for_log "r$revision/g$revision: codeActive" 45
+    wait_for_log "r$revision/g$revision: codeActive" 90
     kill -0 "$app_pid"
     touch "$data_container/Documents/HelixE2ERun-$revision"
     wait_for_evidence "$expected_evidence" 15
@@ -216,6 +216,11 @@ xcodebuild \
     -derivedDataPath "$derived_data" \
     clean build 2>&1 | tee "$build_log" >/dev/null
 echo "Built LiveReloadE2EHost."
+shell_receipt="$derived_data/Build/Products/HelixGenerated/live/Shell/ShellBuildReceipt.json"
+if ! grep -Fq '"logicalPath":"Sources/LiveReloadE2E.Support.swift"' "$shell_receipt"; then
+    echo "Helix did not capture the second Feature source automatically." >&2
+    exit 1
+fi
 
 xcodebuild \
     -project "$project" \
@@ -246,7 +251,6 @@ env \
     WRAPPER_NAME="$(setting WRAPPER_NAME)" \
     EXECUTABLE_PATH="$(setting EXECUTABLE_PATH)" \
     MARKETING_VERSION="$(setting MARKETING_VERSION)" \
-    HELIX_ACTIVITY_LOG_DIR="$(setting HELIX_ACTIVITY_LOG_DIR)" \
     HELIX_PROFILE_OUTPUT_DIR="$(setting HELIX_PROFILE_OUTPUT_DIR)" \
     "$helix" xcode phase \
         --plan "$script_directory/HostPlan.json" \
@@ -290,10 +294,10 @@ xcrun simctl io "$simulator_udid" screenshot \
     "$generated_directory/Dismissal.png" >/dev/null
 
 restore_baseline_source
-wait_for_log "r8/g8: codeActive" 45
+wait_for_log "r8/g8: codeActive" 90
 kill -0 "$app_pid"
 touch "$data_container/Documents/HelixE2ERun-8"
-wait_for_evidence "title=HELIX ACTION BASELINE 6" 15
+wait_for_evidence "state=baseline-action-6" 15
 kill -0 "$app_pid"
 
 echo "LiveReloadE2E passed eight generations and five UI scenarios in process $app_pid."

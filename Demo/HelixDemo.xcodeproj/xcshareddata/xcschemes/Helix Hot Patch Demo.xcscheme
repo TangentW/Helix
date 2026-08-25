@@ -18,13 +18,6 @@
                     </EnvironmentBuildable>
                 </ActionContent>
             </ExecutionAction>
-            <ExecutionAction ActionType="Xcode.IDEStandardExecutionActionsCore.ExecutionActionType.ShellScriptAction">
-                <ActionContent title="Helix Hub: Prepare hot" scriptText="/bin/sh &quot;$SRCROOT/.helix/xcode/Profiles/hot/prepare.sh&quot;">
-                    <EnvironmentBuildable>
-                        <BuildableReference BlueprintIdentifier="200000000000000000000001" BlueprintName="HotPatchFeature" BuildableIdentifier="primary" BuildableName="HotPatchFeature.framework" ReferencedContainer="container:HelixDemo.xcodeproj"></BuildableReference>
-                    </EnvironmentBuildable>
-                </ActionContent>
-            </ExecutionAction>
         </PreActions>
         <BuildActionEntries>
             <BuildActionEntry buildForTesting="YES" buildForRunning="YES" buildForProfiling="YES" buildForArchiving="YES" buildForAnalyzing="YES">

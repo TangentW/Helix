@@ -99,8 +99,8 @@ struct OnboardingPlannerTests {
         }
     }
 
-    @Test("Root-level Swift files remain valid feature inputs")
-    func supportsRootLevelSources() throws {
+    @Test("Feature source membership is delegated to the successful Swift compile")
+    func delegatesSourceMembershipToSwiftCompile() throws {
         let app = target(
             id: "APP",
             name: "ExampleApp",
@@ -108,7 +108,7 @@ struct OnboardingPlannerTests {
             products: ["HelixDevAppRuntime"]
         )
         var feature = target(id: "FEATURE", name: "Feature", kind: .framework)
-        feature.sourceFiles = ["First.swift", "Second.swift"]
+        feature.sourceFiles = []
         let root = URL(fileURLWithPath: "/tmp/helix-hub-root")
         let project = Hub.XcodeProject(
             projectURL: root.appendingPathComponent("Example.xcodeproj"),
@@ -139,8 +139,8 @@ struct OnboardingPlannerTests {
         )
 
         let plan = try Hub.OnboardingPlanner().plan(draft).hostPlan
-        #expect(plan.features[0].sourceRoot == ".")
-        #expect(plan.features[0].sourceFiles == ["First.swift", "Second.swift"])
+        #expect(plan.features[0].id == "feature")
+        #expect(plan.features[0].moduleName == "Feature")
         try plan.validate()
     }
 

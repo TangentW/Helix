@@ -201,13 +201,41 @@ struct Pipeline {
         try Data("public func transform(_ x: Int) -> Int { x + 5 }\n".utf8)
             .write(to: fixture.sourceURL)
         var request = fixture.request()
-        request.sourceFiles = [fixture.sourceURL, fixture.sourceURL]
+        request.sources = .files([fixture.sourceURL, fixture.sourceURL])
 
         #expect(throws: ReleaseCompiler.DriverError.sourceSetMismatch(
             "expected 1 files from HLXI, received 2"
         )) {
             try ReleasePipeline.Builder().build(request)
         }
+    }
+
+    @Test("Exact source mappings compile generated paths that do not mirror HLXI names")
+    func buildsFromExactSourceMappings() throws {
+        let fixture = try Fixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let generated = fixture.directory.appendingPathComponent(
+            "Generated/Completely Different.swift"
+        )
+        try FileManager.default.createDirectory(
+            at: generated.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("public func transform(_ x: Int) -> Int { x + 31 }\n".utf8)
+            .write(to: generated)
+        let logicalPath = try #require(fixture.archive.sources.first?.logicalPath)
+        let request = ReleasePipeline.BuildRequest(
+            configuration: fixture.configuration,
+            archive: fixture.archive,
+            sourceMappings: [logicalPath: generated],
+            certificate: fixture.certificate,
+            signingKey: fixture.signingKey,
+            trustedRoot: fixture.root
+        )
+
+        let artifact = try ReleasePipeline.Builder().build(request)
+
+        #expect(artifact.report.changedFunctions.count == 1)
     }
 
     @Test("CLI builds the same signed release artifact from files")

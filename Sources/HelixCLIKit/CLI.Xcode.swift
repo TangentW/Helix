@@ -24,7 +24,6 @@ public struct XcodeValidationReport: Codable, Hashable, Sendable {
     public var schemaVersion: UInt16
     public var projectPath: String
     public var featureCount: UInt32
-    public var sourceFileCount: UInt32
     public var profiles: [CLI.XcodeValidationProfile]
 }
 
@@ -389,7 +388,8 @@ func executeXcodePhase(_ arguments: [String]) async throws -> CLI.Result {
             planURL: planURL,
             profileID: profileID,
             variables: environment,
-            requireFeatureCompilerSettings: phase == .prepare
+            requireFeatureCompilerSettings: phase == .prepare,
+            requireTargetCompilerCapture: phase == .prepare
         )
     } catch let error as XcodeIntegration.EnvironmentError {
         throw CLI.Error.input(error.description)
@@ -445,7 +445,12 @@ private func auditXcodeProduct(
             label: "finalized HLXI"
         )
         let archive = try InterfaceArchive.Codec.decode(archiveBytes).archive
-        try validateXcodeArchive(archive, context: context)
+        let capture = try capturedXcodeFeature(context)
+        try validateXcodeArchive(
+            archive,
+            context: context,
+            sourceMappings: capture.sourceMappings
+        )
         let executableBytes = try readRegularFile(
             product.executableURL,
             maximumBytes: 2 * 1_024 * 1_024 * 1_024,
@@ -512,7 +517,7 @@ private func buildXcodePatch(
     } catch let error as XcodeIntegration.EnvironmentError {
         throw CLI.Error.input(error.description)
     }
-    let (baseline, archive, audit) = try loadXcodeReleaseBaseline(
+    let (baseline, archive, audit, sourceMappings) = try loadXcodeReleaseBaseline(
         context,
         marketingVersion: patch.marketingVersion
     )
@@ -566,7 +571,7 @@ private func buildXcodePatch(
         .init(
             configuration: configuration,
             archive: archive,
-            sourceFiles: context.sourceURLs,
+            sourceMappings: sourceMappings,
             compilerURL: context.environment.compilerURL,
             certificate: certificate,
             signingKey: signingKey,
@@ -643,15 +648,21 @@ private func loadXcodeReleaseBaseline(
 ) throws -> (
     XcodeIntegration.ReleaseBaseline,
     InterfaceArchive.Archive,
-    ReleaseLeakage.Report
+    ReleaseLeakage.Report,
+    [String: URL]
 ) {
     let archiveBytes = try readRegularFile(
         context.environment.finalArchiveURL,
         maximumBytes: 64 * 1_024 * 1_024,
-        label: "frozen finalized HLXI"
+        label: "finalized HLXI"
     )
     let archive = try InterfaceArchive.Codec.decode(archiveBytes).archive
-    try validateXcodeArchive(archive, context: context)
+    let capture = try capturedXcodeFeature(context)
+    try validateXcodeArchive(
+        archive,
+        context: context,
+        sourceMappings: capture.sourceMappings
+    )
     let auditBytes = try readRegularFile(
         context.environment.profileOutputURL.appendingPathComponent("ReleaseAudit.json"),
         maximumBytes: 4 * 1_024 * 1_024,
@@ -661,10 +672,10 @@ private func loadXcodeReleaseBaseline(
     do {
         audit = try JSONDecoder().decode(ReleaseLeakage.Report.self, from: auditBytes)
     } catch {
-        throw CLI.Error.input("cannot decode the frozen Release audit report")
+        throw CLI.Error.input("cannot decode the Release audit report")
     }
     guard try Core.CanonicalJSON.encode(audit) == auditBytes, audit.passed else {
-        throw CLI.Error.input("frozen Release audit is noncanonical or failed")
+        throw CLI.Error.input("Release audit is noncanonical or failed")
     }
     let baseline = try XcodeIntegration.ReleaseBaselineCodec.decode(
         readRegularFile(
@@ -692,15 +703,16 @@ private func loadXcodeReleaseBaseline(
           baseline.releaseAuditSHA256 == .sha256(auditBytes)
     else {
         throw CLI.Error.input(
-            "current Xcode patch action does not match the frozen audited Release baseline"
+            "current Xcode patch action does not match the audited Release baseline"
         )
     }
-    return (baseline, archive, audit)
+    return (baseline, archive, audit, capture.sourceMappings)
 }
 
 private func validateXcodeArchive(
     _ archive: InterfaceArchive.Archive,
-    context: XcodeIntegration.BuildContext
+    context: XcodeIntegration.BuildContext,
+    sourceMappings: [String: URL]
 ) throws {
     let minimumOS: Core.SemanticVersion
     do {
@@ -719,10 +731,10 @@ private func validateXcodeArchive(
           invocation.targetTriple == context.environment.targetTriple,
           invocation.sdkName == context.environment.sdkName,
           invocation.sdkBuild == context.environment.sdkBuild,
-          Set(archive.sources.map(\.logicalPath)) == Set(context.feature.sourceFiles)
+          Set(archive.sources.map(\.logicalPath)) == Set(sourceMappings.keys)
     else {
         throw CLI.Error.input(
-            "finalized HLXI does not match the active Xcode profile and source contract"
+            "finalized HLXI does not match the active profile or automatically captured Feature build"
         )
     }
 }
@@ -775,36 +787,12 @@ private func registerXcodeLiveSession(
 ) async throws -> CLI.Result {
     let product = try resolveXcodeProduct(context)
     _ = try finalizeXcodeShell(context, product: product)
-    let capturedFrontendJobs: [BuildCapture.CapturedFrontendJob]?
-    let activityLog: URL?
-    if FileManager.default.fileExists(
-        atPath: context.environment.frontendInvocationURL.path
-    ) {
-        capturedFrontendJobs = [
-            try BuildCapture.SwiftInvocationReader().readFrontendJob(
-                at: context.environment.frontendInvocationURL
-            ),
-        ]
-        activityLog = nil
-    } else {
-        capturedFrontendJobs = nil
-        do {
-            activityLog = try BuildCapture.XcodeActivityReader().latestActivityLog(
-                in: product.activityLogDirectoryURL
-            )
-        } catch {
-            throw CLI.Error.input(
-                "cannot find a captured Swift invocation or Xcode activity log: "
-                    + String(describing: error)
-            )
-        }
-    }
+    let capture = try capturedXcodeFeature(context)
     var prepared = try DevSession.Preparer(
         probe: BuildCapture.DefaultFrontendReplayProbe(runner: .init())
     ).prepare(
         .init(
-            activityLogURL: activityLog,
-            capturedFrontendJobs: capturedFrontendJobs,
+            capturedFrontendJobs: [capture.rawJob],
             workingDirectory: context.environment.sourceRootURL,
             workspaceURL: product.projectURL,
             scheme: context.profile.schemeName,
@@ -816,18 +804,8 @@ private func registerXcodeLiveSession(
                 .appendingPathComponent("ReloadIndex.json"),
             interfaceArchiveURL: context.environment.finalArchiveURL,
             compilerURL: context.environment.compilerURL,
-            sourceMappings: Dictionary(
-                uniqueKeysWithValues: zip(
-                    context.feature.sourceFiles,
-                    context.sourceURLs
-                ).map { ($0.0, $0.1) }
-            ),
-            compiledSourceMappings: Dictionary(
-                uniqueKeysWithValues: zip(
-                    context.feature.sourceFiles,
-                    context.sourceURLs
-                ).map { ($0.0, $0.1) }
-            ),
+            sourceMappings: capture.sourceMappings,
+            compiledSourceMappings: capture.sourceMappings,
             expandedCodeSignIdentity: product.expandedCodeSignIdentity,
             teamIdentifier: product.teamIdentifier,
             entitlementsURL: product.entitlementsURL
@@ -976,6 +954,81 @@ private final class XcodePhaseLock {
     deinit { unlock() }
 }
 
+private struct XcodeFeatureCapture {
+    var recordBytes: Data
+    var rawJob: BuildCapture.CapturedFrontendJob
+    var frontendSources: [FrontendReceipt.Source]
+    var sourceMappings: [String: URL]
+}
+
+/// Loads the invocation recorded by the Feature target's successful Swift
+/// compile and turns its exact source membership into stable archive paths.
+private func capturedXcodeFeature(
+    _ context: XcodeIntegration.BuildContext,
+    at captureURL: URL? = nil
+) throws -> XcodeFeatureCapture {
+    do {
+        let recordBytes = try readOwnerOnlyRegularFile(
+            captureURL ?? context.environment.frontendInvocationURL,
+            maximumBytes: BuildCapture.SwiftInvocationRecord.maximumByteCount,
+            label: "Feature Swift compile capture"
+        )
+        let rawJob = try BuildCapture.SwiftInvocationRecord.decode(
+            recordBytes
+        )
+        let normalized = try BuildCapture.FrontendJobNormalizer().normalize(
+            rawJob,
+            workingDirectory: context.environment.sourceRootURL
+        )
+        let compiler = URL(fileURLWithPath: normalized.executable).standardizedFileURL
+        let expectedCompiler = context.environment.compilerURL.standardizedFileURL
+        let sdk = URL(fileURLWithPath: normalized.sdkPath).standardizedFileURL
+        let expectedSDK = context.environment.sdkRootURL.standardizedFileURL
+        let optimization = normalized.arguments.last(where: {
+            ["-Onone", "-O", "-Osize"].contains($0)
+        }) ?? "-Onone"
+        guard normalized.executable.hasPrefix("/"),
+              compiler == expectedCompiler,
+              normalized.moduleName == context.feature.moduleName,
+              normalized.targetTriple == context.environment.targetTriple,
+              normalized.sdkPath.hasPrefix("/"),
+              sdk == expectedSDK,
+              optimization == context.environment.optimization
+        else {
+            throw CLI.Error.input(
+                "captured Feature Swift invocation does not match the active "
+                    + "compiler, module, SDK, target, or optimization settings"
+            )
+        }
+        let mappings = try BuildCapture.SourceMapper().map(
+            normalized,
+            workspaceRoot: context.environment.sourceRootURL
+        )
+        let sourceMappings = Dictionary(
+            uniqueKeysWithValues: mappings.map { ($0.logicalPath, $0.url) }
+        )
+        return .init(
+            recordBytes: recordBytes,
+            rawJob: rawJob,
+            frontendSources: mappings.map {
+                FrontendReceipt.Source(logicalPath: $0.logicalPath, url: $0.url)
+            },
+            sourceMappings: sourceMappings
+        )
+    } catch let error as CLI.Error {
+        throw error
+    } catch let error as BuildCapture.Error {
+        throw CLI.Error.input(
+            "cannot use the Feature target's Swift compile capture: \(error.description)"
+        )
+    } catch {
+        throw CLI.Error.input(
+            "cannot use the Feature target's Swift compile capture: "
+                + error.localizedDescription
+        )
+    }
+}
+
 private func prepareXcodeShell(
     _ context: XcodeIntegration.BuildContext
 ) async throws -> CLI.Result {
@@ -988,6 +1041,10 @@ private func prepareXcodeShell(
     let configuration = PatchConfiguration.Document.automaticProjectPolicy(
         moduleName: context.feature.moduleName
     )
+    guard let targetCaptureURL = context.environment.targetFrontendInvocationURL else {
+        throw CLI.Error.input("Feature prepare phase has no target compiler capture path")
+    }
+    let capture = try capturedXcodeFeature(context, at: targetCaptureURL)
     let minimumOS: Core.SemanticVersion
     do {
         minimumOS = try Core.SemanticVersion(
@@ -1020,9 +1077,7 @@ private func prepareXcodeShell(
         .init(
             metadata: metadata,
             configuration: configuration,
-            sources: zip(context.feature.sourceFiles, context.sourceURLs).map {
-                .init(logicalPath: $0.0, url: $0.1)
-            },
+            sources: capture.frontendSources,
             compilerURL: context.environment.compilerURL,
             nativeImportCatalog: .empty,
             callingSurfacePolicy: context.profile.workflow == .liveReload
@@ -1050,7 +1105,7 @@ private func prepareXcodeShell(
     }
     let materialized = try ShellBuild.Materializer().materialize(
         receipt: indexed.receipt,
-        sourceRoot: context.sourceRootURL,
+        sourceMappings: capture.sourceMappings,
         hubBinding: hubBinding
     )
     var artifacts = try materialized.artifacts()
@@ -1061,6 +1116,8 @@ private func prepareXcodeShell(
     artifacts["FrontendDiagnostics.json"] = try Core.CanonicalJSON.encode(
         indexed.diagnostics
     )
+    artifacts[XcodeIntegration.CompilerCapture.shellRelativeInvocationPath] =
+        capture.recordBytes
     if let hubReservation {
         artifacts[XcodeIntegration.HubReservationDocument.relativePath] =
             try Core.CanonicalJSON.encode(hubReservation)
@@ -1079,11 +1136,12 @@ private func prepareXcodeShell(
         artifacts,
         to: context.environment.shellOutputURL,
         force: true,
-        privatePaths: hubReservation == nil ? [] : [
+        privatePaths: Set([
+            XcodeIntegration.CompilerCapture.shellRelativeInvocationPath,
+        ] + (hubReservation == nil ? [] : [
             XcodeIntegration.HubReservationDocument.relativePath,
-        ]
+        ]))
     )
-    try prepareXcodeCompilerProxy(context)
     return .init(
         exitCode: 0,
         standardOutput: "Prepared \(context.profile.id) Helix Shell at "
@@ -1096,35 +1154,6 @@ private func prepareXcodeShell(
 private func xcodeHubControlClient() throws -> any HubControl.ClientProtocol {
     if let hubControlClient { return hubControlClient }
     return try HubControl.Client.applicationSupport()
-}
-
-private func prepareXcodeCompilerProxy(
-    _ context: XcodeIntegration.BuildContext
-) throws {
-    let manager = FileManager.default
-    let proxy = try XcodeIntegration.CompilerCapture.proxyScript(
-        realCompilerURL: context.environment.compilerURL
-    )
-    do {
-        let proxyURL = context.environment.compilerProxyURL
-        try manager.createDirectory(
-            at: proxyURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        // Keep the last successful capture for incremental builds where Xcode
-        // does not need to recompile the Feature target. Bridge compilation
-        // validates it against the active compiler, SDK, and target triple.
-        try files.write(proxy, to: proxyURL)
-        try manager.setAttributes(
-            [.posixPermissions: NSNumber(value: UInt16(0o755))],
-            ofItemAtPath: proxyURL.path
-        )
-    } catch {
-        throw CLI.Error.input(
-            "cannot prepare the Helix Swift compiler proxy: "
-                + error.localizedDescription
-        )
-    }
 }
 
 private func compileXcodeBridge(
@@ -1180,9 +1209,7 @@ private func compileXcodeBridge(
         }
         return resolved
     }
-    let captured = try BuildCapture.SwiftInvocationReader().readFrontendJob(
-        at: context.environment.frontendInvocationURL
-    )
+    let captured = try capturedXcodeFeature(context).rawJob
     let moduleMapNames = ["HelixRuntimeSupport"]
     let runtimeModuleMaps = try moduleMapNames.compactMap { name -> URL? in
         let url = context.environment.generatedModuleMapDirectoryURL
@@ -1307,18 +1334,12 @@ private func readRegularFile(
     maximumBytes: Int,
     label: String
 ) throws -> Data {
-    guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-          (attributes[.type] as? FileAttributeType) == .typeRegular,
-          let byteCount = (attributes[.size] as? NSNumber)?.uint64Value,
-          byteCount <= UInt64(maximumBytes)
-    else {
-        throw CLI.Error.input("\(label) is missing, unsafe, or too large: \(url.path)")
-    }
-    do {
-        return try Data(contentsOf: url, options: .mappedIfSafe)
-    } catch {
-        throw CLI.Error.input("cannot read \(label): \(error.localizedDescription)")
-    }
+    try readBoundedRegularFile(
+        url,
+        maximumBytes: maximumBytes,
+        label: label,
+        requireOwnerOnly: false
+    )
 }
 
 /// Reads a secret-bearing build handoff without following its final symlink.
@@ -1326,6 +1347,20 @@ private func readOwnerOnlyRegularFile(
     _ url: URL,
     maximumBytes: Int,
     label: String
+) throws -> Data {
+    try readBoundedRegularFile(
+        url,
+        maximumBytes: maximumBytes,
+        label: label,
+        requireOwnerOnly: true
+    )
+}
+
+private func readBoundedRegularFile(
+    _ url: URL,
+    maximumBytes: Int,
+    label: String,
+    requireOwnerOnly: Bool
 ) throws -> Data {
     let descriptor = url.path.withCString {
         Darwin.open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
@@ -1337,17 +1372,37 @@ private func readOwnerOnlyRegularFile(
     defer { try? handle.close() }
     var status = Darwin.stat()
     guard fstat(descriptor, &status) == 0,
-          status.st_uid == geteuid(),
           status.st_mode & S_IFMT == S_IFREG,
-          status.st_mode & 0o077 == 0,
-          status.st_size > 0,
+          status.st_size >= 0,
           status.st_size <= maximumBytes
     else {
-        throw CLI.Error.input("\(label) must be an owner-only regular file")
+        throw CLI.Error.input(
+            "\(label) is missing, unsafe, or too large: \(url.path)"
+        )
+    }
+    if requireOwnerOnly {
+        guard status.st_uid == geteuid(),
+              status.st_mode & 0o077 == 0,
+              status.st_size > 0
+        else {
+            throw CLI.Error.input("\(label) must be an owner-only regular file")
+        }
     }
     do {
-        let data = try handle.readToEnd() ?? Data()
-        guard data.count == Int(status.st_size) else {
+        let expectedByteCount = Int(status.st_size)
+        var data = Data()
+        data.reserveCapacity(expectedByteCount)
+        while data.count < expectedByteCount {
+            let remaining = expectedByteCount - data.count
+            let chunk = try handle.read(upToCount: min(remaining, 64 * 1_024))
+                ?? Data()
+            guard !chunk.isEmpty else {
+                throw CLI.Error.input("\(label) changed while being read")
+            }
+            data.append(chunk)
+        }
+        let trailingByte = try handle.read(upToCount: 1) ?? Data()
+        guard trailingByte.isEmpty else {
             throw CLI.Error.input("\(label) changed while being read")
         }
         return data
@@ -1384,7 +1439,12 @@ private func generateXcodeIntegration(_ arguments: [String]) throws -> CLI.Resul
     }
     let inputPath = planURL.standardizedFileURL.path
     let outputPrefix = outputURL.path.hasSuffix("/") ? outputURL.path : outputURL.path + "/"
-    guard inputPath != outputURL.path, !inputPath.hasPrefix(outputPrefix) else {
+    let installedPlanPath = outputURL.appendingPathComponent(
+        XcodeIntegration.HostPlan.defaultFileName
+    ).standardizedFileURL.path
+    guard inputPath == installedPlanPath
+        || (inputPath != outputURL.path && !inputPath.hasPrefix(outputPrefix))
+    else {
         throw CLI.Error.input("Host Plan input must be outside the generated integration root")
     }
     let base = sourceRoot.resolvingSymlinksInPath()
@@ -1407,8 +1467,20 @@ private func generateXcodeIntegration(_ arguments: [String]) throws -> CLI.Resul
     }
 
     let output = try XcodeIntegration.KitGenerator().generate(plan: plan)
+    var artifacts = output.artifacts
+    if options.hasFlag("force") {
+        for (path, data) in try preservedXcodeProjectConfigurations(
+            integrationRoot: outputURL
+        ) {
+            guard artifacts.updateValue(data, forKey: path) == nil else {
+                throw CLI.Error.input(
+                    "generated Integration Kit collides with Hub project configuration \(path)"
+                )
+            }
+        }
+    }
     try files.writeDirectory(
-        output.artifacts,
+        artifacts,
         to: outputURL,
         force: options.hasFlag("force"),
         executablePaths: output.executablePaths
@@ -1419,6 +1491,80 @@ private func generateXcodeIntegration(_ arguments: [String]) throws -> CLI.Resul
             + "Profiles: \(output.manifest.profiles.count), "
             + "artifacts: \(output.artifacts.count)\n"
     )
+}
+
+/// Hub-owned project wrappers share the integration root but are not derivable
+/// from HostPlan alone. A headless kit refresh must preserve that bounded,
+/// regular-file directory instead of silently disconnecting Xcode targets.
+private func preservedXcodeProjectConfigurations(
+    integrationRoot: URL
+) throws -> [String: Data] {
+    let directory = integrationRoot.appendingPathComponent(
+        "ProjectConfigurations",
+        isDirectory: true
+    )
+    var information = Darwin.stat()
+    guard lstat(directory.path, &information) == 0 else {
+        if errno == ENOENT { return [:] }
+        throw CLI.Error.input("cannot inspect Hub project configurations")
+    }
+    guard information.st_mode & S_IFMT == S_IFDIR else {
+        throw CLI.Error.input(
+            "Hub ProjectConfigurations must be a real directory"
+        )
+    }
+    let entries: [URL]
+    do {
+        entries = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: []
+        ).sorted { $0.lastPathComponent < $1.lastPathComponent }
+    } catch {
+        throw CLI.Error.input(
+            "cannot read Hub project configurations: \(error.localizedDescription)"
+        )
+    }
+    guard entries.count <= 1_024 else {
+        throw CLI.Error.input("Hub ProjectConfigurations contains too many files")
+    }
+    var totalBytes = 0
+    var result: [String: Data] = [:]
+    for entry in entries {
+        let name = entry.lastPathComponent
+        guard name.utf8.count <= 255,
+              ["xcconfig", "plist"].contains(entry.pathExtension.lowercased()),
+              !name.unicodeScalars.contains(where: {
+                  CharacterSet.controlCharacters.contains($0)
+              })
+        else {
+            throw CLI.Error.input(
+                "Hub ProjectConfigurations contains an unexpected filename"
+            )
+        }
+        var entryInformation = Darwin.stat()
+        guard lstat(entry.path, &entryInformation) == 0,
+              entryInformation.st_mode & S_IFMT == S_IFREG,
+              entryInformation.st_size >= 0,
+              entryInformation.st_size <= 4 * 1_024 * 1_024
+        else {
+            throw CLI.Error.input(
+                "Hub ProjectConfigurations contains a non-regular or oversized entry"
+            )
+        }
+        let addition = totalBytes.addingReportingOverflow(Int(entryInformation.st_size))
+        guard !addition.overflow, addition.partialValue <= 64 * 1_024 * 1_024 else {
+            throw CLI.Error.input("Hub ProjectConfigurations exceeds 64 MiB")
+        }
+        totalBytes = addition.partialValue
+        let data = try readRegularFile(
+            entry,
+            maximumBytes: 4 * 1_024 * 1_024,
+            label: "Hub project configuration"
+        )
+        result["ProjectConfigurations/\(name)"] = data
+    }
+    return result
 }
 
 private func validateXcodeIntegration(_ arguments: [String]) throws -> CLI.Result {
@@ -1447,7 +1593,7 @@ private func validateXcodeIntegration(_ arguments: [String]) throws -> CLI.Resul
         exitCode: 0,
         standardOutput: "Helix Xcode Host Plan is valid.\n"
             + "Project: \(report.projectPath)\n"
-            + "Features: \(report.featureCount), sources: \(report.sourceFileCount), "
+            + "Features: \(report.featureCount), sources: automatic, "
             + "profiles: \(report.profiles.count)\n"
     )
 }
@@ -1480,34 +1626,6 @@ private func validateHostInputs(
     }
     try requireDirectory(project, label: "Xcode project or workspace")
 
-    var sourceCount = 0
-    for feature in plan.features {
-        let sourceRoot = base.appendingPathComponent(
-            feature.sourceRoot,
-            isDirectory: true
-        ).standardizedFileURL
-        try requireDirectory(sourceRoot, label: "feature \(feature.id) source root")
-        let resolvedRoot = sourceRoot.resolvingSymlinksInPath()
-        guard Self.contains(resolvedRoot, in: base) else {
-            throw CLI.Error.input(
-                "feature \(feature.id) source root escapes the Host Plan root"
-            )
-        }
-        for logicalPath in feature.sourceFiles {
-            let source = sourceRoot.appendingPathComponent(logicalPath).standardizedFileURL
-            let resolved = source.resolvingSymlinksInPath()
-            guard Self.contains(resolved, in: resolvedRoot) else {
-                throw CLI.Error.input(
-                    "feature \(feature.id) source escapes its source root: \(logicalPath)"
-                )
-            }
-            try requireRegularFile(source, label: "Swift source")
-            sourceCount += 1
-        }
-    }
-    guard sourceCount <= 65_536 else {
-        throw CLI.Error.input("Xcode Host Plan exceeds 65,536 Swift sources")
-    }
     for profile in plan.profiles {
         guard let patch = profile.patch else { continue }
         let inputs: [(String, String)] = [
@@ -1539,16 +1657,13 @@ private func validateHostInputs(
             patchActionSchemeName: $0.patch?.actionSchemeName
         )
     }
-    guard let featureCount = UInt32(exactly: plan.features.count),
-          let encodedSourceCount = UInt32(exactly: sourceCount)
-    else {
+    guard let featureCount = UInt32(exactly: plan.features.count) else {
         throw CLI.Error.input("Xcode Host Plan count exceeds its schema")
     }
     return .init(
         schemaVersion: CLI.XcodeValidationReport.currentSchemaVersion,
         projectPath: project.path,
         featureCount: featureCount,
-        sourceFileCount: encodedSourceCount,
         profiles: profiles
     )
 
@@ -1612,14 +1727,15 @@ static let xcodeGenerateHelp = """
 Usage: helix xcode generate --plan HostPlan.json [--output .helix/xcode] [--force]
 
 The output must match the plan's integrationRoot. Helix writes the entire kit
-atomically so Xcode never observes a partially regenerated source contract.
+atomically so Xcode never observes a partially regenerated integration kit.
 """ + "\n"
 
 static let xcodeValidateHelp = """
 Usage: helix xcode validate --plan HostPlan.json [--json]
 
 Validation checks canonical schema, workflow/runtime separation, project and
-configuration inputs, source containment, and every declared Swift file.
+configuration inputs. Swift source membership is captured automatically from
+the active Feature target compile.
 """ + "\n"
 
 static let xcodePhaseHelp = """

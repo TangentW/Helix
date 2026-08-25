@@ -253,9 +253,7 @@ struct Application {
             features: [
                 .init(
                     id: "feature",
-                    moduleName: "Feature",
-                    sourceRoot: "Feature",
-                    sourceFiles: ["Sources/Feature.swift"]
+                    moduleName: "Feature"
                 ),
             ],
             profiles: [
@@ -288,7 +286,6 @@ struct Application {
             from: Data(validation.standardOutput.dropLast().utf8)
         )
         #expect(report.featureCount == 1)
-        #expect(report.sourceFileCount == 1)
         #expect(report.profiles.first?.runtimePackageProduct == "HelixDevAppRuntime")
 
         let generationArguments = [
@@ -310,12 +307,22 @@ struct Application {
             atPath: output.appendingPathComponent("Profiles/live/live-register.sh").path
         )
         #expect((scriptAttributes[.posixPermissions] as? NSNumber)?.intValue == 0o755)
+        let wrapper = output.appendingPathComponent(
+            "ProjectConfigurations/live-Feature-Debug.xcconfig"
+        )
+        let wrapperBytes = Data("#include \"../Profiles/live/Feature.xcconfig\"\n".utf8)
+        try FileManager.default.createDirectory(
+            at: wrapper.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try wrapperBytes.write(to: wrapper)
 
         let refused = application.run(generationArguments)
         #expect(refused.exitCode == 1)
         #expect(refused.standardError.contains("output already exists"))
         let replaced = application.run(generationArguments + ["--force"])
         #expect(replaced.exitCode == 0)
+        #expect(try Data(contentsOf: wrapper) == wrapperBytes)
 
         let installedPlanURL = output.appendingPathComponent("HostPlan.json")
         let installedValidation = application.run([
@@ -330,10 +337,16 @@ struct Application {
         ])
         #expect(installedGeneration.exitCode == 1)
         #expect(
-            installedGeneration.standardError.contains(
-                "Host Plan input must be outside the generated integration root"
-            )
+            installedGeneration.standardError.contains("output already exists")
         )
+        let installedRegeneration = application.run([
+            "xcode", "generate", "--plan", installedPlanURL.path, "--force",
+        ])
+        #expect(
+            installedRegeneration.exitCode == 0,
+            Comment(rawValue: installedRegeneration.standardError)
+        )
+        #expect(try Data(contentsOf: wrapper) == wrapperBytes)
 
         let doctor = application.run([
             "xcode", "doctor", "--plan", planURL.path,
@@ -384,9 +397,7 @@ struct Application {
             features: [
                 .init(
                     id: "feature",
-                    moduleName: "Feature",
-                    sourceRoot: "Feature",
-                    sourceFiles: ["Sources/Feature.swift"]
+                    moduleName: "Feature"
                 ),
             ],
             profiles: [
@@ -439,9 +450,21 @@ struct Application {
             executable: "/usr/bin/xcrun",
             arguments: ["--sdk", "iphonesimulator", "--show-sdk-path"]
         )
+        let sourceURL = sourceRoot.appendingPathComponent("Sources/Feature.swift")
+        try writeSwiftCapture(
+            profileID: "patch",
+            buildDirectory: buildDirectory,
+            compiler: compiler,
+            sdkRoot: sdkRoot,
+            sourceURLs: [sourceURL]
+        )
         let environment = [
             "SRCROOT": directory.path,
             "BUILD_DIR": buildDirectory.path,
+            "OBJROOT": buildDirectory.appendingPathComponent("Intermediates").path,
+            "TARGET_TEMP_DIR": buildDirectory.appendingPathComponent(
+                "Intermediates/patch"
+            ).path,
             "CONFIGURATION": "Release",
             "PLATFORM_NAME": "iphonesimulator",
             "SDKROOT": sdkRoot,
@@ -465,6 +488,25 @@ struct Application {
             currentDirectoryURL: directory,
             environment: environment,
             hubControlClient: StubHubControlClient()
+        )
+        let patchCaptureURL = buildDirectory.appendingPathComponent(
+            "Intermediates/patch/Helix/FrontendInvocation.hlxswiftc"
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644],
+            ofItemAtPath: patchCaptureURL.path
+        )
+        let permissiveCapture = await application.runAsync([
+            "xcode", "phase",
+            "--plan", generatedPlanURL.path,
+            "--profile", "patch",
+            "--phase", "prepare",
+        ])
+        #expect(permissiveCapture.exitCode != 0)
+        #expect(permissiveCapture.standardError.contains("owner-only"))
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: patchCaptureURL.path
         )
         let result = await application.runAsync([
             "xcode", "phase",
@@ -490,14 +532,8 @@ struct Application {
                 atPath: shell.appendingPathComponent(path).path
             ))
         }
-        for path in ["Compiler/Feature/swiftc"] {
-            let proxy = buildDirectory.appendingPathComponent(
-                "HelixGenerated/patch/\(path)"
-            )
-            #expect(FileManager.default.isExecutableFile(atPath: proxy.path))
-        }
         #expect(!FileManager.default.fileExists(atPath: buildDirectory
-            .appendingPathComponent("HelixGenerated/patch/Compiler/Application/swiftc")
+            .appendingPathComponent("HelixGenerated/patch/Compiler/Feature/swiftc")
             .path))
 
         let patchReceipt = try ShellBuildReceipt.Codec.decode(
@@ -516,6 +552,16 @@ struct Application {
         liveEnvironment["HELIX_PROFILE_ID"] = "live"
         liveEnvironment["HELIX_WORKFLOW"] = "liveReload"
         liveEnvironment["HELIX_RUNTIME_PRODUCT"] = "HelixDevAppRuntime"
+        liveEnvironment["TARGET_TEMP_DIR"] = buildDirectory.appendingPathComponent(
+            "Intermediates/live"
+        ).path
+        try writeSwiftCapture(
+            profileID: "live",
+            buildDirectory: buildDirectory,
+            compiler: compiler,
+            sdkRoot: sdkRoot,
+            sourceURLs: [sourceURL]
+        )
         let liveResult = await CLI.Application(
             currentDirectoryURL: directory,
             environment: liveEnvironment,
@@ -539,6 +585,15 @@ struct Application {
         )
         #expect(
             (reservationAttributes[.posixPermissions] as? NSNumber)?.intValue
+                == 0o600
+        )
+        let sharedCaptureAttributes = try FileManager.default.attributesOfItem(
+            atPath: liveShell.appendingPathComponent(
+                XcodeIntegration.CompilerCapture.shellRelativeInvocationPath
+            ).path
+        )
+        #expect(
+            (sharedCaptureAttributes[.posixPermissions] as? NSNumber)?.intValue
                 == 0o600
         )
         let contract = try String(
@@ -597,6 +652,40 @@ struct Application {
         }
         return String(decoding: data, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func writeSwiftCapture(
+        profileID: String,
+        buildDirectory: URL,
+        compiler: String,
+        sdkRoot: String,
+        sourceURLs: [URL]
+    ) throws {
+        let url = buildDirectory.appendingPathComponent(
+            "Intermediates/\(profileID)/Helix/FrontendInvocation.hlxswiftc"
+        )
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let fields = [
+            Core.CompilerCapture.recordMarker,
+            compiler,
+            "-module-name", "Feature",
+            "-target", "arm64-apple-ios15.0-simulator",
+            "-sdk", sdkRoot,
+            "-Onone",
+        ] + sourceURLs.map(\.path)
+        var data = Data()
+        for field in fields {
+            data.append(Data(field.utf8))
+            data.append(0)
+        }
+        try data.write(to: url)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: url.path
+        )
     }
 
     private func module() throws -> Bytecode.Module {

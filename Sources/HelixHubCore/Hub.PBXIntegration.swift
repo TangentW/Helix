@@ -28,6 +28,7 @@ struct PBXIntegration {
         var document = try Hub.PBXProjectDocument(data: data)
         var wrappers: [String: Data] = [:]
         var patchTargetIDs: [String: String] = [:]
+        try removeOwnedIntegrationPhases(document: &document)
 
         for profile in plan.profiles {
             let feature = try plan.feature(id: profile.featureID)
@@ -62,37 +63,70 @@ struct PBXIntegration {
             )
             wrappers[appWrapper.path] = appWrapper.data
 
+            let preparePhaseID = identifier(
+                component: "prepare-phase:\(featureTarget.id)"
+            )
+            try document.addObject(
+                preparePhaseID,
+                isa: "PBXShellScriptBuildPhase",
+                fields: shellPhase(
+                    name: "Helix Prepare (Generated)",
+                    script: "exec /bin/sh \"${HELIX_INTEGRATION_ROOT:?}/Profiles/${HELIX_PROFILE_ID:?}/prepare.sh\"",
+                    inputs: [],
+                    outputs: [],
+                    alwaysOutOfDate: true
+                )
+            )
+            try installPhases(
+                [preparePhaseID],
+                targetID: featureTarget.id,
+                placement: .afterSources,
+                document: &document
+            )
+
             let bridgePhaseID = identifier(
-                component: "bridge-phase:\(profile.id):\(appTarget.id)"
+                component: "bridge-phase:\(appTarget.id)"
             )
             try document.addObject(
                 bridgePhaseID,
                 isa: "PBXShellScriptBuildPhase",
                 fields: shellPhase(
                     name: "Helix Bridge (Generated)",
-                    script: "exec /bin/sh \"${HELIX_INTEGRATION_ROOT:?}/Profiles/\(profile.id)/bridge.sh\"",
+                    script: "exec /bin/sh \"${HELIX_INTEGRATION_ROOT:?}/Profiles/${HELIX_PROFILE_ID:?}/bridge.sh\"",
                     inputs: [],
                     outputs: ["$(HELIX_BRIDGE_OBJECT)"],
                     alwaysOutOfDate: true
                 )
             )
             var ownedAppPhases = [bridgePhaseID]
-            if let patch = profile.patch {
+            let appRequiresTrust = plan.profiles.contains {
+                $0.applicationTargetName == appTarget.name && $0.patch != nil
+            }
+            if appRequiresTrust {
                 let trustPhaseID = identifier(
-                    component: "trust-phase:\(profile.id):\(appTarget.id)"
+                    component: "trust-phase:\(appTarget.id)"
                 )
                 try document.addObject(
                     trustPhaseID,
                     isa: "PBXShellScriptBuildPhase",
                     fields: shellPhase(
                         name: "Embed Helix Trust Root (Generated)",
-                        script: "set -eu\n/usr/bin/install -m 0444 \"$SRCROOT/\(patch.trustedRootPath)\" \"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/HelixTrustedRoot.json\"\n",
-                        inputs: ["$(SRCROOT)/\(patch.trustedRootPath)"],
-                        outputs: ["$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/HelixTrustedRoot.json"],
-                        alwaysOutOfDate: false
+                        script: """
+                        set -eu
+                        if [ -z "${HELIX_PATCH_TRUSTED_ROOT:-}" ]; then
+                            exit 0
+                        fi
+                        /usr/bin/install -m 0444 "$HELIX_PATCH_TRUSTED_ROOT" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/HelixTrustedRoot.json"
+
+                        """,
+                        inputs: [],
+                        outputs: [],
+                        alwaysOutOfDate: true
                     )
                 )
                 ownedAppPhases.append(trustPhaseID)
+            }
+            if profile.patch != nil {
                 patchTargetIDs[profile.id] = try configurePatchAction(
                     profile: profile,
                     plan: plan,
@@ -100,9 +134,10 @@ struct PBXIntegration {
                     document: &document
                 )
             }
-            try installOwnedPhases(
+            try installPhases(
                 ownedAppPhases,
                 targetID: appTarget.id,
+                placement: .beforeSources,
                 document: &document
             )
         }
@@ -226,9 +261,51 @@ struct PBXIntegration {
             .replacingOccurrences(of: "\"", with: "\\\"")
     }
 
-    private func installOwnedPhases(
+    private enum PhasePlacement {
+        case beforeSources
+        case afterSources
+    }
+
+    private func removeOwnedIntegrationPhases(
+        document: inout Hub.PBXProjectDocument
+    ) throws {
+        let names: Set<String> = [
+            "Helix Prepare (Generated)",
+            "Helix Bridge (Generated)",
+            "Embed Helix Trust Root (Generated)",
+        ]
+        let owned: Set<String> = Set(document.objects.compactMap {
+            identifier, value -> String? in
+            guard value.dictionary?["isa"]?.string == "PBXShellScriptBuildPhase",
+                  let name = value.dictionary?["name"]?.string,
+                  names.contains(name)
+            else { return nil }
+            return identifier
+        })
+        guard !owned.isEmpty else { return }
+        let targetIDs = document.objects.compactMap { identifier, value in
+            value.dictionary?["isa"]?.string == "PBXNativeTarget"
+                ? identifier : nil
+        }
+        for targetID in targetIDs {
+            let target = try document.object(targetID)
+            let phases = target["buildPhases"]?.array?.compactMap(\.string) ?? []
+            guard phases.contains(where: owned.contains) else { continue }
+            try document.updateObject(targetID) { target in
+                target["buildPhases"] = .strings(
+                    phases.filter { !owned.contains($0) }
+                )
+            }
+        }
+        for identifier in owned {
+            document.removeObject(identifier)
+        }
+    }
+
+    private func installPhases(
         _ phaseIDs: [String],
         targetID: String,
+        placement: PhasePlacement,
         document: inout Hub.PBXProjectDocument
     ) throws {
         let sources = Set(document.objects.compactMap { identifier, value in
@@ -239,9 +316,14 @@ struct PBXIntegration {
             var phases = target["buildPhases"]?.array?.compactMap(\.string) ?? []
             let owned = Set(phaseIDs)
             phases.removeAll { owned.contains($0) }
-            let insertion = phases.firstIndex {
-                sources.contains($0)
-            } ?? 0
+            let insertion: Int
+            switch placement {
+            case .beforeSources:
+                insertion = phases.firstIndex { sources.contains($0) } ?? 0
+            case .afterSources:
+                insertion = phases.lastIndex { sources.contains($0) }
+                    .map { phases.index(after: $0) } ?? phases.endIndex
+            }
             phases.insert(contentsOf: phaseIDs, at: insertion)
             target["buildPhases"] = .strings(phases)
         }

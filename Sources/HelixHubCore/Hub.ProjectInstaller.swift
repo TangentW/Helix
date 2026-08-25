@@ -128,9 +128,7 @@ public struct ProjectInstaller: Sendable {
             guard let scheme = project.sharedSchemes.first(where: {
                 $0.name == profile.schemeName
             }),
-                let app = project.target(named: profile.applicationTargetName),
-                let featureName = onboarding.featureTargetNames[profile.featureID],
-                let feature = project.target(named: featureName)
+                let app = project.target(named: profile.applicationTargetName)
             else {
                 throw Hub.Error.integrationConflict(
                     "profile \(profile.id) references a missing target or shared scheme"
@@ -139,7 +137,6 @@ public struct ProjectInstaller: Sendable {
             let schemeData = try boundedFile(scheme.url, maximumBytes: 8 * 1_024 * 1_024)
             let configured = try Hub.SchemeDocument(data: schemeData).configure(
                 profile: profile,
-                featureTarget: feature,
                 applicationTarget: app,
                 projectName: project.name,
                 integrationRoot: onboarding.hostPlan.integrationRoot

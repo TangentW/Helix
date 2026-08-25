@@ -85,9 +85,10 @@ struct ProjectInstallationTests {
             as: UTF8.self
         )
         #expect(projectText.components(separatedBy: "Helix Bridge (Generated)").count - 1 == 2)
+        #expect(projectText.components(separatedBy: "Helix Prepare (Generated)").count - 1 == 2)
         #expect(projectText.contains("alwaysOutOfDate = 1"))
         #expect(projectText.contains(
-            "${HELIX_INTEGRATION_ROOT:?}/Profiles/live/bridge.sh"
+            "${HELIX_INTEGRATION_ROOT:?}/Profiles/${HELIX_PROFILE_ID:?}/bridge.sh"
         ))
         #expect(!projectText.contains("Build Helix Patch (Generated)"))
         #expect(!projectText.contains("$(HELIX_INTEGRATION_ROOT)/Profiles/"))
@@ -96,8 +97,35 @@ struct ProjectInstallationTests {
             "xcshareddata/xcschemes/Live.xcscheme"
         )
         let liveScheme = String(decoding: try Data(contentsOf: liveSchemeURL), as: UTF8.self)
-        #expect(liveScheme.components(separatedBy: "Helix Hub: Prepare live").count - 1 == 1)
+        #expect(!liveScheme.contains("Helix Hub: Prepare"))
         #expect(liveScheme.components(separatedBy: "Helix Hub: Register live").count - 1 == 1)
+        var projectParser = try Hub.OpenStep.Parser(
+            data: Data(projectText.utf8)
+        )
+        let projectRoot = try #require(try projectParser.parse().dictionary)
+        let objects = try #require(projectRoot["objects"]?.dictionary)
+        func phaseNames(targetID: String) -> [String] {
+            let identifiers = objects[targetID]?.dictionary?["buildPhases"]?
+                .array?.compactMap(\.string) ?? []
+            return identifiers.compactMap { identifier in
+                let object = objects[identifier]?.dictionary
+                return object?["name"]?.string ?? object?["isa"]?.string
+            }
+        }
+        #expect(phaseNames(targetID: "HOTFEATURE") == [
+            "PBXSourcesBuildPhase", "Helix Prepare (Generated)",
+        ])
+        #expect(phaseNames(targetID: "LIVEFEATURE") == [
+            "PBXSourcesBuildPhase", "Helix Prepare (Generated)",
+        ])
+        #expect(phaseNames(targetID: "HOTAPP") == [
+            "Helix Bridge (Generated)",
+            "Embed Helix Trust Root (Generated)",
+            "PBXSourcesBuildPhase",
+        ])
+        #expect(phaseNames(targetID: "LIVEAPP") == [
+            "Helix Bridge (Generated)", "PBXSourcesBuildPhase",
+        ])
         let patchSchemeURL = projectURL.appendingPathComponent(
             "xcshareddata/xcschemes/Helix Build Patch.xcscheme"
         )
@@ -150,6 +178,7 @@ struct ProjectInstallationTests {
             as: UTF8.self
         )
         #expect(secondText.components(separatedBy: "Helix Bridge (Generated)").count - 1 == 2)
+        #expect(secondText.components(separatedBy: "Helix Prepare (Generated)").count - 1 == 2)
         let secondScheme = String(decoding: try Data(contentsOf: liveSchemeURL), as: UTF8.self)
         #expect(secondScheme.components(separatedBy: "Helix Hub: Register live").count - 1 == 1)
         let canonicalPlan = try XcodeIntegration.HostPlanCodec.decode(

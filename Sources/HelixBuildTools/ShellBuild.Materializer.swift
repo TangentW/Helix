@@ -130,9 +130,28 @@ public struct Materializer: Sendable {
         sourceRoot: URL,
         hubBinding: ShellBuild.HubBinding? = nil
     ) throws -> ShellBuild.Output {
+        let sourceMappings = try sourceMappings(
+            for: receipt.sources,
+            from: sourceRoot
+        )
+        return try materialize(
+            receipt: receipt,
+            sourceMappings: sourceMappings,
+            hubBinding: hubBinding
+        )
+    }
+
+    public func materialize(
+        receipt: ShellBuildReceipt.Document,
+        sourceMappings: [String: URL],
+        hubBinding: ShellBuild.HubBinding? = nil
+    ) throws -> ShellBuild.Output {
         try limits.validate()
         try receipt.validate()
-        let sourceContents = try loadSources(receipt.sources, from: sourceRoot)
+        let sourceContents = try loadSources(
+            receipt.sources,
+            from: sourceMappings
+        )
         try validateNativeAnchors(receipt: receipt, sources: sourceContents)
         let initialSources = receipt.sources.map {
             InterfaceArchive.SourceRecord(logicalPath: $0.logicalPath, contentHash: $0.contentHash)
@@ -440,24 +459,54 @@ public struct Materializer: Sendable {
         )
     }
 
-    private func loadSources(
-        _ sources: [ShellBuildReceipt.Source],
+    private func sourceMappings(
+        for sources: [ShellBuildReceipt.Source],
         from sourceRoot: URL
-    ) throws -> [String: Data] {
+    ) throws -> [String: URL] {
         let root = sourceRoot.standardizedFileURL.resolvingSymlinksInPath()
         let rootValues = try root.resourceValues(forKeys: [.isDirectoryKey])
         guard rootValues.isDirectory == true else {
             throw ShellBuild.Error.invalidFilesystemEntry(root.path)
         }
         let rootPrefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
-        var total = 0
-        var result: [String: Data] = [:]
+        var result: [String: URL] = [:]
         for source in sources {
-            let unresolved = root.appendingPathComponent(source.logicalPath).standardizedFileURL
+            let unresolved = root.appendingPathComponent(source.logicalPath)
+                .standardizedFileURL
             let url = unresolved.resolvingSymlinksInPath()
             guard url.path.hasPrefix(rootPrefix) else {
                 throw ShellBuild.Error.sourceEscapesRoot(source.logicalPath)
             }
+            result[source.logicalPath] = url
+        }
+        return result
+    }
+
+    private func loadSources(
+        _ sources: [ShellBuildReceipt.Source],
+        from sourceMappings: [String: URL]
+    ) throws -> [String: Data] {
+        guard Set(sourceMappings.keys) == Set(sources.map(\.logicalPath)),
+              Set(sourceMappings.values.map { $0.standardizedFileURL.path }).count
+                == sourceMappings.count,
+              Set(sourceMappings.values.map {
+                  $0.standardizedFileURL.resolvingSymlinksInPath().path
+              }).count == sourceMappings.count
+        else {
+            throw ShellBuild.Error.invalidInput(
+                "source mappings must exactly and uniquely cover the receipt"
+            )
+        }
+        var total = 0
+        var result: [String: Data] = [:]
+        for source in sources {
+            guard let mapped = sourceMappings[source.logicalPath],
+                  mapped.isFileURL,
+                  mapped.path.hasPrefix("/")
+            else {
+                throw ShellBuild.Error.invalidFilesystemEntry(source.logicalPath)
+            }
+            let url = mapped.standardizedFileURL.resolvingSymlinksInPath()
             let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
             guard values.isRegularFile == true, let byteCount = values.fileSize,
                   byteCount <= limits.maximumSourceBytes

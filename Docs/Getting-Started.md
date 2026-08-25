@@ -28,7 +28,8 @@ compile the original handwritten files.
 flowchart LR
     A["Application target"] --> F["Feature framework · original Swift sources"]
     A --> R["One Helix aggregate runtime"]
-    P["Build pre-action"] --> S["Shell metadata in DerivedData"]
+    F --> P["Helix prepare phase · exact successful compile"]
+    P --> S["Shell metadata in DerivedData"]
     S --> H["Hidden Bridge object"]
     H --> A
     D["Saved Swift body"] --> N["Automatic native Swift or verified HLBC"]
@@ -170,21 +171,24 @@ headless service.
 
 | Workflow | Xcode location | Purpose |
 | --- | --- | --- |
-| Both | first Scheme Build pre-action | prepare the exact Feature Shell and capture contract |
+| Both | Feature target phase immediately after Sources | capture the exact successful Feature compile and prepare its current Shell |
 | Hot Patch | last Scheme Build post-action | finalize the linked executable and audit the complete Release bundle |
 | Live Reload | Scheme Run pre-action | register the exact final executable and activate its reserved invitation |
 | Patch build | Patch Scheme Build pre-action, App as `EnvironmentBuildable` | compile, sign, and optionally stage `.hlxp` without rebuilding the App |
 
-Live Reload uses Xcode's ordinary Apple debugger. The Build pre-action reserves
-a one-time invitation; the hidden Bridge contains only that invitation and the
-persistent Helix Host Identity pin. After link, the Run pre-action registers the
-exact executable UUID and Build Context. There is no custom LLDB init, Python
-installer, launch environment, Run post-action, host address, port, or session
-secret in the project.
+Live Reload uses Xcode's ordinary Apple debugger. The Feature prepare phase
+reserves a one-time invitation; the hidden Bridge contains only that invitation
+and the persistent Helix Host Identity pin. After link, the Run pre-action
+registers the exact executable UUID and Build Context. There is no custom LLDB
+init, Python installer, launch environment, Run post-action, host address, port,
+or session secret in the project.
 
 The Feature compiler proxy is limited to the selected Feature configuration. It
 forwards every real `swiftc` argument and commits an owner-only capture used by
 later saves. App, package, and unrelated targets keep Xcode's normal driver.
+Adding, deleting, moving, or generating a Swift source needs only the ordinary
+Xcode build that already owns that membership; there is no Helix source list to
+configure, regenerate, or freeze.
 
 ## 8. Start the runtime without generated imports
 
@@ -330,13 +334,16 @@ existing watched source file. A new `final` class may also inherit an
 HLXI-frozen, `NSObject`-compatible project or system type under the closed
 hosted profile and cross into native code as that superclass; the current
 profile permits only inherited no-argument initialization, no new stored
-properties, and no-argument/Bool `Void` overrides. Adding a new file or
-arbitrary native Swift metadata remains outside this workflow.
+properties, and no-argument/Bool `Void` overrides. A source file newly added to
+the target is discovered automatically by the next ordinary Xcode build and
+then participates in later Live Reload sessions. The already-running Shell
+cannot acquire new native Swift metadata without that rebuild.
 
 ## 11. Build a Hot Patch
 
 1. Build/archive the Release Shell Scheme. Its post-action finalizes the real
-   executable identity, audits the bundle, and freezes the baseline.
+   executable identity, audits the bundle, and records the immutable audited
+   baseline used to verify patches for that installed build.
 2. Preserve that exact build and complete source context.
 3. Change an eligible implementation without changing its interface.
 4. Update the patch recipe with a new revision, incident, validity, limits,

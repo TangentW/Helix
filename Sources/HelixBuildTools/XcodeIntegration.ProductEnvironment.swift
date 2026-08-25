@@ -5,7 +5,6 @@ extension XcodeIntegration {
 public struct ProductEnvironment: Sendable {
     public var applicationBundleURL: URL
     public var executableURL: URL
-    public var activityLogDirectoryURL: URL
     public var projectURL: URL
     public var marketingVersion: String
     public var expandedCodeSignIdentity: String?
@@ -60,25 +59,6 @@ extension XcodeIntegration.EnvironmentResolver {
             throw XcodeIntegration.EnvironmentError.unsafePath(executable.path)
         }
 
-        let activityDirectory: URL
-        if let value = variables["HELIX_ACTIVITY_LOG_DIR"], !value.isEmpty {
-            activityDirectory = try absolutePath(
-                "HELIX_ACTIVITY_LOG_DIR",
-                variables: variables
-            )
-        } else {
-            let products = context.environment.buildDirectoryURL
-            guard products.lastPathComponent == "Products",
-                  products.deletingLastPathComponent().lastPathComponent == "Build"
-            else {
-                throw XcodeIntegration.EnvironmentError.missing(
-                    "HELIX_ACTIVITY_LOG_DIR"
-                )
-            }
-            activityDirectory = products.deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .appendingPathComponent("Logs/Build", isDirectory: true)
-        }
         let project = context.environment.sourceRootURL.appendingPathComponent(
             context.plan.projectPath
         ).standardizedFileURL
@@ -112,7 +92,6 @@ extension XcodeIntegration.EnvironmentResolver {
         return .init(
             applicationBundleURL: application,
             executableURL: executable,
-            activityLogDirectoryURL: activityDirectory,
             projectURL: project,
             marketingVersion: marketingVersion,
             expandedCodeSignIdentity: Self.normalized(

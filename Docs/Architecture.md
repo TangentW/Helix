@@ -799,15 +799,19 @@ See [Production Hot Patching](Production-Hot-Patching.md) for the full flow.
 ## Development architecture
 
 The Xcode project contains only the original Feature sources and stable App
-runtime imports. A Build pre-action materializes the Shell under DerivedData;
-an App phase reconstructs the captured Feature invocation and compiles all
-generated Bridge sources into one validated relocatable object. App linking
-retains its stable C provider symbol, so `ApplicationSession` discovers the
-generated contract without a Bridge framework, generated source target, or
-generated Swift import. Large generated descriptor and invoker collections are
-emitted as deterministic, explicitly typed bounded chunks; this preserves
-ordering and the single-object contract while bounding Swift constraint-solver
-memory during the hidden compilation.
+runtime imports. The selected Feature's ordinary Sources phase runs through a
+transparent target-scoped compiler proxy. The Helix phase immediately after it
+validates that exact successful invocation and materializes the current Shell
+under DerivedData. An App phase reconstructs the captured Feature invocation and
+compiles all generated Bridge sources into one validated relocatable object. App
+linking retains its stable C provider symbol, so `ApplicationSession` discovers
+the generated contract without a Bridge framework, generated source target, or
+generated Swift import. Xcode remains the sole owner of source membership:
+adding, deleting, moving, or generating a Swift source requires no Helix list or
+reconfiguration. Large generated descriptor and invoker collections are emitted
+as deterministic, explicitly typed bounded chunks; this preserves ordering and
+the single-object contract while bounding Swift constraint-solver memory during
+the hidden compilation.
 
 The Xcode integration captures the frontend, link, SDK, module, source, and
 target facts from a real Debug build. A source monitor turns editor writes and

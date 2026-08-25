@@ -9,13 +9,6 @@
                     </EnvironmentBuildable>
                 </ActionContent>
             </ExecutionAction>
-            <ExecutionAction ActionType="Xcode.IDEStandardExecutionActionsCore.ExecutionActionType.ShellScriptAction">
-                <ActionContent title="Helix Hub: Prepare live" scriptText="/bin/sh &quot;$SRCROOT/.helix/xcode/Profiles/live/prepare.sh&quot;">
-                    <EnvironmentBuildable>
-                        <BuildableReference BlueprintIdentifier="200000000000000000000004" BlueprintName="LiveReloadFeature" BuildableIdentifier="primary" BuildableName="LiveReloadFeature.framework" ReferencedContainer="container:HelixDemo.xcodeproj"></BuildableReference>
-                    </EnvironmentBuildable>
-                </ActionContent>
-            </ExecutionAction>
         </PreActions>
         <BuildActionEntries>
             <BuildActionEntry buildForTesting="YES" buildForRunning="YES" buildForProfiling="YES" buildForArchiving="NO" buildForAnalyzing="YES">

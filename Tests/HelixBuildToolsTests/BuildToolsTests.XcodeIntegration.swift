@@ -1,5 +1,6 @@
 import Foundation
 import HelixCore
+import HelixDevTools
 import Testing
 @testable import HelixBuildTools
 
@@ -53,12 +54,18 @@ struct XcodeIntegrationContract {
         #expect(first.artifacts.count == first.manifest.artifacts.count + 1)
         #expect(!first.manifest.artifacts.contains { $0.path == "IntegrationManifest.json" })
         #expect(first.executablePaths.contains("Scripts/helix-phase.sh"))
+        #expect(first.executablePaths.contains(
+            XcodeIntegration.CompilerCapture.integrationProxyPath
+        ))
         #expect(first.manifest.artifacts.first {
             $0.path == "Scripts/helix-phase.sh"
         }?.permissions == 0o755)
         #expect(first.manifest.artifacts.first {
             $0.path == "Shared/Helix.xcconfig"
         }?.permissions == 0o644)
+        #expect(first.manifest.artifacts.first {
+            $0.path == XcodeIntegration.CompilerCapture.integrationProxyPath
+        }?.permissions == 0o755)
 
         let live = try #require(first.manifest.profiles.first {
             $0.profileID == "live"
@@ -79,7 +86,7 @@ struct XcodeIntegrationContract {
         #expect(liveFeature.contains("-enable-dynamic-replacement-chaining"))
         #expect(liveFeature.contains("HELIX_REAL_SWIFT_EXEC"))
         #expect(liveFeature.contains(
-            "SWIFT_EXEC = $(HELIX_PROFILE_OUTPUT_DIR)/Compiler/Feature/swiftc"
+            "SWIFT_EXEC = $(HELIX_INTEGRATION_ROOT)/Scripts/Compiler/swiftc"
         ))
         #expect(liveFeature.contains("SWIFT_USE_INTEGRATED_DRIVER = NO"))
         #expect(liveFeature.contains("LD_DYLIB_INSTALL_NAME = @rpath/$(EXECUTABLE_PATH)"))
@@ -123,17 +130,19 @@ struct XcodeIntegrationContract {
         )
         #expect(patchGuide.contains("Bridge produced from the current prepared Shell"))
         #expect(!patchGuide.contains("fresh one-time invitation"))
-        let liveProfile = text(
-            try #require(first.artifacts[live.commonConfiguration])
-        )
-        #expect(liveProfile.contains("EMIT_FRONTEND_COMMAND_LINES = YES"))
-        #expect(!patchProfile.contains("EMIT_FRONTEND_COMMAND_LINES = YES"))
+        let liveProfile = text(try #require(
+            first.artifacts[live.commonConfiguration]
+        ))
+        #expect(!liveProfile.contains("EMIT_FRONTEND_COMMAND_LINES"))
+        #expect(!patchProfile.contains("EMIT_FRONTEND_COMMAND_LINES"))
 
         #expect(first.artifacts[live.bridgePhaseScript] != nil)
         #expect(!first.artifacts.keys.contains { $0.hasSuffix("Sources.xcfilelist") })
         #expect(!first.artifacts.keys.contains { $0.hasSuffix("Bridge.xcconfig") })
         #expect(guide.contains("never add Helix"))
         #expect(guide.contains("DerivedData output to the project"))
+        #expect(guide.contains("immediately after the Feature's Sources phase"))
+        #expect(guide.contains("never requires updating a Helix file list"))
         let livePrepare = text(try #require(
             first.artifacts["Profiles/live/prepare.sh"]
         ))
@@ -165,18 +174,131 @@ struct XcodeIntegrationContract {
         ))
         #expect(!dispatcher.contains("SESSION_SECRET"))
 
-        let proxy = try XcodeIntegration.CompilerCapture.proxyScript(
-            realCompilerURL: URL(fileURLWithPath: "/Toolchain/usr/bin/swiftc")
-        )
+        let proxy = XcodeIntegration.CompilerCapture.proxyScript()
         let proxyText = text(proxy)
         #expect(proxyText.contains("HLX.SwiftInvocation.v1"))
         #expect(proxyText.contains("FrontendInvocation.hlxswiftc"))
         #expect(proxyText.contains("has_module=false"))
         #expect(proxyText.contains("[ \"$has_sdk\" = true ]"))
+        #expect(proxyText.contains("${HELIX_REAL_SWIFT_EXEC:-}"))
+        #expect(proxyText.contains("/usr/bin/xcrun --find swiftc"))
+        #expect(proxyText.contains("should_capture=false"))
+        #expect(proxyText.contains("-output-file-map"))
+        #expect(proxyText.contains("Objects-*"))
         let invocation = try #require(proxyText.range(of: "\"$real_compiler\" \"$@\""))
         let capture = try #require(proxyText.range(of: "mv -f \"$temporary\" \"$capture_file\""))
         #expect(invocation.lowerBound < capture.lowerBound)
         #expect(proxyText.contains("compiler_status=$?"))
+    }
+
+    @Test("Compiler proxy forwards discovery and captures successful target compiles")
+    func compilerProxyForwardsDiscoveryAndCapturesCompile() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-swift-discovery-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let realCompiler = root.appendingPathComponent("swiftc")
+        try Data(
+            """
+            #!/bin/sh
+            if [ "${HELIX_FIXTURE_FAIL:-}" = 1 ]; then
+                exit 23
+            fi
+            printf 'Swift version fixture\n'
+
+            """.utf8
+        ).write(
+            to: realCompiler
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: realCompiler.path
+        )
+        let proxy = root.appendingPathComponent("proxy-swiftc")
+        try XcodeIntegration.CompilerCapture.proxyScript().write(to: proxy)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: proxy.path
+        )
+
+        let standardOutput = Pipe()
+        let process = Process()
+        process.executableURL = proxy
+        process.arguments = ["--version"]
+        process.environment = ["HELIX_REAL_SWIFT_EXEC": realCompiler.path]
+        process.standardOutput = standardOutput
+        process.standardError = Pipe()
+        try process.run()
+        process.waitUntilExit()
+
+        #expect(process.terminationStatus == 0)
+        #expect(String(
+            decoding: standardOutput.fileHandleForReading.readDataToEndOfFile(),
+            as: UTF8.self
+        ) == "Swift version fixture\n")
+        #expect(!FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("Compiler").path
+        ))
+
+        let outputMap = root.appendingPathComponent(
+            "Intermediates/Demo.build/Debug/Feature.build/Objects-normal/arm64/Feature-OutputFileMap.json"
+        )
+        try FileManager.default.createDirectory(
+            at: outputMap.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let compilation = Process()
+        compilation.executableURL = proxy
+        compilation.arguments = [
+            "-module-name", "Feature",
+            "-target", "arm64-apple-ios15.0-simulator",
+            "-sdk", "/SDK/iPhoneSimulator.sdk",
+            "-output-file-map", outputMap.path,
+        ]
+        let failedCompilation = Process()
+        failedCompilation.executableURL = proxy
+        failedCompilation.arguments = compilation.arguments
+        failedCompilation.environment = [
+            "HELIX_REAL_SWIFT_EXEC": realCompiler.path,
+            "HELIX_FIXTURE_FAIL": "1",
+        ]
+        failedCompilation.standardOutput = Pipe()
+        failedCompilation.standardError = Pipe()
+        try failedCompilation.run()
+        failedCompilation.waitUntilExit()
+        #expect(failedCompilation.terminationStatus == 23)
+
+        let recordURL = root.appendingPathComponent(
+            "Intermediates/Demo.build/Debug/Feature.build/Helix/FrontendInvocation.hlxswiftc"
+        )
+        #expect(!FileManager.default.fileExists(atPath: recordURL.path))
+
+        compilation.environment = ["HELIX_REAL_SWIFT_EXEC": realCompiler.path]
+        let diagnostics = Pipe()
+        compilation.standardOutput = Pipe()
+        compilation.standardError = diagnostics
+        try compilation.run()
+        compilation.waitUntilExit()
+        #expect(
+            compilation.terminationStatus == 0,
+            Comment(rawValue: String(
+                decoding: diagnostics.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            ))
+        )
+
+        let record = try BuildCapture.SwiftInvocationReader().readFrontendJob(
+            at: recordURL
+        )
+        #expect(record.executable == realCompiler.path)
+        #expect(record.arguments == (compilation.arguments ?? []))
+        let attributes = try FileManager.default.attributesOfItem(
+            atPath: recordURL.path
+        )
+        #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
     }
 
     @Test("Xcode phase discovers the exact tool published by the running Hub")
@@ -416,7 +538,7 @@ struct XcodeIntegrationContract {
         }
     }
 
-    @Test("Host Plan fails closed on unknown fields, duplicate sources, and path expansion")
+    @Test("Host Plan fails closed on unknown or obsolete fields and path expansion")
     func rejectsAmbiguousPlans() throws {
         let canonical = try XcodeIntegration.HostPlanCodec.encode(makePlan())
         var text = String(decoding: canonical, as: UTF8.self)
@@ -425,10 +547,12 @@ struct XcodeIntegrationContract {
             try XcodeIntegration.HostPlanCodec.decode(Data(text.utf8))
         }
 
-        var duplicate = makePlan()
-        duplicate.features[0].sourceFiles = ["Sources/Feature.swift", "Sources/Feature.swift"]
-        #expect(throws: XcodeIntegration.Error.self) {
-            try duplicate.validate()
+        let obsolete = String(decoding: canonical, as: UTF8.self).replacingOccurrences(
+            of: "\"moduleName\":\"LiveFeature\"",
+            with: "\"moduleName\":\"LiveFeature\",\"sourceFiles\":[\"Feature.swift\"],\"sourceRoot\":\"Sources\""
+        )
+        #expect(throws: XcodeIntegration.Error.hostPlanNonCanonical) {
+            try XcodeIntegration.HostPlanCodec.decode(Data(obsolete.utf8))
         }
 
         var expanding = makePlan()
@@ -498,6 +622,12 @@ struct XcodeIntegrationContract {
         var variables = [
             "SRCROOT": root.path,
             "BUILD_DIR": root.appendingPathComponent("DerivedData/Build/Products").path,
+            "OBJROOT": root.appendingPathComponent(
+                "DerivedData/Build/Intermediates.noindex"
+            ).path,
+            "TARGET_TEMP_DIR": root.appendingPathComponent(
+                "DerivedData/Build/Intermediates.noindex/Demo.build/Debug/LiveDemo.build"
+            ).path,
             "CONFIGURATION": "Debug",
             "PLATFORM_NAME": "iphonesimulator",
             "SDKROOT": root.appendingPathComponent("iPhoneSimulator.sdk").path,
@@ -531,15 +661,13 @@ struct XcodeIntegrationContract {
             ).path,
             "WRAPPER_NAME": "LiveDemo.app",
             "EXECUTABLE_PATH": "LiveDemo.app/LiveDemo",
-            "HELIX_ACTIVITY_LOG_DIR": root.appendingPathComponent(
-                "DerivedData/Logs/Build"
-            ).path,
         ]
         let context = try XcodeIntegration.EnvironmentResolver().resolve(
             plan: plan,
             planURL: planURL,
             profileID: "live",
-            variables: variables
+            variables: variables,
+            requireTargetCompilerCapture: true
         )
         #expect(context.environment.targetTriple == "arm64-apple-ios15.0-simulator")
         #expect(context.environment.compilerURL == compiler)
@@ -556,13 +684,43 @@ struct XcodeIntegrationContract {
                     "DerivedData/Build/Products/HelixGenerated/live"
                 ).path
         )
+        #expect(
+            context.environment.targetFrontendInvocationURL?.path
+                == root.appendingPathComponent(
+                    "DerivedData/Build/Intermediates.noindex/Demo.build/Debug/LiveDemo.build/Helix/FrontendInvocation.hlxswiftc"
+                ).path
+        )
+        var schemeVariables = variables
+        schemeVariables.removeValue(forKey: "OBJROOT")
+        schemeVariables.removeValue(forKey: "TARGET_TEMP_DIR")
+        let schemeContext = try XcodeIntegration.EnvironmentResolver().resolve(
+            plan: plan,
+            planURL: planURL,
+            profileID: "live",
+            variables: schemeVariables,
+            requireFeatureCompilerSettings: false
+        )
+        #expect(schemeContext.environment.targetFrontendInvocationURL == nil)
+
+        var escapedCapture = variables
+        escapedCapture["TARGET_TEMP_DIR"] = root.appendingPathComponent(
+            "Outside/LiveDemo.build"
+        ).path
+        #expect(throws: XcodeIntegration.EnvironmentError.self) {
+            try XcodeIntegration.EnvironmentResolver().resolve(
+                plan: plan,
+                planURL: planURL,
+                profileID: "live",
+                variables: escapedCapture,
+                requireTargetCompilerCapture: true
+            )
+        }
         let product = try XcodeIntegration.EnvironmentResolver().resolveProduct(
             context: context,
             variables: variables
         )
         #expect(product.applicationBundleURL.lastPathComponent == "LiveDemo.app")
         #expect(product.executableURL.lastPathComponent == "LiveDemo")
-        #expect(product.activityLogDirectoryURL.lastPathComponent == "Build")
 
         var deviceVariables = variables
         deviceVariables["PLATFORM_NAME"] = "iphoneos"
@@ -613,10 +771,6 @@ struct XcodeIntegrationContract {
             variables: variables
         )
         #expect(generatedContext.environment.sourceRootURL == root)
-        #expect(
-            generatedContext.sourceRootURL.standardizedFileURL.path
-                == root.appendingPathComponent("LiveFeature").standardizedFileURL.path
-        )
 
         variables["HELIX_RUNTIME_PRODUCT"] = "HelixAppRuntime"
         #expect(throws: XcodeIntegration.EnvironmentError.mismatch(
@@ -660,6 +814,12 @@ struct XcodeIntegrationContract {
         let variables = [
             "SRCROOT": root.path,
             "BUILD_DIR": buildDirectory.path,
+            "OBJROOT": root.appendingPathComponent(
+                "DerivedData/Build/Intermediates.noindex"
+            ).path,
+            "TARGET_TEMP_DIR": root.appendingPathComponent(
+                "DerivedData/Build/Intermediates.noindex/Demo.build/Release/App.build"
+            ).path,
             "CONFIGURATION": "Release",
             "PLATFORM_NAME": "iphonesimulator",
             "SDKROOT": root.appendingPathComponent("iPhoneSimulator.sdk").path,
@@ -708,15 +868,11 @@ struct XcodeIntegrationContract {
             features: [
                 .init(
                     id: "patch-feature",
-                    moduleName: "PatchFeature",
-                    sourceRoot: "PatchFeature",
-                    sourceFiles: ["Sources/Feature.swift"]
+                    moduleName: "PatchFeature"
                 ),
                 .init(
                     id: "live-feature",
-                    moduleName: "LiveFeature",
-                    sourceRoot: "LiveFeature",
-                    sourceFiles: ["Sources/Live Feature.swift"]
+                    moduleName: "LiveFeature"
                 ),
             ],
             profiles: [

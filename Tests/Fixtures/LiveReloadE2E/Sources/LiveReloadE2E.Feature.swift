@@ -95,6 +95,7 @@ public final class HostViewController: UIViewController {
     private func runScenario() {
         // HELIX_E2E_SCENARIO_BEGIN
         actionCount += 1
+        scenarioState = "baseline-action-\(actionCount)"
         titleLabel.text = "HELIX ACTION BASELINE \(actionCount)"
         print("HELIX E2E BASELINE ACTION \(actionCount)")
         // HELIX_E2E_SCENARIO_END

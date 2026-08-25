@@ -137,6 +137,40 @@ struct ShellBuildPipeline {
         #expect(roundTripped == finalized)
     }
 
+    @Test("Exact source mappings support files outside the project root")
+    func materializesExactSourceMappings() throws {
+        let fixture = try makeFixture()
+        let generatedRoot = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-shell-generated-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer {
+            try? FileManager.default.removeItem(at: fixture.directory)
+            try? FileManager.default.removeItem(at: generatedRoot)
+        }
+        try FileManager.default.createDirectory(
+            at: generatedRoot,
+            withIntermediateDirectories: true
+        )
+        let generated = generatedRoot.appendingPathComponent("Unexpected Name.swift")
+        try Data(contentsOf: fixture.directory.appendingPathComponent(
+            "Sources/Patch.swift"
+        )).write(to: generated)
+
+        let output = try ShellBuild.Materializer().materialize(
+            receipt: fixture.receipt,
+            sourceMappings: ["Sources/Patch.swift": generated]
+        )
+        #expect(output.archive.sources.map(\.logicalPath) == ["Sources/Patch.swift"])
+
+        #expect(throws: ShellBuild.Error.self) {
+            try ShellBuild.Materializer().materialize(
+                receipt: fixture.receipt,
+                sourceMappings: ["Wrong.swift": generated]
+            )
+        }
+    }
+
     @Test("A Dev Shell embeds only its pinned Hub invitation contract")
     func embedsHubContract() throws {
         let fixture = try makeFixture()

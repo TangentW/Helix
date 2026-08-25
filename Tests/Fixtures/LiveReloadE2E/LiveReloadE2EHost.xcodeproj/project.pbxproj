@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		400000000000000000000001 /* LiveReloadE2E.Feature.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000001 /* LiveReloadE2E.Feature.swift */; };
+		400000000000000000000002 /* LiveReloadE2E.Support.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000002 /* LiveReloadE2E.Support.swift */; };
 		400000000000000000000004 /* LiveReloadE2EHost.Application.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000004 /* LiveReloadE2EHost.Application.swift */; };
 		400000000000000000000005 /* LiveReloadE2E.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 100000000000000000000006 /* LiveReloadE2E.framework */; };
 		400000000000000000000007 /* LiveReloadE2E.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 100000000000000000000006 /* LiveReloadE2E.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
@@ -44,6 +45,7 @@
 
 /* Begin PBXFileReference section */
 		100000000000000000000001 /* LiveReloadE2E.Feature.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/LiveReloadE2E.Feature.swift; sourceTree = SOURCE_ROOT; };
+		100000000000000000000002 /* LiveReloadE2E.Support.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/LiveReloadE2E.Support.swift; sourceTree = SOURCE_ROOT; };
 		100000000000000000000004 /* LiveReloadE2EHost.Application.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Host/LiveReloadE2EHost.Application.swift; sourceTree = SOURCE_ROOT; };
 		100000000000000000000005 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Host/Info.plist; sourceTree = SOURCE_ROOT; };
 		100000000000000000000006 /* LiveReloadE2E.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = LiveReloadE2E.framework; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -118,6 +120,7 @@
 			isa = PBXGroup;
 			children = (
 				100000000000000000000001 /* LiveReloadE2E.Feature.swift */,
+				100000000000000000000002 /* LiveReloadE2E.Support.swift */,
 			);
 			name = Feature;
 			sourceTree = "<group>";
@@ -155,6 +158,7 @@
 			buildConfigurationList = 600000000000000000000002 /* Build configuration list for PBXNativeTarget "LiveReloadE2E" */;
 			buildPhases = (
 				300000000000000000000001 /* Sources */,
+				5748D160830FE75172F55B9E /* Helix Prepare (Generated) */,
 				300000000000000000000002 /* Frameworks */,
 			);
 			buildRules = (
@@ -172,7 +176,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 600000000000000000000004 /* Build configuration list for PBXNativeTarget "LiveReloadE2EHost" */;
 			buildPhases = (
-				30000000000000000000000C /* Compile Hidden Helix Bridge */,
+				BA86DB73A54E70F639557FFD /* Helix Bridge (Generated) */,
 				300000000000000000000005 /* Sources */,
 				300000000000000000000006 /* Frameworks */,
 				300000000000000000000007 /* Embed Frameworks */,
@@ -269,7 +273,7 @@
 /* End PBXProject section */
 
 /* Begin PBXShellScriptBuildPhase section */
-		30000000000000000000000C /* Compile Hidden Helix Bridge */ = {
+		5748D160830FE75172F55B9E /* Helix Prepare (Generated) */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
 			buildActionMask = 2147483647;
@@ -277,13 +281,29 @@
 			);
 			inputPaths = (
 			);
-			name = "Compile Hidden Helix Bridge";
+			name = "Helix Prepare (Generated)";
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "exec /bin/sh \"${HELIX_INTEGRATION_ROOT:?}/Profiles/${HELIX_PROFILE_ID:?}/prepare.sh\"";
+			showEnvVarsInLog = 0;
+		};
+		BA86DB73A54E70F639557FFD /* Helix Bridge (Generated) */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+			);
+			name = "Helix Bridge (Generated)";
 			outputPaths = (
 				"$(HELIX_BRIDGE_OBJECT)",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "exec /bin/sh \"$HELIX_INTEGRATION_ROOT/Profiles/live/bridge.sh\"\n";
+			shellScript = "exec /bin/sh \"${HELIX_INTEGRATION_ROOT:?}/Profiles/${HELIX_PROFILE_ID:?}/bridge.sh\"";
 			showEnvVarsInLog = 0;
 		};
 /* End PBXShellScriptBuildPhase section */
@@ -294,6 +314,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				400000000000000000000001 /* LiveReloadE2E.Feature.swift in Sources */,
+				400000000000000000000002 /* LiveReloadE2E.Support.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -371,7 +392,6 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEFINES_MODULE = YES;
 				DYLIB_INSTALL_NAME_BASE = "@rpath";
-				EMIT_FRONTEND_COMMAND_LINES = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACH_O_TYPE = mh_dylib;
 				MARKETING_VERSION = 1.0;
@@ -406,7 +426,6 @@
 				ARCHS = arm64;
 				CODE_SIGNING_ALLOWED = NO;
 				CURRENT_PROJECT_VERSION = 1;
-				EMIT_FRONTEND_COMMAND_LINES = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Host/Info.plist;

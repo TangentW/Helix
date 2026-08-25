@@ -139,6 +139,10 @@ struct DemoIntegration {
         #expect(!project.contains("HELIX_DEVICE_NATIVE_QUALIFIED"))
         #expect(project.occurrences(of: "INFOPLIST_FILE = LiveReloadDemo/Info.plist;") == 2)
         #expect(project.occurrences(of: "Helix Bridge (Generated)") == 2)
+        #expect(project.occurrences(of: "Helix Prepare (Generated)") == 2)
+        #expect(project.contains(
+            "Profiles/${HELIX_PROFILE_ID:?}/prepare.sh"
+        ))
         #expect(!project.contains("HelixGenerated"))
         #expect(!project.contains("DerivedSources"))
         #expect(!project.contains("HelixBridge.framework"))
@@ -164,18 +168,18 @@ struct DemoIntegration {
 
         #expect(hot.contains("buildConfiguration=\"Release\""))
         #expect(hot.occurrences(of: "Prepare Helix Demo Prerequisites") == 1)
-        #expect(hot.occurrences(of: "Helix Hub: Prepare hot") == 1)
+        #expect(!hot.contains("Helix Hub: Prepare"))
         #expect(hot.occurrences(of: "Helix Hub: Audit hot") == 1)
-        #expect(hot.occurrences(of: "Profiles/hot/prepare.sh") == 1)
+        #expect(!hot.contains("Profiles/hot/prepare.sh"))
         #expect(hot.occurrences(of: "Profiles/hot/audit.sh") == 1)
         #expect(hot.contains("BlueprintName=\"HotPatchDemo\""))
         #expect(!hot.contains("HelixBridge"))
 
         #expect(live.contains("buildConfiguration=\"Debug\""))
         #expect(live.occurrences(of: "Prepare Helix Demo Prerequisites") == 1)
-        #expect(live.occurrences(of: "Helix Hub: Prepare live") == 1)
+        #expect(!live.contains("Helix Hub: Prepare"))
         #expect(live.occurrences(of: "Helix Hub: Register live") == 1)
-        #expect(live.occurrences(of: "Profiles/live/prepare.sh") == 1)
+        #expect(!live.contains("Profiles/live/prepare.sh"))
         #expect(live.occurrences(of: "Profiles/live/live-register.sh") == 1)
         #expect(!live.contains("live-start.sh"))
         #expect(!live.contains("live-stop.sh"))

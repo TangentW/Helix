@@ -14,7 +14,7 @@ Live Reload 不再为每次 Xcode Run 创建 daemon，也不使用自定义 LLDB
 
 Xcode lifecycle 传递的是身份，不是凭据：
 
-1. Scheme Build pre-action 向 Service 预留一个绑定 profile 的一次性邀请。
+1. Feature 的普通 Sources phase 会通过仅作用于该 target 的透明 proxy 编译当前 membership；紧随其后的 Helix prepare phase 校验这次精确的成功调用，再向 Service 预留一个绑定 profile 的一次性邀请。增加、删除、移动或生成 Swift 源文件都不需要更新 Helix 文件列表。
 2. 隐藏 Bridge object 只嵌入邀请和持久 Helix Host Identity 的公开 pin。Project 与 App environment 都不会写入 session secret。
 3. App link 完成后，Scheme Run pre-action 注册精确 executable UUID 与完整 Build Context，再把预留邀请绑定到最终 Shell。
 4. Xcode 用默认 Apple debugger 启动 App。进程开始时，`DevRuntime.LaunchMode.current()` 只调用一次 Darwin `sysctl` 并检查 `P_TRACED`。被跟踪的进程进入 `automaticXcode`；探测失败会保守进入 `manual`。
@@ -49,7 +49,7 @@ sequenceDiagram
     U-->>E: "已刷新或需要手动刷新"
 ```
 
-监控器只观察 Dev Build Manifest 冻结的源文件。编辑器 safe-save rename 与原地写入会先 debounce；Snapshotter 要求连续两次读取的 inode、大小、修改时间和内容 hash 全部一致。每个 transaction 都有单调递增的 `sourceRevision`，较慢的旧编译或传输无法覆盖后来已接受的保存。
+监控器观察 Xcode 自动捕获到当前 Dev Build Manifest 的精确 target 源码成员。新增、删除、移动或生成 target 源码后，只需正常执行一次 Xcode Build，让 Xcode 发布新的源码成员；开发者不需要维护 Helix 源码列表或额外配置。编辑器 safe-save rename 与原地写入会先 debounce；Snapshotter 要求连续两次读取的 inode、大小、修改时间和内容 hash 全部一致。每个 transaction 都有单调递增的 `sourceRevision`，较慢的旧编译或传输无法覆盖后来已接受的保存。
 
 编译、artifact 验证、激活或 UI 刷新失败都不会丢掉上一个成功代码 generation。代码是否激活与 UI 是否刷新会分开报告。
 
@@ -59,7 +59,7 @@ sequenceDiagram
 
 对于通过检查的一次保存，Helix 会：
 
-1. 为冻结 module 上下文中的全部源码捕获同一个稳定 revision。
+1. 为当前 module 构建上下文中的全部源码捕获同一个稳定 revision。
 2. 重新 type-check 完整 module，并拒绝 interface、stored layout、source membership、依赖或 Build Settings 变化。
 3. 通过声明身份与 implementation fingerprint 确定变化的 eligible root，再让捕获的 Swift 编译器产出 SIL。
 4. 构造闭合调用表：patch-local 函数优先，其次是 eligible Shell `EntryIndex`，最后是 Dev Shell 在构建期实际生成的精确 `NativeImportID` 能力。

@@ -84,6 +84,11 @@ public struct KitGenerator: Sendable {
             at: "Scripts/helix-phase.sh",
             into: &artifacts
         )
+        try insert(
+            XcodeIntegration.CompilerCapture.proxyScript(),
+            at: XcodeIntegration.CompilerCapture.integrationProxyPath,
+            into: &artifacts
+        )
 
         var contracts: [XcodeIntegration.ProfileContract] = []
         for profile in plan.profiles {
@@ -104,7 +109,10 @@ public struct KitGenerator: Sendable {
         let guide = renderGuide(plan: plan, contracts: contracts)
         try insert(Data(guide.utf8), at: "Integration.md", into: &artifacts)
 
-        let executablePaths = Set(artifacts.keys.filter { $0.hasSuffix(".sh") })
+        let executablePaths = Set(
+            artifacts.keys.filter { $0.hasSuffix(".sh") }
+                + [XcodeIntegration.CompilerCapture.integrationProxyPath]
+        )
         let records = artifacts.map {
             XcodeIntegration.KitArtifact(
                 path: $0.key,
@@ -184,9 +192,6 @@ public struct KitGenerator: Sendable {
         profile: XcodeIntegration.Profile,
         plan: XcodeIntegration.HostPlan
     ) -> String {
-        let activitySetting = profile.workflow == .liveReload
-            ? "EMIT_FRONTEND_COMMAND_LINES = YES\n"
-            : ""
         let patchSettings: String
         if let patch = profile.patch {
             patchSettings = """
@@ -214,8 +219,6 @@ public struct KitGenerator: Sendable {
         HELIX_FINAL_ARCHIVE = $(HELIX_PROFILE_OUTPUT_DIR)/Shell.final.hlxi
         HELIX_BRIDGE_OBJECT = $(HELIX_PROFILE_OUTPUT_DIR)/Bridge/HelixBridge.o
         HELIX_DEV_CONFIGURATION = $(HELIX_PROFILE_OUTPUT_DIR)/HelixDev.json
-        HELIX_ACTIVITY_LOG_DIR = $(BUILD_DIR)/../../Logs/Build
-        \(activitySetting)
         \(patchSettings)
         """.trimmingCharacters(in: .newlines) + "\n"
     }
@@ -230,7 +233,7 @@ public struct KitGenerator: Sendable {
         LD_DYLIB_INSTALL_NAME = @rpath/$(EXECUTABLE_PATH)
         OTHER_SWIFT_FLAGS = $(inherited) -Xfrontend -enable-private-imports -Xfrontend -enable-implicit-dynamic -Xfrontend -enable-dynamic-replacement-chaining
         HELIX_REAL_SWIFT_EXEC = $(TOOLCHAIN_DIR)/usr/bin/swiftc
-        SWIFT_EXEC = $(HELIX_PROFILE_OUTPUT_DIR)/Compiler/Feature/\(XcodeIntegration.CompilerCapture.proxyFileName)
+        SWIFT_EXEC = $(HELIX_INTEGRATION_ROOT)/\(XcodeIntegration.CompilerCapture.integrationProxyPath)
         SWIFT_USE_INTEGRATED_DRIVER = NO
 
         """.trimmingCharacters(in: .newlines) + "\n"
@@ -259,9 +262,9 @@ public struct KitGenerator: Sendable {
         : "${HELIX_HOST_PLAN:?HELIX_HOST_PLAN is not configured}"
         : "${HELIX_PROFILE_ID:?HELIX_PROFILE_ID is not configured}"
 
-        # Scheme Build pre/post-actions are also invoked by `xcodebuild clean`
-        # and some non-product actions. Those actions have no linked App to
-        # finalize or audit and must not materialize a new Shell baseline.
+        # Xcode can invoke target phases and Scheme post-actions for non-product
+        # actions. They have no linked App to finalize or audit and must not
+        # materialize a new Shell baseline.
         case "${ACTION:-}" in
             clean|analyze|installhdrs|installsrc)
                 exit 0
@@ -323,7 +326,7 @@ public struct KitGenerator: Sendable {
         script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
         integration_root=$(CDPATH= cd -- "$script_directory/../.." && pwd -P)
 
-        # Scheme pre-actions run before target xcconfig values are exported.
+        # Keep wrappers usable from both target phases and Scheme actions.
         export HELIX_INTEGRATION_ROOT="$integration_root"
         export HELIX_HOST_PLAN="$integration_root/HostPlan.json"
         export HELIX_PROFILE_ID="\(profileID)"
@@ -361,7 +364,7 @@ public struct KitGenerator: Sendable {
             case .liveReload:
                 bridgeFreshness = """
                   Disable "Based on dependency analysis" for this phase: every Xcode Run must
-                  embed the fresh one-time invitation reserved by the Build pre-action, even
+                  embed the fresh one-time invitation reserved by the Feature prepare phase, even
                   when no project source changed.
                 """
             }
@@ -372,14 +375,16 @@ public struct KitGenerator: Sendable {
             - Use `\(contract.featureConfiguration)` as the Feature target base configuration.
               Keep the Feature's ordinary Swift files in its Sources phase; never add Helix
               DerivedData output to the project.
+            - Add one Run Script phase immediately after the Feature's Sources phase:
+              `exec /bin/sh "${HELIX_INTEGRATION_ROOT:?}/Profiles/${HELIX_PROFILE_ID:?}/prepare.sh"`.
+              Helix reads the exact successful Swift invocation, so adding, deleting, moving,
+              or generating a Swift source never requires updating a Helix file list.
             - Use `\(contract.applicationConfiguration)` as the App target base configuration.
             - Add one Run Script phase before the App's Sources phase:
-              `exec /bin/sh "${HELIX_INTEGRATION_ROOT:?}/Profiles/\(contract.profileID)/bridge.sh"`.
+              `exec /bin/sh "${HELIX_INTEGRATION_ROOT:?}/Profiles/${HELIX_PROFILE_ID:?}/bridge.sh"`.
               Declare `$(HELIX_BRIDGE_OBJECT)` as its output. The script compiles the generated
               Bridge privately in DerivedData before the App links.
             \(bridgeFreshness)
-            - Run `Profiles/\(contract.profileID)/prepare.sh` as the first Scheme Build
-              pre-action, with build settings supplied by the Feature target.
             """
             switch profile.workflow {
             case .hotPatch:
@@ -408,7 +413,7 @@ public struct KitGenerator: Sendable {
             case .liveReload:
                 return common + """
 
-                - Keep the Helix status-bar app open. The Build pre-action reserves a one-time
+                - Keep the Helix status-bar app open. The Feature prepare phase reserves a one-time
                   code and compiles only its code plus the persistent Host Identity pin into the
                   hidden Bridge in DerivedData.
                 - Run `Profiles/\(contract.profileID)/live-register.sh` as the Scheme Run

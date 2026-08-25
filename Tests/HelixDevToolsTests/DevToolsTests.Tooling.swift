@@ -118,6 +118,76 @@ struct Tooling {
         #expect(!normalized.arguments.contains("-primary-filelist"))
     }
 
+    @Test("Captured sources map project and generated files without leaking host paths")
+    func mapsCapturedSourceMembership() throws {
+        let workspace = try temporaryDirectory("helix-source-mapping")
+        let generatedRoot = try temporaryDirectory("helix-generated-source")
+        defer {
+            try? FileManager.default.removeItem(at: workspace)
+            try? FileManager.default.removeItem(at: generatedRoot)
+        }
+        let projectSource = workspace.appendingPathComponent(
+            "Feature/Sources/Screen With Space.swift"
+        )
+        let generatedSource = generatedRoot.appendingPathComponent("Generated.swift")
+        try FileManager.default.createDirectory(
+            at: projectSource.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("func screen() {}\n".utf8).write(to: projectSource)
+        try Data("func generated() {}\n".utf8).write(to: generatedSource)
+
+        let mappings = try BuildCapture.SourceMapper().map(
+            sourcePaths: [generatedSource.path, projectSource.path],
+            workspaceRoot: workspace
+        )
+
+        #expect(mappings.count == 2)
+        let external = try #require(mappings.first {
+            $0.logicalPath.hasPrefix("__HelixExternal/")
+        })
+        #expect(external.logicalPath.hasSuffix("/Generated.swift"))
+        #expect(!external.logicalPath.contains(generatedRoot.path))
+        #expect(
+            mappings.contains {
+                $0.logicalPath == "Feature/Sources/Screen With Space.swift"
+            }
+        )
+        #expect(Set(mappings.map(\.url)) == Set([generatedSource, projectSource]))
+    }
+
+    @Test("Captured source mapping rejects missing files and physical aliases")
+    func rejectsUnsafeCapturedSourceMembership() throws {
+        let workspace = try temporaryDirectory("helix-source-alias")
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let source = workspace.appendingPathComponent("Feature.swift")
+        let alias = workspace.appendingPathComponent("Alias.swift")
+        try Data("func value() {}\n".utf8).write(to: source)
+        try FileManager.default.createSymbolicLink(
+            at: alias,
+            withDestinationURL: source
+        )
+
+        #expect(throws: BuildCapture.Error.self) {
+            try BuildCapture.SourceMapper().map(
+                sourcePaths: [source.path, alias.path],
+                workspaceRoot: workspace
+            )
+        }
+        #expect(throws: BuildCapture.Error.self) {
+            try BuildCapture.SourceMapper().map(
+                sourcePaths: [workspace.appendingPathComponent("Missing.swift").path],
+                workspaceRoot: workspace
+            )
+        }
+        #expect(throws: BuildCapture.Error.self) {
+            try BuildCapture.SourceMapper().map(
+                sourcePaths: [workspace.appendingPathComponent("NotSwift.txt").path],
+                workspaceRoot: workspace
+            )
+        }
+    }
+
     #if os(macOS)
     @Test("The selected Xcode toolchain passes an isolated Simulator replay probe")
     func frontendReplayProbe() throws {

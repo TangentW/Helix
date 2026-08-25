@@ -4,37 +4,44 @@ import HelixCore
 extension XcodeIntegration {
 /// Stable filenames and proxy rendering for exact Xcode Swift invocation capture.
 public enum CompilerCapture {
-    // Swift Driver selects its mode from argv[0]. The proxy must therefore
-    // retain the canonical basename even though it lives in a private output
-    // directory distinct from the toolchain.
+    // Swift Driver selects its mode from argv[0]. The proxy must retain the
+    // canonical basename even though it is generated outside the toolchain.
     public static let proxyFileName = "swiftc"
+    public static let integrationProxyPath = "Scripts/Compiler/\(proxyFileName)"
     public static let invocationFileName = "FrontendInvocation.hlxswiftc"
+    public static let shellRelativeInvocationPath =
+        "Compiler/\(invocationFileName)"
     public static let recordMarker = Core.CompilerCapture.recordMarker
 
-    public static func proxyScript(realCompilerURL: URL) throws -> Data {
-        let path = realCompilerURL.standardizedFileURL.path
-        guard realCompilerURL.isFileURL,
-              path.hasPrefix("/"),
-              !path.unicodeScalars.contains(where: {
-                  CharacterSet.controlCharacters.contains($0)
-              }),
-              ["swiftc", "swift-driver"].contains(realCompilerURL.lastPathComponent)
-        else {
-            throw XcodeIntegration.EnvironmentError.invalid(
-                name: "HELIX_REAL_SWIFT_EXEC",
-                value: path
-            )
-        }
-        let compiler = shellSingleQuoted(path)
-        return Data(
+    /// The proxy is toolchain-independent so it exists before the first clean
+    /// Feature build. It derives a target-private capture directory from
+    /// Swift Driver's own output paths because XCBuild does not export custom
+    /// build settings to a custom compiler process.
+    public static func proxyScript() -> Data {
+        Data(
             """
             #!/bin/sh
-            set -u
+            set -eu
             umask 077
 
-            real_compiler=\(compiler)
-            proxy_directory=$(/usr/bin/dirname "$0")
-            capture_file="$proxy_directory/\(invocationFileName)"
+            # XCBuild queries a custom SWIFT_EXEC before it creates a target
+            # build environment. Forward those discovery calls through xcrun;
+            # real target compilation supplies the exact selected toolchain.
+            real_compiler="${HELIX_REAL_SWIFT_EXEC:-}"
+            if [ -z "$real_compiler" ]; then
+                real_compiler=$(/usr/bin/xcrun --find swiftc)
+            fi
+            case "$real_compiler" in
+                /*/swiftc|/*/swift-driver) ;;
+                *)
+                    echo "error: HELIX_REAL_SWIFT_EXEC is not an absolute Swift compiler" >&2
+                    exit 2
+                    ;;
+            esac
+            if [ ! -x "$real_compiler" ]; then
+                echo "error: Helix cannot execute the selected Swift compiler" >&2
+                exit 2
+            fi
             temporary=
 
             cleanup() {
@@ -47,20 +54,62 @@ public enum CompilerCapture {
             has_module=false
             has_target=false
             has_sdk=false
+            next_output=
+            output_file_map=
+            module_output=
             for argument in "$@"; do
+                if [ -n "$next_output" ]; then
+                    if [ "$next_output" = map ]; then
+                        output_file_map="$argument"
+                    else
+                        module_output="$argument"
+                    fi
+                    next_output=
+                    continue
+                fi
                 case "$argument" in
                     -module-name) has_module=true ;;
                     -target) has_target=true ;;
                     -sdk) has_sdk=true ;;
+                    -output-file-map) next_output=map ;;
+                    -output-file-map=*) output_file_map="${argument#*=}" ;;
+                    -emit-module-path) next_output=module ;;
+                    -emit-module-path=*) module_output="${argument#*=}" ;;
                 esac
             done
+            should_capture=false
+            if [ "$has_module" = true ] && [ "$has_target" = true ] && [ "$has_sdk" = true ]; then
+                compiler_output="${output_file_map:-$module_output}"
+                case "$compiler_output" in
+                    /*) ;;
+                    *)
+                        echo "error: Helix cannot locate the Xcode Swift object directory" >&2
+                        exit 2
+                        ;;
+                esac
+                architecture_directory=$(/usr/bin/dirname "$compiler_output")
+                objects_directory=$(/usr/bin/dirname "$architecture_directory")
+                case $(/usr/bin/basename "$objects_directory") in
+                    Objects-*) ;;
+                    *)
+                        echo "error: Helix received an unexpected Xcode Swift output path" >&2
+                        exit 2
+                        ;;
+                esac
+                should_capture=true
+                proxy_directory="$(/usr/bin/dirname "$objects_directory")/Helix"
+                capture_file="$proxy_directory/\(invocationFileName)"
+                /bin/mkdir -p "$proxy_directory"
+            fi
+            set +e
             "$real_compiler" "$@"
             compiler_status=$?
+            set -e
             if [ "$compiler_status" -ne 0 ]; then
                 exit "$compiler_status"
             fi
 
-            if [ "$has_module" = true ] && [ "$has_target" = true ] && [ "$has_sdk" = true ]; then
+            if [ "$should_capture" = true ]; then
                 temporary=$(/usr/bin/mktemp "$proxy_directory/.FrontendInvocation.XXXXXX")
                 {
                     /usr/bin/printf '%s\\0' '\(recordMarker)' "$real_compiler"
@@ -76,10 +125,6 @@ public enum CompilerCapture {
 
             """.utf8
         )
-    }
-
-    private static func shellSingleQuoted(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: "'\\\"'\\\"'") + "'"
     }
 }
 }

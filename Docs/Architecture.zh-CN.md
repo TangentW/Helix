@@ -105,7 +105,7 @@ Async function root 出于不同原因复用同一套精确 range 源码 body �
 
 ## 开发期架构
 
-Xcode 工程只包含原始 Feature 源码和稳定 App Runtime import。Build pre-action 在 DerivedData 中 materialize Shell；App phase 根据捕获的 Feature 调用重建编译参数，把全部生成 Bridge 源码私下编译成一个经过校验的 relocatable object。App 链接时保留稳定 C provider 符号，`ApplicationSession` 因此无需 Bridge framework、生成源码 target 或生成 Swift import 就能取得合同。大规模 descriptor 与 invoker 集合会按确定顺序生成显式类型的有界分块；这不改变顺序或单 object 合同，同时限制隐藏编译阶段 Swift constraint solver 的内存峰值。
+Xcode 工程只包含原始 Feature 源码和稳定 App Runtime import。所选 Feature 的普通 Sources phase 会通过仅作用于该 target 的透明 compiler proxy；紧随其后的 Helix phase 校验这次精确的成功调用，并在 DerivedData 中 materialize 当前 Shell。App phase 根据捕获的 Feature 调用重建编译参数，把全部生成 Bridge 源码私下编译成一个经过校验的 relocatable object。App 链接时保留稳定 C provider 符号，`ApplicationSession` 因此无需 Bridge framework、生成源码 target 或生成 Swift import 就能取得合同。源码 membership 始终只由 Xcode 管理：增加、删除、移动或生成 Swift 源文件都不需要维护 Helix 列表或重新配置。大规模 descriptor 与 invoker 集合会按确定顺序生成显式类型的有界分块；这不改变顺序或单 object 合同，同时限制隐藏编译阶段 Swift constraint solver 的内存峰值。
 
 Xcode 集成会从一次真实 Debug Build 中捕获 frontend、link、SDK、module、源码和 target 事实。源码监控器把编辑器写入与原子 rename 整理成稳定、单调递增编号的快照。开发编译器在原 module 上下文中重新检查整个 transaction：自动路由在经过资格验证的 iOS Simulator 上优先生成新的原生 Swift Dynamic Replacement image，其他情况则把与 Release 编译器相同的受支持 canonical SIL 降成不可变 HLBC generation。认证 daemon 传输选定的有界 artifact，Debug App 校验后再原子激活。
 

@@ -6,6 +6,15 @@ import HelixInterface
 public enum ReleaseCompiler {}
 
 extension ReleaseCompiler {
+    public enum SourceSet: Sendable {
+        /// Resolves logical archive paths by their source-path suffix. This is
+        /// convenient for the standalone CLI where callers provide only files.
+        case files([URL])
+        /// Carries the exact logical-to-physical mapping captured by a host
+        /// build, including generated sources outside the project directory.
+        case mappings([String: URL])
+    }
+
     public struct ToolchainIdentity: Codable, Hashable, Sendable {
         public var fingerprint: String
         public var versionOutput: String
@@ -27,7 +36,7 @@ extension ReleaseCompiler {
 
     public struct BuildRequest: Sendable {
         public var archive: InterfaceArchive.Archive
-        public var sourceFiles: [URL]
+        public var sources: ReleaseCompiler.SourceSet
         public var selectedFunctionKeys: Set<Core.FunctionKey>?
         public var compilerURL: URL
         public var enforceToolchainFingerprint: Bool
@@ -41,8 +50,44 @@ extension ReleaseCompiler {
             enforceToolchainFingerprint: Bool = true,
             requestedResources: Core.ResourceLimits = .init()
         ) {
+            self.init(
+                archive: archive,
+                sources: .files(sourceFiles),
+                selectedFunctionKeys: selectedFunctionKeys,
+                compilerURL: compilerURL,
+                enforceToolchainFingerprint: enforceToolchainFingerprint,
+                requestedResources: requestedResources
+            )
+        }
+
+        public init(
+            archive: InterfaceArchive.Archive,
+            sourceMappings: [String: URL],
+            selectedFunctionKeys: Set<Core.FunctionKey>? = nil,
+            compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
+            enforceToolchainFingerprint: Bool = true,
+            requestedResources: Core.ResourceLimits = .init()
+        ) {
+            self.init(
+                archive: archive,
+                sources: .mappings(sourceMappings),
+                selectedFunctionKeys: selectedFunctionKeys,
+                compilerURL: compilerURL,
+                enforceToolchainFingerprint: enforceToolchainFingerprint,
+                requestedResources: requestedResources
+            )
+        }
+
+        public init(
+            archive: InterfaceArchive.Archive,
+            sources: ReleaseCompiler.SourceSet,
+            selectedFunctionKeys: Set<Core.FunctionKey>? = nil,
+            compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
+            enforceToolchainFingerprint: Bool = true,
+            requestedResources: Core.ResourceLimits = .init()
+        ) {
             self.archive = archive
-            self.sourceFiles = sourceFiles
+            self.sources = sources
             self.selectedFunctionKeys = selectedFunctionKeys
             self.compilerURL = compilerURL
             self.enforceToolchainFingerprint = enforceToolchainFingerprint
@@ -232,18 +277,18 @@ extension ReleaseCompiler {
 
         public func build(_ request: BuildRequest) throws -> BuildResult {
             try request.archive.validate()
-            guard !request.sourceFiles.isEmpty else { throw DriverError.emptySourceSet }
-            for source in request.sourceFiles {
+            let orderedSourceFiles = try orderedCompleteSourceSet(
+                request.sources,
+                archive: request.archive
+            )
+            guard !orderedSourceFiles.isEmpty else { throw DriverError.emptySourceSet }
+            for source in orderedSourceFiles {
                 guard source.pathExtension == "swift",
                       FileManager.default.fileExists(atPath: source.path)
                 else {
                     throw DriverError.sourceDoesNotExist(source.path)
                 }
             }
-            let orderedSourceFiles = try orderedCompleteSourceSet(
-                request.sourceFiles,
-                archive: request.archive
-            )
             let toolchain = try toolchainIdentity(compilerURL: request.compilerURL)
             if request.enforceToolchainFingerprint,
                request.archive.compatibility.compilerFingerprint != toolchain.fingerprint {
@@ -1273,6 +1318,48 @@ extension ReleaseCompiler {
         }
 
         private func orderedCompleteSourceSet(
+            _ sources: ReleaseCompiler.SourceSet,
+            archive: InterfaceArchive.Archive
+        ) throws -> [URL] {
+            switch sources {
+            case let .files(sourceFiles):
+                return try orderedCompleteSourceFiles(
+                    sourceFiles,
+                    archive: archive
+                )
+            case let .mappings(sourceMappings):
+                let expected = Set(archive.sources.map(\.logicalPath))
+                guard Set(sourceMappings.keys) == expected else {
+                    throw DriverError.sourceSetMismatch(
+                        "explicit mappings must exactly cover HLXI sources"
+                    )
+                }
+                let ordered = try archive.sources.sorted {
+                    $0.logicalPath < $1.logicalPath
+                }.map { source -> URL in
+                    guard let url = sourceMappings[source.logicalPath],
+                          url.isFileURL,
+                          url.path.hasPrefix("/")
+                    else {
+                        throw DriverError.sourceSetMismatch(
+                            "logical source \(source.logicalPath) has no absolute file mapping"
+                        )
+                    }
+                    return url.standardizedFileURL
+                }
+                let resolved = ordered.map {
+                    $0.resolvingSymlinksInPath().standardizedFileURL.path
+                }
+                guard Set(resolved).count == resolved.count else {
+                    throw DriverError.sourceSetMismatch(
+                        "the same physical source was mapped more than once"
+                    )
+                }
+                return ordered
+            }
+        }
+
+        private func orderedCompleteSourceFiles(
             _ sourceFiles: [URL],
             archive: InterfaceArchive.Archive
         ) throws -> [URL] {

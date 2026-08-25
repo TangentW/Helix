@@ -17,19 +17,13 @@ public enum Workflow: String, Codable, CaseIterable, Hashable, Sendable {
 public struct Feature: Codable, Hashable, Sendable {
     public var id: String
     public var moduleName: String
-    public var sourceRoot: String
-    public var sourceFiles: [String]
 
     public init(
         id: String,
-        moduleName: String,
-        sourceRoot: String,
-        sourceFiles: [String]
+        moduleName: String
     ) {
         self.id = id
         self.moduleName = moduleName
-        self.sourceRoot = sourceRoot
-        self.sourceFiles = sourceFiles.sorted()
     }
 
     public var bridgeTypeName: String { "\(moduleName)Bridge" }
@@ -105,9 +99,9 @@ public struct Profile: Codable, Hashable, Sendable {
     public var runtimePackageProduct: String { workflow.runtimePackageProduct }
 }
 
-/// The checked-in contract for one Xcode host. It intentionally records only
-/// stable project facts; volatile DerivedData paths and compiler identities are
-/// measured from the active Xcode build environment.
+/// Hub-owned routing for one Xcode host. It records only the selected targets
+/// and workflows; source membership, DerivedData paths, and compiler identities
+/// are measured from the active Xcode build environment.
 public struct HostPlan: Codable, Hashable, Sendable {
     public static let currentSchemaVersion: UInt16 = 1
     public static let defaultFileName = "HostPlan.json"
@@ -263,17 +257,10 @@ public struct HostPlan: Codable, Hashable, Sendable {
 
     private static func validate(_ feature: XcodeIntegration.Feature) throws {
         guard isFileComponent(feature.id),
-              isSwiftIdentifier(feature.moduleName),
-              feature.sourceRoot == "." || isSafeRelativePath(feature.sourceRoot),
-              !feature.sourceFiles.isEmpty,
-              feature.sourceFiles == feature.sourceFiles.sorted(),
-              Set(feature.sourceFiles).count == feature.sourceFiles.count,
-              feature.sourceFiles.allSatisfy({
-                  isSafeRelativePath($0) && $0.hasSuffix(".swift")
-              })
+              isSwiftIdentifier(feature.moduleName)
         else {
             throw XcodeIntegration.Error.invalidHostPlan(
-                "feature \(feature.id) has invalid modules, paths, or source files"
+                "feature \(feature.id) has an invalid identifier or module name"
             )
         }
     }

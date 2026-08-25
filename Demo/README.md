@@ -12,7 +12,7 @@
   than one-shot hierarchy installation, so the visible test edit exercises the
   same callback Helix invalidates after activation. The managed Debug Shell
   also measures the public synchronous SDK-member surface whose boundary types
-  are already frozen, including concrete generic owners and supported callback
+  are representable, including concrete generic owners and supported callback
   parameters. Adding `view.backgroundColor = .black`, UIKit animation calls,
   or another eligible measured member therefore exercises first-use framework
   code without rebuilding the App.

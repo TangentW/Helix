@@ -3,7 +3,7 @@ import HelixCore
 import HelixDevProtocol
 
 extension XcodeIntegration {
-/// Private handoff from the Build pre-action to the Run registration action.
+/// Private handoff from the Feature prepare phase to the Run registration action.
 public struct HubReservationDocument: Codable, Hashable, Sendable {
     public static let currentSchemaVersion: UInt16 = 1
     public static let relativePath = "HubReservation.json"

@@ -9,7 +9,7 @@ extension ReleasePipeline {
 public struct BuildRequest: Sendable {
     public var configuration: ReleasePipeline.Configuration
     public var archive: InterfaceArchive.Archive
-    public var sourceFiles: [URL]
+    public var sources: ReleaseCompiler.SourceSet
     public var selectedFunctionKeys: Set<Core.FunctionKey>?
     public var compilerURL: URL
     public var signingService: any PatchPackage.SignatureProviding
@@ -31,7 +31,29 @@ public struct BuildRequest: Sendable {
     ) {
         self.configuration = configuration
         self.archive = archive
-        self.sourceFiles = sourceFiles
+        sources = .files(sourceFiles)
+        self.selectedFunctionKeys = selectedFunctionKeys
+        self.compilerURL = compilerURL
+        signingService = ReleasePipeline.LocalSigningService(
+            certificate: certificate,
+            signingKey: signingKey
+        )
+        self.trustedRoot = trustedRoot
+    }
+
+    public init(
+        configuration: ReleasePipeline.Configuration,
+        archive: InterfaceArchive.Archive,
+        sourceMappings: [String: URL],
+        selectedFunctionKeys: Set<Core.FunctionKey>? = nil,
+        compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
+        certificate: PatchPackage.SigningCertificate,
+        signingKey: ReleasePipeline.SigningKeyDocument,
+        trustedRoot: PatchPackage.TrustedRoot
+    ) {
+        self.configuration = configuration
+        self.archive = archive
+        sources = .mappings(sourceMappings)
         self.selectedFunctionKeys = selectedFunctionKeys
         self.compilerURL = compilerURL
         signingService = ReleasePipeline.LocalSigningService(
@@ -52,7 +74,25 @@ public struct BuildRequest: Sendable {
     ) {
         self.configuration = configuration
         self.archive = archive
-        self.sourceFiles = sourceFiles
+        sources = .files(sourceFiles)
+        self.selectedFunctionKeys = selectedFunctionKeys
+        self.compilerURL = compilerURL
+        self.signingService = signingService
+        self.trustedRoot = trustedRoot
+    }
+
+    public init(
+        configuration: ReleasePipeline.Configuration,
+        archive: InterfaceArchive.Archive,
+        sourceMappings: [String: URL],
+        selectedFunctionKeys: Set<Core.FunctionKey>? = nil,
+        compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
+        signingService: any PatchPackage.SignatureProviding,
+        trustedRoot: PatchPackage.TrustedRoot
+    ) {
+        self.configuration = configuration
+        self.archive = archive
+        sources = .mappings(sourceMappings)
         self.selectedFunctionKeys = selectedFunctionKeys
         self.compilerURL = compilerURL
         self.signingService = signingService
@@ -77,7 +117,7 @@ public struct Builder: Sendable {
         let compilation = try ReleaseCompiler.Driver().build(
             .init(
                 archive: request.archive,
-                sourceFiles: request.sourceFiles,
+                sources: request.sources,
                 selectedFunctionKeys: request.selectedFunctionKeys,
                 compilerURL: request.compilerURL,
                 enforceToolchainFingerprint: true,
