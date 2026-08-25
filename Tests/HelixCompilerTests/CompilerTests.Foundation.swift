@@ -8,6 +8,39 @@ enum CompilerTests {}
 extension CompilerTests {
 @Suite("Patch configuration and fingerprints")
 struct Foundation {
+    @Test("Automatic project policy discovers every representable source boundary")
+    func automaticProjectPolicy() throws {
+        let configuration = PatchConfiguration.Document.automaticProjectPolicy(
+            moduleName: "CheckoutFeature"
+        )
+        try configuration.validate()
+
+        let module = try #require(configuration.modules["CheckoutFeature"])
+        #expect(module.entrypoints == .all)
+        #expect(module.includes(logicalPath: "Checkout.swift"))
+        #expect(module.includes(logicalPath: "UI/CheckoutView.swift"))
+        #expect(module.nativeImports.candidateIndex == .sourceAndCatalog)
+        #expect(module.nativeImports.emit == .scoped)
+        #expect(module.nativeImports.allow.isEmpty)
+        let scope = try #require(module.nativeImports.sourceScope)
+        #expect(scope.visibility == .all)
+        #expect(scope.profile == .readWrite)
+        #expect(scope.includes(
+            logicalPath: "Services/Pricing.swift",
+            canonicalCallee: "CheckoutFeature.Pricing.refresh()",
+            accessLevel: "private"
+        ))
+        #expect(
+            scope.maximumBoundedDurationMicroseconds
+                == Core.NativeImportExecutionPolicy.maximumMainThreadDurationMicroseconds
+        )
+        #expect(
+            scope.maximumSuspendingDurationMicroseconds
+                == Core.NativeImportExecutionPolicy.maximumSuspendingDurationMicroseconds
+        )
+        #expect(scope.allowsMainThread)
+    }
+
     @Test("The documented default-deny YAML subset parses without an external YAML runtime")
     func parsesConfiguration() throws {
         let configuration = try PatchConfiguration.Document.parse(yaml: """

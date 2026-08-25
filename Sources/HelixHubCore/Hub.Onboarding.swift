@@ -216,12 +216,10 @@ public struct OnboardingPlanner: Sendable {
 
             let featureID = Self.slug(featureTarget.name)
             let sourceLayout = try Self.sourceLayout(featureTarget.sourceFiles)
-            let configurationPath = "Configurations/Helix/\(featureID).yml"
             let feature = XcodeIntegration.Feature(
                 id: featureID,
                 moduleName: profile.featureModuleName,
                 sourceRoot: sourceLayout.root,
-                patchConfigurationPath: configurationPath,
                 sourceFiles: sourceLayout.files
             )
             if let existing = featuresByTarget[featureTarget.id], existing != feature {
@@ -236,9 +234,6 @@ public struct OnboardingPlanner: Sendable {
                 )
             }
             featureTargetNames[featureID] = featureTarget.name
-            artifacts[configurationPath] = Data(
-                Self.configurationYAML(moduleName: feature.moduleName).utf8
-            )
 
             let patchSettings: XcodeIntegration.PatchSettings?
             switch profile.capability {
@@ -347,17 +342,6 @@ public struct OnboardingPlanner: Sendable {
             throw Hub.Error.invalidOnboarding("Feature source layout is invalid")
         }
         return (root, files)
-    }
-
-    private static func configurationYAML(moduleName: String) -> String {
-        """
-        schema: 1
-        modules:
-          \(moduleName):
-            include:
-              - **/*.swift
-            entrypoints: all
-        """ + "\n"
     }
 
     private static func recipe(

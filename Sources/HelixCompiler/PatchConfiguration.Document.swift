@@ -195,6 +195,36 @@ public struct Document: Codable, Hashable, Sendable {
         self.language = language
     }
 
+    /// Builds a zero-configuration policy for one complete project module.
+    /// Wildcards exist only while indexing on the Mac; persisted interfaces
+    /// contain exact entries, NativeImport identities, and execution contracts.
+    public static func automaticProjectPolicy(moduleName: String) -> Self {
+        let allSwiftSources = ["**/*.swift"]
+        return .init(modules: [
+            moduleName: .init(
+                include: allSwiftSources,
+                entrypoints: .all,
+                nativeImports: .init(
+                    candidateIndex: .sourceAndCatalog,
+                    emit: .scoped,
+                    sourceScope: .init(
+                        include: allSwiftSources,
+                        declarations: ["*"],
+                        visibility: .all,
+                        profile: .readWrite,
+                        maximumBoundedDurationMicroseconds:
+                            Core.NativeImportExecutionPolicy
+                                .maximumMainThreadDurationMicroseconds,
+                        maximumSuspendingDurationMicroseconds:
+                            Core.NativeImportExecutionPolicy
+                                .maximumSuspendingDurationMicroseconds,
+                        allowsMainThread: true
+                    )
+                )
+            ),
+        ])
+    }
+
     public static func parse(yaml: String) throws -> Self {
         try Parser().parse(yaml)
     }

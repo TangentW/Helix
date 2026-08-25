@@ -19,12 +19,13 @@
 
 The checked-in Xcode integration under `.helix/xcode` is owned by Helix Hub.
 The canonical plan is `.helix/xcode/HostPlan.json`; developers do not maintain a
-separate input plan. Public compiler selection lives under
-`Configurations/Helix`, while local signing material, build products, sessions,
-and patch outputs are ignored. The shared schemes use the exact helper published
-by the running Helix service, so normal use needs no `HELIX_EXECUTABLE`, shell
-`PATH`, custom LLDB init, host, or port setting. Neither App imports generated
-Swift, and the project contains no Bridge target or generated source reference.
+separate input plan or compiler-policy file. Helix derives source and API
+eligibility automatically; `Configurations/Helix` contains only the editable
+Hot Patch recipe. Local signing material, build products, sessions, and patch
+outputs are ignored. The shared schemes use the exact helper published by the
+running Helix service, so normal use needs no `HELIX_EXECUTABLE`, shell `PATH`,
+custom LLDB init, host, or port setting. Neither App imports generated Swift,
+and the project contains no Bridge target or generated source reference.
 Live Reload also has no UIKit type registry or page-owned reload hook; Helix
 finds the displayed controller from the compiler-emitted nominal identity and
 invalidates it in place.

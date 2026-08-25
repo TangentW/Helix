@@ -131,11 +131,6 @@ struct ProjectInstallationTests {
             "live-Application-Info.plist"
         ))
 
-        let configurationURL = root.appendingPathComponent(
-            "Configurations/Helix/livefeature.yml"
-        )
-        let customConfiguration = Data("# Developer-owned NativeImport catalog\n".utf8)
-        try customConfiguration.write(to: configurationURL)
         let recipeURL = root.appendingPathComponent(
             "Configurations/Helix/QuickPatchRecipe.json"
         )
@@ -149,7 +144,6 @@ struct ProjectInstallationTests {
 
         _ = try installer.install(plan)
         #expect(try Data(contentsOf: keyURL) == firstKey)
-        #expect(try Data(contentsOf: configurationURL) == customConfiguration)
         #expect(try Data(contentsOf: recipeURL) == customRecipe)
         let secondText = String(
             decoding: try Data(contentsOf: projectURL.appendingPathComponent("project.pbxproj")),

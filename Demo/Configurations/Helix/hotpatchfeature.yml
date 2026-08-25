@@ -1,6 +1,0 @@
-schema: 1
-modules:
-  HotPatchFeature:
-    include:
-      - **/*.swift
-    entrypoints: all

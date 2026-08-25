@@ -710,14 +710,12 @@ struct XcodeIntegrationContract {
                     id: "patch-feature",
                     moduleName: "PatchFeature",
                     sourceRoot: "PatchFeature",
-                    patchConfigurationPath: "Configurations/Patch.yml",
                     sourceFiles: ["Sources/Feature.swift"]
                 ),
                 .init(
                     id: "live-feature",
                     moduleName: "LiveFeature",
                     sourceRoot: "LiveFeature",
-                    patchConfigurationPath: "Configurations/Live.yml",
                     sourceFiles: ["Sources/Live Feature.swift"]
                 ),
             ],

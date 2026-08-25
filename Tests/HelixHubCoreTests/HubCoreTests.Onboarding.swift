@@ -47,14 +47,9 @@ struct OnboardingPlannerTests {
         ])
         #expect(result.requirements.isEmpty)
         #expect(result.developmentIdentityProfiles == ["hot"])
-        #expect(
-            String(
-                decoding: try #require(
-                    result.artifacts["Configurations/Helix/livereloadfeature.yml"]
-                ),
-                as: UTF8.self
-            ).contains("entrypoints: all")
-        )
+        #expect(result.artifacts.keys.sorted() == [
+            "Configurations/Helix/QuickPatchRecipe.json",
+        ])
 
         let recipeData = try #require(
             result.artifacts["Configurations/Helix/QuickPatchRecipe.json"]

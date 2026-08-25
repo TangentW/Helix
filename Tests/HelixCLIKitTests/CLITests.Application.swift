@@ -248,13 +248,6 @@ struct Application {
         try Data("public func value() -> Int { 1 }\n".utf8).write(
             to: sourceRoot.appendingPathComponent("Sources/Feature.swift")
         )
-        try FileManager.default.createDirectory(
-            at: directory.appendingPathComponent("Configurations"),
-            withIntermediateDirectories: true
-        )
-        try Data("schema: 1\nmodules: {}\n".utf8).write(
-            to: directory.appendingPathComponent("Configurations/Helix.yml")
-        )
         let plan = XcodeIntegration.HostPlan(
             projectPath: "Demo.xcodeproj",
             features: [
@@ -262,7 +255,6 @@ struct Application {
                     id: "feature",
                     moduleName: "Feature",
                     sourceRoot: "Feature",
-                    patchConfigurationPath: "Configurations/Helix.yml",
                     sourceFiles: ["Sources/Feature.swift"]
                 ),
             ],
@@ -368,7 +360,7 @@ struct Application {
         #expect(!installedDoctorReport.checks.contains { $0.severity == .error })
     }
 
-    @Test("Xcode prepare keeps Production explicit and manages the Debug calling surface")
+    @Test("Xcode prepare discovers all source entries and manages the Debug SDK surface")
     func xcodePreparePhase() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -387,20 +379,6 @@ struct Application {
             public func value(_ input: Int) -> Int { hidden(input) }
             """.utf8
         ).write(to: sourceRoot.appendingPathComponent("Sources/Feature.swift"))
-        try FileManager.default.createDirectory(
-            at: directory.appendingPathComponent("Configurations"),
-            withIntermediateDirectories: true
-        )
-        try Data(
-            """
-            schema: 1
-            modules:
-              Feature:
-                include:
-                  - Sources/**/*.swift
-
-            """.utf8
-        ).write(to: directory.appendingPathComponent("Configurations/Helix.yml"))
         let plan = XcodeIntegration.HostPlan(
             projectPath: "Demo.xcodeproj",
             features: [
@@ -408,7 +386,6 @@ struct Application {
                     id: "feature",
                     moduleName: "Feature",
                     sourceRoot: "Feature",
-                    patchConfigurationPath: "Configurations/Helix.yml",
                     sourceFiles: ["Sources/Feature.swift"]
                 ),
             ],
@@ -581,7 +558,6 @@ struct Application {
         #expect(liveReceipt.configuration.schema == 1)
         #expect(featureConfiguration.nativeImports.sourceScope?.visibility == .all)
         #expect(liveReceipt.nativeImportCandidates.map(\.canonicalCallee).sorted() == [
-            "Feature.hidden(_:)",
             "Swift.String.init(describing:)",
             "Swift.String.init(reflecting:)",
             "Swift.debugPrint(_:separator:terminator:)",
@@ -590,7 +566,7 @@ struct Application {
         let entrySymbols = Set(liveReceipt.roots.compactMap { root in
             root.bridge == nil ? nil : root.declarationMangledName
         })
-        #expect(entrySymbols.count == 1)
+        #expect(entrySymbols.count == 2)
         let importedSymbols = Set(
             liveReceipt.nativeImportCandidates.flatMap(\.silMangledNames)
         )

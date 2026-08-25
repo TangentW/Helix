@@ -72,8 +72,6 @@ public struct BuildContext: Sendable {
     public var environment: XcodeIntegration.BuildEnvironment
     public var sourceRootURL: URL
     public var sourceURLs: [URL]
-    public var patchConfigurationURL: URL
-    public var nativeImportCatalogURL: URL?
 }
 
 public enum EnvironmentError: Swift.Error, Equatable, Sendable, CustomStringConvertible {
@@ -247,19 +245,6 @@ public struct EnvironmentResolver: Sendable {
             semanticArguments: semanticArguments,
             bridgeModuleSearchArguments: bridgeModuleSearchArguments
         )
-        let configurationURL = xcodeSourceRoot.appendingPathComponent(
-            feature.patchConfigurationPath
-        ).standardizedFileURL
-        guard Self.contains(configurationURL.resolvingSymlinksInPath(), in: xcodeSourceRoot) else {
-            throw XcodeIntegration.EnvironmentError.unsafePath(configurationURL.path)
-        }
-        let catalogURL = feature.nativeImportCatalogPath.map {
-            xcodeSourceRoot.appendingPathComponent($0).standardizedFileURL
-        }
-        if let catalogURL,
-           !Self.contains(catalogURL.resolvingSymlinksInPath(), in: xcodeSourceRoot) {
-            throw XcodeIntegration.EnvironmentError.unsafePath(catalogURL.path)
-        }
         return .init(
             planURL: planURL,
             plan: plan,
@@ -267,9 +252,7 @@ public struct EnvironmentResolver: Sendable {
             feature: feature,
             environment: environment,
             sourceRootURL: sourceRoot,
-            sourceURLs: sources,
-            patchConfigurationURL: configurationURL,
-            nativeImportCatalogURL: catalogURL
+            sourceURLs: sources
         )
     }
 

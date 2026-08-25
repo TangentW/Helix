@@ -91,8 +91,8 @@ Hot Patch 与 Live Reload 必须使用不同 App target。Release target 只能�
 
 | 区域 | Helix 管理的内容 |
 | --- | --- |
-| 公开计划 | `.helix/xcode/HostPlan.json`、profile contract、manifest 与生成说明 |
-| 编译选择 | `Configurations/Helix/<feature>.yml`，按完整工程源码发现并明确 entrypoint policy |
+| 生成的接入状态 | `.helix/xcode/HostPlan.json`、profile contract、manifest 与生成说明 |
+| 编译策略 | 根据所选 module 与 Swift 源码在内部自动生成；工程无需维护策略文件或 API 白名单 |
 | Xcode settings | 保留 target 原 Base Configuration 的 wrapper xcconfig |
 | Bridge | App Sources 前的一个 phase；生成 Swift 与 `HelixBridge.o` 只留在 DerivedData |
 | Scheme lifecycle | Build 准备、Release 审计、Live 最终 executable 注册与 Patch 构建动作 |
@@ -245,7 +245,7 @@ swift run helix xcode doctor \
 | --- | --- |
 | 找不到 linked Bridge provider | App 没使用 `Application.xcconfig`、隐藏 phase 不在 Sources 前，或 output/link flags 缺失 |
 | Feature compiler capture 缺失或过期 | 确认使用 `Feature.xcconfig`，再通过正确 Scheme clean Run 一次 |
-| 源码已索引但没有 patchable root | 检查 patch 配置 pattern 是否相对 `sourceRoot`，且确实匹配 logical path |
+| 源码已索引但没有 patchable root | Helix 会自动选择所有可表示声明；根据诊断排查不支持的声明、错误的 module 捕获或过期 Build Context |
 | `codeActive` 但 UI 没变化 | 函数是 observe-only、当前没有匹配的 UIKit/SwiftUI 实例，或确实需要显式 hook/factory |
 | Interface 或源码 membership 变化 | 已超出 body-only transaction，执行正常构建 |
 | 当前后端不支持函数体 | Simulator 自动路由通常使用原生 Swift；设备或生产 HLBC 路径应按精确诊断处理，或执行一次正常构建 |

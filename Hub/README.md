@@ -21,10 +21,10 @@ The app provides:
 3. For each workflow, choose an App target, Swift Feature target, shared Scheme,
    and configuration. Helix resolves the module and bundle identity from
    Xcode's real build settings.
-4. Apply the configuration. PBX, shared-Scheme, xcconfig, public configuration,
-   local-network plist, Patch action, and Integration Kit changes commit as one
-   transaction. Package linkage and runtime startup remain visible code-level
-   actions.
+4. Apply the configuration. PBX, shared-Scheme, xcconfig, generated integration
+   metadata, local-network plist, Patch action, and Integration Kit changes
+   commit as one transaction. Package linkage and runtime startup remain
+   visible code-level actions.
 5. Keep Helix open while using Live Reload. A normal Xcode debugger launch
    connects automatically. A directly opened test build stays offline until its
    debug page submits the four-character code shown by Helix.

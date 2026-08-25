@@ -985,27 +985,9 @@ private func prepareXcodeShell(
             "Swift compiler is not executable: \(context.environment.compilerURL.path)"
         )
     }
-    let configurationData = try readRegularFile(
-        context.patchConfigurationURL,
-        maximumBytes: 4 * 1_024 * 1_024,
-        label: "patchability configuration"
+    let configuration = PatchConfiguration.Document.automaticProjectPolicy(
+        moduleName: context.feature.moduleName
     )
-    guard let configurationText = String(data: configurationData, encoding: .utf8) else {
-        throw CLI.Error.input("patchability configuration is not UTF-8")
-    }
-    let configuration = try PatchConfiguration.Document.parse(yaml: configurationText)
-    let catalog: NativeImportCatalog.Document
-    if let catalogURL = context.nativeImportCatalogURL {
-        catalog = try NativeImportCatalog.Codec.decode(
-            readRegularFile(
-                catalogURL,
-                maximumBytes: NativeImportCatalog.Codec.maximumDocumentBytes,
-                label: "NativeImport catalog"
-            )
-        )
-    } else {
-        catalog = .empty
-    }
     let minimumOS: Core.SemanticVersion
     do {
         minimumOS = try Core.SemanticVersion(
@@ -1042,7 +1024,7 @@ private func prepareXcodeShell(
                 .init(logicalPath: $0.0, url: $0.1)
             },
             compilerURL: context.environment.compilerURL,
-            nativeImportCatalog: catalog,
+            nativeImportCatalog: .empty,
             callingSurfacePolicy: context.profile.workflow == .liveReload
                 ? .managedDebugModule
                 : .configured
@@ -1521,30 +1503,6 @@ private func validateHostInputs(
             }
             try requireRegularFile(source, label: "Swift source")
             sourceCount += 1
-        }
-        let configurationURL = base.appendingPathComponent(
-            feature.patchConfigurationPath
-        ).standardizedFileURL
-        guard Self.contains(configurationURL.resolvingSymlinksInPath(), in: base) else {
-            throw CLI.Error.input(
-                "feature \(feature.id) patchability configuration escapes the Host Plan root"
-            )
-        }
-        try requireRegularFile(
-            configurationURL,
-            label: "patchability configuration"
-        )
-        if let path = feature.nativeImportCatalogPath {
-            let catalogURL = base.appendingPathComponent(path).standardizedFileURL
-            guard Self.contains(catalogURL.resolvingSymlinksInPath(), in: base) else {
-                throw CLI.Error.input(
-                    "feature \(feature.id) NativeImport catalog escapes the Host Plan root"
-                )
-            }
-            try requireRegularFile(
-                catalogURL,
-                label: "NativeImport catalog"
-            )
         }
     }
     guard sourceCount <= 65_536 else {

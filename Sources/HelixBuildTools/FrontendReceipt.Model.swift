@@ -9,8 +9,8 @@ public enum FrontendReceipt {}
 
 extension FrontendReceipt {
 public enum CallingSurfacePolicy: Hashable, Sendable {
-    /// Uses only the NativeImport scopes and catalog explicitly configured by
-    /// the Release/host integration.
+    /// Uses the exact NativeImport scope resolved for this build. Xcode
+    /// integration creates it automatically; headless callers may supply one.
     case configured
     /// Expands one Debug feature module into exact generated operations. The
     /// archive still contains no wildcard and eligible Entries take priority.

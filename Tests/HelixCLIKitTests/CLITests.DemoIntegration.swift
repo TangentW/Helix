@@ -207,12 +207,10 @@ struct DemoIntegration {
                 "Demo/LiveReloadFeature/Sources/LiveReloadFeature.Screen.swift"
             )
         )
-        let liveConfiguration = try text(root.appendingPathComponent(
-            "Demo/Configurations/Helix/livereloadfeature.yml"
-        ))
-        let hotConfiguration = try text(root.appendingPathComponent(
-            "Demo/Configurations/Helix/hotpatchfeature.yml"
-        ))
+        let configurationRoot = root.appendingPathComponent(
+            "Demo/Configurations/Helix",
+            isDirectory: true
+        )
         let bootstrap = try text(
             root.appendingPathComponent("Demo/Scripts/DemoBootstrap.sh")
         )
@@ -229,8 +227,16 @@ struct DemoIntegration {
         #expect(hot.contains("return 1_999 // HELIX_DEMO_BUG"))
         #expect(live.occurrences(of: "HELIX_LIVE_BASELINE") == 1)
         #expect(live.contains("// HELIX_LIVE_BASELINE"))
-        #expect(liveConfiguration.contains("entrypoints: all"))
-        #expect(hotConfiguration.contains("entrypoints: all"))
+        #expect(!FileManager.default.fileExists(
+            atPath: configurationRoot.appendingPathComponent(
+                "livereloadfeature.yml"
+            ).path
+        ))
+        #expect(!FileManager.default.fileExists(
+            atPath: configurationRoot.appendingPathComponent(
+                "hotpatchfeature.yml"
+            ).path
+        ))
         #expect(liveInfo["NSBonjourServices"] as? [String] == ["_helix._tcp"])
         #expect(
             (liveInfo["NSLocalNetworkUsageDescription"] as? String)?.isEmpty == false

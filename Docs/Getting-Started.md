@@ -130,8 +130,8 @@ The transaction creates or updates:
 
 | Area | What Helix owns |
 | --- | --- |
-| Public plan | `.helix/xcode/HostPlan.json`, profile contracts, manifest, and generated guide |
-| Compiler selection | one `Configurations/Helix/<feature>.yml` with project-wide source discovery and explicit entrypoint policy |
+| Generated integration state | `.helix/xcode/HostPlan.json`, profile contracts, manifest, and generated guide |
+| Compiler policy | generated internally from the selected module and its Swift sources; no project policy file or API allowlist |
 | Xcode settings | wrapper xcconfigs that preserve the target's previous Base Configuration |
 | Bridge | one App phase before Sources; generated Swift and `HelixBridge.o` stay under DerivedData |
 | Scheme lifecycle | Build preparation, Release audit, exact Live executable registration, and Patch build action |
@@ -355,7 +355,7 @@ rejects App Store and controlled-native Release configurations.
 | --- | --- |
 | Linked Bridge provider is missing | The App does not use `Application.xcconfig`, the hidden phase is after Sources, or its output/link flags are absent |
 | Feature compiler capture is missing/stale | Use `Feature.xcconfig` and perform one clean Run with the correct Scheme |
-| Source is indexed but no root is patchable | Check that the patch configuration pattern is relative to `sourceRoot` and includes the logical path |
+| Source is indexed but no root is patchable | Helix selects every representable declaration automatically; use the reported diagnostic to identify an unsupported declaration, wrong module capture, or stale build context |
 | Code is active but UI is unchanged | The changed function is observe-only, no displayed UIKit/SwiftUI target matches, or explicit hook/factory work is required |
 | Interface or source membership changed | This is not a body-only transaction; perform a full build |
 | A body is unsupported on the selected backend | Simulator automatic routing normally uses native Swift; on a device or production HLBC path, follow the precise diagnostic or perform a normal build |

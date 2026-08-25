@@ -18,23 +18,17 @@ public struct Feature: Codable, Hashable, Sendable {
     public var id: String
     public var moduleName: String
     public var sourceRoot: String
-    public var patchConfigurationPath: String
-    public var nativeImportCatalogPath: String?
     public var sourceFiles: [String]
 
     public init(
         id: String,
         moduleName: String,
         sourceRoot: String,
-        patchConfigurationPath: String,
-        nativeImportCatalogPath: String? = nil,
         sourceFiles: [String]
     ) {
         self.id = id
         self.moduleName = moduleName
         self.sourceRoot = sourceRoot
-        self.patchConfigurationPath = patchConfigurationPath
-        self.nativeImportCatalogPath = nativeImportCatalogPath
         self.sourceFiles = sourceFiles.sorted()
     }
 
@@ -271,12 +265,6 @@ public struct HostPlan: Codable, Hashable, Sendable {
         guard isFileComponent(feature.id),
               isSwiftIdentifier(feature.moduleName),
               feature.sourceRoot == "." || isSafeRelativePath(feature.sourceRoot),
-              isSafeRelativePath(feature.patchConfigurationPath),
-              ["yml", "yaml"].contains(
-                  URL(fileURLWithPath: feature.patchConfigurationPath)
-                      .pathExtension.lowercased()
-              ),
-              feature.nativeImportCatalogPath.map(isSafeRelativePath) ?? true,
               !feature.sourceFiles.isEmpty,
               feature.sourceFiles == feature.sourceFiles.sorted(),
               Set(feature.sourceFiles).count == feature.sourceFiles.count,
@@ -286,12 +274,6 @@ public struct HostPlan: Codable, Hashable, Sendable {
         else {
             throw XcodeIntegration.Error.invalidHostPlan(
                 "feature \(feature.id) has invalid modules, paths, or source files"
-            )
-        }
-        if let catalog = feature.nativeImportCatalogPath,
-           URL(fileURLWithPath: catalog).pathExtension.lowercased() != "json" {
-            throw XcodeIntegration.Error.invalidHostPlan(
-                "feature \(feature.id) NativeImport catalog must be JSON"
             )
         }
     }

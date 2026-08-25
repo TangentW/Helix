@@ -52,7 +52,7 @@ struct OnboardingView: View {
             Label("Generated Swift stays out of the project navigator", systemImage: "eye.slash")
                 .font(.headline)
             Text(
-                "Helix writes only owned build settings, build actions, and public configuration files to the source tree. Bridge Swift is materialized inside DerivedData during the active Xcode build."
+                "Helix writes only owned build settings, build actions, generated integration metadata, and the optional Hot Patch recipe to the source tree. Compiler policy and API discovery are automatic; Bridge Swift is materialized inside DerivedData during the active Xcode build."
             )
             .foregroundStyle(.secondary)
             Text(

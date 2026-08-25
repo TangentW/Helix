@@ -1,6 +1,0 @@
-schema: 1
-modules:
-  LiveReloadFeature:
-    include:
-      - **/*.swift
-    entrypoints: all
