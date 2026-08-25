@@ -36,6 +36,7 @@ struct AsyncExecution {
     @Test("Multiple NativeImport awaits suspend and resume one VM frame in order")
     func executesMultipleSequentialAwaits() async throws {
         let trace = AsyncCallTrace()
+        let clock = AsyncManualClock()
         let function = Bytecode.Function(
             id: .init(rawValue: 0),
             name: "twiceAsync",
@@ -99,10 +100,19 @@ struct AsyncExecution {
             asyncNativeCatalog: try .init([invoker])
         )
         let input = try VM.Value.integerValue(40)
+        // This test exercises suspension order, not deadlines. A deterministic
+        // clock prevents unrelated full-suite scheduler pressure from turning
+        // the deliberate Task.yield() into a wall-clock timeout.
+        let budget = VM.InvocationBudget(
+            limits: fixture.image.effectiveResourceLimits,
+            isMainThread: false,
+            nowNanoseconds: clock.now
+        )
         let result = await interpreter.invokeAsync(
             entry: .init(rawValue: 0),
             image: fixture.image,
-            arguments: [input]
+            arguments: [input],
+            budget: budget
         )
         #expect(result == .returned(try .integerValue(42)))
         #expect(await trace.snapshot() == [40, 41])
