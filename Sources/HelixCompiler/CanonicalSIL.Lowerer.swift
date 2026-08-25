@@ -5803,6 +5803,29 @@ public struct Lowerer: Sendable {
             return true
         }
 
+        func projectedDefaultArgumentType(
+            _ physicalSpelling: String,
+            token: String,
+            descriptor: InterfaceArchive.NativeImportDefaultArgument
+        ) throws -> Bytecode.ValueType {
+            guard let deferredBlock = deferredNativeBlockNoneTypes[token]
+            else { return try parseStoredType(physicalSpelling) }
+            guard descriptor.origin == .optionalNone,
+                  let expectedBlock = optionalNativeBlockPayload(
+                      in: physicalSpelling
+                  ), normalizedNativeBlockSpelling(deferredBlock)
+                    == expectedBlock
+            else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "projected native block default disagrees with its physical parameter"
+                )
+            }
+            // The value is payload-free and projected out before HLBC. Keep a
+            // non-instantiable placeholder rather than inventing a VM closure
+            // for an Objective-C block that never crosses the boundary.
+            return .optional(.never)
+        }
+
         func projectNativeImportArguments(
             _ physicalTokens: [String],
             for reference: ResolvedFunctionReference,
@@ -5851,8 +5874,10 @@ public struct Lowerer: Sendable {
                         "NativeImport projection has no physical default descriptor"
                     )
                 }
-                let expectedDefaultType = try parseStoredType(
-                    reference.physicalValueParameterSpellings[index]
+                let expectedDefaultType = try projectedDefaultArgumentType(
+                    reference.physicalValueParameterSpellings[index],
+                    token: token,
+                    descriptor: defaultArgument
                 )
                 let address = addressBase(token)
                 switch defaultArgument.origin {
@@ -5982,8 +6007,10 @@ public struct Lowerer: Sendable {
                       reference.physicalValueParameterSpellings.indices
                         .contains(index)
                 else { return false }
-                let expected = try parseStoredType(
-                    reference.physicalValueParameterSpellings[index]
+                let expected = try projectedDefaultArgumentType(
+                    reference.physicalValueParameterSpellings[index],
+                    token: token,
+                    descriptor: descriptor
                 )
                 switch descriptor.origin {
                 case .externalGenerator:
@@ -32151,6 +32178,36 @@ public struct Lowerer: Sendable {
         ).filter { !$0.isEmpty }
         return parameters.count <= 64
             && parameters.allSatisfy { $0.utf8.count <= 4_096 }
+    }
+
+    private func optionalNativeBlockPayload(in raw: String) -> String? {
+        var spelling = raw.trimmingCharacters(in: .whitespaces)
+        var removed = true
+        while removed {
+            removed = false
+            for prefix in [
+                "$", "@owned ", "@guaranteed ", "@unowned ",
+                "@autoreleased ", "@in_guaranteed ",
+            ] where spelling.hasPrefix(prefix) {
+                spelling.removeFirst(prefix.count)
+                spelling = spelling.trimmingCharacters(in: .whitespaces)
+                removed = true
+                break
+            }
+        }
+        for prefix in ["Optional<", "Swift.Optional<"]
+        where spelling.hasPrefix(prefix) && spelling.hasSuffix(">") {
+            let payload = String(
+                spelling.dropFirst(prefix.count).dropLast()
+            ).trimmingCharacters(in: .whitespaces)
+            guard isDeferredNativeBlockType(payload) else { return nil }
+            return normalizedNativeBlockSpelling(payload)
+        }
+        return nil
+    }
+
+    private func normalizedNativeBlockSpelling(_ raw: String) -> String {
+        raw.filter { !$0.isWhitespace }
     }
 
     private func closureBlockBoundaryABIMatches(

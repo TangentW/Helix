@@ -134,7 +134,7 @@ struct Foundation {
     }
 
     @Test("Source discovery requires an access profile and bounded exact deadlines")
-    func rejectsIncompleteNativeImportSourceScope() {
+    func rejectsIncompleteNativeImportSourceScope() throws {
         #expect(throws: PatchConfiguration.Error.self) {
             try PatchConfiguration.Document.parse(yaml: """
             schema: 1
@@ -164,9 +164,44 @@ struct Foundation {
                     include:
                       - Sources/**
                     profile: pure
-                    maximumBoundedDurationMicroseconds: 2001
+                    maximumBoundedDurationMicroseconds: 16001
             """)
         }
+        #expect(throws: PatchConfiguration.Error.self) {
+            try PatchConfiguration.Document.parse(yaml: """
+            schema: 1
+            modules:
+              InvalidModule:
+                include:
+                  - Sources/**
+                nativeImports:
+                  candidateIndex: source-and-catalog
+                  emit: scoped
+                  sourceScope:
+                    include:
+                      - Sources/**
+                    profile: pure
+                    maximumBoundedDurationMicroseconds: 2001
+                    allowsMainThread: false
+            """)
+        }
+        #expect(try PatchConfiguration.Document.parse(yaml: """
+        schema: 1
+        modules:
+          MainActorModule:
+            include:
+              - Sources/**
+            nativeImports:
+              candidateIndex: source-and-catalog
+              emit: scoped
+              sourceScope:
+                include:
+                  - Sources/**
+                profile: read-write
+                maximumBoundedDurationMicroseconds: 16000
+                allowsMainThread: true
+        """).modules["MainActorModule"]?.nativeImports.sourceScope?
+            .maximumBoundedDurationMicroseconds == 16_000)
         #expect(throws: PatchConfiguration.Error.self) {
             try PatchConfiguration.Document.parse(yaml: """
             schema: 1

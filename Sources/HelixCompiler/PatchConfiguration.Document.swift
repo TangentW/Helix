@@ -81,19 +81,25 @@ public struct NativeImportSourceScope: Codable, Hashable, Sendable {
     }
 
     fileprivate func validate(moduleName: String) throws {
+        // MainActor calls may use one frame of synchronous budget. Other
+        // declarations are clamped to the stricter 2 ms bound during exact
+        // source discovery even when they share this scope.
+        let maximumSourceBoundedDuration = allowsMainThread
+            ? Core.NativeImportExecutionPolicy.maximumMainThreadDurationMicroseconds
+            : Core.NativeImportExecutionPolicy.maximumBoundedDurationMicroseconds
         guard !include.isEmpty,
               include.allSatisfy({ !$0.isEmpty }),
               exclude.allSatisfy({ !$0.isEmpty }),
               !declarations.isEmpty,
               declarations.allSatisfy({ !$0.isEmpty }),
               profile != nil,
-              (1...Core.NativeImportExecutionPolicy.maximumBoundedDurationMicroseconds)
+              (1...maximumSourceBoundedDuration)
                 .contains(maximumBoundedDurationMicroseconds),
               (1...Core.NativeImportExecutionPolicy.maximumSuspendingDurationMicroseconds)
                 .contains(maximumSuspendingDurationMicroseconds)
         else {
             throw PatchConfiguration.Error.invalid(
-                "module \(moduleName) sourceScope needs nonempty patterns, an explicit access profile, a 1...2000 us bounded deadline, and a 1...60000000 us suspending deadline"
+                "module \(moduleName) sourceScope needs nonempty patterns, an explicit access profile, a 1...\(maximumSourceBoundedDuration) us bounded deadline, and a 1...60000000 us suspending deadline"
             )
         }
     }

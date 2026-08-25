@@ -250,6 +250,31 @@ struct Identities {
             try oversizedMainThreadWork.validate(effects: .init())
         }
 
+        let mainActorFrameWork = Core.NativeImportContract.bounded(
+            kind: .instanceMethod,
+            domain: .application,
+            access: .readWrite,
+            maximumDurationMicroseconds: 16_000,
+            allowsMainThread: true
+        )
+        try mainActorFrameWork.validate(effects: .init(
+            hasExternalSideEffects: true,
+            requiresMainActor: true
+        ))
+        #expect(throws: Core.NativeImportContractError.self) {
+            try mainActorFrameWork.validate(effects: .init(
+                hasExternalSideEffects: true
+            ))
+        }
+        var oversizedMainActorFrameWork = mainActorFrameWork
+        oversizedMainActorFrameWork.execution.maximumDurationMicroseconds = 16_001
+        #expect(throws: Core.NativeImportContractError.self) {
+            try oversizedMainActorFrameWork.validate(effects: .init(
+                hasExternalSideEffects: true,
+                requiresMainActor: true
+            ))
+        }
+
         var duplicateCallbacks = Core.NativeImportContract.bounded(
             kind: .globalFunction,
             domain: .application,

@@ -175,17 +175,14 @@ extension FrontendReceipt.ManagedDebugSurface {
             membersByOwner[owner, default: []].append(symbol)
         }
         return owners.keys.sorted().compactMap { precise -> OwnerSurface? in
-            guard let owner = owners[precise],
-                  let members = membersByOwner[precise],
-                  !members.isEmpty
-            else { return nil }
+            guard let owner = owners[precise] else { return nil }
             return OwnerSurface(
                 moduleName: graph.module.name,
                 preciseIdentifier: precise,
                 swiftPath: owner.pathComponents.joined(separator: "."),
                 runtimeName: clangRuntimeName(precise),
                 requiresMainActor: requiresMainActor(owner),
-                members: members.sorted {
+                members: (membersByOwner[precise] ?? []).sorted {
                     ($0.pathComponents.joined(separator: "\u{0}"),
                      $0.identifier.precise)
                         < ($1.pathComponents.joined(separator: "\u{0}"),
@@ -274,13 +271,39 @@ extension FrontendReceipt.ManagedDebugSurface {
         surface: OwnerSurface,
         importedType: FrontendReceipt.Adapter.ImportedNativeType
     ) -> [Candidate] {
-        surface.members.flatMap { member in
+        var candidates = surface.members.flatMap { member in
             makeCandidates(
                 member: member,
                 surface: surface,
                 importedType: importedType
             )
         }
+        // Imported SDK types can inherit or synthesize `init()` without a
+        // corresponding member in the symbol graph. The exact frontend probe
+        // below remains authoritative, so this nomination broadens no boundary
+        // when zero-argument construction is unavailable.
+        if !candidates.contains(where: {
+            $0.dispatch == .initializer
+                && $0.argumentLabels.isEmpty
+                && $0.parameterTypes.isEmpty
+        }) {
+            candidates.append(Candidate(
+                preciseIdentifier: surface.preciseIdentifier
+                    + "#zero-argument-construction",
+                moduleName: surface.moduleName,
+                probeOwnerType: surface.swiftPath,
+                ownerType: importedType.swiftType,
+                dispatch: .initializer,
+                memberName: "init",
+                argumentLabels: [],
+                parameterTypes: [],
+                sourceFileLogicalID: importedType.sourceFileLogicalID,
+                importedModules: importedType.importedModules,
+                requiresMainActor: surface.requiresMainActor,
+                mayThrow: false
+            ))
+        }
+        return candidates
     }
 
     private static func makeCandidates(

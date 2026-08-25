@@ -173,9 +173,12 @@ nativeImports:
     allowsMainThread: true
 ```
 
-The profile is exactly `pure`, `read`, or `read-write`. Bounded deadlines must
-be 1...2,000 microseconds and suspending deadlines 1...60,000,000 microseconds;
-neither deadline authorizes a broader access effect.
+The profile is exactly `pure`, `read`, or `read-write`. When main-thread
+execution is forbidden, bounded deadlines must be 1...2,000 microseconds. When
+it is allowed, the configured range is 1...16,000 microseconds, but only an
+exact MainActor declaration receives the portion above 2,000; every other
+synchronous declaration is clamped to 2 ms. Suspending deadlines remain
+1...60,000,000 microseconds. No deadline authorizes a broader access effect.
 
 A Swift generic collection method is not a safe NativeImport shortcut. Its
 physical ABI may carry concrete-type metadata, protocol witness tables,
@@ -331,6 +334,11 @@ This covers Swift and Objective-C APIs through one path, including
 `UIView.alpha`, `UIView.setNeedsLayout()`,
 `UIView.setAnimationsEnabled(_:)`, `URLCache.shared`, `Bundle.main`, and
 `Bundle.path(forResource:ofType:)` when every boundary type is already frozen.
+For each such imported SDK type, Helix also nominates the exact zero-argument
+`Type()` expression even when an inherited or importer-synthesized initializer
+is absent from the symbol graph. It becomes a NativeImport only when the same
+frontend probe proves that exact call and ABI, so types that require arguments
+remain unavailable.
 The logical Swift `throws` contract is also preserved for the canonical
 Clang-importer `NSError **` bridge proven by the captured SIL, such as
 `FileManager.removeItem(atPath:)`; an unfamiliar pointer, sentinel, cleanup, or
@@ -339,10 +347,14 @@ physical aliases such as `CGFloat` are resolved from compiler identity and
 source evidence instead of guessed from Objective-C runtime spelling. Those
 compiler-proven Swift/SIL spellings are retained as server-side aliases of the
 same frozen native identity for later patch compilation; ambiguous aliases are
-omitted and none enter the device interface. This
-source boundary also ignores inherited implicit constructors that the frontend
-synthesizes for a project subclass; their `Bundle`/`Coder` parameters do not
-become frozen merely because a superclass declares them. A compiler-proven
+omitted and none enter the device interface. Symbol-graph implicitly unwrapped
+optionals such as `UIViewController.view: UIView!` remain valid probe syntax
+and are measured by the frontend as their exact Optional ABI instead of being
+dropped before compilation. This
+source boundary still ignores inherited implicit constructors that the frontend
+synthesizes for a project subclass; beyond the separately proven zero-argument
+SDK-type construction above, inherited `Bundle`/`Coder` parameters do not become
+frozen merely because a superclass declares them. A compiler-proven
 Objective-C protocol parameter keeps the v1 `AnyObject` boundary identity but
 records its exact Swift existential spelling for the generated invoker. The
 invoker performs that conformance-checked decode inside `MainActor` when the
@@ -719,6 +731,10 @@ may receive one source-proven escaping native callable argument layer; an
 import may return the same native callable shape, escaping by construction.
 Both become identity-bearing targets invoked by ordinary typed closure control
 flow, while image-local closures remain invalid as native results.
+When a direct NativeImport call omits an Optional Objective-C block parameter,
+the compiler-emitted `Optional.none` is checked against that exact physical
+block spelling and projected away without creating a VM closure value. The
+generated Swift invoker then supplies the source default.
 
 The current generator collects reachable ordinary functions, private class
 instance methods, computed accessors, and their non-exported patch-local types

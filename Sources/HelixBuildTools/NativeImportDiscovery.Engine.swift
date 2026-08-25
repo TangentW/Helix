@@ -149,7 +149,10 @@ extension NativeImportDiscovery {
                         domain: .application,
                         access: operationAccess,
                         maximumDurationMicroseconds:
-                            scope.maximumBoundedDurationMicroseconds,
+                            boundedDuration(
+                                for: declaration,
+                                scope: scope
+                            ),
                         allowsMainThread: scope.allowsMainThread,
                         callbacks: declaration.callbacks
                     )
@@ -206,6 +209,19 @@ extension NativeImportDiscovery {
                 candidates: candidates.sorted { $0.record.key.rawValue < $1.record.key.rawValue },
                 diagnostics: diagnostics.sorted(by: diagnosticOrder)
             )
+        }
+
+        private func boundedDuration(
+            for declaration: NativeImportDiscovery.Declaration,
+            scope: PatchConfiguration.NativeImportSourceScope
+        ) -> UInt32 {
+            let ceiling = declaration.inferredEffects.requiresMainActor
+                && scope.allowsMainThread
+                ? Core.NativeImportExecutionPolicy
+                    .maximumMainThreadDurationMicroseconds
+                : Core.NativeImportExecutionPolicy
+                    .maximumBoundedDurationMicroseconds
+            return min(scope.maximumBoundedDurationMicroseconds, ceiling)
         }
 
         private func rejection(

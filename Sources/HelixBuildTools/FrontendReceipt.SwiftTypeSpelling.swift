@@ -47,17 +47,24 @@ enum SwiftTypeSpelling {
         let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return !value.isEmpty
             && value.utf8.count <= 64 * 1_024
-            && isType(value)
+            && isType(value, allowsImplicitlyUnwrappedOptional: true)
     }
 
-    private static func isType(_ value: String) -> Bool {
+    private static func isType(
+        _ value: String,
+        allowsImplicitlyUnwrappedOptional: Bool = false
+    ) -> Bool {
         if let function = FrontendReceipt.FunctionTypeSpelling.parse(value) {
             guard function.isSynchronousNonthrowing,
                   let parameters = FrontendReceipt.FunctionTypeSpelling
                     .parameterSpellings(in: value)
             else { return false }
-            return parameters.allSatisfy(isType)
-                && (isVoid(function.result) || isType(function.result))
+            return parameters.allSatisfy {
+                isType($0, allowsImplicitlyUnwrappedOptional: true)
+            } && (isVoid(function.result) || isType(
+                function.result,
+                allowsImplicitlyUnwrappedOptional: true
+            ))
         }
         if value.hasPrefix("@") { return false }
         if value.hasPrefix("any ") {
@@ -66,6 +73,13 @@ enum SwiftTypeSpelling {
             return !existential.isEmpty
                 && !existential.hasPrefix("any ")
                 && isType(existential)
+        }
+        if value.hasSuffix("!") {
+            let wrapped = String(value.dropLast())
+            return allowsImplicitlyUnwrappedOptional
+                && !wrapped.hasSuffix("?")
+                && !wrapped.hasSuffix("!")
+                && isType(wrapped)
         }
         if value.hasSuffix("?") {
             return isType(String(value.dropLast()))
@@ -89,7 +103,7 @@ enum SwiftTypeSpelling {
             guard let components = splitTopLevel(body, separator: ","),
                   components.count >= 2
             else { return false }
-            return components.allSatisfy(isType)
+            return components.allSatisfy { isType($0) }
         }
         if let open = value.firstIndex(of: "<") {
             guard value.hasSuffix(">"),
@@ -101,7 +115,7 @@ enum SwiftTypeSpelling {
             guard let arguments = splitTopLevel(body, separator: ","),
                   !arguments.isEmpty
             else { return false }
-            return arguments.allSatisfy(isType)
+            return arguments.allSatisfy { isType($0) }
         }
         return isModulePath(value)
     }

@@ -836,7 +836,9 @@ extension FrontendReceipt.Adapter {
                 declarations: ["\(moduleName).*"],
                 visibility: .all,
                 profile: .readWrite,
-                maximumBoundedDurationMicroseconds: 2_000,
+                maximumBoundedDurationMicroseconds:
+                    Core.NativeImportExecutionPolicy
+                        .maximumMainThreadDurationMicroseconds,
                 maximumSuspendingDurationMicroseconds: 30_000_000,
                 allowsMainThread: true
             )

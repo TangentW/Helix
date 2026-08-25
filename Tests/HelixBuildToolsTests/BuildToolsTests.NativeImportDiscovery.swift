@@ -57,6 +57,11 @@ struct NativeImportDiscoveryTests {
         #expect(FrontendReceipt.SwiftTypeSpelling.isGeneratedType(
             "Swift.Optional<any Swift.Error>"
         ))
+        #expect(FrontendReceipt.SwiftTypeSpelling.isGeneratedType("UIKit.UIView!"))
+        #expect(!FrontendReceipt.SwiftTypeSpelling.isGeneratedType("UIKit.UIView!!"))
+        #expect(!FrontendReceipt.SwiftTypeSpelling.isGeneratedType(
+            "Swift.Array<UIKit.UIView!>"
+        ))
         #expect(FrontendReceipt.SwiftTypeSpelling.isGeneratedType(
             "(@escaping (Swift.Int) -> Swift.Void) -> Swift.Void"
         ))
@@ -641,6 +646,98 @@ struct NativeImportDiscoveryTests {
         })
         #expect(invalidation.parameterSwiftTypes == ["Timer"])
         #expect(invalidation.resultSwiftType == "Swift.Void")
+    }
+
+    @Test("Managed SDK probing admits only compiler-proven zero-argument construction")
+    func discoversManagedSDKZeroArgumentConstruction() throws {
+        let frontend = SwiftFrontend.Driver(
+            compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc")
+        )
+        let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        let expansion = try FrontendReceipt.ManagedDebugSurface.expand(
+            importedTypes: [
+                .init(
+                    canonicalName: "UIViewController",
+                    swiftType: "UIViewController",
+                    kind: .reference,
+                    aliases: ["__C.UIViewController", "UIKit.UIViewController"],
+                    representation: .reference,
+                    sourceFileLogicalID: "Sources/Fixture.swift",
+                    importedModules: ["UIKit"],
+                    requiresMainActor: true
+                ),
+                .init(
+                    canonicalName: "UIView",
+                    swiftType: "UIView",
+                    kind: .reference,
+                    aliases: ["__C.UIView", "UIKit.UIView"],
+                    representation: .reference,
+                    sourceFileLogicalID: "Sources/Fixture.swift",
+                    importedModules: ["UIKit"],
+                    requiresMainActor: true
+                ),
+                .init(
+                    canonicalName: "UIColor",
+                    swiftType: "UIColor",
+                    kind: .reference,
+                    aliases: ["__C.UIColor", "UIKit.UIColor"],
+                    representation: .reference,
+                    sourceFileLogicalID: "Sources/Fixture.swift",
+                    importedModules: ["UIKit"],
+                    requiresMainActor: false
+                ),
+                .init(
+                    canonicalName: "UIUserInterfaceStyle",
+                    swiftType: "UIUserInterfaceStyle",
+                    kind: .value,
+                    aliases: ["__C.UIUserInterfaceStyle", "UIKit.UIUserInterfaceStyle"],
+                    representation: .rawRepresentable,
+                    sourceFileLogicalID: "Sources/Fixture.swift",
+                    importedModules: ["UIKit"],
+                    requiresMainActor: false
+                ),
+            ],
+            minimumOS: .init(15),
+            frontend: frontend,
+            invocation: .init(
+                moduleName: "ManagedSDKConstructionFixture",
+                targetTriple: "arm64-apple-ios15.0-simulator",
+                sdkName: sdk.name,
+                sdkBuild: sdk.buildVersion,
+                optimization: "-Onone",
+                semanticArguments: ["-parse-as-library"]
+            )
+        )
+
+        let controllerInitializer = try #require(expansion.operations.first {
+            $0.ownerType == "UIViewController"
+                && $0.baseName == "init"
+                && $0.dispatch == .initializer
+                && $0.argumentLabels.isEmpty
+        })
+        #expect(controllerInitializer.parameterSwiftTypes.isEmpty)
+        #expect(controllerInitializer.resultSwiftType == "UIViewController")
+        #expect(controllerInitializer.requiresMainActor)
+        _ = try #require(expansion.operations.first {
+            $0.ownerType == "UIViewController"
+                && $0.baseName == "view"
+                && $0.dispatch == .instanceGetter
+        })
+        _ = try #require(expansion.operations.first {
+            $0.ownerType == "UIView"
+                && $0.baseName == "backgroundColor"
+                && $0.dispatch == .instanceSetter
+        })
+        _ = try #require(expansion.operations.first {
+            $0.ownerType == "UIColor"
+                && $0.baseName == "black"
+                && $0.dispatch == .staticGetter
+        })
+        #expect(!expansion.operations.contains {
+            $0.ownerType == "UIUserInterfaceStyle"
+                && $0.dispatch == .initializer
+                && $0.argumentLabels.isEmpty
+        })
     }
 
     @Test("Imported calls retain NSError-backed Swift throwing ABI")
@@ -2625,7 +2722,9 @@ struct NativeImportDiscoveryTests {
                 url: URL,
                 group: DispatchGroup,
                 operations: OperationQueue,
-                operation: Operation
+                operation: Operation,
+                viewController: UIViewController,
+                color: UIColor
             ) {
                 let withoutAnimation: @MainActor () -> Void = {
                     view.alpha = 0.25
@@ -2722,9 +2821,8 @@ struct NativeImportDiscoveryTests {
                     title: "Complete",
                     handler: handleContextualAction
                 )
-                present(UIViewController(), animated: true) {
-                    view.setNeedsLayout()
-                }
+                _ = color
+                present(viewController, animated: true)
                 _ = NotificationCenter.default.addObserver(
                     forName: nil,
                     object: nil,
@@ -2898,6 +2996,31 @@ struct NativeImportDiscoveryTests {
         #expect(!importedNativeNames.contains("NSCoder"))
         let generatedOperations = output.receipt.nativeImportBindings
             .compactMap(\.generated)
+        let controllerInitializer = try #require(generatedOperations.first {
+            $0.ownerType == "UIViewController"
+                && $0.baseName == "init"
+                && $0.dispatch == .initializer
+                && $0.argumentLabels.isEmpty
+        })
+        #expect(controllerInitializer.parameterSwiftTypes.isEmpty)
+        #expect(controllerInitializer.resultSwiftType == "UIViewController")
+        let presentBinding = try #require(
+            output.receipt.nativeImportBindings.first {
+                $0.generated?.ownerType == "UIViewController"
+                    && $0.generated?.baseName == "present"
+                    && $0.generated?.dispatch == .instanceMethod
+            }
+        )
+        let presentImport = try #require(
+            output.receipt.nativeImportCandidates.first {
+                $0.key == presentBinding.key
+            }
+        )
+        #expect(presentImport.effects.requiresMainActor)
+        #expect(
+            presentImport.contract.execution.maximumDurationMicroseconds
+                == 16_000
+        )
         #expect(!generatedOperations.contains {
             [
                 "commitAnimations",
@@ -2972,6 +3095,8 @@ struct NativeImportDiscoveryTests {
         #expect(generatedBridge.contains("import Foundation"))
         #expect(generatedBridge.contains(".textAlignment ="))
         #expect(generatedBridge.contains(".accessibilityTraits ="))
+        #expect(generatedBridge.contains("UIColor.black"))
+        #expect(generatedBridge.contains(".backgroundColor ="))
         #expect(generatedBridge.contains("UIFont.systemFont("))
         #expect(generatedBridge.contains(".addingTimeInterval("))
         #expect(generatedBridge.contains(".configuration ="))
@@ -2990,6 +3115,7 @@ struct NativeImportDiscoveryTests {
         #expect(generatedBridge.contains("UIAction("))
         #expect(generatedBridge.contains("UIAlertAction("))
         #expect(generatedBridge.contains("UIContextualAction("))
+        #expect(generatedBridge.contains("UIViewController()"))
         #expect(generatedBridge.contains(".present("))
         #expect(generatedBridge.contains("encodeNativeClosure("))
         #expect(generatedBridge.contains("callbackEncoder.encodeError("))
@@ -3025,6 +3151,12 @@ struct NativeImportDiscoveryTests {
             .replacingOccurrences(
                 of: "withTimeInterval: 1",
                 with: "withTimeInterval: 2"
+            )
+            .replacingOccurrences(
+                of: "present(viewController, animated: true)",
+                with: "let presentedController = UIViewController()\n"
+                    + "                presentedController.view.backgroundColor = .black\n"
+                    + "                present(presentedController, animated: true)"
             )
         try Data(changed.utf8).write(to: sourceURL)
         let patch = try ReleaseCompiler.Driver().build(
@@ -3303,6 +3435,9 @@ struct NativeImportDiscoveryTests {
         })
         #expect(black.contract.kind == .staticGetter)
         #expect(!black.effects.requiresMainActor)
+        #expect(
+            black.contract.execution.maximumDurationMicroseconds == 2_000
+        )
         let systemBlue = try #require(managed.receipt.nativeImportCandidates.first {
             $0.canonicalCallee
                 == "\(moduleName).HelixExternal.UIColor.systemBlue.get"
@@ -3312,6 +3447,10 @@ struct NativeImportDiscoveryTests {
             $0.canonicalCallee == firstUseNames[2]
         })
         #expect(application.effects.requiresMainActor)
+        #expect(
+            application.contract.execution.maximumDurationMicroseconds
+                == 16_000
+        )
         let bundle = try #require(managed.receipt.nativeImportCandidates.first {
             $0.canonicalCallee == firstUseNames[4]
         })
@@ -3658,6 +3797,58 @@ struct NativeImportDiscoveryTests {
                 configuration: configuration
             )
         }
+    }
+
+    @Test("Source discovery grants one frame only to exact MainActor bounded calls")
+    func assignsActorSpecificBoundedDeadlines() throws {
+        let configuration = try PatchConfiguration.Document.parse(yaml: """
+        schema: 1
+        modules:
+          ScopeFixture:
+            include:
+              - Patchable/**
+            nativeImports:
+              candidateIndex: source-and-catalog
+              emit: scoped
+              sourceScope:
+                include:
+                  - Native/**
+                declarations:
+                  - ScopeFixture.*
+                visibility: public
+                profile: read-write
+                maximumBoundedDurationMicroseconds: 16000
+                allowsMainThread: true
+        """)
+        let signature = Core.LoweredSignature(
+            parameters: ["Swift.Int"],
+            result: "Swift.Int"
+        )
+        let ordinary = declaration(
+            canonicalCallee: "ScopeFixture.compute(_:)",
+            mangledName: "$s12ScopeFixture7computeyS2iF",
+            signature: signature
+        )
+        let actor = declaration(
+            canonicalCallee: "ScopeFixture.render(_:)",
+            mangledName: "$s12ScopeFixture6renderyS2iF",
+            signature: signature,
+            effects: .init(requiresMainActor: true)
+        )
+
+        let output = try NativeImportDiscovery.Engine().discover(
+            declarations: [ordinary, actor],
+            metadata: makeMetadata(moduleName: "ScopeFixture"),
+            configuration: configuration
+        )
+        let durations = Dictionary(uniqueKeysWithValues:
+            output.candidates.map {
+                ($0.record.canonicalCallee,
+                 $0.record.contract.execution.maximumDurationMicroseconds)
+            }
+        )
+        #expect(durations["ScopeFixture.compute(_:)"] == 2_000)
+        #expect(durations["ScopeFixture.render(_:)"] == 16_000)
     }
 
     @Test("Automatic discovery accepts frozen Native values but rejects address and closure boundaries")

@@ -390,6 +390,79 @@ struct NativeBlockBridge {
         }
     }
 
+    @Test("Payload-free native block defaults are projected by exact physical type")
+    func projectsNativeBlockOptionalNoneDefault() throws {
+        let symbol = "$s7Fixture7presentyySbcSgF"
+        let importID = Core.NativeImportID(rawValue: 0)
+        let requirement = Bytecode.ImportRequirement(
+            id: importID,
+            key: .init(rawValue: .sha256("native-block-none-default")),
+            signature: .init(parameters: [], result: "Swift.Void"),
+            effects: .init(),
+            contract: .bounded(
+                kind: .globalFunction,
+                domain: .application,
+                access: .pure,
+                maximumDurationMicroseconds: 500,
+                allowsMainThread: true
+            )
+        )
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: symbol,
+                parameterTypes: [],
+                parameterProjection: .init(
+                    physicalParameterCount: 1,
+                    logicalParameterIndices: [],
+                    defaultArguments: [
+                        .optionalNone(physicalParameterIndex: 0),
+                    ]
+                ),
+                resultType: .void,
+                target: .nativeImport(requirement)
+            ),
+        ])
+        let physicalType = "@convention(thin) ("
+            + "@owned Optional<@convention(block) (Bool) -> ()>) -> ()"
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture3runyyF",
+            loweredType: "@convention(thin) () -> ()",
+            body: """
+            bb0:
+              %0 = enum $Optional<@convention(block) (Bool) -> ()>, #Optional.none!enumelt
+              %1 = function_ref @\(symbol) : $\(physicalType)
+              %2 = apply %1(%0) : $\(physicalType)
+              %3 = tuple ()
+              return %3
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer().lower(
+            function,
+            displayName: "Fixture.run",
+            directCalls: calls
+        )
+        #expect(lowered.blocks.flatMap(\.instructions).contains {
+            guard case let .nativeApply(_, id, arguments) = $0 else {
+                return false
+            }
+            return id == importID && arguments.isEmpty
+        })
+
+        var mismatched = function
+        mismatched.body = function.body.replacingOccurrences(
+            of: "enum $Optional<@convention(block) (Bool) -> ()>",
+            with: "enum $Optional<@convention(block) (String) -> ()>"
+        )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            try CanonicalSIL.Lowerer().lower(
+                mismatched,
+                displayName: "Fixture.mismatched",
+                directCalls: calls
+            )
+        }
+    }
+
     @Test("Native block thunks preserve bridgeable callback results")
     func recognizesNativeBlockResults() throws {
         let logicalPredicate = "@callee_guaranteed ("

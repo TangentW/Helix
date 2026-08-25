@@ -633,6 +633,9 @@ does not by itself certify a physical device or distribution channel.
   Source defaults omitted beside a callback are
   represented by a checked physical-to-logical projection and are supplied by
   the generated Swift invocation after SIL provenance and ownership validation.
+  An omitted Optional Objective-C block default is accepted only when the
+  compiler-emitted `Optional.none` has the exact frozen physical block spelling;
+  it is projected away without materializing a VM closure.
   A representation-preserving `convert_closure` may only add MainActor to an
   otherwise ABI-identical closure. The Verifier rejects the reverse conversion,
   any ownership/result/effect change, and an escaping NativeImport that receives
@@ -663,9 +666,12 @@ does not by itself certify a physical device or distribution channel.
   async closure transport and completion-handler-to-async inference remain
   unsupported. A source scope selects the effect-independent access profile
   `pure`, `read`, or `read-write`, with
-  `maximumBoundedDurationMicroseconds` (1...2,000) and
+  `maximumBoundedDurationMicroseconds` (1...2,000 when main-thread execution is
+  forbidden, otherwise 1...16,000) and
   `maximumSuspendingDurationMicroseconds` (1...60,000,000) configuring the two
-  deadline classes independently.
+  deadline classes independently. Only an exact MainActor declaration may use
+  the portion above 2,000 microseconds; every other synchronous declaration in
+  the same scope is clamped to the 2 ms qualification ceiling.
 - VM-owned `Any`, `is`, `as?`, and `as!`. A closed recursive logical descriptor
   distinguishes source types that deliberately share HLBC storage, including
   `Int`/`Int64`, `UInt`/`UInt64`, `Double`/`CGFloat`, String/Character,
@@ -703,8 +709,15 @@ does not by itself certify a physical device or distribution channel.
   `UIColor.black`, `UIColor.init(white:alpha:)`, `UIView.alpha`, `UIView.setNeedsLayout()`,
   `UIView.setAnimationsEnabled(_:)`, `URLCache.shared`,
   `Bundle.path(forResource:ofType:)`, and `FileManager.removeItem(atPath:)`.
-  Frontend-synthesized inherited constructors do not expand the source-authored
-  boundary. Proven Objective-C protocol inputs retain the frozen `AnyObject`
+  An exact zero-argument `Type()` call is also nominated for each already-frozen
+  imported SDK type and admitted only when the frontend proves that call, even
+  if an inherited or importer-synthesized initializer is absent from the symbol
+  graph. Symbol-graph implicitly unwrapped optionals such as
+  `UIViewController.view: UIView!` remain valid frontend probes and are measured
+  as their exact Optional ABI. Other frontend-synthesized inherited
+  constructors, including project subclass constructors, do not expand the
+  source-authored boundary. Proven
+  Objective-C protocol inputs retain the frozen `AnyObject`
   ABI while the generated invoker decodes the exact existential type, inside
   MainActor isolation when required.
   Production Shells do not receive this convenience surface, and it does not
@@ -864,7 +877,7 @@ machine code.
 | Change an existing stored-property `willSet` or `didSet` body | Directly declared synchronous global, eligible frozen struct, and source reference-class observers are independently patchable through an exact hashed in-place wrapper in the derived source. Implicit/custom old/new-value names, baseline fallback, private same-file access, direct value-storage mutation, and transactional value-receiver writeback are preserved. Static/class, inherited, lazy/wrapped, weak/unowned/Objective-C, availability/generic, actor/global-actor, baseline-magic-literal, old/new-value ABI-shape changes, and direct self-property assignment from a reference observer fail closed; observer Native replacement is never emitted |
 | Use explicit `inout`, mutate an actor root, or change an existing native static/class method | One synchronous eligible Shell `inout` parameter is supported. Multiple/async regions remain rejected; actor executors and native metatype ABI are not implemented |
 | Call an existing private/internal/public declaration from that body | Supported only when it resolves to a same-image function, eligible Shell Entry, or exact emitted NativeImport |
-| First use a public SDK member in a managed Debug body | Supported for a uniquely measured, nondeprecated synchronous initializer, instance/static method, or readable/writable property when every boundary type is already representable in the frozen imported/Bridge surface and the declaration is valid at the Shell minimum OS. Inherited implicit constructors do not expand the source boundary. Closure-bearing methods require the exact synchronous, nonthrowing bridge-and-failure-value profile above. Async SDK declarations, completion-handler conversion, unfamiliar error bridges, subscripts, and unrepresentable signatures require a full build; suspending NativeImports currently come from exact project-source discovery or an explicit catalog |
+| First use a public SDK member in a managed Debug body | Supported for a uniquely measured, nondeprecated synchronous initializer, instance/static method, or readable/writable property when every boundary type is already representable in the frozen imported/Bridge surface and the declaration is valid at the Shell minimum OS. This includes a separately compiler-proven zero-argument `Type()` construction for an already-frozen imported SDK type; other inherited implicit constructors and project-subclass constructors do not expand the source boundary. Closure-bearing methods require the exact synchronous, nonthrowing bridge-and-failure-value profile above. Async SDK declarations, completion-handler conversion, unfamiliar error bridges, subscripts, and unrepresentable signatures require a full build; suspending NativeImports currently come from exact project-source discovery or an explicit catalog |
 | Add an ordinary top-level helper, private class instance method, or computed accessor in an existing source file | Supported when reachable from a changed root and its concrete signature/body fit HLBC; it remains private to that image |
 | Ordinary direct recursion | Resolves to the function in the same immutable HLBC image |
 | Deliberately call the previous generation from source | Not supported by HLBC; save/activate a restoring generation instead |

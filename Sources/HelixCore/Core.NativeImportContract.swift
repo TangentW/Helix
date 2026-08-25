@@ -207,11 +207,19 @@ public struct NativeImportContract: Codable, Hashable, Sendable {
         }
         switch execution.deadlineMode {
         case .bounded:
+            let maximumBoundedDuration =
+                effects.requiresMainActor && execution.allowsMainThread
+                    ? Core.NativeImportExecutionPolicy
+                        .maximumMainThreadDurationMicroseconds
+                    : Core.NativeImportExecutionPolicy
+                        .maximumBoundedDurationMicroseconds
             guard execution.maximumDurationMicroseconds
-                    <= Core.NativeImportExecutionPolicy.maximumBoundedDurationMicroseconds
+                    <= maximumBoundedDuration
             else {
                 throw Core.NativeImportContractError.invalid(
-                    "bounded native imports exceed the 2 ms qualification limit"
+                    effects.requiresMainActor && execution.allowsMainThread
+                        ? "MainActor bounded native imports exceed the 16 ms qualification limit"
+                        : "bounded native imports exceed the 2 ms qualification limit"
                 )
             }
         case .cooperative:
