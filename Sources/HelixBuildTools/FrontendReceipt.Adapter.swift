@@ -10,36 +10,79 @@ public struct Adapter: Sendable {
     public init() {}
 
     public func generate(_ request: FrontendReceipt.Request) throws -> FrontendReceipt.Output {
-        try validate(request)
+        let performance = BuildPerformance.Recorder()
+        try performance.measure("frontend.validate_request") {
+            try validate(request)
+        }
         let orderedSources = request.sources.sorted { $0.logicalPath < $1.logicalPath }
-        let sourceStates = try loadSources(orderedSources)
-        let toolchain = try ReleaseCompiler.Driver().toolchainIdentity(
-            compilerURL: request.compilerURL
+        performance.setCounter("frontend.source_count", value: UInt64(orderedSources.count))
+        let sourceStates = try performance.measure("frontend.load_sources") {
+            try loadSources(orderedSources)
+        }
+        performance.setCounter(
+            "frontend.source_bytes",
+            value: sourceStates.reduce(0) { $0 + UInt64($1.contents.count) }
         )
-        let frontend = SwiftFrontend.Driver(compilerURL: request.compilerURL)
-        let astOutput = try frontend.emitTypedAST(
-            sourceFiles: orderedSources.map(\.url),
-            invocation: request.metadata.frontendInvocation
+        let toolchain = try performance.measure("frontend.toolchain_identity") {
+            try ReleaseCompiler.Driver().toolchainIdentity(
+                compilerURL: request.compilerURL,
+                invocationObserver: performance.subprocessObserver
+            )
+        }
+        let frontend = SwiftFrontend.Driver(
+            compilerURL: request.compilerURL,
+            invocationObserver: performance.subprocessObserver
         )
-        let documents = try FrontendReceipt.TypedAST.parseDocuments(astOutput)
+        let astOutput = try performance.measure("frontend.emit_typed_ast") {
+            try frontend.emitTypedAST(
+                sourceFiles: orderedSources.map(\.url),
+                invocation: request.metadata.frontendInvocation
+            )
+        }
+        performance.setCounter(
+            "frontend.typed_ast_bytes",
+            value: UInt64(astOutput.utf8.count)
+        )
+        let documents = try performance.measure("frontend.parse_typed_ast") {
+            try FrontendReceipt.TypedAST.parseDocuments(astOutput)
+        }
         try validateCompilerVersion(documents, toolchain: toolchain)
-        let demangled = try FrontendReceipt.Demangler(compilerURL: request.compilerURL)
-            .demangle(FrontendReceipt.TypedAST.mangledTypes(in: documents))
-        let canonicalSIL = try frontend.emitCanonicalSIL(
-            sourceFiles: orderedSources.map(\.url),
-            invocation: request.metadata.frontendInvocation
+        let demangled = try performance.measure("frontend.demangle_types") {
+            try FrontendReceipt.Demangler(
+                compilerURL: request.compilerURL,
+                invocationObserver: performance.subprocessObserver
+            ).demangle(FrontendReceipt.TypedAST.mangledTypes(in: documents))
+        }
+        let canonicalSIL = try performance.measure("frontend.emit_identity_sil") {
+            try frontend.emitCanonicalSIL(
+                sourceFiles: orderedSources.map(\.url),
+                invocation: request.metadata.frontendInvocation
+            )
+        }
+        performance.setCounter(
+            "frontend.identity_sil_bytes",
+            value: UInt64(canonicalSIL.utf8.count)
         )
-        let silFile = try CanonicalSIL.File(text: canonicalSIL)
+        let silFile = try performance.measure("frontend.parse_identity_sil") {
+            try CanonicalSIL.File(text: canonicalSIL)
+        }
         // Native-call discovery needs source-level default-argument
         // provenance. Even at -Onone, mandatory SIL transforms may inline an
         // imported default generator once nearby call shapes change.
-        let operationSILFile = try CanonicalSIL.File(
-            text: frontend.emitCanonicalSIL(
+        let operationSIL = try performance.measure("frontend.emit_semantic_sil") {
+            try frontend.emitCanonicalSIL(
                 sourceFiles: orderedSources.map(\.url),
                 invocation: request.metadata.frontendInvocation,
                 purpose: .semanticLowering
             )
+        }
+        performance.setCounter(
+            "frontend.semantic_sil_bytes",
+            value: UInt64(operationSIL.utf8.count)
         )
+        let operationSILFile = try performance.measure("frontend.parse_semantic_sil") {
+            try CanonicalSIL.File(text: operationSIL)
+        }
         let moduleName = request.metadata.frontendInvocation.moduleName
         let configuredCallingSurface = try callingSurfaceConfiguration(
             request.configuration,
@@ -89,11 +132,47 @@ public struct Adapter: Sendable {
             operationTypes: importedOperationSurface.types
         )
         if request.callingSurfacePolicy == .managedDebugModule {
-            let managedSurface = try FrontendReceipt.ManagedDebugSurface.expand(
-                importedTypes: importedTypes,
-                minimumOS: request.metadata.minimumOS,
-                frontend: frontend,
-                invocation: request.metadata.frontendInvocation
+            let managedSurface = try performance.measure(
+                "frontend.expand_managed_debug_surface"
+            ) {
+                try FrontendReceipt.ManagedDebugSurface.expand(
+                    importedTypes: importedTypes,
+                    minimumOS: request.metadata.minimumOS,
+                    frontend: frontend,
+                    invocation: request.metadata.frontendInvocation
+                )
+            }
+            performance.setCounter(
+                "managed_debug.imported_type_count",
+                value: UInt64(managedSurface.importedTypes.count)
+            )
+            performance.setCounter(
+                "managed_debug.measured_operation_count",
+                value: UInt64(managedSurface.operations.count)
+            )
+            performance.setCounter(
+                "managed_debug.module_count",
+                value: managedSurface.metrics.moduleCount
+            )
+            performance.setCounter(
+                "managed_debug.candidate_count",
+                value: managedSurface.metrics.candidateCount
+            )
+            performance.setCounter(
+                "managed_debug.probe_attempt_count",
+                value: managedSurface.metrics.probeAttemptCount
+            )
+            performance.setCounter(
+                "managed_debug.failed_probe_count",
+                value: managedSurface.metrics.failedProbeCount
+            )
+            performance.setCounter(
+                "managed_debug.rejected_singleton_count",
+                value: managedSurface.metrics.rejectedSingletonCount
+            )
+            performance.setCounter(
+                "managed_debug.generated_probe_source_bytes",
+                value: managedSurface.metrics.generatedProbeSourceBytes
             )
             importedTypes = managedSurface.importedTypes
             let observedCallbackSymbols = Set(
@@ -403,13 +482,30 @@ public struct Adapter: Sendable {
             nativeTypeBindings: nativeTypeBindings
         )
         try receipt.validate()
+        performance.setCounter(
+            "frontend.declaration_count",
+            value: UInt64(receipt.declarations.count)
+        )
+        performance.setCounter(
+            "frontend.root_count",
+            value: UInt64(receipt.roots.count)
+        )
+        performance.setCounter(
+            "frontend.native_import_count",
+            value: UInt64(receipt.nativeImportCandidates.count)
+        )
+        performance.setCounter(
+            "frontend.native_type_count",
+            value: UInt64(receipt.nativeTypes.count)
+        )
         return .init(
             receipt: receipt,
             diagnostics: (indexed.diagnostics + discovery.diagnostics).sorted {
                 ($0.location?.file ?? "", $0.location?.line ?? 0, $0.code, $0.message)
                     < ($1.location?.file ?? "", $1.location?.line ?? 0, $1.code, $1.message)
             },
-            toolchain: toolchain
+            toolchain: toolchain,
+            performance: performance.trace()
         )
     }
 

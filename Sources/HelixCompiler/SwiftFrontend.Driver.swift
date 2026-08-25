@@ -5,6 +5,45 @@ import HelixInterface
 public enum SwiftFrontend {}
 
 extension SwiftFrontend {
+public enum InvocationKind: String, Codable, Hashable, Sendable {
+    case typedAST = "typed_ast"
+    case canonicalSIL = "canonical_sil"
+    case symbolGraph = "symbol_graph"
+    case sdkPath = "sdk_path"
+    case sdkBuild = "sdk_build"
+    case targetInfo = "target_info"
+    case compilerVersion = "compiler_version"
+    case demangle
+    case other
+}
+
+public struct InvocationMetric: Hashable, Sendable {
+    public var kind: SwiftFrontend.InvocationKind
+    public var executableName: String
+    public var durationMicroseconds: UInt64
+    public var terminationStatus: Int32?
+    public var standardOutputBytes: UInt64
+    public var standardErrorBytes: UInt64
+
+    public init(
+        kind: SwiftFrontend.InvocationKind,
+        executableName: String,
+        durationMicroseconds: UInt64,
+        terminationStatus: Int32?,
+        standardOutputBytes: UInt64,
+        standardErrorBytes: UInt64
+    ) {
+        self.kind = kind
+        self.executableName = executableName
+        self.durationMicroseconds = durationMicroseconds
+        self.terminationStatus = terminationStatus
+        self.standardOutputBytes = standardOutputBytes
+        self.standardErrorBytes = standardErrorBytes
+    }
+}
+
+public typealias InvocationObserver = @Sendable (SwiftFrontend.InvocationMetric) -> Void
+
 public struct Output: Sendable {
     public var standardOutput: String
     public var standardError: String
@@ -52,13 +91,16 @@ public struct Driver: Sendable {
 
     public var compilerURL: URL
     public var environment: [String: String]
+    public var invocationObserver: SwiftFrontend.InvocationObserver?
 
     public init(
         compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        invocationObserver: SwiftFrontend.InvocationObserver? = nil
     ) {
         self.compilerURL = compilerURL
         self.environment = environment
+        self.invocationObserver = invocationObserver
     }
 
     public func emitCanonicalSIL(
@@ -240,7 +282,8 @@ public struct Driver: Sendable {
         }
         let xcrun = SwiftFrontend.Driver(
             compilerURL: URL(fileURLWithPath: "/usr/bin/xcrun"),
-            environment: environment
+            environment: environment,
+            invocationObserver: invocationObserver
         )
         let path = try xcrun.run(arguments: ["--sdk", name, "--show-sdk-path"])
         let build = try xcrun.run(arguments: ["--sdk", name, "--show-sdk-build-version"])
@@ -260,6 +303,25 @@ public struct Driver: Sendable {
     }
 
     public func run(arguments: [String], workingDirectory: URL? = nil) throws -> SwiftFrontend.Output {
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        let kind = invocationKind(arguments: arguments)
+        let executableName = compilerURL.lastPathComponent
+        var metricStatus: Int32?
+        var metricStandardOutputBytes: UInt64 = 0
+        var metricStandardErrorBytes: UInt64 = 0
+        defer {
+            invocationObserver?(
+                .init(
+                    kind: kind,
+                    executableName: executableName,
+                    durationMicroseconds:
+                        (DispatchTime.now().uptimeNanoseconds &- startedAt) / 1_000,
+                    terminationStatus: metricStatus,
+                    standardOutputBytes: metricStandardOutputBytes,
+                    standardErrorBytes: metricStandardErrorBytes
+                )
+            )
+        }
         let captureDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("helix-frontend-capture-\(UUID().uuidString)", isDirectory: true)
         do {
@@ -305,16 +367,39 @@ public struct Driver: Sendable {
         try stderr.synchronize()
         let outputData = try Data(contentsOf: outputURL, options: .mappedIfSafe)
         let errorData = try Data(contentsOf: diagnosticsURL, options: .mappedIfSafe)
+        metricStandardOutputBytes = UInt64(outputData.count)
+        metricStandardErrorBytes = UInt64(errorData.count)
         guard let output = String(data: outputData, encoding: .utf8),
               let diagnostics = String(data: errorData, encoding: .utf8)
         else {
             throw SwiftFrontend.Error.invalidUTF8Output
         }
+        metricStatus = process.terminationStatus
         return .init(
             standardOutput: output,
             standardError: diagnostics,
             terminationStatus: process.terminationStatus
         )
+    }
+
+    private func invocationKind(arguments: [String]) -> SwiftFrontend.InvocationKind {
+        let executable = compilerURL.lastPathComponent
+        if executable == "swift-symbolgraph-extract"
+            || arguments.first == "swift-symbolgraph-extract" {
+            return .symbolGraph
+        }
+        if executable == "swift-demangle" || arguments.first == "swift-demangle" {
+            return .demangle
+        }
+        if arguments.contains("-dump-ast") { return .typedAST }
+        if arguments.contains("-emit-sil") { return .canonicalSIL }
+        if arguments.contains("--show-sdk-path") { return .sdkPath }
+        if arguments.contains("--show-sdk-build-version") { return .sdkBuild }
+        if arguments.contains("-print-target-info") { return .targetInfo }
+        if arguments.contains("-version") || arguments.contains("--version") {
+            return .compilerVersion
+        }
+        return .other
     }
 }
 }

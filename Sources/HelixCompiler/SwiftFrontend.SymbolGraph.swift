@@ -158,7 +158,8 @@ extension SwiftFrontend.Driver {
         ] + (try symbolGraphImportArguments(invocation.semanticArguments))
         let output = try SwiftFrontend.Driver(
             compilerURL: tool.executable,
-            environment: environment
+            environment: environment,
+            invocationObserver: invocationObserver
         ).run(arguments: arguments)
         guard output.terminationStatus == 0 else {
             throw SwiftFrontend.Error.symbolGraphFailed(

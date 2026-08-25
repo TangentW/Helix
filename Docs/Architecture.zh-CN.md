@@ -15,6 +15,8 @@ Helix 的核心思路只有一套：工程师修改普通 Swift 源码；但生�
 
 两条产品路径都不会把 Swift 源码或原生机器码下载进 App。生产路径接受可持久化、绑定策略的签名包；开发路径接受仅绑定一次认证 Dev Session 的临时 artifact。这一隔离是架构边界，不是一个可随意切换的运行时开关。
 
+Xcode 侧的 `prepare`、`bridge`、`finalize` 与 `patch` 会在当前 profile 的 DerivedData 输出目录写入 schema 1 的 `BuildPerformance.<operation>.json`。报告使用单调时钟，聚合具名阶段、脱敏后的 frontend 子进程事实、计数与产物大小；它只作为本地诊断证据，不进入 HLBC、HLXI、补丁签名输入、Shell identity、Release baseline identity 或 App bundle。阶段允许嵌套，不能直接累加。实测基线与解释规则见[构建性能观测与基线](Build-Performance-Baseline.zh-CN.md)。
+
 ```mermaid
 flowchart TB
     S["普通 Swift 源码"] --> I["自动捕获的构建身份"]

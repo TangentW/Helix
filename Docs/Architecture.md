@@ -24,6 +24,15 @@ App. Production accepts a persistable, policy-bound signed package; development
 accepts an ephemeral artifact bound to one authenticated Dev Session. This
 distinction is structural, not a runtime configuration toggle.
 
+Xcode-side `prepare`, `bridge`, `finalize`, and `patch` operations emit a local
+schema-1 `BuildPerformance.<operation>.json` under the active profile's
+DerivedData output. The report uses a monotonic clock and aggregates named
+stages, privacy-safe frontend subprocess facts, counters, and artifact sizes.
+It is diagnostic evidence only: it is excluded from HLBC, HLXI, signed patch
+inputs, Shell identity, Release baseline identity, and the App bundle. Nested
+stages are not additive. The measured baseline and interpretation rules are
+recorded in [Build performance observability and baseline](Build-Performance-Baseline.md).
+
 ```mermaid
 flowchart TB
     S["Ordinary Swift source"] --> I["Automatically captured build identities"]

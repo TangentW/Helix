@@ -14,6 +14,7 @@ public struct BuildRequest: Sendable {
     public var compilerURL: URL
     public var signingService: any PatchPackage.SignatureProviding
     public var trustedRoot: PatchPackage.TrustedRoot
+    public var invocationObserver: SwiftFrontend.InvocationObserver?
 
     public var certificate: PatchPackage.SigningCertificate {
         signingService.certificate
@@ -27,7 +28,8 @@ public struct BuildRequest: Sendable {
         compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
         certificate: PatchPackage.SigningCertificate,
         signingKey: ReleasePipeline.SigningKeyDocument,
-        trustedRoot: PatchPackage.TrustedRoot
+        trustedRoot: PatchPackage.TrustedRoot,
+        invocationObserver: SwiftFrontend.InvocationObserver? = nil
     ) {
         self.configuration = configuration
         self.archive = archive
@@ -39,6 +41,7 @@ public struct BuildRequest: Sendable {
             signingKey: signingKey
         )
         self.trustedRoot = trustedRoot
+        self.invocationObserver = invocationObserver
     }
 
     public init(
@@ -49,7 +52,8 @@ public struct BuildRequest: Sendable {
         compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
         certificate: PatchPackage.SigningCertificate,
         signingKey: ReleasePipeline.SigningKeyDocument,
-        trustedRoot: PatchPackage.TrustedRoot
+        trustedRoot: PatchPackage.TrustedRoot,
+        invocationObserver: SwiftFrontend.InvocationObserver? = nil
     ) {
         self.configuration = configuration
         self.archive = archive
@@ -61,6 +65,7 @@ public struct BuildRequest: Sendable {
             signingKey: signingKey
         )
         self.trustedRoot = trustedRoot
+        self.invocationObserver = invocationObserver
     }
 
     public init(
@@ -70,7 +75,8 @@ public struct BuildRequest: Sendable {
         selectedFunctionKeys: Set<Core.FunctionKey>? = nil,
         compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
         signingService: any PatchPackage.SignatureProviding,
-        trustedRoot: PatchPackage.TrustedRoot
+        trustedRoot: PatchPackage.TrustedRoot,
+        invocationObserver: SwiftFrontend.InvocationObserver? = nil
     ) {
         self.configuration = configuration
         self.archive = archive
@@ -79,6 +85,7 @@ public struct BuildRequest: Sendable {
         self.compilerURL = compilerURL
         self.signingService = signingService
         self.trustedRoot = trustedRoot
+        self.invocationObserver = invocationObserver
     }
 
     public init(
@@ -88,7 +95,8 @@ public struct BuildRequest: Sendable {
         selectedFunctionKeys: Set<Core.FunctionKey>? = nil,
         compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
         signingService: any PatchPackage.SignatureProviding,
-        trustedRoot: PatchPackage.TrustedRoot
+        trustedRoot: PatchPackage.TrustedRoot,
+        invocationObserver: SwiftFrontend.InvocationObserver? = nil
     ) {
         self.configuration = configuration
         self.archive = archive
@@ -97,6 +105,7 @@ public struct BuildRequest: Sendable {
         self.compilerURL = compilerURL
         self.signingService = signingService
         self.trustedRoot = trustedRoot
+        self.invocationObserver = invocationObserver
     }
 }
 
@@ -121,7 +130,8 @@ public struct Builder: Sendable {
                 selectedFunctionKeys: request.selectedFunctionKeys,
                 compilerURL: request.compilerURL,
                 enforceToolchainFingerprint: true,
-                requestedResources: request.configuration.requestedResources
+                requestedResources: request.configuration.requestedResources,
+                invocationObserver: request.invocationObserver
             )
         )
         try verifyBytecode(compilation, archive: request.archive)

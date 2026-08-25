@@ -56,6 +56,7 @@ public struct Output: Sendable {
     public var receipt: ShellBuildReceipt.Document
     public var diagnostics: [Core.Diagnostic]
     public var toolchain: ReleaseCompiler.ToolchainIdentity
+    public var performance: BuildPerformance.Trace
 }
 
 public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {

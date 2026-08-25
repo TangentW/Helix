@@ -34,6 +34,7 @@ enum TypedAST {
 
 struct Demangler {
     var compilerURL: URL
+    var invocationObserver: SwiftFrontend.InvocationObserver? = nil
 
     func demangle(_ mangledTypes: Set<String>) throws -> [String: String] {
         let ordered = mangledTypes.sorted()
@@ -68,10 +69,16 @@ struct Demangler {
         let driver: SwiftFrontend.Driver
         let invocation: [String]
         if FileManager.default.isExecutableFile(atPath: sibling.path) {
-            driver = .init(compilerURL: sibling)
+            driver = .init(
+                compilerURL: sibling,
+                invocationObserver: invocationObserver
+            )
             invocation = arguments
         } else {
-            driver = .init(compilerURL: URL(fileURLWithPath: "/usr/bin/xcrun"))
+            driver = .init(
+                compilerURL: URL(fileURLWithPath: "/usr/bin/xcrun"),
+                invocationObserver: invocationObserver
+            )
             invocation = ["swift-demangle"] + arguments
         }
         let output = try driver.run(arguments: invocation)

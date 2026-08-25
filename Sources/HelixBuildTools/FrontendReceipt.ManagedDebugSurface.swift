@@ -12,6 +12,16 @@ extension FrontendReceipt.ManagedDebugSurface {
     struct Expansion: Sendable {
         var importedTypes: [FrontendReceipt.Adapter.ImportedNativeType]
         var operations: [FrontendReceipt.Adapter.ImportedOperation]
+        var metrics: Metrics
+    }
+
+    struct Metrics: Sendable {
+        var moduleCount: UInt64 = 0
+        var candidateCount: UInt64 = 0
+        var probeAttemptCount: UInt64 = 0
+        var failedProbeCount: UInt64 = 0
+        var rejectedSingletonCount: UInt64 = 0
+        var generatedProbeSourceBytes: UInt64 = 0
     }
 
     private struct OwnerSurface: Sendable {
@@ -114,16 +124,22 @@ extension FrontendReceipt.ManagedDebugSurface {
             )
         }
 
+        var metrics = Metrics(
+            moduleCount: UInt64(moduleNames.count),
+            candidateCount: UInt64(candidates.count)
+        )
         let operations = try probe(
             candidates,
             importedTypes: enrichedTypes,
             frontend: frontend,
-            invocation: invocation
+            invocation: invocation,
+            metrics: &metrics
         )
         return Expansion(
             importedTypes: enrichedTypes,
             operations: try FrontendReceipt.Adapter()
-                .mergeImportedOperations(operations)
+                .mergeImportedOperations(operations),
+            metrics: metrics
         )
     }
 
@@ -591,7 +607,8 @@ extension FrontendReceipt.ManagedDebugSurface {
         _ candidates: [Candidate],
         importedTypes: [FrontendReceipt.Adapter.ImportedNativeType],
         frontend: SwiftFrontend.Driver,
-        invocation: InterfaceArchive.FrontendInvocation
+        invocation: InterfaceArchive.FrontendInvocation,
+        metrics: inout Metrics
     ) throws -> [FrontendReceipt.Adapter.ImportedOperation] {
         var operations: [FrontendReceipt.Adapter.ImportedOperation] = []
         for start in stride(from: 0, to: candidates.count, by: 256) {
@@ -600,7 +617,8 @@ extension FrontendReceipt.ManagedDebugSurface {
                 Array(candidates[start..<end]),
                 importedTypes: importedTypes,
                 frontend: frontend,
-                invocation: invocation
+                invocation: invocation,
+                metrics: &metrics
             )
         }
         return operations
@@ -610,7 +628,8 @@ extension FrontendReceipt.ManagedDebugSurface {
         _ candidates: [Candidate],
         importedTypes: [FrontendReceipt.Adapter.ImportedNativeType],
         frontend: SwiftFrontend.Driver,
-        invocation: InterfaceArchive.FrontendInvocation
+        invocation: InterfaceArchive.FrontendInvocation,
+        metrics: inout Metrics
     ) throws -> [FrontendReceipt.Adapter.ImportedOperation] {
         guard !candidates.isEmpty else { return [] }
         do {
@@ -618,22 +637,29 @@ extension FrontendReceipt.ManagedDebugSurface {
                 candidates,
                 importedTypes: importedTypes,
                 frontend: frontend,
-                invocation: invocation
+                invocation: invocation,
+                metrics: &metrics
             )
         } catch let error as SwiftFrontend.Error {
             guard case .compilationFailed = error else { throw error }
-            guard candidates.count > 1 else { return [] }
+            metrics.failedProbeCount += 1
+            guard candidates.count > 1 else {
+                metrics.rejectedSingletonCount += 1
+                return []
+            }
             let middle = candidates.count / 2
             return try probeBatch(
                 Array(candidates[..<middle]),
                 importedTypes: importedTypes,
                 frontend: frontend,
-                invocation: invocation
+                invocation: invocation,
+                metrics: &metrics
             ) + probeBatch(
                 Array(candidates[middle...]),
                 importedTypes: importedTypes,
                 frontend: frontend,
-                invocation: invocation
+                invocation: invocation,
+                metrics: &metrics
             )
         }
     }
@@ -642,8 +668,10 @@ extension FrontendReceipt.ManagedDebugSurface {
         _ candidates: [Candidate],
         importedTypes: [FrontendReceipt.Adapter.ImportedNativeType],
         frontend: SwiftFrontend.Driver,
-        invocation: InterfaceArchive.FrontendInvocation
+        invocation: InterfaceArchive.FrontendInvocation,
+        metrics: inout Metrics
     ) throws -> [FrontendReceipt.Adapter.ImportedOperation] {
+        metrics.probeAttemptCount += 1
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "helix-managed-debug-surface-\(UUID().uuidString)",
             isDirectory: true
@@ -657,6 +685,7 @@ extension FrontendReceipt.ManagedDebugSurface {
         let sourceURL = directory.appendingPathComponent("ManagedDebugSurface.swift")
         let source = renderSource(candidates)
         let contents = Data(source.utf8)
+        metrics.generatedProbeSourceBytes += UInt64(contents.count)
         guard contents.count <= 8 * 1_024 * 1_024 else {
             throw FrontendReceipt.Error.frontendFailed(
                 "managed Debug probe source exceeds 8 MiB"
@@ -669,7 +698,8 @@ extension FrontendReceipt.ManagedDebugSurface {
         )
         let documents = try FrontendReceipt.TypedAST.parseDocuments(astOutput)
         let demangled = try FrontendReceipt.Demangler(
-            compilerURL: frontend.compilerURL
+            compilerURL: frontend.compilerURL,
+            invocationObserver: frontend.invocationObserver
         ).demangle(FrontendReceipt.TypedAST.mangledTypes(in: documents))
         let canonicalSIL = try frontend.emitCanonicalSIL(
             sourceFiles: [sourceURL],

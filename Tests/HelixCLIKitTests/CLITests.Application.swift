@@ -507,6 +507,18 @@ struct Application {
         ])
         #expect(permissiveCapture.exitCode != 0)
         #expect(permissiveCapture.standardError.contains("owner-only"))
+        let failedPerformance = try buildPerformanceReport(
+            at: buildDirectory.appendingPathComponent(
+                "HelixGenerated/patch/BuildPerformance.prepare.json"
+            )
+        )
+        #expect(failedPerformance.schemaVersion == 1)
+        #expect(failedPerformance.operation == .prepare)
+        #expect(failedPerformance.workflow == .hotPatch)
+        #expect(failedPerformance.outcome == .failure)
+        #expect(failedPerformance.trace.stages.contains {
+            $0.name == "prepare.capture_frontend"
+        })
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o600],
             ofItemAtPath: patchCaptureURL.path
@@ -518,6 +530,25 @@ struct Application {
             "--phase", "prepare",
         ])
         #expect(result.exitCode == 0, Comment(rawValue: result.standardError))
+        let patchPerformance = try buildPerformanceReport(
+            at: buildDirectory.appendingPathComponent(
+                "HelixGenerated/patch/BuildPerformance.prepare.json"
+            )
+        )
+        #expect(patchPerformance.outcome == .success)
+        #expect(patchPerformance.totalDurationMicroseconds > 0)
+        #expect(patchPerformance.trace.stages.contains {
+            $0.name == "prepare.frontend_receipt"
+        })
+        #expect(patchPerformance.trace.subprocesses.contains {
+            $0.kind == .typedAST && $0.failureCount == 0
+        })
+        #expect(patchPerformance.trace.counters.contains {
+            $0.name == "frontend.source_count" && $0.value == 1
+        })
+        #expect(patchPerformance.trace.artifacts.contains {
+            $0.relativePath == "Shell/ShellBuildReceipt.json" && $0.byteCount > 0
+        })
         let shell = buildDirectory.appendingPathComponent(
             "HelixGenerated/patch/Shell",
             isDirectory: true
@@ -576,6 +607,20 @@ struct Application {
             "--phase", "prepare",
         ])
         #expect(liveResult.exitCode == 0, Comment(rawValue: liveResult.standardError))
+        let livePerformance = try buildPerformanceReport(
+            at: buildDirectory.appendingPathComponent(
+                "HelixGenerated/live/BuildPerformance.prepare.json"
+            )
+        )
+        #expect(livePerformance.operation == .prepare)
+        #expect(livePerformance.workflow == .liveReload)
+        #expect(livePerformance.outcome == .success)
+        #expect(livePerformance.trace.counters.contains {
+            $0.name == "managed_debug.probe_attempt_count"
+        })
+        #expect(livePerformance.trace.subprocesses.contains {
+            $0.kind == .canonicalSIL && $0.invocationCount >= 2
+        })
         let liveShell = buildDirectory.appendingPathComponent(
             "HelixGenerated/live/Shell",
             isDirectory: true
@@ -629,6 +674,19 @@ struct Application {
             liveReceipt.nativeImportCandidates.flatMap(\.silMangledNames)
         )
         #expect(entrySymbols.isDisjoint(with: importedSymbols))
+    }
+
+    private func buildPerformanceReport(
+        at url: URL
+    ) throws -> BuildPerformance.Report {
+        let bytes = try Data(contentsOf: url)
+        let report = try JSONDecoder().decode(
+            BuildPerformance.Report.self,
+            from: bytes
+        )
+        try report.validate()
+        #expect(try Core.CanonicalJSON.encode(report) == bytes)
+        return report
     }
 
     private func temporaryDirectory() throws -> URL {

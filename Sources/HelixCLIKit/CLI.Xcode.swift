@@ -549,6 +549,34 @@ private func describeXcodeAudit(_ report: ReleaseLeakage.Report) -> String {
 private func buildXcodePatch(
     _ context: XcodeIntegration.BuildContext
 ) throws -> CLI.Result {
+    let performance = BuildPerformance.Recorder()
+    do {
+        let result = try performBuildXcodePatch(
+            context,
+            performance: performance
+        )
+        try writeXcodeBuildPerformance(
+            performance,
+            operation: .patch,
+            context: context,
+            outcome: .success
+        )
+        return result
+    } catch {
+        try? writeXcodeBuildPerformance(
+            performance,
+            operation: .patch,
+            context: context,
+            outcome: .failure
+        )
+        throw error
+    }
+}
+
+private func performBuildXcodePatch(
+    _ context: XcodeIntegration.BuildContext,
+    performance: BuildPerformance.Recorder
+) throws -> CLI.Result {
     guard context.profile.patch != nil else {
         throw CLI.Error.input(
             "Hot Patch profile \(context.profile.id) has no patch settings"
@@ -556,74 +584,90 @@ private func buildXcodePatch(
     }
     let patch: XcodeIntegration.PatchEnvironment
     do {
-        patch = try XcodeIntegration.EnvironmentResolver().resolvePatch(
-            context: context,
-            variables: environment
-        )
+        patch = try performance.measure("patch.resolve_environment") {
+            try XcodeIntegration.EnvironmentResolver().resolvePatch(
+                context: context,
+                variables: environment
+            )
+        }
     } catch let error as XcodeIntegration.EnvironmentError {
         throw CLI.Error.input(error.description)
     }
-    let (baseline, archive, audit, sourceMappings) = try loadXcodeReleaseBaseline(
-        context,
-        marketingVersion: patch.marketingVersion
-    )
-    let recipe: ReleasePipeline.QuickPatchRecipe = try CLI.JSONDocument.decode(
-        ReleasePipeline.QuickPatchRecipe.self,
-        from: readRegularFile(
-            patch.recipeURL,
-            maximumBytes: 1 * 1_024 * 1_024,
-            label: "quick-patch recipe"
-        ),
-        kind: .quickPatchRecipe
-    )
-    let certificate: PatchPackage.SigningCertificate = try CLI.JSONDocument.decode(
-        PatchPackage.SigningCertificate.self,
-        from: readRegularFile(
-            patch.signingCertificateURL,
-            maximumBytes: 1 * 1_024 * 1_024,
-            label: "signing certificate"
-        ),
-        kind: .signingCertificate
-    )
-    let trustedRoot: PatchPackage.TrustedRoot = try CLI.JSONDocument.decode(
-        PatchPackage.TrustedRoot.self,
-        from: readRegularFile(
-            patch.trustedRootURL,
-            maximumBytes: 1 * 1_024 * 1_024,
-            label: "trusted root"
-        ),
-        kind: .trustedRoot
-    )
-    let signingKey: ReleasePipeline.SigningKeyDocument = try CLI.JSONDocument.decode(
-        ReleasePipeline.SigningKeyDocument.self,
-        from: files.readPrivateKeyDocument(patch.privateKeyURL.path),
-        kind: .signingKey
-    )
+    let (baseline, archive, audit, sourceMappings) = try performance.measure(
+        "patch.load_release_baseline"
+    ) {
+        try loadXcodeReleaseBaseline(
+            context,
+            marketingVersion: patch.marketingVersion
+        )
+    }
+    let (recipe, certificate, trustedRoot, signingKey) = try performance.measure(
+        "patch.load_signing_inputs"
+    ) {
+        let recipe: ReleasePipeline.QuickPatchRecipe = try CLI.JSONDocument.decode(
+            ReleasePipeline.QuickPatchRecipe.self,
+            from: readRegularFile(
+                patch.recipeURL,
+                maximumBytes: 1 * 1_024 * 1_024,
+                label: "quick-patch recipe"
+            ),
+            kind: .quickPatchRecipe
+        )
+        let certificate: PatchPackage.SigningCertificate = try CLI.JSONDocument.decode(
+            PatchPackage.SigningCertificate.self,
+            from: readRegularFile(
+                patch.signingCertificateURL,
+                maximumBytes: 1 * 1_024 * 1_024,
+                label: "signing certificate"
+            ),
+            kind: .signingCertificate
+        )
+        let trustedRoot: PatchPackage.TrustedRoot = try CLI.JSONDocument.decode(
+            PatchPackage.TrustedRoot.self,
+            from: readRegularFile(
+                patch.trustedRootURL,
+                maximumBytes: 1 * 1_024 * 1_024,
+                label: "trusted root"
+            ),
+            kind: .trustedRoot
+        )
+        let signingKey: ReleasePipeline.SigningKeyDocument = try CLI.JSONDocument.decode(
+            ReleasePipeline.SigningKeyDocument.self,
+            from: files.readPrivateKeyDocument(patch.privateKeyURL.path),
+            kind: .signingKey
+        )
+        return (recipe, certificate, trustedRoot, signingKey)
+    }
     let now = Date().timeIntervalSince1970
     guard now > 0, now <= Double(Int64.max) else {
         throw CLI.Error.input("system clock cannot timestamp a patch")
     }
     let platform: PatchPackage.Platform = context.environment.sdkName == "iphoneos"
         ? .iOS : .iOSSimulator
-    let configuration = try recipe.resolve(
-        archive: archive,
-        certificate: certificate,
-        marketingVersion: patch.marketingVersion,
-        architecture: context.environment.architecture,
-        platform: platform,
-        nowUnixSeconds: Int64(now)
-    )
-    let artifact = try ReleasePipeline.Builder().build(
-        .init(
-            configuration: configuration,
+    let configuration = try performance.measure("patch.resolve_configuration") {
+        try recipe.resolve(
             archive: archive,
-            sourceMappings: sourceMappings,
-            compilerURL: context.environment.compilerURL,
             certificate: certificate,
-            signingKey: signingKey,
-            trustedRoot: trustedRoot
+            marketingVersion: patch.marketingVersion,
+            architecture: context.environment.architecture,
+            platform: platform,
+            nowUnixSeconds: Int64(now)
         )
-    )
+    }
+    let artifact = try performance.measure("patch.compile_sign_verify") {
+        try ReleasePipeline.Builder().build(
+            .init(
+                configuration: configuration,
+                archive: archive,
+                sourceMappings: sourceMappings,
+                compilerURL: context.environment.compilerURL,
+                certificate: certificate,
+                signingKey: signingKey,
+                trustedRoot: trustedRoot,
+                invocationObserver: performance.subprocessObserver
+            )
+        )
+    }
     guard !artifact.report.changedFunctions.isEmpty else {
         throw CLI.Error.input(
             "no eligible Swift function body changed from the finalized Shell"
@@ -633,15 +677,17 @@ private func buildXcodePatch(
         context.profile.id,
         isDirectory: true
     )
-    do {
-        try FileManager.default.createDirectory(
-            at: profileRoot,
-            withIntermediateDirectories: true
-        )
-    } catch {
-        throw CLI.Error.input(
-            "cannot create patch output root: \(error.localizedDescription)"
-        )
+    try performance.measure("patch.prepare_output") {
+        do {
+            try FileManager.default.createDirectory(
+                at: profileRoot,
+                withIntermediateDirectories: true
+            )
+        } catch {
+            throw CLI.Error.input(
+                "cannot create patch output root: \(error.localizedDescription)"
+            )
+        }
     }
     var profileInformation = Darwin.stat()
     let resolvedPatchRoot = patch.outputRootURL.resolvingSymlinksInPath()
@@ -653,7 +699,7 @@ private func buildXcodePatch(
         throw CLI.Error.input("patch profile output is not a contained directory")
     }
     let output = profileRoot.appendingPathComponent("Current", isDirectory: true)
-    try files.writeDirectory(
+    let outputArtifacts = try performance.measure("patch.encode_artifacts") {
         [
             "Patch.hlxp": artifact.packageBytes,
             "Patch.hlbc": artifact.compilation.bytecode,
@@ -664,18 +710,35 @@ private func buildXcodePatch(
             "ReleaseBaseline.json": try XcodeIntegration.ReleaseBaselineCodec.encode(
                 baseline
             ),
-        ],
-        to: output,
-        force: true
+        ]
+    }
+    try performance.measure("patch.publish_artifacts") {
+        try files.writeDirectory(
+            outputArtifacts,
+            to: output,
+            force: true
+        )
+    }
+    for (path, data) in outputArtifacts {
+        performance.recordArtifact(
+            relativePath: "Current/\(path)",
+            byteCount: UInt64(data.count)
+        )
+    }
+    performance.setCounter(
+        "patch.changed_function_count",
+        value: UInt64(artifact.report.changedFunctions.count)
     )
     let staged: URL?
     if context.environment.sdkName == "iphonesimulator",
        let inbox = patch.simulatorInboxPath {
-        staged = try PatchDelivery.SimulatorStager().stage(
-            packageURL: output.appendingPathComponent("Patch.hlxp"),
-            bundleID: context.profile.bundleIdentifier,
-            relativeInboxPath: inbox
-        )
+        staged = try performance.measure("patch.stage_simulator") {
+            try PatchDelivery.SimulatorStager().stage(
+                packageURL: output.appendingPathComponent("Patch.hlxp"),
+                bundleID: context.profile.bundleIdentifier,
+                relativeInboxPath: inbox
+            )
+        }
     } else {
         staged = nil
     }
@@ -803,27 +866,81 @@ private func finalizeXcodeShell(
     _ context: XcodeIntegration.BuildContext,
     product: XcodeIntegration.ProductEnvironment
 ) throws -> InterfaceArchive.Archive {
-    let executable = try readRegularFile(
-        product.executableURL,
-        maximumBytes: 2 * 1_024 * 1_024 * 1_024,
-        label: "linked application executable"
-    )
-    let provisional = try InterfaceArchive.Codec.decode(
-        readRegularFile(
+    let performance = BuildPerformance.Recorder()
+    do {
+        let archive = try performFinalizeXcodeShell(
+            context,
+            product: product,
+            performance: performance
+        )
+        try writeXcodeBuildPerformance(
+            performance,
+            operation: .finalize,
+            context: context,
+            outcome: .success
+        )
+        return archive
+    } catch {
+        try? writeXcodeBuildPerformance(
+            performance,
+            operation: .finalize,
+            context: context,
+            outcome: .failure
+        )
+        throw error
+    }
+}
+
+private func performFinalizeXcodeShell(
+    _ context: XcodeIntegration.BuildContext,
+    product: XcodeIntegration.ProductEnvironment,
+    performance: BuildPerformance.Recorder
+) throws -> InterfaceArchive.Archive {
+    let executable = try performance.measure("finalize.load_executable") {
+        try readRegularFile(
+            product.executableURL,
+            maximumBytes: 2 * 1_024 * 1_024 * 1_024,
+            label: "linked application executable"
+        )
+    }
+    let provisionalBytes = try performance.measure("finalize.load_archive") {
+        try readRegularFile(
             context.environment.shellOutputURL.appendingPathComponent(
                 "Shell.provisional.hlxi"
             ),
             maximumBytes: 64 * 1_024 * 1_024,
             label: "provisional HLXI"
         )
-    ).archive
-    let finalized = try ShellBuild.Finalizer().finalize(
-        provisionalArchive: provisional,
-        linkedExecutable: executable
+    }
+    let provisional = try performance.measure("finalize.decode_archive") {
+        try InterfaceArchive.Codec.decode(provisionalBytes).archive
+    }
+    let finalized = try performance.measure("finalize.bind_macho_identity") {
+        try ShellBuild.Finalizer().finalize(
+            provisionalArchive: provisional,
+            linkedExecutable: executable
+        )
+    }
+    let finalizedBytes = try performance.measure("finalize.encode_archive") {
+        try InterfaceArchive.Codec.encode(finalized)
+    }
+    try performance.measure("finalize.publish_archive") {
+        try files.write(
+            finalizedBytes,
+            to: context.environment.finalArchiveURL
+        )
+    }
+    performance.recordArtifact(
+        relativePath: "Shell.hlxi",
+        byteCount: UInt64(finalizedBytes.count)
     )
-    try files.write(
-        try InterfaceArchive.Codec.encode(finalized),
-        to: context.environment.finalArchiveURL
+    performance.setCounter(
+        "finalize.function_count",
+        value: UInt64(finalized.functions.count)
+    )
+    performance.setCounter(
+        "finalize.macho_uuid_count",
+        value: UInt64(finalized.metadata.machOUUIDs.count)
     )
     return finalized
 }
@@ -1094,11 +1211,41 @@ private func capturedXcodeFeature(
 private func prepareXcodeShell(
     _ context: XcodeIntegration.BuildContext
 ) async throws -> CLI.Result {
-    let manager = FileManager.default
-    guard manager.isExecutableFile(atPath: context.environment.compilerURL.path) else {
-        throw CLI.Error.input(
-            "Swift compiler is not executable: \(context.environment.compilerURL.path)"
+    let performance = BuildPerformance.Recorder()
+    do {
+        let result = try await performPrepareXcodeShell(
+            context,
+            performance: performance
         )
+        try writeXcodeBuildPerformance(
+            performance,
+            operation: .prepare,
+            context: context,
+            outcome: .success
+        )
+        return result
+    } catch {
+        try? writeXcodeBuildPerformance(
+            performance,
+            operation: .prepare,
+            context: context,
+            outcome: .failure
+        )
+        throw error
+    }
+}
+
+private func performPrepareXcodeShell(
+    _ context: XcodeIntegration.BuildContext,
+    performance: BuildPerformance.Recorder
+) async throws -> CLI.Result {
+    let manager = FileManager.default
+    try performance.measure("prepare.validate_environment") {
+        guard manager.isExecutableFile(atPath: context.environment.compilerURL.path) else {
+            throw CLI.Error.input(
+                "Swift compiler is not executable: \(context.environment.compilerURL.path)"
+            )
+        }
     }
     let configuration = PatchConfiguration.Document.automaticProjectPolicy(
         moduleName: context.feature.moduleName
@@ -1106,7 +1253,9 @@ private func prepareXcodeShell(
     guard let targetCaptureURL = context.environment.targetFrontendInvocationURL else {
         throw CLI.Error.input("Feature prepare phase has no target compiler capture path")
     }
-    let capture = try capturedXcodeFeature(context, at: targetCaptureURL)
+    let capture = try performance.measure("prepare.capture_frontend") {
+        try capturedXcodeFeature(context, at: targetCaptureURL)
+    }
     let minimumOS: Core.SemanticVersion
     do {
         minimumOS = try Core.SemanticVersion(
@@ -1125,33 +1274,39 @@ private func prepareXcodeShell(
         optimization: context.environment.optimization,
         semanticArguments: context.environment.semanticArguments
     )
-    let metadata = try ShellBuild.MetadataFactory().make(
-        .init(
-            bundleID: context.profile.bundleIdentifier,
-            buildNumber: context.environment.buildNumber,
-            namespaceSeed: context.profile.namespaceSeed,
-            minimumOS: minimumOS,
-            xcodeBuild: context.environment.xcodeBuild,
-            frontendInvocation: invocation
+    let metadata = try performance.measure("prepare.make_metadata") {
+        try ShellBuild.MetadataFactory().make(
+            .init(
+                bundleID: context.profile.bundleIdentifier,
+                buildNumber: context.environment.buildNumber,
+                namespaceSeed: context.profile.namespaceSeed,
+                minimumOS: minimumOS,
+                xcodeBuild: context.environment.xcodeBuild,
+                frontendInvocation: invocation
+            )
         )
-    )
-    let indexed = try FrontendReceipt.Adapter().generate(
-        .init(
-            metadata: metadata,
-            configuration: configuration,
-            sources: capture.frontendSources,
-            compilerURL: context.environment.compilerURL,
-            nativeImportCatalog: .empty,
-            callingSurfacePolicy: context.profile.workflow == .liveReload
-                ? .managedDebugModule
-                : .configured
+    }
+    let indexed = try performance.measure("prepare.frontend_receipt") {
+        try FrontendReceipt.Adapter().generate(
+            .init(
+                metadata: metadata,
+                configuration: configuration,
+                sources: capture.frontendSources,
+                compilerURL: context.environment.compilerURL,
+                nativeImportCatalog: .empty,
+                callingSurfacePolicy: context.profile.workflow == .liveReload
+                    ? .managedDebugModule
+                    : .configured
+            )
         )
-    )
+    }
+    performance.merge(indexed.performance)
     let hubReservation: XcodeIntegration.HubReservationDocument?
     let hubBinding: ShellBuild.HubBinding?
     if context.profile.workflow == .liveReload {
-        let reserved = try await xcodeHubControlClient()
-            .reserveAutomaticInvitation()
+        let reserved = try await performance.measure("prepare.reserve_hub") {
+            try await xcodeHubControlClient().reserveAutomaticInvitation()
+        }
         let document = try XcodeIntegration.HubReservationDocument(
             reservation: reserved.reservation,
             spkiSHA256: reserved.spkiSHA256
@@ -1165,24 +1320,29 @@ private func prepareXcodeShell(
         hubReservation = nil
         hubBinding = nil
     }
-    let materialized = try ShellBuild.Materializer().materialize(
-        receipt: indexed.receipt,
-        sourceMappings: capture.sourceMappings,
-        hubBinding: hubBinding
-    )
-    var artifacts = try materialized.artifacts()
-    artifacts["ReleaseMetadata.json"] = try Core.CanonicalJSON.encode(metadata)
-    artifacts["ShellBuildReceipt.json"] = try ShellBuildReceipt.Codec.encode(
-        indexed.receipt
-    )
-    artifacts["FrontendDiagnostics.json"] = try Core.CanonicalJSON.encode(
-        indexed.diagnostics
-    )
-    artifacts[XcodeIntegration.CompilerCapture.shellRelativeInvocationPath] =
-        capture.recordBytes
-    if let hubReservation {
-        artifacts[XcodeIntegration.HubReservationDocument.relativePath] =
-            try Core.CanonicalJSON.encode(hubReservation)
+    let materialized = try performance.measure("prepare.materialize_shell") {
+        try ShellBuild.Materializer().materialize(
+            receipt: indexed.receipt,
+            sourceMappings: capture.sourceMappings,
+            hubBinding: hubBinding
+        )
+    }
+    let artifacts = try performance.measure("prepare.encode_artifacts") {
+        var artifacts = try materialized.artifacts()
+        artifacts["ReleaseMetadata.json"] = try Core.CanonicalJSON.encode(metadata)
+        artifacts["ShellBuildReceipt.json"] = try ShellBuildReceipt.Codec.encode(
+            indexed.receipt
+        )
+        artifacts["FrontendDiagnostics.json"] = try Core.CanonicalJSON.encode(
+            indexed.diagnostics
+        )
+        artifacts[XcodeIntegration.CompilerCapture.shellRelativeInvocationPath] =
+            capture.recordBytes
+        if let hubReservation {
+            artifacts[XcodeIntegration.HubReservationDocument.relativePath] =
+                try Core.CanonicalJSON.encode(hubReservation)
+        }
+        return artifacts
     }
     do {
         try manager.createDirectory(
@@ -1194,15 +1354,31 @@ private func prepareXcodeShell(
             "cannot create Helix profile output: \(error.localizedDescription)"
         )
     }
-    try files.writeDirectory(
-        artifacts,
-        to: context.environment.shellOutputURL,
-        force: true,
-        privatePaths: Set([
-            XcodeIntegration.CompilerCapture.shellRelativeInvocationPath,
-        ] + (hubReservation == nil ? [] : [
-            XcodeIntegration.HubReservationDocument.relativePath,
-        ]))
+    try performance.measure("prepare.publish_artifacts") {
+        try files.writeDirectory(
+            artifacts,
+            to: context.environment.shellOutputURL,
+            force: true,
+            privatePaths: Set([
+                XcodeIntegration.CompilerCapture.shellRelativeInvocationPath,
+            ] + (hubReservation == nil ? [] : [
+                XcodeIntegration.HubReservationDocument.relativePath,
+            ]))
+        )
+    }
+    for (path, data) in artifacts {
+        performance.recordArtifact(
+            relativePath: "Shell/\(path)",
+            byteCount: UInt64(data.count)
+        )
+    }
+    performance.setCounter(
+        "prepare.eligible_function_count",
+        value: UInt64(materialized.report.eligibleFunctionCount)
+    )
+    performance.setCounter(
+        "prepare.rejected_function_count",
+        value: UInt64(materialized.report.rejectedFunctionCount)
     )
     return .init(
         exitCode: 0,
@@ -1210,6 +1386,29 @@ private func prepareXcodeShell(
             + "\(context.environment.shellOutputURL.path)\n"
             + "Functions: \(materialized.report.eligibleFunctionCount) eligible, "
             + "\(materialized.report.rejectedFunctionCount) rejected\n"
+    )
+}
+
+private func writeXcodeBuildPerformance(
+    _ recorder: BuildPerformance.Recorder,
+    operation: BuildPerformance.Operation,
+    context: XcodeIntegration.BuildContext,
+    outcome: BuildPerformance.Outcome
+) throws {
+    try FileManager.default.createDirectory(
+        at: context.environment.profileOutputURL,
+        withIntermediateDirectories: true
+    )
+    let report = try recorder.report(
+        operation: operation,
+        workflow: context.profile.workflow == .liveReload ? .liveReload : .hotPatch,
+        outcome: outcome
+    )
+    try files.write(
+        try Core.CanonicalJSON.encode(report),
+        to: context.environment.profileOutputURL.appendingPathComponent(
+            "BuildPerformance.\(operation.rawValue).json"
+        )
     )
 }
 
@@ -1221,19 +1420,55 @@ private func xcodeHubControlClient() throws -> any HubControl.ClientProtocol {
 private func compileXcodeBridge(
     _ context: XcodeIntegration.BuildContext
 ) throws -> CLI.Result {
+    let performance = BuildPerformance.Recorder()
+    do {
+        let result = try performCompileXcodeBridge(
+            context,
+            performance: performance
+        )
+        try writeXcodeBuildPerformance(
+            performance,
+            operation: .bridge,
+            context: context,
+            outcome: .success
+        )
+        return result
+    } catch {
+        try? writeXcodeBuildPerformance(
+            performance,
+            operation: .bridge,
+            context: context,
+            outcome: .failure
+        )
+        throw error
+    }
+}
+
+private func performCompileXcodeBridge(
+    _ context: XcodeIntegration.BuildContext,
+    performance: BuildPerformance.Recorder
+) throws -> CLI.Result {
     let reportURL = context.environment.shellOutputURL.appendingPathComponent(
         "ShellBuildReport.json"
     )
-    let reportBytes = try readRegularFile(
-        reportURL,
-        maximumBytes: 16 * 1_024 * 1_024,
-        label: "Shell build report"
-    )
+    let reportBytes = try performance.measure("bridge.load_report") {
+        try readRegularFile(
+            reportURL,
+            maximumBytes: 16 * 1_024 * 1_024,
+            label: "Shell build report"
+        )
+    }
     let report: ShellBuild.Report
     do {
-        report = try JSONDecoder().decode(ShellBuild.Report.self, from: reportBytes)
-        guard try Core.CanonicalJSON.encode(report) == reportBytes else {
-            throw CLI.Error.input("Shell build report is noncanonical")
+        report = try performance.measure("bridge.decode_report") {
+            let report = try JSONDecoder().decode(
+                ShellBuild.Report.self,
+                from: reportBytes
+            )
+            guard try Core.CanonicalJSON.encode(report) == reportBytes else {
+                throw CLI.Error.input("Shell build report is noncanonical")
+            }
+            return report
         }
     } catch let error as CLI.Error {
         throw error
@@ -1252,60 +1487,80 @@ private func compileXcodeBridge(
     }
     let shellRoot = context.environment.shellOutputURL.standardizedFileURL
         .resolvingSymlinksInPath()
-    let sourceURLs = try sourceArtifacts.map { artifact -> URL in
-        let source = context.environment.shellOutputURL
-            .appendingPathComponent(artifact.path).standardizedFileURL
-        let resolved = source.resolvingSymlinksInPath()
-        guard Self.contains(resolved, in: shellRoot) else {
-            throw CLI.Error.input("Bridge source escapes the Shell output: \(artifact.path)")
+    let sourceURLs = try performance.measure("bridge.validate_sources") {
+        try sourceArtifacts.map { artifact -> URL in
+            let source = context.environment.shellOutputURL
+                .appendingPathComponent(artifact.path).standardizedFileURL
+            let resolved = source.resolvingSymlinksInPath()
+            guard Self.contains(resolved, in: shellRoot) else {
+                throw CLI.Error.input(
+                    "Bridge source escapes the Shell output: \(artifact.path)"
+                )
+            }
+            let bytes = try readRegularFile(
+                resolved,
+                maximumBytes: 64 * 1_024 * 1_024,
+                label: "generated Bridge source"
+            )
+            guard UInt64(bytes.count) == artifact.byteCount,
+                  Core.Digest.sha256(bytes) == artifact.contentHash
+            else {
+                throw CLI.Error.input(
+                    "generated Bridge source drifted: \(artifact.path)"
+                )
+            }
+            return resolved
         }
-        let bytes = try readRegularFile(
-            resolved,
-            maximumBytes: 64 * 1_024 * 1_024,
-            label: "generated Bridge source"
-        )
-        guard UInt64(bytes.count) == artifact.byteCount,
-              Core.Digest.sha256(bytes) == artifact.contentHash
-        else {
-            throw CLI.Error.input("generated Bridge source drifted: \(artifact.path)")
-        }
-        return resolved
     }
-    let captured = try capturedXcodeFeature(context).analysisJob
+    performance.setCounter(
+        "bridge.generated_source_count",
+        value: UInt64(sourceArtifacts.count)
+    )
+    performance.setCounter(
+        "bridge.generated_source_bytes",
+        value: sourceArtifacts.reduce(0) { $0 + $1.byteCount }
+    )
+    let captured = try performance.measure("bridge.load_capture") {
+        try capturedXcodeFeature(context).analysisJob
+    }
     let moduleMapNames = ["HelixRuntimeSupport"]
-    let runtimeModuleMaps = try moduleMapNames.compactMap { name -> URL? in
-        let url = context.environment.generatedModuleMapDirectoryURL
-            .appendingPathComponent("\(name).modulemap")
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        _ = try readRegularFile(
-            url,
-            maximumBytes: 1 * 1_024 * 1_024,
-            label: "\(name) module map"
-        )
-        return url
+    let runtimeModuleMaps = try performance.measure("bridge.load_module_maps") {
+        try moduleMapNames.compactMap { name -> URL? in
+            let url = context.environment.generatedModuleMapDirectoryURL
+                .appendingPathComponent("\(name).modulemap")
+            guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+            _ = try readRegularFile(
+                url,
+                maximumBytes: 1 * 1_024 * 1_024,
+                label: "\(name) module map"
+            )
+            return url
+        }
     }
     let manager = FileManager.default
-    do {
-        try manager.createDirectory(
-            at: context.environment.bridgeOutputURL,
-            withIntermediateDirectories: true
-        )
-    } catch {
-        throw CLI.Error.input(
-            "cannot create hidden Bridge output: \(error.localizedDescription)"
-        )
-    }
-    let resolvedProfileOutput = context.environment.profileOutputURL
-        .resolvingSymlinksInPath()
-    let resolvedBridgeOutput = context.environment.bridgeOutputURL
-        .resolvingSymlinksInPath()
-    guard Self.contains(resolvedBridgeOutput, in: resolvedProfileOutput),
-          let bridgeAttributes = try? manager.attributesOfItem(
-              atPath: context.environment.bridgeOutputURL.path
-          ),
-          (bridgeAttributes[.type] as? FileAttributeType) == .typeDirectory
-    else {
-        throw CLI.Error.input("hidden Bridge output is not a safe directory")
+    try performance.measure("bridge.prepare_output") {
+        do {
+            try manager.createDirectory(
+                at: context.environment.bridgeOutputURL,
+                withIntermediateDirectories: true
+            )
+        } catch {
+            throw CLI.Error.input(
+                "cannot create hidden Bridge output: \(error.localizedDescription)"
+            )
+        }
+        let resolvedProfileOutput = context.environment.profileOutputURL
+            .resolvingSymlinksInPath()
+        let resolvedBridgeOutput = context.environment.bridgeOutputURL
+            .resolvingSymlinksInPath()
+        guard Self.contains(resolvedBridgeOutput, in: resolvedProfileOutput),
+              let bridgeAttributes = try? manager.attributesOfItem(
+                  atPath: context.environment.bridgeOutputURL.path
+              ),
+              (bridgeAttributes[.type] as? FileAttributeType) == .typeDirectory
+        else {
+            throw CLI.Error.input("hidden Bridge output is not a safe directory")
+        }
     }
     let temporary = context.environment.bridgeOutputURL.appendingPathComponent(
         ".HelixBridge.\(UUID().uuidString).o"
@@ -1324,30 +1579,34 @@ private func compileXcodeBridge(
     let moduleSuffix = Core.Digest.sha256(context.profile.id).hex.prefix(16)
     let plan: XcodeIntegration.BridgeCompilationPlan
     do {
-        plan = try XcodeIntegration.BridgeCompilationPlanner().plan(
-            compilerPath: captured.executable,
-            capturedArguments: captured.arguments,
-            expectedCompilerPath: context.environment.compilerURL.path,
-            expectedCapturedModuleName: context.feature.moduleName,
-            expectedTargetTriple: context.environment.targetTriple,
-            expectedSDKPath: context.environment.sdkRootURL.path,
-            expectedOptimization: context.environment.optimization,
-            additionalModuleSearchArguments:
-                context.environment.bridgeModuleSearchArguments,
-            clangModuleMapURLs: runtimeModuleMaps,
-            generatedSourceURLs: sourceURLs,
-            outputURL: temporary,
-            moduleName: "HelixBridge_\(moduleSuffix)"
-        )
+        plan = try performance.measure("bridge.plan_compilation") {
+            try XcodeIntegration.BridgeCompilationPlanner().plan(
+                compilerPath: captured.executable,
+                capturedArguments: captured.arguments,
+                expectedCompilerPath: context.environment.compilerURL.path,
+                expectedCapturedModuleName: context.feature.moduleName,
+                expectedTargetTriple: context.environment.targetTriple,
+                expectedSDKPath: context.environment.sdkRootURL.path,
+                expectedOptimization: context.environment.optimization,
+                additionalModuleSearchArguments:
+                    context.environment.bridgeModuleSearchArguments,
+                clangModuleMapURLs: runtimeModuleMaps,
+                generatedSourceURLs: sourceURLs,
+                outputURL: temporary,
+                moduleName: "HelixBridge_\(moduleSuffix)"
+            )
+        }
     } catch let error as XcodeIntegration.BridgeCompilationError {
         throw CLI.Error.input(error.description)
     }
-    let compilation = try ProcessExecution.Runner().run(
-        executable: plan.compilerURL,
-        arguments: plan.arguments,
-        environment: environment,
-        workingDirectory: context.environment.bridgeOutputURL
-    )
+    let compilation = try performance.measure("bridge.compile_swift") {
+        try ProcessExecution.Runner().run(
+            executable: plan.compilerURL,
+            arguments: plan.arguments,
+            environment: environment,
+            workingDirectory: context.environment.bridgeOutputURL
+        )
+    }
     guard compilation.status == 0 else {
         let diagnostics = String(compilation.standardError.prefix(512 * 1_024))
         throw CLI.Error.input(
@@ -1356,11 +1615,13 @@ private func compileXcodeBridge(
                 : diagnostics
         )
     }
-    try validateXcodeObject(
-        temporary,
-        context: context,
-        label: "hidden Bridge"
-    )
+    try performance.measure("bridge.validate_swift_object") {
+        try validateXcodeObject(
+            temporary,
+            context: context,
+            label: "hidden Bridge"
+        )
+    }
     let autostartSymbol = context.profile.workflow == .liveReload
         ? "hlx_dev_runtime_autostart_v1" : "hlx_runtime_autostart_v1"
     let constructor = """
@@ -1372,21 +1633,25 @@ private func compileXcodeBridge(
     }
 
     """
-    try Data(constructor.utf8).write(to: bootstrapSource, options: .atomic)
+    try performance.measure("bridge.write_bootstrap_source") {
+        try Data(constructor.utf8).write(to: bootstrapSource, options: .atomic)
+    }
     let clangURL = context.environment.compilerURL.deletingLastPathComponent()
         .appendingPathComponent("clang")
-    let bootstrapCompilation = try ProcessExecution.Runner().run(
-        executable: clangURL,
-        arguments: [
-            "-c", bootstrapSource.path,
-            "-o", bootstrapObject.path,
-            "-target", context.environment.targetTriple,
-            "-isysroot", context.environment.sdkRootURL.path,
-            "-fvisibility=hidden",
-        ],
-        environment: environment,
-        workingDirectory: context.environment.bridgeOutputURL
-    )
+    let bootstrapCompilation = try performance.measure("bridge.compile_bootstrap") {
+        try ProcessExecution.Runner().run(
+            executable: clangURL,
+            arguments: [
+                "-c", bootstrapSource.path,
+                "-o", bootstrapObject.path,
+                "-target", context.environment.targetTriple,
+                "-isysroot", context.environment.sdkRootURL.path,
+                "-fvisibility=hidden",
+            ],
+            environment: environment,
+            workingDirectory: context.environment.bridgeOutputURL
+        )
+    }
     guard bootstrapCompilation.status == 0 else {
         let diagnostics = String(
             bootstrapCompilation.standardError.prefix(512 * 1_024)
@@ -1397,25 +1662,41 @@ private func compileXcodeBridge(
                 : diagnostics
         )
     }
-    try validateXcodeObject(
-        bootstrapObject,
-        context: context,
-        label: "hidden bootstrap"
-    )
-    guard Darwin.rename(
-        bootstrapObject.path,
-        context.environment.bootstrapObjectURL.path
-    ) == 0 else {
-        throw CLI.Error.input(
-            "cannot atomically publish the hidden bootstrap object: "
-                + String(cString: strerror(errno))
+    try performance.measure("bridge.validate_bootstrap_object") {
+        try validateXcodeObject(
+            bootstrapObject,
+            context: context,
+            label: "hidden bootstrap"
         )
     }
-    guard Darwin.rename(temporary.path, context.environment.bridgeObjectURL.path) == 0 else {
-        throw CLI.Error.input(
-            "cannot atomically publish the hidden Bridge object: "
-                + String(cString: strerror(errno))
-        )
+    try performance.measure("bridge.publish_objects") {
+        guard Darwin.rename(
+            bootstrapObject.path,
+            context.environment.bootstrapObjectURL.path
+        ) == 0 else {
+            throw CLI.Error.input(
+                "cannot atomically publish the hidden bootstrap object: "
+                    + String(cString: strerror(errno))
+            )
+        }
+        guard Darwin.rename(
+            temporary.path,
+            context.environment.bridgeObjectURL.path
+        ) == 0 else {
+            throw CLI.Error.input(
+                "cannot atomically publish the hidden Bridge object: "
+                    + String(cString: strerror(errno))
+            )
+        }
+    }
+    for (name, url) in [
+        ("Bridge.o", context.environment.bridgeObjectURL),
+        ("Bootstrap.o", context.environment.bootstrapObjectURL),
+    ] {
+        if let attributes = try? manager.attributesOfItem(atPath: url.path),
+           let byteCount = (attributes[.size] as? NSNumber)?.uint64Value {
+            performance.recordArtifact(relativePath: name, byteCount: byteCount)
+        }
     }
     return .init(
         exitCode: 0,

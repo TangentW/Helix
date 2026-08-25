@@ -41,6 +41,7 @@ extension ReleaseCompiler {
         public var compilerURL: URL
         public var enforceToolchainFingerprint: Bool
         public var requestedResources: Core.ResourceLimits
+        public var invocationObserver: SwiftFrontend.InvocationObserver?
 
         public init(
             archive: InterfaceArchive.Archive,
@@ -48,7 +49,8 @@ extension ReleaseCompiler {
             selectedFunctionKeys: Set<Core.FunctionKey>? = nil,
             compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
             enforceToolchainFingerprint: Bool = true,
-            requestedResources: Core.ResourceLimits = .init()
+            requestedResources: Core.ResourceLimits = .init(),
+            invocationObserver: SwiftFrontend.InvocationObserver? = nil
         ) {
             self.init(
                 archive: archive,
@@ -56,7 +58,8 @@ extension ReleaseCompiler {
                 selectedFunctionKeys: selectedFunctionKeys,
                 compilerURL: compilerURL,
                 enforceToolchainFingerprint: enforceToolchainFingerprint,
-                requestedResources: requestedResources
+                requestedResources: requestedResources,
+                invocationObserver: invocationObserver
             )
         }
 
@@ -66,7 +69,8 @@ extension ReleaseCompiler {
             selectedFunctionKeys: Set<Core.FunctionKey>? = nil,
             compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
             enforceToolchainFingerprint: Bool = true,
-            requestedResources: Core.ResourceLimits = .init()
+            requestedResources: Core.ResourceLimits = .init(),
+            invocationObserver: SwiftFrontend.InvocationObserver? = nil
         ) {
             self.init(
                 archive: archive,
@@ -74,7 +78,8 @@ extension ReleaseCompiler {
                 selectedFunctionKeys: selectedFunctionKeys,
                 compilerURL: compilerURL,
                 enforceToolchainFingerprint: enforceToolchainFingerprint,
-                requestedResources: requestedResources
+                requestedResources: requestedResources,
+                invocationObserver: invocationObserver
             )
         }
 
@@ -84,7 +89,8 @@ extension ReleaseCompiler {
             selectedFunctionKeys: Set<Core.FunctionKey>? = nil,
             compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
             enforceToolchainFingerprint: Bool = true,
-            requestedResources: Core.ResourceLimits = .init()
+            requestedResources: Core.ResourceLimits = .init(),
+            invocationObserver: SwiftFrontend.InvocationObserver? = nil
         ) {
             self.archive = archive
             self.sources = sources
@@ -92,6 +98,7 @@ extension ReleaseCompiler {
             self.compilerURL = compilerURL
             self.enforceToolchainFingerprint = enforceToolchainFingerprint
             self.requestedResources = requestedResources
+            self.invocationObserver = invocationObserver
         }
     }
 
@@ -162,7 +169,8 @@ extension ReleaseCompiler {
 
         public func toolchainIdentity(
             compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
-            environment: [String: String] = ProcessInfo.processInfo.environment
+            environment: [String: String] = ProcessInfo.processInfo.environment,
+            invocationObserver: SwiftFrontend.InvocationObserver? = nil
         ) throws -> ToolchainIdentity {
             let requestedURL = compilerURL.resolvingSymlinksInPath()
             guard FileManager.default.isExecutableFile(atPath: requestedURL.path) else {
@@ -173,7 +181,8 @@ extension ReleaseCompiler {
             let identityEnvironment = toolchainIdentityEnvironment(environment)
             let requested = SwiftFrontend.Driver(
                 compilerURL: requestedURL,
-                environment: identityEnvironment
+                environment: identityEnvironment,
+                invocationObserver: invocationObserver
             )
             let requestedTarget = try requested.run(arguments: ["-print-target-info"])
             guard requestedTarget.terminationStatus == 0 else {
@@ -185,7 +194,8 @@ extension ReleaseCompiler {
             )
             let frontend = SwiftFrontend.Driver(
                 compilerURL: canonicalURL,
-                environment: identityEnvironment
+                environment: identityEnvironment,
+                invocationObserver: invocationObserver
             )
             let version = try frontend.run(arguments: ["-version"])
             guard version.terminationStatus == 0 else {
@@ -289,7 +299,10 @@ extension ReleaseCompiler {
                     throw DriverError.sourceDoesNotExist(source.path)
                 }
             }
-            let toolchain = try toolchainIdentity(compilerURL: request.compilerURL)
+            let toolchain = try toolchainIdentity(
+                compilerURL: request.compilerURL,
+                invocationObserver: request.invocationObserver
+            )
             if request.enforceToolchainFingerprint,
                request.archive.compatibility.compilerFingerprint != toolchain.fingerprint {
                 throw DriverError.toolchainMismatch(
@@ -314,7 +327,10 @@ extension ReleaseCompiler {
             guard modules.count == 1, let moduleName = modules.first else {
                 throw DriverError.mixedModules
             }
-            let canonicalSIL = try SwiftFrontend.Driver(compilerURL: request.compilerURL)
+            let canonicalSIL = try SwiftFrontend.Driver(
+                compilerURL: request.compilerURL,
+                invocationObserver: request.invocationObserver
+            )
                 .emitCanonicalSIL(
                     sourceFiles: orderedSourceFiles,
                     invocation: request.archive.metadata.frontendInvocation
@@ -506,7 +522,8 @@ extension ReleaseCompiler {
             // inline imported default generators even at -Onone, while patch
             // call-variant selection requires their source-level provenance.
             let loweringSIL = try SwiftFrontend.Driver(
-                compilerURL: request.compilerURL
+                compilerURL: request.compilerURL,
+                invocationObserver: request.invocationObserver
             ).emitCanonicalSIL(
                 sourceFiles: orderedSourceFiles,
                 invocation: request.archive.metadata.frontendInvocation,
