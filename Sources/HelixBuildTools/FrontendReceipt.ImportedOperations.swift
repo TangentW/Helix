@@ -35,6 +35,10 @@ extension FrontendReceipt.Adapter {
         var baseName: String
         var argumentLabels: [String]
         var parameterSwiftTypes: [String]
+        /// Compiler-observed parameter order of the imported declaration.
+        /// This includes values supplied by default generators even though
+        /// they do not cross the generated adapter boundary.
+        var physicalParameterSwiftTypes: [String]? = nil
         /// Exact Swift parameter spellings used inside the generated invoker
         /// when a compiler-proven foreign boundary has a narrower source type
         /// than its frozen logical ABI (currently Objective-C protocols erased
@@ -56,6 +60,7 @@ extension FrontendReceipt.Adapter {
         var argumentLabels: [String]
         var parameterSwiftTypes: [String]
         var invocationParameterSwiftTypes: [String]
+        var physicalParameterSwiftTypes: [String]
         var parameterProjection: InterfaceArchive.NativeImportParameterProjection
         var resultSwiftType: String
 
@@ -67,6 +72,8 @@ extension FrontendReceipt.Adapter {
             parameterSwiftTypes = operation.parameterSwiftTypes
             invocationParameterSwiftTypes = operation.invocationParameterSwiftTypes
                 ?? operation.parameterSwiftTypes
+            physicalParameterSwiftTypes = operation.physicalParameterSwiftTypes
+                ?? invocationParameterSwiftTypes
             parameterProjection = operation.parameterProjection
                 ?? .identity(parameterCount: operation.parameterSwiftTypes.count)
             resultSwiftType = operation.resultSwiftType
@@ -76,6 +83,7 @@ extension FrontendReceipt.Adapter {
     private struct ImportedOperationPhysicalABI: Hashable {
         var dispatch: NativeImportDiscovery.Dispatch
         var physicalParameterCount: UInt16
+        var physicalParameterSwiftTypes: [String]
         var resultSwiftType: String
         var requiresMainActor: Bool
         var mayThrow: Bool
@@ -86,6 +94,9 @@ extension FrontendReceipt.Adapter {
             physicalParameterCount = (operation.parameterProjection
                 ?? .identity(parameterCount: operation.parameterSwiftTypes.count))
                 .physicalParameterCount
+            physicalParameterSwiftTypes = operation.physicalParameterSwiftTypes
+                ?? operation.invocationParameterSwiftTypes
+                ?? operation.parameterSwiftTypes
             resultSwiftType = operation.resultSwiftType
             requiresMainActor = operation.requiresMainActor
             mayThrow = operation.mayThrow
@@ -97,6 +108,7 @@ extension FrontendReceipt.Adapter {
         var physical: ImportedOperationPhysicalABI
         var parameterSwiftTypes: [String]
         var invocationParameterSwiftTypes: [String]
+        var physicalParameterSwiftTypes: [String]
         var parameterProjection: InterfaceArchive.NativeImportParameterProjection
 
         init(_ operation: ImportedOperation) {
@@ -104,6 +116,8 @@ extension FrontendReceipt.Adapter {
             parameterSwiftTypes = operation.parameterSwiftTypes
             invocationParameterSwiftTypes = operation.invocationParameterSwiftTypes
                 ?? operation.parameterSwiftTypes
+            physicalParameterSwiftTypes = operation.physicalParameterSwiftTypes
+                ?? invocationParameterSwiftTypes
             parameterProjection = operation.parameterProjection
                 ?? .identity(parameterCount: operation.parameterSwiftTypes.count)
         }
@@ -335,6 +349,8 @@ extension FrontendReceipt.Adapter {
                 baseName: operation.baseName,
                 argumentLabels: operation.argumentLabels,
                 parameterSwiftTypes: generatedParameterTypes,
+                physicalParameterSwiftTypes:
+                    operation.physicalParameterSwiftTypes,
                 invocationParameterSwiftTypes: invocationParameterSwiftTypes,
                 parameterProjection: operation.parameterProjection
                     ?? .identity(parameterCount: parameterTypes.count),
@@ -504,6 +520,9 @@ extension FrontendReceipt.Adapter {
             lhs.parameterSwiftTypes.joined(separator: ","), lhs.resultSwiftType,
             (lhs.invocationParameterSwiftTypes ?? lhs.parameterSwiftTypes)
                 .joined(separator: ","),
+            (lhs.physicalParameterSwiftTypes
+                ?? lhs.invocationParameterSwiftTypes
+                ?? lhs.parameterSwiftTypes).joined(separator: ","),
             lhs.sourceFileLogicalID,
         ]
         let right = [
@@ -512,6 +531,9 @@ extension FrontendReceipt.Adapter {
             rhs.parameterSwiftTypes.joined(separator: ","), rhs.resultSwiftType,
             (rhs.invocationParameterSwiftTypes ?? rhs.parameterSwiftTypes)
                 .joined(separator: ","),
+            (rhs.physicalParameterSwiftTypes
+                ?? rhs.invocationParameterSwiftTypes
+                ?? rhs.parameterSwiftTypes).joined(separator: ","),
             rhs.sourceFileLogicalID,
         ]
         return left.lexicographicallyPrecedes(right)
@@ -1588,6 +1610,9 @@ extension FrontendReceipt.Adapter {
                 baseName: dispatch == .initializer ? "init" : baseName,
                 argumentLabels: argumentLabels,
                 parameterSwiftTypes: parameterTypes,
+                physicalParameterSwiftTypes: usesNSErrorBridge
+                    ? physicalParameterIndices.map { physicalParameters[$0] }
+                    : physicalParameters,
                 invocationParameterSwiftTypes: invocationParameterSwiftTypes,
                 parameterProjection: parameterProjection,
                 resultSwiftType: resultType,
@@ -3516,12 +3541,18 @@ extension FrontendReceipt.Adapter {
                        $0.argumentLabels.joined(separator: ":") + "|"
                            + $0.parameterSwiftTypes.joined(separator: ",") + "|"
                            + ($0.invocationParameterSwiftTypes
+                                ?? $0.parameterSwiftTypes).joined(separator: ",") + "|"
+                           + ($0.physicalParameterSwiftTypes
+                                ?? $0.invocationParameterSwiftTypes
                                 ?? $0.parameterSwiftTypes).joined(separator: ","),
                        $0.sourceFileLogicalID)
             let rhs = ($1.dispatch.rawValue, $1.ownerType, $1.baseName,
                        $1.argumentLabels.joined(separator: ":") + "|"
                            + $1.parameterSwiftTypes.joined(separator: ",") + "|"
                            + ($1.invocationParameterSwiftTypes
+                                ?? $1.parameterSwiftTypes).joined(separator: ",") + "|"
+                           + ($1.physicalParameterSwiftTypes
+                                ?? $1.invocationParameterSwiftTypes
                                 ?? $1.parameterSwiftTypes).joined(separator: ","),
                        $1.sourceFileLogicalID)
             return lhs < rhs
@@ -3543,6 +3574,13 @@ extension FrontendReceipt.Adapter {
         }
         result.invocationParameterSwiftTypes = operation
             .invocationParameterSwiftTypes?.map {
+                FrontendReceipt.SwiftTypeSpelling.replacingNominalAliases(
+                    in: $0,
+                    aliases: aliases
+                )
+            }
+        result.physicalParameterSwiftTypes = operation
+            .physicalParameterSwiftTypes?.map {
                 FrontendReceipt.SwiftTypeSpelling.replacingNominalAliases(
                     in: $0,
                     aliases: aliases

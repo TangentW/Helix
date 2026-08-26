@@ -83,7 +83,9 @@ public struct NativeImportExecutionPolicy: Codable, Hashable, Sendable {
     }
 }
 
-/// Security- and scheduling-relevant metadata frozen into every native import identity.
+/// Security and scheduling authority attached to one cataloged native call.
+/// API identity lives in `NativeCall.Descriptor`; policy deadlines and domains
+/// remain independently reviewable and do not perturb the stable call key.
 public struct NativeImportContract: Codable, Hashable, Sendable {
     public var kind: Core.NativeImportKind
     public var domain: Core.NativeImportDomain

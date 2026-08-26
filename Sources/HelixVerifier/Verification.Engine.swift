@@ -79,11 +79,13 @@ public struct Engine: Verification.ImageVerifying {
             policy: policy,
             capabilities: module.capabilities
         )
+        let nativeCallSites = nativeCallSites(in: module)
         let declaredImports = try verifyImports(
             module.imports,
             shell: shell,
             policy: policy,
-            capabilities: module.capabilities
+            capabilities: module.capabilities,
+            callSites: nativeCallSites
         )
         try verifyNativeTypes(module.functions, shell: shell)
         for definition in module.localTypes {
@@ -929,33 +931,52 @@ public struct Engine: Verification.ImageVerifying {
         _ imports: [Bytecode.ImportRequirement],
         shell: Verification.ShellInterface,
         policy: Core.RuntimePolicy,
-        capabilities: Set<Core.Capability>
+        capabilities: Set<Core.Capability>,
+        callSites: [Core.NativeImportID: Core.SourceLocation]
     ) throws -> [Core.NativeImportID: Bytecode.ImportRequirement] {
         if !imports.isEmpty, !capabilities.contains(.nativeImportsV1) {
             throw Verification.Error.capabilityDenied(.nativeImportsV1)
         }
         var seen = Set<Core.NativeImportID>()
+        var seenKeys = Set<Core.NativeCall.Key>()
         var result: [Core.NativeImportID: Bytecode.ImportRequirement] = [:]
         for requirement in imports {
-            guard seen.insert(requirement.id).inserted else {
-                throw Verification.Error.duplicateImport(requirement.id)
+            let context = Verification.NativeCallContext(
+                key: requirement.key,
+                location: callSites[requirement.id]
+            )
+            guard seen.insert(requirement.id).inserted,
+                  seenKeys.insert(requirement.key).inserted
+            else {
+                throw Verification.Error.duplicateNativeCall(context)
             }
-            guard policy.allowedNativeImports.contains(requirement.id) else {
-                throw Verification.Error.importDenied(requirement.id)
+            guard policy.allowedNativeCalls.contains(requirement.key) else {
+                throw Verification.Error.nativeCallDenied(context)
             }
             guard let descriptor = shell.imports[requirement.id] else {
-                throw Verification.Error.unknownImport(requirement.id)
+                throw Verification.Error.unknownNativeCall(context)
             }
             guard capabilities.contains(requirement.requiredCapability) else {
                 throw Verification.Error.capabilityDenied(requirement.requiredCapability)
             }
             guard descriptor.key == requirement.key,
-                  descriptor.signature == requirement.signature,
-                  descriptor.effects == requirement.effects,
+                  descriptor.descriptor == requirement.descriptor,
                   descriptor.contract == requirement.contract,
                   descriptor.capability == requirement.requiredCapability
             else {
-                throw Verification.Error.importDescriptorMismatch(requirement.id)
+                throw Verification.Error.nativeCallDescriptorMismatch(context)
+            }
+            do {
+                try requirement.descriptor.validate(contract: requirement.contract)
+                guard try Core.NativeCall.Key.derive(
+                    descriptor: requirement.descriptor
+                ) == requirement.key else {
+                    throw Core.NativeCall.DescriptorError.invalid(
+                        "stored key does not match the descriptor"
+                    )
+                }
+            } catch {
+                throw Verification.Error.nativeCallDescriptorMismatch(context)
             }
             if descriptor.effects.mayThrow,
                !capabilities.contains(.untypedThrowsV1),
@@ -973,9 +994,60 @@ public struct Engine: Verification.ImageVerifying {
                (descriptor.parameterTypes + [descriptor.resultType]).contains(where: {
                    usesMainActorNativeType($0, shell: shell)
                }) {
-                throw Verification.Error.importDescriptorMismatch(requirement.id)
+                throw Verification.Error.nativeCallDescriptorMismatch(context)
             }
             result[requirement.id] = requirement
+        }
+        return result
+    }
+
+    private func nativeCallSites(
+        in module: Bytecode.Module
+    ) -> [Core.NativeImportID: Core.SourceLocation] {
+        struct Coordinate: Hashable {
+            var function: Bytecode.FunctionID
+            var block: Bytecode.BlockID
+            var offset: UInt32
+        }
+        let locations = Dictionary(uniqueKeysWithValues: module.sourceMap.map {
+            (
+                Coordinate(
+                    function: $0.functionID,
+                    block: $0.blockID,
+                    offset: $0.instructionOffset
+                ),
+                $0.location
+            )
+        })
+        var result: [Core.NativeImportID: Core.SourceLocation] = [:]
+        for function in module.functions {
+            for block in function.blocks {
+                for (offset, instruction) in block.instructions.enumerated() {
+                    let id: Core.NativeImportID? = switch instruction {
+                    case let .nativeApply(_, id, _),
+                         let .nativeTryApply(id, _, _, _),
+                         let .makeClosure(_, .nativeImport(id), _, _):
+                        id
+                    default:
+                        nil
+                    }
+                    guard let id else { continue }
+                    let location = UInt32(exactly: offset).flatMap {
+                        locations[.init(
+                            function: function.id,
+                            block: block.id,
+                            offset: $0
+                        )]
+                    } ?? function.sourceLocation
+                    guard let location else { continue }
+                    if let existing = result[id],
+                       (existing.file, existing.line, existing.column)
+                        <= (location.file, location.line, location.column) {
+                        continue
+                    }
+                    result[id] = location
+                }
+            }
         }
         return result
     }

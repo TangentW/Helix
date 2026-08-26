@@ -35,32 +35,47 @@ public struct ResolvedEntry: Hashable, Sendable {
 
 public struct ResolvedNativeImport: Hashable, Sendable {
     public var id: Core.NativeImportID
-    public var key: Core.NativeImportKey
+    public var key: Core.NativeCall.Key
+    public var descriptor: Core.NativeCall.Descriptor
     public var parameterTypes: [Bytecode.ValueType]
     public var resultType: Bytecode.ValueType
-    public var signature: Core.LoweredSignature
-    public var effects: Core.Effects
-    public var contract: Core.NativeImportContract
+    public var contract: Core.NativeImportContract {
+        didSet {
+            descriptor.replaceCallbackLifetimes(contract.callbacks)
+        }
+    }
     public var capability: Core.Capability
 
     public init(
         id: Core.NativeImportID,
-        key: Core.NativeImportKey,
+        key: Core.NativeCall.Key,
+        descriptor: Core.NativeCall.Descriptor,
         parameterTypes: [Bytecode.ValueType],
         resultType: Bytecode.ValueType,
-        signature: Core.LoweredSignature,
-        effects: Core.Effects,
         contract: Core.NativeImportContract,
         capability: Core.Capability = .nativeImportsV1
     ) {
         self.id = id
         self.key = key
+        self.descriptor = descriptor
         self.parameterTypes = parameterTypes
         self.resultType = resultType
-        self.signature = signature
-        self.effects = effects
         self.contract = contract
         self.capability = capability
+    }
+
+    public var signature: Core.LoweredSignature {
+        get { descriptor.loweredSignature }
+        set {
+            descriptor.replaceLogicalSignature(
+                newValue,
+                callbacks: contract.callbacks
+            )
+        }
+    }
+    public var effects: Core.Effects {
+        get { descriptor.effects }
+        set { descriptor.effects = newValue }
     }
 
     public var parameterConventions: [Bytecode.ParameterConvention] {
@@ -162,6 +177,11 @@ public struct ShellInterface: Sendable {
 
     func validateBoundarySignatures() throws {
         try validateFrozenValueTypes()
+        guard Set(imports.values.map(\.key)).count == imports.count else {
+            throw Verification.Error.invalidShellInterface(
+                "native call keys must be unique across compact import slots"
+            )
+        }
         for index in entries.keys.sorted() {
             guard let entry = entries[index] else { continue }
             guard entry.parameterConventions.count
@@ -220,10 +240,17 @@ public struct ShellInterface: Sendable {
                 )
             }
             do {
-                try descriptor.contract.validate(effects: descriptor.effects)
+                try descriptor.descriptor.validate(contract: descriptor.contract)
+                guard try Core.NativeCall.Key.derive(
+                    descriptor: descriptor.descriptor
+                ) == descriptor.key else {
+                    throw Core.NativeCall.DescriptorError.invalid(
+                        "stored key does not match the descriptor"
+                    )
+                }
             } catch {
                 throw Verification.Error.invalidShellInterface(
-                    "native import \(descriptor.id) has an invalid contract: \(error)"
+                    "native call \(descriptor.key) has an invalid descriptor or contract: \(error)"
                 )
             }
             guard callbacks == callbacks.sorted(),

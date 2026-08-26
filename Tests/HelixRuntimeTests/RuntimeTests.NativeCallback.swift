@@ -302,8 +302,10 @@ struct NativeCallback {
         let exportContract: Core.NativeImportContract
         let observationContract: Core.NativeImportContract
         let exportSignature: Core.LoweredSignature
-        let exportKey: Core.NativeImportKey
-        let observationKey: Core.NativeImportKey
+        let exportDescriptor: Core.NativeCall.Descriptor
+        let observationDescriptor: Core.NativeCall.Descriptor
+        let exportKey: Core.NativeCall.Key
+        let observationKey: Core.NativeCall.Key
         let entryKey: Core.FunctionKey
         let callbackEntryKey: Core.FunctionKey
 
@@ -346,15 +348,16 @@ struct NativeCallback {
                 ],
                 result: "Swift.Void"
             )
-            exportKey = try Core.NativeImportKey.derive(
-                namespace: namespace,
+            exportDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
                 canonicalCallee: "Fixture.retainCallback(_:)",
                 signature: exportSignature,
                 effects: effects,
                 contract: exportContract
             )
-            observationKey = try Core.NativeImportKey.derive(
-                namespace: namespace,
+            exportKey = try Core.NativeCall.Key.derive(
+                descriptor: exportDescriptor
+            )
+            observationDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
                 canonicalCallee: "Fixture.observe(_:)",
                 signature: .init(
                     parameters: ["Swift.Int"],
@@ -362,6 +365,9 @@ struct NativeCallback {
                 ),
                 effects: effects,
                 contract: observationContract
+            )
+            observationKey = try Core.NativeCall.Key.derive(
+                descriptor: observationDescriptor
             )
             entryKey = try Core.FunctionKey.derive(
                 namespace: namespace,
@@ -632,10 +638,6 @@ struct NativeCallback {
                     effects: effects
                 )
             }
-            let observationSignature = Core.LoweredSignature(
-                parameters: ["Swift.Int"],
-                result: "Swift.Void"
-            )
             var capabilities: Set<Core.Capability> = [
                 .baselineV1, .nativeImportsV1, .closureValuesV1,
                 .escapingClosureValuesV1,
@@ -669,15 +671,13 @@ struct NativeCallback {
                     .init(
                         id: exportID,
                         key: exportKey,
-                        signature: exportSignature,
-                        effects: effects,
+                        descriptor: exportDescriptor,
                         contract: exportContract
                     ),
                     .init(
                         id: observationID,
                         key: observationKey,
-                        signature: observationSignature,
-                        effects: effects,
+                        descriptor: observationDescriptor,
                         contract: observationContract
                     ),
                 ]
@@ -708,19 +708,17 @@ struct NativeCallback {
                     .init(
                         id: exportID,
                         key: exportKey,
+                        descriptor: exportDescriptor,
                         parameterTypes: [.closure(boundarySignature)],
                         resultType: .void,
-                        signature: exportSignature,
-                        effects: effects,
                         contract: exportContract
                     ),
                     .init(
                         id: observationID,
                         key: observationKey,
+                        descriptor: observationDescriptor,
                         parameterTypes: [.int64],
                         resultType: .void,
-                        signature: observationSignature,
-                        effects: effects,
                         contract: observationContract
                     ),
                 ]
@@ -734,7 +732,7 @@ struct NativeCallback {
                     resourceCeiling: .init(
                         maxWallTimeMainThreadMilliseconds: 1_000
                     ),
-                    allowedNativeImports: [exportID, observationID]
+                    allowedNativeCalls: [exportKey, observationKey]
                 )
             )
             return try Runtime.Generation(

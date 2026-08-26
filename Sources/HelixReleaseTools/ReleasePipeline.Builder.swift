@@ -307,11 +307,13 @@ public struct Builder: Sendable {
         _ compilation: ReleaseCompiler.BuildResult,
         archive: InterfaceArchive.Archive
     ) throws {
-        let allowedImports = Set(archive.nativeImports.compactMap(\.id))
+        let allowedCalls = Set(
+            archive.nativeImports.filter(\.isEmittedToDevice).map(\.key)
+        )
         let policy = Core.RuntimePolicy(
             acceptedCapabilities: compilation.module.capabilities,
             resourceCeiling: compilation.module.requestedResources,
-            allowedNativeImports: allowedImports,
+            allowedNativeCalls: allowedCalls,
             allowMainActorEntries: compilation.module.capabilities.contains(.mainActorIsolationV1)
         )
         _ = try Verification.Engine().verify(

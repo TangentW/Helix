@@ -613,7 +613,7 @@ public final class Bootstrap: @unchecked Sendable {
         )
         let policy = options.runtimePolicy ?? Core.RuntimePolicy(
             acceptedCapabilities: shell.capabilities,
-            allowedNativeImports: Set(shell.imports.keys),
+            allowedNativeCalls: Set(shell.imports.values.map(\.key)),
             allowMainActorEntries: true,
             productionChannelEnabled: false
         )

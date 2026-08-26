@@ -40,7 +40,7 @@ struct UIKitIntegration {
 
         static func make(
             id: Core.NativeImportID,
-            key: Core.NativeImportKey
+            key: Core.NativeCall.Key
         ) -> any VM.NativeInvoker {
             VM.ClosureNativeInvoker(
                 id: id,

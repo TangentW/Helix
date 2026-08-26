@@ -69,8 +69,7 @@ enum DirectCalls {
             let requirement = Bytecode.ImportRequirement(
                 id: id,
                 key: item.key,
-                signature: item.signature,
-                effects: item.effects,
+                descriptor: item.descriptor,
                 contract: item.contract,
                 requiredCapability: item.capability
             )

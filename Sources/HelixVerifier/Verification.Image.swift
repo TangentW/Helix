@@ -5,6 +5,24 @@ import HelixCore
 #endif
 
 extension Verification {
+public struct NativeCallContext: Equatable, Sendable, CustomStringConvertible {
+    public var key: Core.NativeCall.Key
+    public var location: Core.SourceLocation?
+
+    public init(
+        key: Core.NativeCall.Key,
+        location: Core.SourceLocation? = nil
+    ) {
+        self.key = key
+        self.location = location
+    }
+
+    public var description: String {
+        let prefix = location.map { "\($0): " } ?? ""
+        return "\(prefix)native call \(key)"
+    }
+}
+
 public struct Image: Sendable {
     public let imageHash: Core.Digest
     public let module: Bytecode.Module
@@ -52,13 +70,13 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
     case capabilityUnavailableInShell(Core.Capability)
     case duplicateFunction(Bytecode.FunctionID)
     case duplicateEntry(Core.EntryIndex)
-    case duplicateImport(Core.NativeImportID)
+    case duplicateNativeCall(Verification.NativeCallContext)
     case unknownEntry(Core.EntryIndex)
     case entryKeyMismatch(Core.EntryIndex)
     case entrySignatureMismatch(Core.EntryIndex)
-    case unknownImport(Core.NativeImportID)
-    case importDescriptorMismatch(Core.NativeImportID)
-    case importDenied(Core.NativeImportID)
+    case unknownNativeCall(Verification.NativeCallContext)
+    case nativeCallDescriptorMismatch(Verification.NativeCallContext)
+    case nativeCallDenied(Verification.NativeCallContext)
     case unknownNativeType(Core.TypeID)
     case invalidModule(String)
     case invalidSourceMap(String)
@@ -79,13 +97,17 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
         case let .capabilityUnavailableInShell(capability): "Shell does not provide capability \(capability)"
         case let .duplicateFunction(id): "duplicate HLBC function \(id)"
         case let .duplicateEntry(index): "duplicate HLBC entry \(index)"
-        case let .duplicateImport(id): "duplicate HLBC native import \(id)"
+        case let .duplicateNativeCall(context):
+            "\(context) is declared more than once"
         case let .unknownEntry(index): "unknown Shell entry \(index)"
         case let .entryKeyMismatch(index): "function key mismatch for Shell entry \(index)"
         case let .entrySignatureMismatch(index): "signature mismatch for Shell entry \(index)"
-        case let .unknownImport(id): "unknown Shell native import \(id)"
-        case let .importDescriptorMismatch(id): "descriptor mismatch for native import \(id)"
-        case let .importDenied(id): "runtime policy denies native import \(id)"
+        case let .unknownNativeCall(context):
+            "\(context) is not published by this Shell"
+        case let .nativeCallDescriptorMismatch(context):
+            "\(context) does not match the Shell descriptor"
+        case let .nativeCallDenied(context):
+            "runtime policy denies \(context)"
         case let .unknownNativeType(type): "Shell does not provide native type \(type)"
         case let .invalidModule(reason): "invalid HLBC module: \(reason)"
         case let .invalidSourceMap(reason): "invalid HLBC source map: \(reason)"

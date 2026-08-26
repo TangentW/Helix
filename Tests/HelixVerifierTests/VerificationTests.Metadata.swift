@@ -25,9 +25,9 @@ struct Metadata {
             allowsMainThread: true,
             callbacks: [.init(parameterIndex: 0, lifetime: .escaping)]
         )
-        let descriptor = Verification.ResolvedNativeImport(
+        let descriptor = try nativeImport(
             id: .init(rawValue: 0),
-            key: .init(rawValue: .sha256("callback-import")),
+            canonicalCallee: "Fixture.Callbacks.install(_:)",
             parameterTypes: [.optional(.closure(callbackSignature))],
             resultType: .void,
             signature: .init(
@@ -50,7 +50,7 @@ struct Metadata {
                 .baselineV1, .nativeImportsV1, .closureValuesV1,
                 .escapingClosureValuesV1,
             ],
-            imports: [descriptor]
+            imports: [try refreshed(descriptor)]
         )
 
         var returning = descriptor
@@ -67,7 +67,7 @@ struct Metadata {
                 .baselineV1, .nativeImportsV1, .closureValuesV1,
                 .escapingClosureValuesV1,
             ],
-            imports: [returning]
+            imports: [try refreshed(returning)]
         )
 
         let nativeCallable = Bytecode.ClosureSignature(
@@ -95,7 +95,7 @@ struct Metadata {
                 .baselineV1, .nativeImportsV1, .closureValuesV1,
                 .escapingClosureValuesV1,
             ],
-            imports: [higherOrder]
+            imports: [try refreshed(higherOrder)]
         )
         #expect(throws: Verification.Error.self) {
             try Verification.ShellInterface(
@@ -104,7 +104,7 @@ struct Metadata {
                 capabilities: [
                     .baselineV1, .nativeImportsV1, .closureValuesV1,
                 ],
-                imports: [higherOrder]
+                imports: [try refreshed(higherOrder)]
             )
         }
 
@@ -125,7 +125,7 @@ struct Metadata {
                     .baselineV1, .nativeImportsV1, .closureValuesV1,
                     .escapingClosureValuesV1,
                 ],
-                imports: [returning]
+                imports: [try refreshed(returning)]
             )
         }
 
@@ -139,7 +139,7 @@ struct Metadata {
                     .baselineV1, .nativeImportsV1, .closureValuesV1,
                     .escapingClosureValuesV1,
                 ],
-                imports: [missingLifetime]
+                imports: [try refreshed(missingLifetime)]
             )
         }
 
@@ -155,7 +155,7 @@ struct Metadata {
                     .baselineV1, .nativeImportsV1, .closureValuesV1,
                     .escapingClosureValuesV1,
                 ],
-                imports: [illegalNonescapingOptional]
+                imports: [try refreshed(illegalNonescapingOptional)]
             )
         }
     }
@@ -174,9 +174,9 @@ struct Metadata {
             maximumDurationMicroseconds: 500,
             allowsMainThread: true
         )
-        var descriptor = Verification.ResolvedNativeImport(
+        var descriptor = try nativeImport(
             id: .init(rawValue: 0),
-            key: .init(rawValue: .sha256("callable-result-import")),
+            canonicalCallee: "Fixture.makeCallable()",
             parameterTypes: [],
             resultType: .closure(callable),
             signature: .init(
@@ -200,7 +200,7 @@ struct Metadata {
             interfaceHash: .sha256("callable-result-shell"),
             compatibility: compatibility,
             capabilities: capabilities,
-            imports: [descriptor]
+            imports: [try refreshed(descriptor)]
         )
 
         descriptor.resultType = .optional(.closure(callable))
@@ -209,7 +209,7 @@ struct Metadata {
             interfaceHash: .sha256("callable-result-shell"),
             compatibility: compatibility,
             capabilities: capabilities,
-            imports: [descriptor]
+            imports: [try refreshed(descriptor)]
         )
 
         for missing in [
@@ -221,7 +221,7 @@ struct Metadata {
                     interfaceHash: .sha256("callable-result-shell"),
                     compatibility: compatibility,
                     capabilities: capabilities.subtracting([missing]),
-                    imports: [descriptor]
+                    imports: [try refreshed(descriptor)]
                 )
             }
         }
@@ -235,14 +235,14 @@ struct Metadata {
                 interfaceHash: .sha256("callable-result-shell"),
                 compatibility: compatibility,
                 capabilities: capabilities,
-                imports: [descriptor]
+                imports: [try refreshed(descriptor)]
             )
         }
         _ = try Verification.ShellInterface(
             interfaceHash: .sha256("callable-result-shell"),
             compatibility: compatibility,
             capabilities: capabilities.union([.mainActorIsolationV1]),
-            imports: [descriptor]
+            imports: [try refreshed(descriptor)]
         )
 
         descriptor.parameterTypes = [.closure(mainActorCallable)]
@@ -259,14 +259,14 @@ struct Metadata {
                 interfaceHash: .sha256("callable-result-shell"),
                 compatibility: compatibility,
                 capabilities: capabilities,
-                imports: [descriptor]
+                imports: [try refreshed(descriptor)]
             )
         }
         _ = try Verification.ShellInterface(
             interfaceHash: .sha256("callable-result-shell"),
             compatibility: compatibility,
             capabilities: capabilities.union([.mainActorIsolationV1]),
-            imports: [descriptor]
+            imports: [try refreshed(descriptor)]
         )
 
         let recursive = Bytecode.ClosureSignature(
@@ -284,7 +284,7 @@ struct Metadata {
                 interfaceHash: .sha256("callable-result-shell"),
                 compatibility: compatibility,
                 capabilities: capabilities,
-                imports: [descriptor]
+                imports: [try refreshed(descriptor)]
             )
         }
     }
@@ -304,9 +304,9 @@ struct Metadata {
             allowsMainThread: true,
             callbacks: [.init(parameterIndex: 0, lifetime: .escaping)]
         )
-        let descriptor = Verification.ResolvedNativeImport(
+        let descriptor = try nativeImport(
             id: .init(rawValue: 0),
-            key: .init(rawValue: .sha256("error-callback-import")),
+            canonicalCallee: "Fixture.installErrorCallback(_:)",
             parameterTypes: [.closure(callback)],
             resultType: .void,
             signature: .init(
@@ -350,7 +350,7 @@ struct Metadata {
                 interfaceHash: .sha256("error-callback-shell"),
                 compatibility: compatibility,
                 capabilities: baseCapabilities.union([.structuredErrorsV1]),
-                imports: [ordinaryParameter]
+                imports: [try refreshed(ordinaryParameter)]
             )
         }
 
@@ -365,9 +365,63 @@ struct Metadata {
                 interfaceHash: .sha256("error-callback-shell"),
                 compatibility: compatibility,
                 capabilities: baseCapabilities.union([.structuredErrorsV1]),
-                imports: [ordinaryResult]
+                imports: [try refreshed(ordinaryResult)]
             )
         }
+    }
+
+    private func nativeImport(
+        id: Core.NativeImportID,
+        canonicalCallee: String,
+        parameterTypes: [Bytecode.ValueType],
+        resultType: Bytecode.ValueType,
+        signature: Core.LoweredSignature,
+        effects: Core.Effects,
+        contract: Core.NativeImportContract
+    ) throws -> Verification.ResolvedNativeImport {
+        let call = try Core.NativeCall.Descriptor.swiftAdapter(
+            canonicalCallee: canonicalCallee,
+            signature: signature,
+            effects: effects,
+            contract: contract
+        )
+        return .init(
+            id: id,
+            key: try Core.NativeCall.Key.derive(descriptor: call),
+            descriptor: call,
+            parameterTypes: parameterTypes,
+            resultType: resultType,
+            contract: contract
+        )
+    }
+
+    private func refreshed(
+        _ value: Verification.ResolvedNativeImport
+    ) throws -> Verification.ResolvedNativeImport {
+        var result = value
+        let nonescaping = Set(result.contract.callbacks.compactMap {
+            $0.lifetime == .nonescaping ? Int($0.parameterIndex) : nil
+        })
+        result.descriptor.physicalSignature.parameters = result.signature
+            .parameters.enumerated().map { index, type in
+                .init(
+                    type: .bridgeValue(type),
+                    ownership: nonescaping.contains(index) ? .borrowed : .owned,
+                    source: .argument(UInt16(index))
+                )
+            }
+        let resultSpelling = result.signature.result
+        result.descriptor.physicalSignature.result = [
+            "()", "Void", "Swift.Void",
+        ].contains(resultSpelling) ? .void : .bridgeValue(resultSpelling)
+        result.descriptor.physicalSignature.resultConvention = .direct
+        result.descriptor.physicalSignature.errorConvention = result.signature
+            .isThrowing ? .swiftThrows : .none
+        result.descriptor = try result.descriptor.canonicalized()
+        result.key = try Core.NativeCall.Key.derive(
+            descriptor: result.descriptor
+        )
+        return result
     }
 }
 }

@@ -1406,28 +1406,28 @@ struct Interpreter {
             parameters: ["Fixture.ClosurePoint"],
             result: "Swift.Int"
         )
-        let importKey = try Core.NativeImportKey.derive(
-            namespace: namespace(),
+        let callDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
             canonicalCallee: "Fixture.sumClosurePoint(_:)",
             signature: importSignature,
             effects: .init(),
             contract: vmPureImportContract
         )
+        let importKey = try Core.NativeCall.Key.derive(
+            descriptor: callDescriptor
+        )
         let importID = Core.NativeImportID(rawValue: 3)
         let requirement = Bytecode.ImportRequirement(
             id: importID,
             key: importKey,
-            signature: importSignature,
-            effects: .init(),
+            descriptor: callDescriptor,
             contract: vmPureImportContract
         )
         let descriptor = Verification.ResolvedNativeImport(
             id: importID,
             key: importKey,
+            descriptor: callDescriptor,
             parameterTypes: [.native(pointType)],
             resultType: .int64,
-            signature: importSignature,
-            effects: .init(),
             contract: vmPureImportContract
         )
         let closureSignature = Bytecode.ClosureSignature(
@@ -1495,7 +1495,7 @@ struct Interpreter {
                 policy: .init(
                     acceptedCapabilities: capabilities,
                     resourceCeiling: limits,
-                    allowedNativeImports: [importID]
+                    allowedNativeCalls: [importKey]
                 ),
                 signature: .init(
                     parameters: ["Fixture.ClosurePoint"],
@@ -1622,7 +1622,7 @@ struct Interpreter {
         #expect(!budget.sideEffectsCommitted)
     }
 
-    @Test("Native catalog identity must match the frozen NativeImportKey")
+    @Test("Native catalog identity must match the stable NativeCallKey")
     func rejectsWrongNativeImportIdentity() throws {
         let fixture = try makeNativeIncrementImage()
         let catalog = try VM.NativeCatalog([
@@ -1752,32 +1752,32 @@ struct Interpreter {
     @Test("Floating-point comparisons preserve unordered NaN semantics")
     func preservesNaNComparisonSemantics() throws {
         let signature = Core.LoweredSignature(parameters: [], result: "Swift.Double")
-        let importKey = try Core.NativeImportKey.derive(
-            namespace: namespace(),
+        let callDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
             canonicalCallee: "Fixture.nan()",
             signature: signature,
             effects: .init(),
             contract: vmPureImportContract
         )
+        let importKey = try Core.NativeCall.Key.derive(
+            descriptor: callDescriptor
+        )
         let requirement = Bytecode.ImportRequirement(
             id: .init(rawValue: 1),
             key: importKey,
-            signature: signature,
-            effects: .init(),
+            descriptor: callDescriptor,
             contract: vmPureImportContract
         )
         let descriptor = Verification.ResolvedNativeImport(
             id: .init(rawValue: 1),
             key: importKey,
+            descriptor: callDescriptor,
             parameterTypes: [],
             resultType: .float(bitWidth: 64),
-            signature: signature,
-            effects: .init(),
             contract: vmPureImportContract
         )
         let policy = Core.RuntimePolicy(
             acceptedCapabilities: [.baselineV1, .nativeImportsV1],
-            allowedNativeImports: [.init(rawValue: 1)]
+            allowedNativeCalls: [importKey]
         )
         let catalog = try VM.NativeCatalog([NaNInvoker(key: importKey)])
         for (predicate, expected) in [
@@ -1949,33 +1949,31 @@ struct Interpreter {
 
         let makeSignature = Core.LoweredSignature(parameters: [], result: "Fixture.Point")
         let sumSignature = Core.LoweredSignature(parameters: ["Fixture.Point"], result: "Swift.Int")
-        let makeKey = try Core.NativeImportKey.derive(
-            namespace: namespace(),
+        let makeDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
             canonicalCallee: "Fixture.makePoint()",
             signature: makeSignature,
             effects: .init(),
             contract: vmPureImportContract
         )
-        let sumKey = try Core.NativeImportKey.derive(
-            namespace: namespace(),
+        let makeKey = try Core.NativeCall.Key.derive(descriptor: makeDescriptor)
+        let sumDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
             canonicalCallee: "Fixture.sum(_:)",
             signature: sumSignature,
             effects: .init(),
             contract: vmPureImportContract
         )
+        let sumKey = try Core.NativeCall.Key.derive(descriptor: sumDescriptor)
         let requirements = [
             Bytecode.ImportRequirement(
                 id: .init(rawValue: 2),
                 key: makeKey,
-                signature: makeSignature,
-                effects: .init(),
+                descriptor: makeDescriptor,
                 contract: vmPureImportContract
             ),
             Bytecode.ImportRequirement(
                 id: .init(rawValue: 3),
                 key: sumKey,
-                signature: sumSignature,
-                effects: .init(),
+                descriptor: sumDescriptor,
                 contract: vmPureImportContract
             ),
         ]
@@ -1983,19 +1981,17 @@ struct Interpreter {
             Verification.ResolvedNativeImport(
                 id: .init(rawValue: 2),
                 key: makeKey,
+                descriptor: makeDescriptor,
                 parameterTypes: [],
                 resultType: .native(pointType),
-                signature: makeSignature,
-                effects: .init(),
                 contract: vmPureImportContract
             ),
             Verification.ResolvedNativeImport(
                 id: .init(rawValue: 3),
                 key: sumKey,
+                descriptor: sumDescriptor,
                 parameterTypes: [.native(pointType)],
                 resultType: .int64,
-                signature: sumSignature,
-                effects: .init(),
                 contract: vmPureImportContract
             ),
         ]
@@ -2043,7 +2039,7 @@ struct Interpreter {
                 policy: .init(
                     acceptedCapabilities: capabilities,
                     resourceCeiling: limits,
-                    allowedNativeImports: [.init(rawValue: 2), .init(rawValue: 3)]
+                    allowedNativeCalls: [makeKey, sumKey]
                 ),
                 signature: .init(parameters: [], result: "Swift.Int"),
                 parameterTypes: [],
@@ -3414,27 +3410,25 @@ struct Interpreter {
             isThrowing: true
         )
         let effects = Core.Effects(mayThrow: true)
-        let key = try Core.NativeImportKey.derive(
-            namespace: namespace(),
+        let callDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
             canonicalCallee: "Fixture.mayFail(_:)",
             signature: signature,
             effects: effects,
             contract: vmPureImportContract
         )
+        let key = try Core.NativeCall.Key.derive(descriptor: callDescriptor)
         let requirement = Bytecode.ImportRequirement(
             id: .init(rawValue: 2),
             key: key,
-            signature: signature,
-            effects: effects,
+            descriptor: callDescriptor,
             contract: vmPureImportContract
         )
         let descriptor = Verification.ResolvedNativeImport(
             id: .init(rawValue: 2),
             key: key,
+            descriptor: callDescriptor,
             parameterTypes: [.bool],
             resultType: .int64,
-            signature: signature,
-            effects: effects,
             contract: vmPureImportContract
         )
         let function = Bytecode.Function(
@@ -3483,7 +3477,7 @@ struct Interpreter {
             shellImports: [descriptor],
             policy: .init(
                 acceptedCapabilities: capabilities,
-                allowedNativeImports: [.init(rawValue: 2)]
+                allowedNativeCalls: [key]
             ),
             signature: .init(parameters: ["Swift.Bool"], result: "Swift.Int"),
             parameterTypes: [.bool],
@@ -3571,7 +3565,7 @@ struct Interpreter {
             shellImports: [descriptor],
             policy: .init(
                 acceptedCapabilities: closureCapabilities,
-                allowedNativeImports: [.init(rawValue: 2)]
+                allowedNativeCalls: [key]
             ),
             signature: .init(
                 parameters: ["Swift.Bool"],
@@ -7078,14 +7072,14 @@ struct Interpreter {
 
     private struct MakePointInvoker: VM.NativeInvoker {
         let id = Core.NativeImportID(rawValue: 2)
-        let key: Core.NativeImportKey
+        let key: Core.NativeCall.Key
         let parameterTypes: [Bytecode.ValueType] = []
         let resultType: Bytecode.ValueType
         let effects = Core.Effects()
         let contract = vmPureImportContract
         let operations: VM.NativeTypeOperations
 
-        init(key: Core.NativeImportKey, operations: VM.NativeTypeOperations) {
+        init(key: Core.NativeCall.Key, operations: VM.NativeTypeOperations) {
             self.key = key
             self.operations = operations
             resultType = .native(operations.id)
@@ -7101,13 +7095,13 @@ struct Interpreter {
 
     private struct SumPointInvoker: VM.NativeInvoker {
         let id = Core.NativeImportID(rawValue: 3)
-        let key: Core.NativeImportKey
+        let key: Core.NativeCall.Key
         let parameterTypes: [Bytecode.ValueType]
         let resultType: Bytecode.ValueType = .int64
         let effects = Core.Effects()
         let contract = vmPureImportContract
 
-        init(key: Core.NativeImportKey, typeID: Core.TypeID) {
+        init(key: Core.NativeCall.Key, typeID: Core.TypeID) {
             self.key = key
             parameterTypes = [.native(typeID)]
         }
@@ -7127,7 +7121,7 @@ struct Interpreter {
 
     private struct IncrementInvoker: VM.NativeInvoker {
         let id = Core.NativeImportID(rawValue: 0)
-        let key: Core.NativeImportKey
+        let key: Core.NativeCall.Key
         let parameterTypes: [Bytecode.ValueType] = [.int64]
         let resultType: Bytecode.ValueType = .int64
         let effects = Core.Effects(hasExternalSideEffects: true)
@@ -7144,7 +7138,7 @@ struct Interpreter {
 
     private struct MisdeclaredIncrementInvoker: VM.NativeInvoker {
         let id = Core.NativeImportID(rawValue: 0)
-        let key: Core.NativeImportKey
+        let key: Core.NativeCall.Key
         let parameterTypes: [Bytecode.ValueType] = [.int64]
         let resultType: Bytecode.ValueType = .int64
         let effects = Core.Effects()
@@ -7166,7 +7160,7 @@ struct Interpreter {
         )
 
         let id = Core.NativeImportID(rawValue: 0)
-        let key: Core.NativeImportKey
+        let key: Core.NativeCall.Key
         let parameterTypes: [Bytecode.ValueType] = []
         let resultType: Bytecode.ValueType = .closure(Self.signature)
         let effects = Core.Effects()
@@ -7205,7 +7199,7 @@ struct Interpreter {
 
     private struct ImageCallableFactoryInvoker: VM.NativeInvoker {
         let id = Core.NativeImportID(rawValue: 0)
-        let key: Core.NativeImportKey
+        let key: Core.NativeCall.Key
         let parameterTypes: [Bytecode.ValueType] = []
         let resultType: Bytecode.ValueType = .closure(
             CallableFactoryInvoker.signature
@@ -7231,7 +7225,7 @@ struct Interpreter {
 
     private struct NaNInvoker: VM.NativeInvoker {
         let id = Core.NativeImportID(rawValue: 1)
-        let key: Core.NativeImportKey
+        let key: Core.NativeCall.Key
         let parameterTypes: [Bytecode.ValueType] = []
         let resultType: Bytecode.ValueType = .float(bitWidth: 64)
         let effects = Core.Effects()
@@ -7247,7 +7241,7 @@ struct Interpreter {
 
     private struct ThrowingInvoker: VM.NativeInvoker {
         let id = Core.NativeImportID(rawValue: 2)
-        let key: Core.NativeImportKey
+        let key: Core.NativeCall.Key
         let parameterTypes: [Bytecode.ValueType] = [.bool]
         let resultType: Bytecode.ValueType = .int64
         let effects = Core.Effects(mayThrow: true)
@@ -7346,27 +7340,27 @@ struct Interpreter {
     ) throws -> Verification.Image {
         let signature = Core.LoweredSignature(parameters: ["Swift.Int"], result: "Swift.Int")
         let effects = Core.Effects(hasExternalSideEffects: true)
-        let importKey = try Core.NativeImportKey.derive(
-            namespace: namespace(),
+        let callDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
             canonicalCallee: "Fixture.increment(_:)",
             signature: signature,
             effects: effects,
             contract: vmWriteImportContract
         )
+        let importKey = try Core.NativeCall.Key.derive(
+            descriptor: callDescriptor
+        )
         let requirement = Bytecode.ImportRequirement(
             id: .init(rawValue: 0),
             key: importKey,
-            signature: signature,
-            effects: effects,
+            descriptor: callDescriptor,
             contract: vmWriteImportContract
         )
         let descriptor = Verification.ResolvedNativeImport(
             id: .init(rawValue: 0),
             key: importKey,
+            descriptor: callDescriptor,
             parameterTypes: [.int64],
             resultType: .int64,
-            signature: signature,
-            effects: effects,
             contract: vmWriteImportContract
         )
         let function: Bytecode.Function
@@ -7445,7 +7439,7 @@ struct Interpreter {
             shellImports: [descriptor],
             policy: .init(
                 acceptedCapabilities: capabilities,
-                allowedNativeImports: [.init(rawValue: 0)]
+                allowedNativeCalls: [importKey]
             )
         )
     }
@@ -7460,27 +7454,27 @@ struct Interpreter {
             parameters: [],
             result: "(Swift.Int) -> Swift.Int"
         )
-        let importKey = try Core.NativeImportKey.derive(
-            namespace: namespace(),
+        let callDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
             canonicalCallee: "Fixture.makeIncrementer()",
             signature: importSignature,
             effects: .init(),
             contract: vmPureImportContract
         )
+        let importKey = try Core.NativeCall.Key.derive(
+            descriptor: callDescriptor
+        )
         let requirement = Bytecode.ImportRequirement(
             id: .init(rawValue: 0),
             key: importKey,
-            signature: importSignature,
-            effects: .init(),
+            descriptor: callDescriptor,
             contract: vmPureImportContract
         )
         let descriptor = Verification.ResolvedNativeImport(
             id: .init(rawValue: 0),
             key: importKey,
+            descriptor: callDescriptor,
             parameterTypes: [],
             resultType: .closure(callable),
-            signature: importSignature,
-            effects: .init(),
             contract: vmPureImportContract
         )
         let registerTypes: [Bytecode.ValueType]
@@ -7560,7 +7554,7 @@ struct Interpreter {
             shellImports: [descriptor],
             policy: .init(
                 acceptedCapabilities: capabilities,
-                allowedNativeImports: [.init(rawValue: 0)],
+                allowedNativeCalls: [importKey],
                 allowMainActorEntries: restrictToMainActor
             ),
             signature: .init(parameters: [], result: "Swift.Int"),

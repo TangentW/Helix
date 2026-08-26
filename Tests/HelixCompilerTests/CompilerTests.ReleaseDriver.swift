@@ -17,7 +17,7 @@ struct ReleaseDriver {
 
     private struct IncrementInvoker: VM.NativeInvoker {
         let id: Core.NativeImportID
-        let key: Core.NativeImportKey
+        let key: Core.NativeCall.Key
         let effects: Core.Effects
         let contract: Core.NativeImportContract
         let parameterTypes: [Bytecode.ValueType] = [.int64]
@@ -1098,7 +1098,7 @@ struct ReleaseDriver {
         #expect(result.disassembly.contains("native_apply #\(importID.rawValue)"))
         let policy = Core.RuntimePolicy(
             acceptedCapabilities: Set(archive.capabilities),
-            allowedNativeImports: [importID]
+            allowedNativeCalls: [nativeImport.key]
         )
         let image = try Verification.Engine().verify(
             bytes: result.bytecode,
@@ -1194,7 +1194,7 @@ struct ReleaseDriver {
         #expect(result.disassembly.contains("closure_apply"))
         let policy = Core.RuntimePolicy(
             acceptedCapabilities: Set(archive.capabilities),
-            allowedNativeImports: [importID]
+            allowedNativeCalls: [nativeImport.key]
         )
         let image = try Verification.Engine().verify(
             bytes: result.bytecode,
@@ -3503,23 +3503,21 @@ struct ReleaseDriver {
                 maximumDurationMicroseconds: 1_000,
                 allowsMainThread: true
             )
-            let key = try Core.NativeImportKey.derive(
-                namespace: namespace,
+            let descriptor = try Core.NativeCall.Descriptor.swiftAdapter(
                 canonicalCallee: helperCallee,
                 signature: resolvedHelperSignature,
                 effects: resolvedHelperEffects,
                 contract: contract
             )
+            let key = try Core.NativeCall.Key.derive(descriptor: descriptor)
             nativeImports.append(
                 .init(
                     id: nil,
                     key: key,
-                    canonicalCallee: helperCallee,
+                    descriptor: descriptor,
                     silMangledNames: [helper.mangledName],
                     parameterTypes: helperParameterTypes,
                     resultType: helperResultType,
-                    signature: resolvedHelperSignature,
-                    effects: resolvedHelperEffects,
                     contract: contract,
                     isEmittedToDevice: true
                 )

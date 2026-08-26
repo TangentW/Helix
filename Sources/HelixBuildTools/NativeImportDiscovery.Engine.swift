@@ -34,6 +34,7 @@ extension NativeImportDiscovery {
         var baseName: String
         var argumentLabels: [String]
         var parameterSwiftTypes: [String]
+        var physicalParameterSwiftTypes: [String]? = nil
         var invocationParameterSwiftTypes: [String]? = nil
         var parameterProjection: InterfaceArchive.NativeImportParameterProjection
         var resultSwiftType: String
@@ -158,27 +159,42 @@ extension NativeImportDiscovery {
                     )
                 }
                 try contract.validate(effects: effects)
-                let key = try Core.NativeImportKey.derive(
-                    namespace: metadata.shellNamespaceID,
+                let physicalSources = try physicalArgumentSources(
+                    projection: declaration.parameterProjection,
+                    logicalParameterCount: declaration.signature.parameters.count
+                )
+                let callDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
                     canonicalCallee: declaration.canonicalCallee,
                     signature: declaration.signature,
                     effects: effects,
-                    contract: contract
+                    contract: contract,
+                    argumentLabels: declaration.argumentLabels,
+                    physicalParameterTypes:
+                        declaration.physicalParameterSwiftTypes
+                            ?? declaration.invocationParameterSwiftTypes
+                            ?? declaration.parameterSwiftTypes,
+                    physicalArgumentSources: physicalSources,
+                    receiverArgumentIndex: isInstanceDispatch(
+                        declaration.dispatch
+                    ) ? declaration.signature.parameters.indices.last.flatMap {
+                        UInt16(exactly: $0)
+                    } : nil
+                )
+                let key = try Core.NativeCall.Key.derive(
+                    descriptor: callDescriptor
                 )
                 candidates.append(
                     .init(
                         record: .init(
                             id: nil,
                             key: key,
-                            canonicalCallee: declaration.canonicalCallee,
+                            descriptor: callDescriptor,
                             silMangledNames: declaration.silSymbols.isEmpty
                                 ? [declaration.mangledName]
                                 : declaration.silSymbols,
                             parameterTypes: declaration.parameterTypes,
                             parameterProjection: declaration.parameterProjection,
                             resultType: declaration.resultType,
-                            signature: declaration.signature,
-                            effects: effects,
                             contract: contract,
                             capability: .nativeImportsV1,
                             isEmittedToDevice: true,
@@ -209,6 +225,50 @@ extension NativeImportDiscovery {
                 candidates: candidates.sorted { $0.record.key.rawValue < $1.record.key.rawValue },
                 diagnostics: diagnostics.sorted(by: diagnosticOrder)
             )
+        }
+
+        private func physicalArgumentSources(
+            projection: InterfaceArchive.NativeImportParameterProjection,
+            logicalParameterCount: Int
+        ) throws -> [Core.NativeCall.ArgumentSource] {
+            guard projection.isValid(
+                logicalParameterCount: logicalParameterCount
+            ) else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "source NativeImport has an invalid physical parameter projection"
+                )
+            }
+            let logicalByPhysical = Dictionary(uniqueKeysWithValues:
+                projection.logicalParameterIndices.enumerated().map {
+                    (physical: $0.element, logical: UInt16($0.offset))
+                }
+            )
+            let defaultByPhysical = Dictionary(uniqueKeysWithValues:
+                projection.defaultArguments.map {
+                    ($0.physicalParameterIndex, $0)
+                }
+            )
+            return try (0..<projection.physicalParameterCount).map { index in
+                if let logical = logicalByPhysical[index] {
+                    return .argument(logical)
+                }
+                guard let defaultArgument = defaultByPhysical[index] else {
+                    throw FrontendReceipt.Error.invalidRequest(
+                        "source NativeImport has an incomplete default-argument projection"
+                    )
+                }
+                switch defaultArgument.origin {
+                case .externalGenerator:
+                    guard let symbol = defaultArgument.generatorSymbol else {
+                        throw FrontendReceipt.Error.invalidRequest(
+                            "source NativeImport default generator has no symbol"
+                        )
+                    }
+                    return .defaultGenerator(symbol)
+                case .optionalNone:
+                    return .optionalNone
+                }
+            }
         }
 
         private func boundedDuration(

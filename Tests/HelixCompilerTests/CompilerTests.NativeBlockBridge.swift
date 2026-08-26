@@ -394,18 +394,28 @@ struct NativeBlockBridge {
     func projectsNativeBlockOptionalNoneDefault() throws {
         let symbol = "$s7Fixture7presentyySbcSgF"
         let importID = Core.NativeImportID(rawValue: 0)
-        let requirement = Bytecode.ImportRequirement(
-            id: importID,
-            key: .init(rawValue: .sha256("native-block-none-default")),
+        let contract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        let descriptor = try Core.NativeCall.Descriptor.swiftAdapter(
+            canonicalCallee: "Fixture.present(_:)",
             signature: .init(parameters: [], result: "Swift.Void"),
             effects: .init(),
-            contract: .bounded(
-                kind: .globalFunction,
-                domain: .application,
-                access: .pure,
-                maximumDurationMicroseconds: 500,
-                allowsMainThread: true
-            )
+            contract: contract,
+            physicalParameterTypes: [
+                "Swift.Optional<(Swift.Bool) -> Swift.Void>",
+            ],
+            physicalArgumentSources: [.optionalNone]
+        )
+        let requirement = Bytecode.ImportRequirement(
+            id: importID,
+            key: try .derive(descriptor: descriptor),
+            descriptor: descriptor,
+            contract: contract
         )
         let calls = try CanonicalSIL.DirectCallTable([
             .init(
@@ -761,17 +771,14 @@ struct NativeBlockBridge {
             parameters: ["() -> Swift.Void"],
             result: "Swift.Void"
         )
-        let key = try Core.NativeImportKey.derive(
-            namespace: .derive(
-                bundleID: "dev.helix.callback-physical-ownership",
-                buildNumber: "1",
-                seed: "fixture"
-            ),
+        var descriptor = try Core.NativeCall.Descriptor.swiftAdapter(
             canonicalCallee: "Fixture.invokeNow(_:)",
             signature: loweredSignature,
             effects: effects,
             contract: contract
         )
+        descriptor.physicalSignature.parameters[0].ownership = .borrowed
+        let key = try Core.NativeCall.Key.derive(descriptor: descriptor)
         let symbol = "$s7Fixture9invokeNowyyyyXEF"
         let calls = try CanonicalSIL.DirectCallTable([
             .init(
@@ -782,8 +789,7 @@ struct NativeBlockBridge {
                 target: .nativeImport(.init(
                     id: .init(rawValue: 0),
                     key: key,
-                    signature: loweredSignature,
-                    effects: effects,
+                    descriptor: descriptor,
                     contract: contract
                 ))
             ),
@@ -838,26 +844,37 @@ struct NativeBlockBridge {
                 .init(parameterIndex: 1, lifetime: .escaping),
             ]
         )
-        let lowered = Core.LoweredSignature(
-            parameters: ["() -> Swift.Void"],
-            result: "Swift.Void"
-        )
-        let key = try Core.NativeImportKey.derive(
-            namespace: .derive(
-                bundleID: "dev.helix.callback-table",
-                buildNumber: "1",
-                seed: "fixture"
+        let malformedDescriptor = try Core.NativeCall.Descriptor(
+            target: .init(
+                backend: .swiftAdapter,
+                module: "Fixture",
+                member: "run(_:)",
+                entryPoint: "Fixture.run(_:)",
+                dispatch: .global
             ),
-            canonicalCallee: "Fixture.run(_:)",
-            signature: lowered,
-            effects: effects,
-            contract: contract
+            logicalSignature: .init(
+                parameters: [.init(type: "() -> Swift.Void")],
+                result: .init(type: "Swift.Void")
+            ),
+            physicalSignature: .init(
+                callingConvention: .swiftAdapter,
+                parameters: [
+                    .init(
+                        type: .bridgeValue("() -> Swift.Void"),
+                        source: .argument(0)
+                    ),
+                ],
+                result: .void
+            ),
+            effects: effects
+        )
+        let key = try Core.NativeCall.Key.derive(
+            descriptor: malformedDescriptor
         )
         let requirement = Bytecode.ImportRequirement(
             id: .init(rawValue: 0),
             key: key,
-            signature: lowered,
-            effects: effects,
+            descriptor: malformedDescriptor,
             contract: contract
         )
         #expect(throws: CanonicalSIL.LoweringError.self) {
@@ -899,22 +916,21 @@ struct NativeBlockBridge {
                 ],
                 result: "Swift.Void"
             )
-            let lifetimeKey = try Core.NativeImportKey.derive(
-                namespace: .derive(
-                    bundleID: "dev.helix.callback-table",
-                    buildNumber: "1",
-                    seed: "lifetime-\(lifetime.rawValue)"
-                ),
+            var lifetimeDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
                 canonicalCallee: "Fixture.run(_:)",
                 signature: lifetimeSignature,
                 effects: effects,
                 contract: lifetimeContract
             )
+            lifetimeDescriptor.physicalSignature.parameters[0].ownership =
+                lifetime == .nonescaping ? .borrowed : .owned
+            let lifetimeKey = try Core.NativeCall.Key.derive(
+                descriptor: lifetimeDescriptor
+            )
             let lifetimeRequirement = Bytecode.ImportRequirement(
                 id: .init(rawValue: 0),
                 key: lifetimeKey,
-                signature: lifetimeSignature,
-                effects: effects,
+                descriptor: lifetimeDescriptor,
                 contract: lifetimeContract
             )
             #expect(throws: CanonicalSIL.LoweringError.self) {

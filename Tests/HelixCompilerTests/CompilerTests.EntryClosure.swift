@@ -90,10 +90,11 @@ struct EntryClosure {
     @Test("Imported free-function references form ordinary Swift closures")
     func lowersNativeImportFunctionReference() throws {
         let symbol = "$s6Darwin3sinyS2dF"
-        let requirement = nativeRequirement(
+        let requirement = try nativeRequirement(
             id: 11,
             parameters: ["Swift.Double"],
-            result: "Swift.Double"
+            result: "Swift.Double",
+            canonicalCallee: "Darwin.sin(_:)"
         )
         let float64 = Bytecode.ValueType.float(bitWidth: 64)
         let directCalls = try CanonicalSIL.DirectCallTable([
@@ -165,7 +166,7 @@ struct EntryClosure {
     @Test("Partial application binds a NativeImport suffix generically")
     func lowersCapturedNativeImportClosure() throws {
         let symbol = "$s7Fixture6offsetyS2i_SitF"
-        let requirement = nativeRequirement(id: 12)
+        let requirement = try nativeRequirement(id: 12)
         let directCalls = try CanonicalSIL.DirectCallTable([
             .init(
                 mangledName: symbol,
@@ -217,21 +218,19 @@ struct EntryClosure {
             reference: "#Widget.transform!foreign",
             loweredType: physicalType
         )
-        let requirement = Bytecode.ImportRequirement(
-            id: .init(rawValue: 14),
-            key: .init(rawValue: .sha256("bound-native-method-closure")),
-            signature: .init(
-                parameters: ["Swift.Int", "Fixture.Widget"],
-                result: "Swift.Int"
-            ),
-            effects: .init(),
-            contract: .bounded(
-                kind: .instanceMethod,
-                domain: .application,
-                access: .pure,
-                maximumDurationMicroseconds: 500,
-                allowsMainThread: true
-            )
+        let contract = Core.NativeImportContract.bounded(
+            kind: .instanceMethod,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        let requirement = try nativeRequirement(
+            id: 14,
+            parameters: ["Swift.Int", "Fixture.Widget"],
+            result: "Swift.Int",
+            canonicalCallee: "Fixture.Widget.transform(_:)",
+            contract: contract
         )
         let directCalls = try CanonicalSIL.DirectCallTable([
             .init(
@@ -290,27 +289,27 @@ struct EntryClosure {
     func lowersNativeInitializerReference() throws {
         let widgetType = Core.TypeID(rawValue: .sha256("Fixture.Widget"))
         let symbol = "$s7Fixture6WidgetC5valueACSi_tcfC"
-        let requirement = Bytecode.ImportRequirement(
-            id: .init(rawValue: 15),
-            key: .init(rawValue: .sha256("native-initializer-closure")),
-            signature: .init(
-                parameters: ["Swift.Int"],
-                result: "Fixture.Widget"
-            ),
-            effects: .init(),
-            contract: .bounded(
-                kind: .initializer,
-                domain: .application,
-                access: .pure,
-                maximumDurationMicroseconds: 500,
-                allowsMainThread: true
-            )
+        let contract = Core.NativeImportContract.bounded(
+            kind: .initializer,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        let requirement = try nativeRequirement(
+            id: 15,
+            parameters: ["Swift.Int"],
+            result: "Fixture.Widget",
+            canonicalCallee: "Fixture.Widget.init(value:)",
+            effects: .init(mayAllocate: true),
+            contract: contract
         )
         let directCalls = try CanonicalSIL.DirectCallTable([
             .init(
                 mangledName: symbol,
                 parameterTypes: [.int64],
                 resultType: .native(widgetType),
+                effects: requirement.effects,
                 target: .nativeImport(requirement)
             ),
         ])
@@ -363,7 +362,7 @@ struct EntryClosure {
     @Test("Call-site argument projections cannot masquerade as function values")
     func rejectsProjectedNativeImportFunctionReference() throws {
         let symbol = "$s7Fixture9defaultedyS2i_SiSgtF"
-        let requirement = nativeRequirement(
+        let requirement = try nativeRequirement(
             id: 13,
             parameters: ["Swift.Int"]
         )
@@ -406,20 +405,29 @@ struct EntryClosure {
     private func nativeRequirement(
         id: UInt32,
         parameters: [String] = ["Swift.Int", "Swift.Int"],
-        result: String = "Swift.Int"
-    ) -> Bytecode.ImportRequirement {
-        .init(
-            id: .init(rawValue: id),
-            key: .init(rawValue: .sha256("closure-import-\(id)")),
+        result: String = "Swift.Int",
+        canonicalCallee: String = "Fixture.offset(_:_:)",
+        effects: Core.Effects = .init(),
+        contract: Core.NativeImportContract? = nil
+    ) throws -> Bytecode.ImportRequirement {
+        let resolvedContract = contract ?? .bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        let descriptor = try Core.NativeCall.Descriptor.swiftAdapter(
+            canonicalCallee: canonicalCallee,
             signature: .init(parameters: parameters, result: result),
-            effects: .init(),
-            contract: .bounded(
-                kind: .globalFunction,
-                domain: .application,
-                access: .pure,
-                maximumDurationMicroseconds: 500,
-                allowsMainThread: true
-            )
+            effects: effects,
+            contract: resolvedContract
+        )
+        return .init(
+            id: .init(rawValue: id),
+            key: try Core.NativeCall.Key.derive(descriptor: descriptor),
+            descriptor: descriptor,
+            contract: resolvedContract
         )
     }
 }

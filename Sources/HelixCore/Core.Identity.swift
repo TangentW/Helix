@@ -58,28 +58,6 @@ public struct TypeID: Core.DigestIdentity {
     }
 }
 
-public struct NativeImportKey: Core.DigestIdentity {
-    public let rawValue: Core.Digest
-    public init(rawValue: Core.Digest) { self.rawValue = rawValue }
-
-    public static func derive(
-        namespace: Core.ShellNamespaceID,
-        canonicalCallee: String,
-        signature: Core.LoweredSignature,
-        effects: Core.Effects,
-        contract: Core.NativeImportContract
-    ) throws -> Self {
-        try contract.validate(effects: effects)
-        var hasher = Core.StableHasher(domain: "HLX.Import.v1")
-        hasher.append(namespace.rawValue)
-        hasher.append(canonicalCallee)
-        hasher.append(try Core.CanonicalJSON.encode(signature))
-        hasher.append(try Core.CanonicalJSON.encode(effects))
-        hasher.append(try Core.CanonicalJSON.encode(contract))
-        return Self(rawValue: hasher.finalize())
-    }
-}
-
 public struct EntryIndex: RawRepresentable, Hashable, Codable, Sendable, Comparable, CustomStringConvertible {
     public let rawValue: UInt32
     public init(rawValue: UInt32) { self.rawValue = rawValue }

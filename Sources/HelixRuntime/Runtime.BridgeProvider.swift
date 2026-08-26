@@ -37,8 +37,8 @@ public struct BridgeDescriptor: Hashable, Sendable {
     public var compatibility: Core.Compatibility
     /// Capabilities compiled into the generated Shell interface.
     public var capabilities: Set<Core.Capability>
-    /// Native imports registered by the generated Bridge.
-    public var nativeImportIDs: Set<Core.NativeImportID>
+    /// Stable native-call capabilities registered by the generated Bridge.
+    public var nativeCallKeys: Set<Core.NativeCall.Key>
     /// Platform for which the Bridge archive was linked.
     public var platform: Platform
     /// Architecture for which the Bridge archive was linked.
@@ -62,7 +62,7 @@ public struct BridgeDescriptor: Hashable, Sendable {
         minimumOSVersion: Core.SemanticVersion,
         compatibility: Core.Compatibility,
         capabilities: Set<Core.Capability>,
-        nativeImportIDs: Set<Core.NativeImportID>,
+        nativeCallKeys: Set<Core.NativeCall.Key>,
         platform: Platform,
         architecture: String,
         xcodeBuild: String,
@@ -76,7 +76,7 @@ public struct BridgeDescriptor: Hashable, Sendable {
         self.minimumOSVersion = minimumOSVersion
         self.compatibility = compatibility
         self.capabilities = capabilities
-        self.nativeImportIDs = nativeImportIDs
+        self.nativeCallKeys = nativeCallKeys
         self.platform = platform
         self.architecture = architecture
         self.xcodeBuild = xcodeBuild
@@ -94,6 +94,8 @@ public struct BridgeDescriptor: Hashable, Sendable {
                   !$0.isEmpty && $0.utf8.count <= 4_096
                       && !$0.unicodeScalars.contains(where: { $0.value == 0 })
               }), ["arm64", "x86_64"].contains(architecture),
+              nativeCallKeys.isEmpty
+                || capabilities.contains(.nativeImportsV1),
               runtimeImageIdentity == .current
         else {
             throw Runtime.BridgeProviderError.invalidDescriptor

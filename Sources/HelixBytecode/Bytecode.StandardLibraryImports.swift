@@ -7,25 +7,22 @@ extension Bytecode {
 public enum StandardLibraryImports {
     /// Complete frozen identity shared by Shell generation and Runtime binding.
     public struct Descriptor: Hashable, Sendable {
-        /// Canonical source-level callee used to derive the NativeImport key.
-        public var canonicalCallee: String
+        /// Single source of truth for native identity, logical behavior, and
+        /// the exact builtin adapter boundary.
+        public var nativeCall: Core.NativeCall.Descriptor
         /// Exact canonical-SIL symbols accepted for this operation.
         public var silMangledNames: [String]
         /// VM types presented to the signed native implementation.
         public var parameterTypes: [Bytecode.ValueType]
         /// VM type returned by the signed native implementation.
         public var resultType: Bytecode.ValueType
-        /// Frozen Swift signature included in the NativeImport identity.
-        public var signature: Core.LoweredSignature
-        /// Effects authorized for callers and enforced by the verifier.
-        public var effects: Core.Effects
         /// Scheduling, policy-domain, and state-access contract.
         public var contract: Core.NativeImportContract
         /// Runtime capability required to dispatch this import.
         public var capability: Core.Capability
 
         /// Creates a complete standard-library NativeImport descriptor.
-        public init(
+        fileprivate init(
             canonicalCallee: String,
             silMangledNames: [String],
             parameterTypes: [Bytecode.ValueType],
@@ -35,15 +32,33 @@ public enum StandardLibraryImports {
             contract: Core.NativeImportContract,
             capability: Core.Capability = .nativeImportsV1
         ) {
-            self.canonicalCallee = canonicalCallee
+            do {
+                nativeCall = try Core.NativeCall.Descriptor.swiftAdapter(
+                    canonicalCallee: canonicalCallee,
+                    signature: signature,
+                    effects: effects,
+                    contract: contract,
+                    backend: .builtin
+                )
+            } catch {
+                // These are hard-coded protocol fixtures. Failure means the
+                // source definition is internally inconsistent.
+                preconditionFailure(
+                    "invalid standard-library native call: \(error)"
+                )
+            }
             self.silMangledNames = silMangledNames.sorted()
             self.parameterTypes = parameterTypes
             self.resultType = resultType
-            self.signature = signature
-            self.effects = effects
             self.contract = contract
             self.capability = capability
         }
+
+        public var canonicalCallee: String { nativeCall.canonicalCallee }
+        public var signature: Core.LoweredSignature {
+            nativeCall.loweredSignature
+        }
+        public var effects: Core.Effects { nativeCall.effects }
     }
 
     /// Swift's variadic print ABI after SIL has materialized `[Any]`.

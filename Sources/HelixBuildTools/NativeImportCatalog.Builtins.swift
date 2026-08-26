@@ -38,26 +38,17 @@ enum Builtins {
         definitions.map(\.descriptor.canonicalCallee)
     )
 
-    static func records(
-        metadata: InterfaceArchive.ReleaseMetadata
-    ) throws -> [InterfaceArchive.NativeImportRecord] {
+    static func records() throws -> [InterfaceArchive.NativeImportRecord] {
         try definitions.map(\.descriptor).map { descriptor in
-            try descriptor.contract.validate(effects: descriptor.effects)
             return InterfaceArchive.NativeImportRecord(
                 id: nil,
-                key: try Core.NativeImportKey.derive(
-                    namespace: metadata.shellNamespaceID,
-                    canonicalCallee: descriptor.canonicalCallee,
-                    signature: descriptor.signature,
-                    effects: descriptor.effects,
-                    contract: descriptor.contract
+                key: try Core.NativeCall.Key.derive(
+                    descriptor: descriptor.nativeCall
                 ),
-                canonicalCallee: descriptor.canonicalCallee,
+                descriptor: descriptor.nativeCall,
                 silMangledNames: descriptor.silMangledNames,
                 parameterTypes: descriptor.parameterTypes,
                 resultType: descriptor.resultType,
-                signature: descriptor.signature,
-                effects: descriptor.effects,
                 contract: descriptor.contract,
                 capability: descriptor.capability,
                 isEmittedToDevice: true
@@ -66,10 +57,9 @@ enum Builtins {
     }
 
     static func merging(
-        _ records: [InterfaceArchive.NativeImportRecord],
-        metadata: InterfaceArchive.ReleaseMetadata
+        _ records: [InterfaceArchive.NativeImportRecord]
     ) throws -> [InterfaceArchive.NativeImportRecord] {
-        let builtins = try self.records(metadata: metadata)
+        let builtins = try self.records()
         let merged = records + builtins
         guard Set(merged.map(\.key)).count == merged.count,
               Set(merged.map(\.canonicalCallee)).count == merged.count,
@@ -87,7 +77,7 @@ enum Builtins {
     static func bindings(
         archive: InterfaceArchive.Archive
     ) throws -> [ShellBuildReceipt.NativeImportBinding] {
-        var byKey: [Core.NativeImportKey: InterfaceArchive.NativeImportRecord] = [:]
+        var byKey: [Core.NativeCall.Key: InterfaceArchive.NativeImportRecord] = [:]
         for record in archive.nativeImports {
             guard byKey.updateValue(record, forKey: record.key) == nil else {
                 throw FrontendReceipt.Error.invalidRequest(
@@ -97,12 +87,8 @@ enum Builtins {
         }
         return try definitions.compactMap { definition in
             let descriptor = definition.descriptor
-            let key = try Core.NativeImportKey.derive(
-                namespace: archive.metadata.shellNamespaceID,
-                canonicalCallee: descriptor.canonicalCallee,
-                signature: descriptor.signature,
-                effects: descriptor.effects,
-                contract: descriptor.contract
+            let key = try Core.NativeCall.Key.derive(
+                descriptor: descriptor.nativeCall
             )
             guard let record = byKey[key], record.isEmittedToDevice
             else { return nil }
@@ -123,7 +109,7 @@ enum Builtins {
                 key: record.key,
                 invokerExpression: definition.invokerFactory + "("
                     + "id: Core.NativeImportID(rawValue: \(id.rawValue)), "
-                    + "key: Core.NativeImportKey(rawValue: try! Core.Digest(hex: "
+                    + "key: Core.NativeCall.Key(rawValue: try! Core.Digest(hex: "
                     + "\(String(reflecting: record.key.rawValue.hex)))))",
                 importedModules: definition.importedModules
             )

@@ -18,7 +18,7 @@ struct Metadata {
             seed: "patch-runtime-test"
         )
         let interfaceHash = Core.Digest.sha256("shell")
-        let importID = Core.NativeImportID(rawValue: 9)
+        let callKey = Core.NativeCall.Key(rawValue: .sha256("fixture-native-call"))
         let contract = try PatchRuntime.BuildContract(
             bundleID: "dev.helix.patch-runtime",
             buildNumber: "7",
@@ -32,7 +32,7 @@ struct Metadata {
                 compilerFingerprint: "test-toolchain"
             ),
             capabilities: [.baselineV1, .nativeImportsV1],
-            nativeImportIDs: [importID]
+            nativeCallKeys: [callKey]
         )
         let process = try PatchRuntime.ProcessIdentity(
             bundleID: "dev.helix.patch-runtime",
@@ -48,8 +48,20 @@ struct Metadata {
         )
         #expect(target.machOUUID == process.executableUUID)
         #expect(target.shellInterfaceHash == interfaceHash)
-        #expect(contract.runtimePolicy().allowedNativeImports == [importID])
+        #expect(contract.runtimePolicy().allowedNativeCalls == [callKey])
         #expect(contract.runtimePolicy().productionChannelEnabled)
+        #expect(throws: PatchRuntime.Error.invalidBuildContract) {
+            try PatchRuntime.BuildContract(
+                bundleID: contract.bundleID,
+                buildNumber: contract.buildNumber,
+                shellNamespaceID: contract.shellNamespaceID,
+                shellInterfaceHash: contract.shellInterfaceHash,
+                minimumOSVersion: contract.minimumOSVersion,
+                compatibility: contract.compatibility,
+                capabilities: [.baselineV1],
+                nativeCallKeys: [callKey]
+            )
+        }
         #expect(throws: PatchRuntime.Error.invalidProcessIdentity(
             "required field is missing"
         )) {

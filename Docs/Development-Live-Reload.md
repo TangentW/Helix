@@ -126,8 +126,9 @@ For an accepted save transaction, Helix:
 3. Uses declaration identities and implementation fingerprints to determine
    the changed eligible roots, then asks the captured Swift compiler for SIL.
 4. Builds a closed call table. Patch-local functions take precedence, followed
-   by eligible Shell `EntryIndex` routes and exact `NativeImportID` capabilities
-   that the Dev Shell emitted at build time.
+   by eligible Shell `EntryIndex` routes and exact native capabilities that the
+   Dev Shell emitted at build time and identifies by stable `NativeCallKey`
+   values. `NativeImportID` remains only a compact Shell slot.
 5. Lowers only the supported canonical SIL into typed HLIR and HLBC, then runs
    the independent structural and semantic verifier on the Mac.
 6. Sends one immutable, session-bound live artifact. The App rechecks session,

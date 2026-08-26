@@ -40,29 +40,23 @@ public struct NativeType: Codable, Hashable, Sendable {
 }
 
 public struct Candidate: Codable, Hashable, Sendable {
-    public var canonicalCallee: String
+    public var descriptor: Core.NativeCall.Descriptor
     public var silMangledNames: [String]
-    public var signature: Core.LoweredSignature
-    public var effects: Core.Effects
     public var contract: Core.NativeImportContract
     public var capability: Core.Capability
     public var factoryType: String
     public var importedModules: [String]
 
     public init(
-        canonicalCallee: String,
+        descriptor: Core.NativeCall.Descriptor,
         silMangledNames: [String],
-        signature: Core.LoweredSignature,
-        effects: Core.Effects = .init(),
         contract: Core.NativeImportContract,
         capability: Core.Capability = .nativeImportsV1,
         factoryType: String,
         importedModules: [String]
     ) {
-        self.canonicalCallee = canonicalCallee
+        self.descriptor = descriptor
         self.silMangledNames = silMangledNames.sorted()
-        self.signature = signature
-        self.effects = effects
         self.contract = contract
         self.capability = capability
         self.factoryType = factoryType
@@ -72,6 +66,10 @@ public struct Candidate: Codable, Hashable, Sendable {
     fileprivate var orderKey: String {
         "\(silMangledNames.first ?? ""):\(canonicalCallee)"
     }
+
+    public var canonicalCallee: String { descriptor.canonicalCallee }
+    public var signature: Core.LoweredSignature { descriptor.loweredSignature }
+    public var effects: Core.Effects { descriptor.effects }
 }
 
 public struct Document: Codable, Hashable, Sendable {
@@ -148,7 +146,25 @@ public struct Document: Codable, Hashable, Sendable {
         let mainActorTypeIDs = Set(nativeTypes.filter(\.requiresMainActor).map {
             nativeTypeIDs[$0.canonicalName]!
         })
+        var callKeys = Set<Core.NativeCall.Key>()
         for candidate in candidates {
+            do {
+                try candidate.descriptor.validate(contract: candidate.contract)
+                let key = try Core.NativeCall.Key.derive(
+                    descriptor: candidate.descriptor
+                )
+                guard callKeys.insert(key).inserted else {
+                    throw NativeImportCatalog.Error.invalid(
+                        "candidate \(candidate.canonicalCallee) duplicates a stable native call key"
+                    )
+                }
+            } catch let error as NativeImportCatalog.Error {
+                throw error
+            } catch {
+                throw NativeImportCatalog.Error.invalid(
+                    "candidate \(candidate.canonicalCallee) has an invalid descriptor: \(error)"
+                )
+            }
             guard let callbackLifetimes = FrontendReceipt.NativeBridgeProfile
                 .authoritativeLifetimes(candidate.contract.callbacks)
             else {
@@ -209,13 +225,6 @@ public struct Document: Codable, Hashable, Sendable {
             else {
                 throw NativeImportCatalog.Error.invalid(
                     "candidate \(candidate.canonicalCallee) has an invalid symbol, signature, factory, or type"
-                )
-            }
-            do {
-                try candidate.contract.validate(effects: candidate.effects)
-            } catch {
-                throw NativeImportCatalog.Error.invalid(
-                    "candidate \(candidate.canonicalCallee) has an invalid contract: \(error)"
                 )
             }
             let signatureUsesMainActorType = signatureParameters.compactMap({ $0 }).contains {

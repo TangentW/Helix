@@ -120,7 +120,7 @@ struct Identities {
         ).contains("\"isAsync\":true"))
     }
 
-    @Test("Native import contracts qualify synchronous execution and enter identity")
+    @Test("Native call descriptors bind dispatch and callback lifetime")
     func nativeImportContractIdentity() throws {
         let effects = Core.Effects(requiresMainActor: true)
         let getter = Core.NativeImportContract.bounded(
@@ -139,50 +139,72 @@ struct Identities {
             maximumDurationMicroseconds: 500,
             allowsMainThread: true
         )
-        let namespace = Core.ShellNamespaceID.derive(
-            bundleID: "dev.helix.contract",
-            buildNumber: "1",
-            seed: "fixture"
-        )
         let signature = Core.LoweredSignature(
             parameters: ["UIKit.UIView"],
             result: "Swift.Bool",
             isolation: "MainActor"
         )
-        let getterKey = try Core.NativeImportKey.derive(
-            namespace: namespace,
+        let getterDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
             canonicalCallee: "UIKit.UIView.isHidden.getter",
             signature: signature,
             effects: effects,
             contract: getter
         )
-        let methodKey = try Core.NativeImportKey.derive(
-            namespace: namespace,
-            canonicalCallee: "UIKit.UIView.isHidden.getter",
+        let methodDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
+            canonicalCallee: "UIKit.UIView.isHidden()",
             signature: signature,
             effects: effects,
             contract: method
         )
+        let getterKey = try Core.NativeCall.Key.derive(
+            descriptor: getterDescriptor
+        )
+        let methodKey = try Core.NativeCall.Key.derive(
+            descriptor: methodDescriptor
+        )
         #expect(getterKey != methodKey)
 
-        let callbackMethod = Core.NativeImportContract.bounded(
+        let nonescapingCallback = Core.NativeImportContract.bounded(
             kind: .instanceMethod,
             domain: .uiKit,
             access: .read,
             maximumDurationMicroseconds: 500,
             allowsMainThread: true,
             callbacks: [
-                .init(parameterIndex: 0, lifetime: .nonescaping),
+                .init(parameterIndex: 1, lifetime: .nonescaping),
             ]
         )
-        let callbackKey = try Core.NativeImportKey.derive(
-            namespace: namespace,
-            canonicalCallee: "UIKit.UIView.isHidden.getter",
-            signature: signature,
-            effects: effects,
-            contract: callbackMethod
+        let escapingCallback = Core.NativeImportContract.bounded(
+            kind: .instanceMethod,
+            domain: .uiKit,
+            access: .read,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true,
+            callbacks: [
+                .init(parameterIndex: 1, lifetime: .escaping),
+            ]
         )
-        #expect(callbackKey != methodKey)
+        let callbackSignature = Core.LoweredSignature(
+            parameters: ["UIKit.UIView", "() -> Swift.Void"],
+            result: "Swift.Bool",
+            isolation: "MainActor"
+        )
+        let nonescapingDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
+            canonicalCallee: "UIKit.UIView.observe(_:)",
+            signature: callbackSignature,
+            effects: effects,
+            contract: nonescapingCallback
+        )
+        let escapingDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
+            canonicalCallee: "UIKit.UIView.observe(_:)",
+            signature: callbackSignature,
+            effects: effects,
+            contract: escapingCallback
+        )
+        #expect(
+            try Core.NativeCall.Key.derive(descriptor: nonescapingDescriptor)
+                != Core.NativeCall.Key.derive(descriptor: escapingDescriptor)
+        )
 
         #expect(throws: Core.NativeImportContractError.self) {
             try getter.validate(

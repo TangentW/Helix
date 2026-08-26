@@ -2076,7 +2076,9 @@ struct NativeImportDiscoveryTests {
             shell: Verification.ShellInterface(archive: shell.archive),
             policy: .init(
                 acceptedCapabilities: Set(shell.archive.capabilities),
-                allowedNativeImports: Set(shell.archive.nativeImports.compactMap(\.id))
+                allowedNativeCalls: Set(
+                    shell.archive.nativeImports.filter(\.isEmittedToDevice).map(\.key)
+                )
             )
         )
     }
@@ -2505,20 +2507,26 @@ struct NativeImportDiscoveryTests {
             $0.interface.baseName == "adjust"
         })
         var overrideRequest = request
+        let overrideEffects = Core.Effects(mayAllocate: true)
+        let overrideContract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        let overrideDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
+            canonicalCallee: "\(moduleName).overrideAdjust(_:by:)",
+            signature: adjustDeclaration.loweredSignature,
+            effects: overrideEffects,
+            contract: overrideContract
+        )
         overrideRequest.nativeImportCatalog = NativeImportCatalog.Document(
             candidates: [
                 .init(
-                    canonicalCallee: "\(moduleName).overrideAdjust(_:by:)",
+                    descriptor: overrideDescriptor,
                     silMangledNames: [adjustDeclaration.mangledName],
-                    signature: adjustDeclaration.loweredSignature,
-                    effects: .init(mayAllocate: true),
-                    contract: .bounded(
-                        kind: .globalFunction,
-                        domain: .application,
-                        access: .pure,
-                        maximumDurationMicroseconds: 500,
-                        allowsMainThread: true
-                    ),
+                    contract: overrideContract,
                     factoryType: "OverrideSupport.AdjustFactory",
                     importedModules: ["OverrideSupport"]
                 ),
@@ -2664,8 +2672,8 @@ struct NativeImportDiscoveryTests {
             shell: Verification.ShellInterface(archive: shell.archive),
             policy: .init(
                 acceptedCapabilities: Set(shell.archive.capabilities),
-                allowedNativeImports: Set(
-                    shell.archive.nativeImports.compactMap(\.id)
+                allowedNativeCalls: Set(
+                    shell.archive.nativeImports.filter(\.isEmittedToDevice).map(\.key)
                 )
             )
         )
@@ -3077,7 +3085,9 @@ struct NativeImportDiscoveryTests {
             shell: Verification.ShellInterface(archive: shell.archive),
             policy: .init(
                 acceptedCapabilities: Set(shell.archive.capabilities),
-                allowedNativeImports: Set(shell.archive.nativeImports.compactMap(\.id))
+                allowedNativeCalls: Set(
+                    shell.archive.nativeImports.filter(\.isEmittedToDevice).map(\.key)
+                )
             )
         )
     }
@@ -3570,7 +3580,19 @@ struct NativeImportDiscoveryTests {
         #expect(generatedBridge.contains("NSPredicate"))
         #expect(generatedBridge.contains("enumerator"))
         #expect(!generatedBridge.contains("NSTimer"))
-        #expect(!generatedBridge.contains("NSFileManager"))
+        let descriptorTypeSpellings = shell.archive.nativeImports.flatMap {
+            record in
+            record.descriptor.logicalSignature.parameters.map(\.type)
+                + [record.descriptor.logicalSignature.result.type]
+                + record.descriptor.physicalSignature.parameters.compactMap {
+                    $0.type.canonicalName
+                }
+                + [record.descriptor.physicalSignature.result.canonicalName]
+                    .compactMap { $0 }
+        }
+        #expect(!descriptorTypeSpellings.contains {
+            $0.contains("NSFileManager")
+        })
         #expect(generatedBridge.contains(".invokeResult("))
         #expect(generatedBridge.contains("failureResult: {"))
         #expect(generatedBridge.contains("let argument0: any UIInteraction"))
@@ -3646,7 +3668,9 @@ struct NativeImportDiscoveryTests {
             shell: Verification.ShellInterface(archive: shell.archive),
             policy: .init(
                 acceptedCapabilities: Set(shell.archive.capabilities),
-                allowedNativeImports: Set(shell.archive.nativeImports.compactMap(\.id)),
+                allowedNativeCalls: Set(
+                    shell.archive.nativeImports.filter(\.isEmittedToDevice).map(\.key)
+                ),
                 allowMainActorEntries: true
             )
         )
@@ -4065,7 +4089,9 @@ struct NativeImportDiscoveryTests {
             shell: Verification.ShellInterface(archive: shell.archive),
             policy: .init(
                 acceptedCapabilities: Set(shell.archive.capabilities),
-                allowedNativeImports: Set(shell.archive.nativeImports.compactMap(\.id)),
+                allowedNativeCalls: Set(
+                    shell.archive.nativeImports.filter(\.isEmittedToDevice).map(\.key)
+                ),
                 allowMainActorEntries: true
             )
         )
@@ -4287,7 +4313,11 @@ struct NativeImportDiscoveryTests {
         let actor = declaration(
             canonicalCallee: "ScopeFixture.render(_:)",
             mangledName: "$s12ScopeFixture6renderyS2iF",
-            signature: signature,
+            signature: .init(
+                parameters: signature.parameters,
+                result: signature.result,
+                isolation: "MainActor"
+            ),
             effects: .init(requiresMainActor: true)
         )
 

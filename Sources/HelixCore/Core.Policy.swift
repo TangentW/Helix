@@ -90,20 +90,22 @@ public enum DistributionPolicy: String, Codable, Hashable, Sendable {
 public struct RuntimePolicy: Codable, Hashable, Sendable {
     public var acceptedCapabilities: Set<Core.Capability>
     public var resourceCeiling: Core.ResourceLimits
-    public var allowedNativeImports: Set<Core.NativeImportID>
+    /// Stable API authorities. Image-local import IDs remain compact dispatch
+    /// slots and cannot grant native-call permission.
+    public var allowedNativeCalls: Set<Core.NativeCall.Key>
     public var allowMainActorEntries: Bool
     public var productionChannelEnabled: Bool
 
     public init(
         acceptedCapabilities: Set<Core.Capability> = [.baselineV1],
         resourceCeiling: Core.ResourceLimits = .init(),
-        allowedNativeImports: Set<Core.NativeImportID> = [],
+        allowedNativeCalls: Set<Core.NativeCall.Key> = [],
         allowMainActorEntries: Bool = false,
         productionChannelEnabled: Bool = false
     ) {
         self.acceptedCapabilities = acceptedCapabilities
         self.resourceCeiling = resourceCeiling
-        self.allowedNativeImports = allowedNativeImports
+        self.allowedNativeCalls = allowedNativeCalls
         self.allowMainActorEntries = allowMainActorEntries
         self.productionChannelEnabled = productionChannelEnabled
     }

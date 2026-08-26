@@ -26,10 +26,9 @@ extension Verification.ShellInterface {
                 return Verification.ResolvedNativeImport(
                     id: id,
                     key: item.key,
+                    descriptor: item.descriptor,
                     parameterTypes: item.parameterTypes,
                     resultType: item.resultType,
-                    signature: item.signature,
-                    effects: item.effects,
                     contract: item.contract,
                     capability: item.capability
                 )

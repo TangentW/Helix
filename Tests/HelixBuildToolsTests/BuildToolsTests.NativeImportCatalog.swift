@@ -12,7 +12,7 @@ extension BuildToolsTests {
 struct NativeImportCatalogPipeline {
     @Test("Catalog JSON is canonical and rejects ambiguous or dishonest descriptors")
     func validatesCatalogDocuments() throws {
-        let candidate = makeCandidate(
+        let candidate = try makeCandidate(
             canonicalCallee: "Fixture.increment(_:)",
             symbol: "$s7Fixture9incrementyS2iF",
             factoryType: "FixtureSupport.IncrementFactory",
@@ -28,7 +28,7 @@ struct NativeImportCatalogPipeline {
             try NativeImportCatalog.Codec.decode(nonCanonical)
         }
 
-        let duplicateSymbol = makeCandidate(
+        let duplicateSymbol = try makeCandidate(
             canonicalCallee: "Fixture.other(_:)",
             symbol: candidate.silMangledNames[0],
             factoryType: "FixtureSupport.OtherFactory",
@@ -43,7 +43,8 @@ struct NativeImportCatalogPipeline {
         }
 
         var dishonest = candidate
-        dishonest.signature.parameters = ["Swift.UnsafeRawPointer"]
+        dishonest.descriptor.logicalSignature.parameters[0].type =
+            "Swift.UnsafeRawPointer"
         #expect(throws: NativeImportCatalog.Error.invalid(
             "candidate Fixture.increment(_:) has an invalid symbol, signature, factory, or type"
         )) {
@@ -61,15 +62,13 @@ struct NativeImportCatalogPipeline {
 
     @Test("Catalog admits Swift Any as an explicitly bounded bridge type")
     func admitsAnySignature() throws {
-        var candidate = makeCandidate(
+        let candidate = try makeCandidate(
             canonicalCallee: "Fixture.echo(_:)",
             symbol: "$s7Fixture4echoyypypF",
             factoryType: "FixtureSupport.EchoFactory",
-            module: "FixtureSupport"
-        )
-        candidate.signature = .init(
-            parameters: ["Swift.Any"],
-            result: "Swift.Any"
+            module: "FixtureSupport",
+            parameterTypes: ["Swift.Any"],
+            resultType: "Swift.Any"
         )
 
         let document = NativeImportCatalog.Document(candidates: [candidate])
@@ -83,24 +82,22 @@ struct NativeImportCatalogPipeline {
 
     @Test("Catalog freezes exact suspending factories and rejects async closure transport")
     func validatesAsyncFactories() throws {
-        var candidate = makeCandidate(
-            canonicalCallee: "Fixture.fetch(_:)",
-            symbol: "$s7Fixture5fetchyS2iYaF",
-            factoryType: "FixtureSupport.FetchFactory",
-            module: "FixtureSupport"
-        )
-        candidate.signature = .init(
-            parameters: ["Swift.Int"],
-            result: "Swift.Int",
-            isAsync: true
-        )
-        candidate.effects.isAsync = true
-        candidate.contract = .suspending(
+        let effects = Core.Effects(isAsync: true)
+        let contract = Core.NativeImportContract.suspending(
             kind: .globalFunction,
             domain: .application,
             access: .pure,
             maximumDurationMicroseconds: 5_000_000,
             allowsMainThread: true
+        )
+        let candidate = try makeCandidate(
+            canonicalCallee: "Fixture.fetch(_:)",
+            symbol: "$s7Fixture5fetchyS2iYaF",
+            factoryType: "FixtureSupport.FetchFactory",
+            module: "FixtureSupport",
+            signatureFlags: .init(isAsync: true),
+            effects: effects,
+            contract: contract
         )
         let document = NativeImportCatalog.Document(candidates: [candidate])
         try document.validate()
@@ -111,15 +108,18 @@ struct NativeImportCatalogPipeline {
         )
 
         var mismatched = candidate
-        mismatched.signature.isAsync = false
+        mismatched.descriptor.logicalSignature.isAsync = false
         #expect(throws: NativeImportCatalog.Error.invalid(
-            "candidate Fixture.fetch(_:) has an invalid symbol, signature, factory, or type"
+            "candidate Fixture.fetch(_:) has an invalid descriptor: "
+                + "invalid native call descriptor: logical signature, effects, "
+                + "isolation, or availability disagree"
         )) {
             try NativeImportCatalog.Document(candidates: [mismatched]).validate()
         }
 
         var closureResult = candidate
-        closureResult.signature.result = "(Swift.Int) -> Swift.Int"
+        closureResult.descriptor.logicalSignature.result.type =
+            "(Swift.Int)->Swift.Int"
         #expect(throws: NativeImportCatalog.Error.invalid(
             "candidate Fixture.fetch(_:) has an invalid symbol, signature, factory, or type"
         )) {
@@ -129,18 +129,7 @@ struct NativeImportCatalogPipeline {
 
     @Test("Catalog validates authoritative native callback lifetimes")
     func validatesCallbackLifetimeAuthority() throws {
-        var candidate = makeCandidate(
-            canonicalCallee: "Fixture.storeCallback(_:)",
-            symbol: "$s7Fixture13storeCallbackyyyycF",
-            factoryType: "FixtureSupport.CallbackFactory",
-            module: "FixtureSupport"
-        )
-        candidate.signature = .init(
-            parameters: ["(Swift.Int) -> Swift.Void"],
-            result: "Swift.Void"
-        )
-        candidate.effects.hasExternalSideEffects = true
-        candidate.contract = .bounded(
+        let contract = Core.NativeImportContract.bounded(
             kind: .globalFunction,
             domain: .application,
             access: .write,
@@ -150,17 +139,28 @@ struct NativeImportCatalogPipeline {
                 .init(parameterIndex: 0, lifetime: .escaping),
             ]
         )
+        let candidate = try makeCandidate(
+            canonicalCallee: "Fixture.storeCallback(_:)",
+            symbol: "$s7Fixture13storeCallbackyyyycF",
+            factoryType: "FixtureSupport.CallbackFactory",
+            module: "FixtureSupport",
+            parameterTypes: ["(Swift.Int) -> Swift.Void"],
+            resultType: "Swift.Void",
+            effects: .init(hasExternalSideEffects: true),
+            contract: contract
+        )
         try NativeImportCatalog.Document(candidates: [candidate]).validate()
 
         var weakened = candidate
-        weakened.signature.parameters = [
-            "@escaping (Swift.Int) -> Swift.Void",
-        ]
+        weakened.descriptor.logicalSignature.parameters[0].type =
+            "@escaping (Swift.Int) -> Swift.Void"
         weakened.contract.callbacks = [
             .init(parameterIndex: 0, lifetime: .nonescaping),
         ]
         #expect(throws: NativeImportCatalog.Error.invalid(
-            "candidate Fixture.storeCallback(_:) has an invalid symbol, signature, factory, or type"
+            "candidate Fixture.storeCallback(_:) has an invalid descriptor: "
+                + "invalid native call descriptor: logical callback lifetimes "
+                + "disagree with the invocation contract"
         )) {
             try NativeImportCatalog.Document(candidates: [weakened]).validate()
         }
@@ -170,7 +170,9 @@ struct NativeImportCatalogPipeline {
             .init(parameterIndex: 0, lifetime: .nonescaping)
         )
         #expect(throws: NativeImportCatalog.Error.invalid(
-            "candidate Fixture.storeCallback(_:) has duplicate callback parameters"
+            "candidate Fixture.storeCallback(_:) has an invalid descriptor: "
+                + "invalid native import contract: callback parameters must be "
+                + "unique, sorted, and bounded"
         )) {
             try NativeImportCatalog.Document(candidates: [duplicated]).validate()
         }
@@ -188,44 +190,52 @@ struct NativeImportCatalogPipeline {
             factoryType: "UIKitSupport.UIViewTypeFactory",
             importedModules: ["UIKitSupport", "UIKit"]
         )
+        let getterContract = Core.NativeImportContract.bounded(
+            kind: .instanceGetter,
+            domain: .uiKit,
+            access: .read,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
         let getter = NativeImportCatalog.Candidate(
-            canonicalCallee: "UIKit.UIView.isHidden.getter",
+            descriptor: try .swiftAdapter(
+                canonicalCallee: "UIKit.UIView.isHidden.getter",
+                signature: .init(
+                    parameters: ["UIKit.UIView"],
+                    result: "Swift.Bool",
+                    isolation: "MainActor"
+                ),
+                effects: .init(requiresMainActor: true),
+                contract: getterContract
+            ),
             silMangledNames: ["$s5UIKit6UIViewC8isHiddenSbvg"],
-            signature: .init(
-                parameters: ["UIKit.UIView"],
-                result: "Swift.Bool",
-                isolation: "MainActor"
-            ),
-            effects: .init(requiresMainActor: true),
-            contract: .bounded(
-                kind: .instanceGetter,
-                domain: .uiKit,
-                access: .read,
-                maximumDurationMicroseconds: 500,
-                allowsMainThread: true
-            ),
+            contract: getterContract,
             factoryType: "UIKitSupport.IsHiddenGetterFactory",
             importedModules: ["UIKitSupport", "UIKit"]
         )
+        let setterContract = Core.NativeImportContract.bounded(
+            kind: .instanceSetter,
+            domain: .uiKit,
+            access: .write,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
         let setter = NativeImportCatalog.Candidate(
-            canonicalCallee: "UIKit.UIView.isHidden.setter",
+            descriptor: try .swiftAdapter(
+                canonicalCallee: "UIKit.UIView.isHidden.setter",
+                signature: .init(
+                    parameters: ["UIKit.UIView", "Swift.Bool"],
+                    result: "Swift.Void",
+                    isolation: "MainActor"
+                ),
+                effects: .init(
+                    hasExternalSideEffects: true,
+                    requiresMainActor: true
+                ),
+                contract: setterContract
+            ),
             silMangledNames: ["$s5UIKit6UIViewC8isHiddenSbvs"],
-            signature: .init(
-                parameters: ["UIKit.UIView", "Swift.Bool"],
-                result: "Swift.Void",
-                isolation: "MainActor"
-            ),
-            effects: .init(
-                hasExternalSideEffects: true,
-                requiresMainActor: true
-            ),
-            contract: .bounded(
-                kind: .instanceSetter,
-                domain: .uiKit,
-                access: .write,
-                maximumDurationMicroseconds: 500,
-                allowsMainThread: true
-            ),
+            contract: setterContract,
             factoryType: "UIKitSupport.IsHiddenSetterFactory",
             importedModules: ["UIKitSupport", "UIKit"]
         )
@@ -240,16 +250,27 @@ struct NativeImportCatalogPipeline {
             ) == document
         )
 
-        var synchronousIO = getter
-        synchronousIO.canonicalCallee = "UIKit.UIView.loadRemoteState()"
-        synchronousIO.silMangledNames = ["$s5UIKit6UIViewC15loadRemoteStateyyF"]
-        synchronousIO.effects.hasExternalSideEffects = true
-        synchronousIO.contract = .cooperative(
+        let synchronousIOContract = Core.NativeImportContract.cooperative(
             kind: .instanceMethod,
             domain: .uiKit,
             access: .io,
             maximumDurationMicroseconds: 10_000,
             allowsMainThread: true
+        )
+        let synchronousIO = NativeImportCatalog.Candidate(
+            descriptor: try .swiftAdapter(
+                canonicalCallee: "UIKit.UIView.loadRemoteState()",
+                signature: getter.signature,
+                effects: .init(
+                    hasExternalSideEffects: true,
+                    requiresMainActor: true
+                ),
+                contract: synchronousIOContract
+            ),
+            silMangledNames: ["$s5UIKit6UIViewC15loadRemoteStateyyF"],
+            contract: synchronousIOContract,
+            factoryType: getter.factoryType,
+            importedModules: getter.importedModules
         )
         try NativeImportCatalog.Document(
             nativeTypes: [viewType],
@@ -305,13 +326,13 @@ struct NativeImportCatalogPipeline {
         let dormantCallee = "\(moduleName).dormant(_:)"
         let catalog = NativeImportCatalog.Document(
             candidates: [
-                makeCandidate(
+                try makeCandidate(
                     canonicalCallee: incrementCallee,
                     symbol: increment.mangledName,
                     factoryType: "NativeSupport.IncrementFactory",
                     module: "NativeSupport"
                 ),
-                makeCandidate(
+                try makeCandidate(
                     canonicalCallee: dormantCallee,
                     symbol: dormant.mangledName,
                     factoryType: "DormantSupport.DormantFactory",
@@ -550,26 +571,46 @@ struct NativeImportCatalogPipeline {
         #expect(bridge.contains("requiresMainActor: true"))
     }
 
+    private struct SignatureFlags {
+        var isThrowing = false
+        var isAsync = false
+        var isolation: String?
+    }
+
     private func makeCandidate(
         canonicalCallee: String,
         symbol: String,
         factoryType: String,
-        module: String
-    ) -> NativeImportCatalog.Candidate {
-        .init(
-            canonicalCallee: canonicalCallee,
+        module: String,
+        parameterTypes: [String] = ["Swift.Int"],
+        resultType: String = "Swift.Int",
+        signatureFlags: SignatureFlags = .init(),
+        effects: Core.Effects = .init(),
+        contract: Core.NativeImportContract? = nil
+    ) throws -> NativeImportCatalog.Candidate {
+        let resolvedContract = contract ?? .bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: effects.hasExternalSideEffects ? .write : .pure,
+            maximumDurationMicroseconds: 1_000,
+            allowsMainThread: true
+        )
+        let signature = Core.LoweredSignature(
+            parameters: parameterTypes,
+            result: resultType,
+            isThrowing: signatureFlags.isThrowing,
+            isAsync: signatureFlags.isAsync,
+            isolation: signatureFlags.isolation
+        )
+        return .init(
+            descriptor: try .swiftAdapter(
+                canonicalCallee: canonicalCallee,
+                signature: signature,
+                effects: effects,
+                contract: resolvedContract
+            ),
             silMangledNames: [symbol],
-            signature: .init(
-                parameters: ["Swift.Int"],
-                result: "Swift.Int"
-            ),
-            contract: .bounded(
-                kind: .globalFunction,
-                domain: .application,
-                access: .pure,
-                maximumDurationMicroseconds: 1_000,
-                allowsMainThread: true
-            ),
+            contract: resolvedContract,
             factoryType: factoryType,
             importedModules: [module]
         )

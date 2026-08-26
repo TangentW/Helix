@@ -60,8 +60,11 @@ Both workflows depend on stable, build-specific identities:
 - `FunctionKey` identifies a Swift callable together with the ABI and effect
   facts that matter to Helix.
 - `EntryIndex` is the compact Shell route used by the production bridge.
-- `TypeID` and `NativeImportID` name predeclared type operations and callable
-  native capabilities without embedding process pointers in a patch.
+- `TypeID` names a captured type operation. `NativeCallKey` is the stable,
+  project-independent identity of a canonical native call descriptor;
+  `NativeImportID` is only the compact per-Shell/per-image dispatch slot. A
+  patch carries both rather than embedding a process pointer or treating the
+  compact slot as authority. See [Native call identity and catalog](Native-Calls.md).
 - Interface and transitive implementation fingerprints distinguish a body
   edit from an ABI, layout, source-membership, or dependency change.
 - Eligible existing Shell structs and enums use a captured logical-value

@@ -465,12 +465,14 @@ struct ReleasePipeline {
             maximumDurationMicroseconds: 1_000,
             allowsMainThread: true
         )
-        let nativeImportKey = try Core.NativeImportKey.derive(
-            namespace: namespace,
+        let nativeCallDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
             canonicalCallee: "Fixture.increment(_:)",
             signature: nativeSignature,
             effects: nativeEffects,
             contract: nativeContract
+        )
+        let nativeImportKey = try Core.NativeCall.Key.derive(
+            descriptor: nativeCallDescriptor
         )
         let nativeTypeID = Core.TypeID.derive(
             namespace: namespace,
@@ -528,12 +530,10 @@ struct ReleasePipeline {
                     .init(
                         id: nil,
                         key: nativeImportKey,
-                        canonicalCallee: "Fixture.increment(_:)",
+                        descriptor: nativeCallDescriptor,
                         silMangledNames: ["$s7Fixture9incrementyS2iF"],
                         parameterTypes: [.int64],
                         resultType: .int64,
-                        signature: nativeSignature,
-                        effects: nativeEffects,
                         contract: nativeContract,
                         isEmittedToDevice: true
                     ),
@@ -753,7 +753,7 @@ struct ReleasePipeline {
             key: nativeImportKey,
             invokerExpression: "FixtureIncrementFactory.make("
                 + "id: Core.NativeImportID(rawValue: \(nativeImportID.rawValue)), "
-                + "key: Core.NativeImportKey(rawValue: try! Core.Digest(hex: "
+                + "key: Core.NativeCall.Key(rawValue: try! Core.Digest(hex: "
                 + "\(String(reflecting: nativeImportKey.rawValue.hex)))))"
         )
         let typeBinding = BridgeGeneration.NativeTypeBinding(
@@ -1584,7 +1584,7 @@ struct ReleasePipeline {
         baseSourceURL: URL,
         directory: URL,
         nativeImportID: Core.NativeImportID,
-        nativeImportKey: Core.NativeImportKey,
+        nativeImportKey: Core.NativeCall.Key,
         nativeTypeID: Core.TypeID,
         nativeTypeLayout: Core.Digest,
         patchBytecode: Data
@@ -1597,7 +1597,7 @@ struct ReleasePipeline {
         enum FixtureIncrementFactory: VM.NativeImportFactory {
             static func make(
                 id: Core.NativeImportID,
-                key: Core.NativeImportKey
+                key: Core.NativeCall.Key
             ) -> any VM.NativeInvoker {
                 VM.ClosureNativeInvoker(
                     id: id,

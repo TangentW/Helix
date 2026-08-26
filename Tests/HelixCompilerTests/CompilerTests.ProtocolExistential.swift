@@ -219,21 +219,27 @@ struct ProtocolExistentialTests {
     @Test("Protocol existential calls cannot cross NativeImport")
     func rejectsExistentialNativeBoundary() throws {
         let symbol = "$s7Fixture7consumeyyAA5Named_pF"
-        let requirement = Bytecode.ImportRequirement(
-            id: .init(rawValue: 0),
-            key: .init(rawValue: .sha256("existential-native-import")),
+        let contract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        let descriptor = try Core.NativeCall.Descriptor.swiftAdapter(
+            canonicalCallee: "Fixture.consume(_:)",
             signature: .init(
                 parameters: ["Swift.Any"],
                 result: "Swift.Void"
             ),
             effects: .init(),
-            contract: .bounded(
-                kind: .globalFunction,
-                domain: .application,
-                access: .pure,
-                maximumDurationMicroseconds: 500,
-                allowsMainThread: true
-            )
+            contract: contract
+        )
+        let requirement = Bytecode.ImportRequirement(
+            id: .init(rawValue: 0),
+            key: try .derive(descriptor: descriptor),
+            descriptor: descriptor,
+            contract: contract
         )
         let functionType = "@convention(thin) (@guaranteed any Fixture.Named & AnyObject) -> ()"
         let calls = try CanonicalSIL.DirectCallTable([

@@ -13,9 +13,9 @@ public enum NativeImportCallbackLifetime: String, Codable, Hashable, Sendable,
 
 /// Identifies a callback-bearing NativeImport parameter and its lifetime contract.
 ///
-/// Callback parameters are sparse because ordinary frozen-value parameters remain
-/// the common case. The parameter index is part of the native import identity so
-/// generated adapters cannot silently strengthen a nonescaping lifetime.
+/// Callback parameters are sparse because ordinary value parameters remain the
+/// common case. The descriptor mirrors this authority in its logical signature,
+/// so a generated adapter cannot silently strengthen a nonescaping lifetime.
 public struct NativeImportCallback: Codable, Hashable, Sendable, Comparable {
     public var parameterIndex: UInt16
     public var lifetime: Core.NativeImportCallbackLifetime

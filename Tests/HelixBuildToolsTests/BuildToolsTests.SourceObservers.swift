@@ -404,7 +404,9 @@ extension BuildToolsTests.FrontendReceiptPipeline {
             shell: .init(archive: shell.archive),
             policy: .init(
                 acceptedCapabilities: Set(shell.archive.capabilities),
-                allowedNativeImports: Set(shell.archive.nativeImports.compactMap(\.id))
+                allowedNativeCalls: Set(
+                    shell.archive.nativeImports.filter(\.isEmittedToDevice).map(\.key)
+                )
             )
         )
         let executionSelected = Set(

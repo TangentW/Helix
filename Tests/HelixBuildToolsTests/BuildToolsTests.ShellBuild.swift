@@ -258,23 +258,21 @@ struct ShellBuildPipeline {
             maximumDurationMicroseconds: 500,
             allowsMainThread: true
         )
-        let key = try Core.NativeImportKey.derive(
-            namespace: forged.metadata.shellNamespaceID,
+        let descriptor = try Core.NativeCall.Descriptor.swiftAdapter(
             canonicalCallee: "Fixture.forged(_:)",
             signature: declaration.loweredSignature,
             effects: effects,
             contract: contract
         )
+        let key = try Core.NativeCall.Key.derive(descriptor: descriptor)
         forged.nativeImportCandidates = [
             .init(
                 id: nil,
                 key: key,
-                canonicalCallee: "Fixture.forged(_:)",
+                descriptor: descriptor,
                 silMangledNames: [entry],
                 parameterTypes: declaration.parameterTypes,
                 resultType: declaration.resultType,
-                signature: declaration.loweredSignature,
-                effects: effects,
                 contract: contract,
                 capability: .nativeImportsV1,
                 isEmittedToDevice: false

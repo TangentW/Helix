@@ -28,8 +28,8 @@ public struct BuildContract: Hashable, Sendable {
     public var compatibility: Core.Compatibility
     /// HLBC capabilities accepted by the audited Shell.
     public var capabilities: Set<Core.Capability>
-    /// Native imports compiled and allowlisted in the Shell.
-    public var nativeImportIDs: Set<Core.NativeImportID>
+    /// Stable native calls compiled and authorized in the Shell.
+    public var nativeCallKeys: Set<Core.NativeCall.Key>
     /// Runtime image ABI identity expected by this framework build.
     public var runtimeImageIdentity: Core.RuntimeImageIdentity
 
@@ -42,7 +42,7 @@ public struct BuildContract: Hashable, Sendable {
         minimumOSVersion: Core.SemanticVersion,
         compatibility: Core.Compatibility,
         capabilities: Set<Core.Capability>,
-        nativeImportIDs: Set<Core.NativeImportID>,
+        nativeCallKeys: Set<Core.NativeCall.Key>,
         runtimeImageIdentity: Core.RuntimeImageIdentity = .current
     ) throws {
         self.bundleID = bundleID
@@ -52,7 +52,7 @@ public struct BuildContract: Hashable, Sendable {
         self.minimumOSVersion = minimumOSVersion
         self.compatibility = compatibility
         self.capabilities = capabilities
-        self.nativeImportIDs = nativeImportIDs
+        self.nativeCallKeys = nativeCallKeys
         self.runtimeImageIdentity = runtimeImageIdentity
         try validate()
     }
@@ -68,7 +68,7 @@ public struct BuildContract: Hashable, Sendable {
             minimumOSVersion: descriptor.minimumOSVersion,
             compatibility: descriptor.compatibility,
             capabilities: descriptor.capabilities,
-            nativeImportIDs: descriptor.nativeImportIDs,
+            nativeCallKeys: descriptor.nativeCallKeys,
             runtimeImageIdentity: descriptor.runtimeImageIdentity
         )
     }
@@ -79,6 +79,8 @@ public struct BuildContract: Hashable, Sendable {
               !buildNumber.isEmpty, buildNumber.utf8.count <= 256,
               !bundleID.unicodeScalars.contains(where: { $0.value == 0 }),
               !buildNumber.unicodeScalars.contains(where: { $0.value == 0 }),
+              nativeCallKeys.isEmpty
+                || capabilities.contains(.nativeImportsV1),
               runtimeImageIdentity == .current
         else {
             throw PatchRuntime.Error.invalidBuildContract
@@ -95,7 +97,7 @@ public struct BuildContract: Hashable, Sendable {
         .init(
             acceptedCapabilities: capabilities,
             resourceCeiling: resourceCeiling,
-            allowedNativeImports: nativeImportIDs,
+            allowedNativeCalls: nativeCallKeys,
             allowMainActorEntries: capabilities.contains(.mainActorIsolationV1),
             productionChannelEnabled: true
         )

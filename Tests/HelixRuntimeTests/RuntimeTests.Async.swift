@@ -519,8 +519,8 @@ struct AsyncRouting {
         var nestedEntry: Core.EntryIndex
         var asyncImportID: Core.NativeImportID
         var nestedImportID: Core.NativeImportID
-        var asyncImportKey: Core.NativeImportKey
-        var nestedImportKey: Core.NativeImportKey
+        var asyncImportKey: Core.NativeCall.Key
+        var nestedImportKey: Core.NativeCall.Key
         var asyncContract: Core.NativeImportContract
         var nestedContract: Core.NativeImportContract
     }
@@ -583,19 +583,23 @@ struct AsyncRouting {
         )
         let asyncImportID = Core.NativeImportID(rawValue: 0)
         let nestedImportID = Core.NativeImportID(rawValue: 1)
-        let asyncImportKey = try Core.NativeImportKey.derive(
-            namespace: namespace,
+        let asyncCallDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
             canonicalCallee: "Fixture.suspend()",
             signature: asyncSignature,
             effects: .init(isAsync: true),
             contract: asyncContract
         )
-        let nestedImportKey = try Core.NativeImportKey.derive(
-            namespace: namespace,
+        let asyncImportKey = try Core.NativeCall.Key.derive(
+            descriptor: asyncCallDescriptor
+        )
+        let nestedCallDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
             canonicalCallee: "Fixture.callNested()",
             signature: nestedSignature,
             effects: .init(),
             contract: nestedContract
+        )
+        let nestedImportKey = try Core.NativeCall.Key.derive(
+            descriptor: nestedCallDescriptor
         )
         let root = Bytecode.Function(
             id: .init(rawValue: 0),
@@ -651,15 +655,13 @@ struct AsyncRouting {
             Bytecode.ImportRequirement(
                 id: asyncImportID,
                 key: asyncImportKey,
-                signature: asyncSignature,
-                effects: .init(isAsync: true),
+                descriptor: asyncCallDescriptor,
                 contract: asyncContract
             ),
             Bytecode.ImportRequirement(
                 id: nestedImportID,
                 key: nestedImportKey,
-                signature: nestedSignature,
-                effects: .init(),
+                descriptor: nestedCallDescriptor,
                 contract: nestedContract
             ),
         ]
@@ -690,19 +692,17 @@ struct AsyncRouting {
             Verification.ResolvedNativeImport(
                 id: asyncImportID,
                 key: asyncImportKey,
+                descriptor: asyncCallDescriptor,
                 parameterTypes: [],
                 resultType: .int64,
-                signature: asyncSignature,
-                effects: .init(isAsync: true),
                 contract: asyncContract
             ),
             Verification.ResolvedNativeImport(
                 id: nestedImportID,
                 key: nestedImportKey,
+                descriptor: nestedCallDescriptor,
                 parameterTypes: [],
                 resultType: .int64,
-                signature: nestedSignature,
-                effects: .init(),
                 contract: nestedContract
             ),
         ]
@@ -739,7 +739,7 @@ struct AsyncRouting {
                 resourceCeiling: .init(
                     maxWallTimeMainThreadMilliseconds: 1_000
                 ),
-                allowedNativeImports: [asyncImportID, nestedImportID]
+                allowedNativeCalls: [asyncImportKey, nestedImportKey]
             )
         )
         return .init(

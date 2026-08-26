@@ -101,7 +101,7 @@ Helix 有意采用 fail-closed 策略。“Swift 编译器接受这个文件”�
 - Generic Shell entry；noncopyable、递归、imported/native-backed 或依赖运行时 metadata 的 value root；typed-throws root；上述具体标准库操作之外的通用 `rethrows`；以及通用 unwind cleanup。Eligible 的同步 Shell 值变异只允许恰好一个逻辑 `inout` 区域，包括可变 `self`；多个或 async `inout`、显式 `_read`/`_modify`、async 或 typed-throws accessor、带 availability 的 function/accessor 声明或上下文、泛型 accessor 声明或泛型声明上下文、无法由生成代码命名 private 嵌套 receiver 的 accessor 与 mutable existential opening 仍会 fail closed。受支持的单区域会精确写回嵌套 projection 与 enum 状态，VM trap 不暴露任何 writeback。已索引的 stored property 不能包含 closure、protocol existential、`AnyObject`、native value、生成的文件作用域代码无法命名的 private 嵌套 nominal，或其他不支持的值。带声明初始化器的 `let` 无法由安全的同源重建 initializer 再次赋值，因此拒绝；`var` 的声明初始化器可以存在，已索引的 payload 仍是最终权威值。带 availability 属性的 value 声明或 enum case 也会拒绝，因为无条件 codec 无法在 Shell 的完整 deployment range 内合法引用它。
 - 带额外原生运行时语义的 closure scope 仍不支持：`autoreleasepool` 必须建立真实的 autorelease-pool 边界，`withUnsafe...` 与 contiguous-storage callback 会暴露 pointer lifetime。它们不会被近似成 `withExtendedLifetime`，也不会被当作空操作 closure call。
 - 不受限 pointer、`unsafeBitCast`、任意 Objective-C selector/IMP、`dlopen`/`dlsym`、Mirror 字段修改与未知 builtin。
-- 目标 Shell 中没有精确 `NativeImportID` 的原生调用，即使 App 中存在名字相似的 Swift 函数。生产补丁也不能给已发布 App 新增 framework，或使用该构建没有生成的 SDK 操作。上面的广泛受管 Debug 表面之所以可用，是因为正常 Debug Build 会自动生成这些具体 ID。
+- 目标 Shell 中没有稳定 `NativeCallKey`、精确 Descriptor 和可执行 binding 的原生调用，即使 App 中存在名字相似的 Swift 函数。随附的 `NativeImportID` 只是该 Shell 的紧凑派发下标。生产补丁也不能给已发布 App 新增 framework，或使用该构建没有生成的 SDK 操作。上面的广泛受管 Debug 表面之所以可用，是因为正常 Debug Build 会自动生成这些具体调用能力。
 
 ## 开发期 Live Reload 边界
 

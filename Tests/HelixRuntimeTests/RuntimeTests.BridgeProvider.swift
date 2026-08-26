@@ -43,6 +43,14 @@ struct BridgeProvider {
             try invalid.validate()
         }
 
+        invalid = makeDescriptor()
+        invalid.nativeCallKeys = [
+            .init(rawValue: .sha256("undeclared-native-call")),
+        ]
+        #expect(throws: Runtime.BridgeProviderError.invalidDescriptor) {
+            try invalid.validate()
+        }
+
         let descriptor = makeDescriptor()
         let provider = Runtime.BridgeProvider(
             descriptor: descriptor,
@@ -83,7 +91,7 @@ struct BridgeProvider {
                 compilerFingerprint: "fixture-swift"
             ),
             capabilities: [.baselineV1],
-            nativeImportIDs: [],
+            nativeCallKeys: [],
             platform: .iOSSimulator,
             architecture: "arm64",
             xcodeBuild: "18A1",

@@ -59,14 +59,14 @@ public struct Root: Hashable, Sendable {
 
 public struct NativeImportBinding: Hashable, Sendable {
     public var id: Core.NativeImportID
-    public var key: Core.NativeImportKey
+    public var key: Core.NativeCall.Key
     public var invokerExpression: String
     public var importedModules: [String]
     public var generated: BridgeGeneration.GeneratedNativeImport?
 
     public init(
         id: Core.NativeImportID,
-        key: Core.NativeImportKey,
+        key: Core.NativeCall.Key,
         invokerExpression: String,
         importedModules: [String] = [],
         generated: BridgeGeneration.GeneratedNativeImport? = nil
@@ -130,19 +130,19 @@ public struct GeneratedNativeImport: Hashable, Sendable {
         "HelixNativeImports_\(Core.Digest.sha256(sourceFileLogicalID).hex)"
     }
 
-    public static func factoryName(key: Core.NativeImportKey) -> String {
+    public static func factoryName(key: Core.NativeCall.Key) -> String {
         "make_\(key.rawValue.hex)"
     }
 
     public static func bindingExpression(
         sourceFileLogicalID: String,
         id: Core.NativeImportID,
-        key: Core.NativeImportKey
+        key: Core.NativeCall.Key
     ) -> String {
         let group = groupName(sourceFileLogicalID: sourceFileLogicalID)
         let factory = factoryName(key: key)
         return "\(group).\(factory)(id: Core.NativeImportID(rawValue: \(id.rawValue)), "
-            + "key: Core.NativeImportKey(rawValue: try! Core.Digest(hex: "
+            + "key: Core.NativeCall.Key(rawValue: try! Core.Digest(hex: "
             + "\(String(reflecting: key.rawValue.hex)))))"
     }
 }
@@ -2309,7 +2309,7 @@ public struct Generator: Sendable {
         return """
         static func \(factoryName)(
             id: Core.NativeImportID,
-            key: Core.NativeImportKey
+            key: Core.NativeCall.Key
         ) -> any \(invokerProtocol) {
             \(invokerType)(
                 id: id,
@@ -3594,19 +3594,19 @@ public struct Generator: Sendable {
     private func renderPatchBuildContractFactory(
         archive: InterfaceArchive.Archive
     ) -> String {
-        let imports = archive.nativeImports.compactMap { record -> String? in
-            guard record.isEmittedToDevice, let id = record.id else { return nil }
-            return "Core.NativeImportID(rawValue: \(id.rawValue))"
+        let calls = archive.nativeImports.compactMap { record -> String? in
+            guard record.isEmittedToDevice, record.id != nil else { return nil }
+            return "Core.NativeCall.Key(rawValue: \(render(record.key.rawValue)))"
         }.sorted()
-        let renderedImports = renderGeneratedArray(
-            imports,
-            elementType: "Core.NativeImportID",
-            factoryName: "makePatchNativeImportIDs",
+        let renderedCalls = renderGeneratedArray(
+            calls,
+            elementType: "Core.NativeCall.Key",
+            factoryName: "makePatchNativeCallKeys",
             directIndentation: 24
         )
         return """
-        \(renderedImports.declarations.isEmpty
-            ? "" : renderedImports.declarations + "\n\n")
+        \(renderedCalls.declarations.isEmpty
+            ? "" : renderedCalls.declarations + "\n\n")
             public static func makePatchBuildContract() throws -> PatchRuntime.BuildContract {
                 try PatchRuntime.BuildContract(
                     bundleID: \(quoted(archive.metadata.bundleID)),
@@ -3618,7 +3618,7 @@ public struct Generator: Sendable {
                     minimumOSVersion: \(render(archive.metadata.minimumOS)),
                     compatibility: \(render(archive.compatibility)),
                     capabilities: \(renderCapabilities(archive.capabilities)),
-                    nativeImportIDs: Set(\(renderedImports.expression)),
+                    nativeCallKeys: Set(\(renderedCalls.expression)),
                     runtimeImageIdentity: .current
                 )
             }
@@ -3727,11 +3727,10 @@ public struct Generator: Sendable {
         """
         Verification.ResolvedNativeImport(
             id: .init(rawValue: \(record.id!.rawValue)),
-            key: Core.NativeImportKey(rawValue: \(render(record.key.rawValue))),
+            key: Core.NativeCall.Key(rawValue: \(render(record.key.rawValue))),
+            descriptor: \(render(record.descriptor)),
             parameterTypes: \(renderValueTypes(record.parameterTypes)),
             resultType: \(render(record.resultType)),
-            signature: \(render(record.signature)),
-            effects: \(render(record.effects)),
             contract: \(render(record.contract)),
             capability: Core.Capability(rawValue: \(quoted(record.capability.rawValue)))
         )
@@ -3802,6 +3801,89 @@ public struct Generator: Sendable {
         return "Core.LoweredSignature(parameters: [\(parameters)], result: \(quoted(signature.result)), "
             + "isThrowing: \(signature.isThrowing), isAsync: \(signature.isAsync), "
             + "isolation: \(isolation))"
+    }
+
+    private func render(_ descriptor: Core.NativeCall.Descriptor) -> String {
+        let target = descriptor.target
+        let owner = target.owner.map(quoted) ?? "nil"
+        let receiver = target.receiverArgumentIndex.map(String.init) ?? "nil"
+        let logicalParameters = descriptor.logicalSignature.parameters.map { parameter in
+            let label = parameter.label.map(quoted) ?? "nil"
+            let lifetime = parameter.callbackLifetime.map {
+                ".\($0.rawValue)"
+            } ?? "nil"
+            return "Core.NativeCall.LogicalParameter(label: \(label), "
+                + "type: \(quoted(parameter.type)), ownership: .\(parameter.ownership.rawValue), "
+                + "callbackLifetime: \(lifetime), isAutoclosure: \(parameter.isAutoclosure))"
+        }.joined(separator: ", ")
+        let physicalParameters = descriptor.physicalSignature.parameters.map {
+            parameter in
+            "Core.NativeCall.ABIParameter(type: \(render(parameter.type)), "
+                + "ownership: .\(parameter.ownership.rawValue), "
+                + "convention: .\(parameter.convention.rawValue), "
+                + "source: \(render(parameter.source)))"
+        }.joined(separator: ", ")
+        let availability = descriptor.availability.map { item in
+            "Core.NativeCall.Availability(platform: \(quoted(item.platform)), "
+                + "introduced: \(render(item.introduced)), "
+                + "deprecated: \(render(item.deprecated)), "
+                + "obsoleted: \(render(item.obsoleted)), "
+                + "isUnavailable: \(item.isUnavailable))"
+        }.joined(separator: ", ")
+        let isolation = descriptor.logicalSignature.isolation.map(quoted) ?? "nil"
+        return """
+        try! Core.NativeCall.Descriptor(
+            target: Core.NativeCall.Target(
+                backend: .\(target.backend.rawValue),
+                module: \(quoted(target.module)),
+                owner: \(owner),
+                member: \(quoted(target.member)),
+                entryPoint: \(quoted(target.entryPoint)),
+                dispatch: .\(target.dispatch.rawValue),
+                receiverArgumentIndex: \(receiver)
+            ),
+            logicalSignature: Core.NativeCall.LogicalSignature(
+                parameters: [\(logicalParameters)],
+                result: Core.NativeCall.LogicalResult(
+                    type: \(quoted(descriptor.logicalSignature.result.type)),
+                    ownership: .\(descriptor.logicalSignature.result.ownership.rawValue)
+                ),
+                isThrowing: \(descriptor.logicalSignature.isThrowing),
+                isAsync: \(descriptor.logicalSignature.isAsync),
+                isolation: \(isolation)
+            ),
+            physicalSignature: Core.NativeCall.PhysicalSignature(
+                callingConvention: .\(descriptor.physicalSignature.callingConvention.rawValue),
+                parameters: [\(physicalParameters)],
+                result: \(render(descriptor.physicalSignature.result)),
+                resultConvention: .\(descriptor.physicalSignature.resultConvention.rawValue),
+                errorConvention: .\(descriptor.physicalSignature.errorConvention.rawValue)
+            ),
+            effects: \(render(descriptor.effects)),
+            availability: [\(availability)]
+        )
+        """
+    }
+
+    private func render(_ type: Core.NativeCall.ABIType) -> String {
+        let canonicalName = type.canonicalName.map(quoted) ?? "nil"
+        let size = type.size.map(String.init) ?? "nil"
+        let alignment = type.alignment.map(String.init) ?? "nil"
+        let encoding = type.encoding.map(quoted) ?? "nil"
+        return "Core.NativeCall.ABIType(kind: .\(type.kind.rawValue), "
+            + "canonicalName: \(canonicalName), size: \(size), alignment: \(alignment), "
+            + "encoding: \(encoding), isNullable: \(type.isNullable))"
+    }
+
+    private func render(_ source: Core.NativeCall.ArgumentSource) -> String {
+        let index = source.logicalArgumentIndex.map(String.init) ?? "nil"
+        let symbol = source.generatorSymbol.map(quoted) ?? "nil"
+        return "Core.NativeCall.ArgumentSource(kind: .\(source.kind.rawValue), "
+            + "logicalArgumentIndex: \(index), generatorSymbol: \(symbol))"
+    }
+
+    private func render(_ version: Core.SemanticVersion?) -> String {
+        version.map(render) ?? "nil"
     }
 
     private func render(_ contract: Core.NativeImportContract) -> String {

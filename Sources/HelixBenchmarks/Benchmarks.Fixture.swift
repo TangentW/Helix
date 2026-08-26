@@ -445,13 +445,13 @@ struct Fixture {
             maximumDurationMicroseconds: 2_000,
             allowsMainThread: true
         )
-        let key = try Core.NativeImportKey.derive(
-            namespace: namespace,
+        let nativeDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
             canonicalCallee: "HelixBenchmark.UIBridge.transform(_:)",
             signature: signature,
             effects: effects,
             contract: contract
         )
+        let key = try Core.NativeCall.Key.derive(descriptor: nativeDescriptor)
         let functionKey = try Core.FunctionKey.derive(
             namespace: namespace,
             module: "BenchmarkFeature",
@@ -486,8 +486,7 @@ struct Fixture {
         let requirement = Bytecode.ImportRequirement(
             id: importID,
             key: key,
-            signature: signature,
-            effects: effects,
+            descriptor: nativeDescriptor,
             contract: contract
         )
         let module = Bytecode.Module(
@@ -512,10 +511,9 @@ struct Fixture {
         let descriptor = Verification.ResolvedNativeImport(
             id: importID,
             key: key,
+            descriptor: nativeDescriptor,
             parameterTypes: [.int64],
             resultType: .int64,
-            signature: signature,
-            effects: effects,
             contract: contract
         )
         let shell = try Verification.ShellInterface(
@@ -547,7 +545,7 @@ struct Fixture {
                     maxWallTimeMainThreadMilliseconds: 1_000,
                     maxWallTimeBackgroundMilliseconds: 1_000
                 ),
-                allowedNativeImports: [importID],
+                allowedNativeCalls: [key],
                 allowMainActorEntries: true
             )
         )
@@ -565,7 +563,7 @@ struct Fixture {
 
     private struct UINativeImportInvoker: VM.NativeInvoker {
         let id: Core.NativeImportID
-        let key: Core.NativeImportKey
+        let key: Core.NativeCall.Key
         let contract: Core.NativeImportContract
         let parameterTypes: [Bytecode.ValueType] = [.int64]
         let resultType: Bytecode.ValueType = .int64

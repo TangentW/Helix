@@ -117,18 +117,13 @@ struct FrontendExecutionHarness {
                 )
             }
             let id = Core.NativeImportID(rawValue: rawID)
-            let key = try Core.NativeImportKey.derive(
-                namespace: namespace,
-                canonicalCallee: descriptor.canonicalCallee,
-                signature: descriptor.signature,
-                effects: descriptor.effects,
-                contract: descriptor.contract
+            let key = try Core.NativeCall.Key.derive(
+                descriptor: descriptor.nativeCall
             )
             let requirement = Bytecode.ImportRequirement(
                 id: id,
                 key: key,
-                signature: descriptor.signature,
-                effects: descriptor.effects,
+                descriptor: descriptor.nativeCall,
                 contract: descriptor.contract,
                 requiredCapability: descriptor.capability
             )
@@ -213,10 +208,9 @@ struct FrontendExecutionHarness {
                 .init(
                     id: item.requirement.id,
                     key: item.requirement.key,
+                    descriptor: item.descriptor.nativeCall,
                     parameterTypes: item.descriptor.parameterTypes,
                     resultType: item.descriptor.resultType,
-                    signature: item.descriptor.signature,
-                    effects: item.descriptor.effects,
                     contract: item.descriptor.contract,
                     capability: item.descriptor.capability
                 )
@@ -243,8 +237,8 @@ struct FrontendExecutionHarness {
             shell: shell,
             policy: .init(
                 acceptedCapabilities: compiled.module.capabilities,
-                allowedNativeImports: Set(
-                    resolvedImports.map { $0.requirement.id }
+                allowedNativeCalls: Set(
+                    resolvedImports.map { $0.requirement.key }
                 ),
                 allowMainActorEntries: rootEffects.requiresMainActor
             )

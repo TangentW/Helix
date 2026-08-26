@@ -17,7 +17,7 @@ struct StandardLibraryImports {
 
     private struct NativeTextProbe: VM.NativeInvoker {
         let id: Core.NativeImportID
-        let key: Core.NativeImportKey
+        let key: Core.NativeCall.Key
         let parameterTypes: [Bytecode.ValueType]
         let resultType: Bytecode.ValueType
         let effects: Core.Effects
@@ -109,13 +109,13 @@ struct StandardLibraryImports {
 
     private struct PrintProbe: VM.NativeInvoker {
         let id: Core.NativeImportID
-        let key: Core.NativeImportKey
+        let key: Core.NativeCall.Key
         let parameterTypes: [Bytecode.ValueType]
         let resultType: Bytecode.ValueType
         let effects: Core.Effects
         let contract: Core.NativeImportContract
 
-        init(id: Core.NativeImportID, key: Core.NativeImportKey) {
+        init(id: Core.NativeImportID, key: Core.NativeCall.Key) {
             let descriptor = Bytecode.StandardLibraryImports.swiftPrint
             self.id = id
             self.key = key
@@ -180,18 +180,13 @@ struct StandardLibraryImports {
             seed: "fixture"
         )
         let importID = Core.NativeImportID(rawValue: 0)
-        let importKey = try Core.NativeImportKey.derive(
-            namespace: namespace,
-            canonicalCallee: descriptor.canonicalCallee,
-            signature: descriptor.signature,
-            effects: descriptor.effects,
-            contract: descriptor.contract
+        let importKey = try Core.NativeCall.Key.derive(
+            descriptor: descriptor.nativeCall
         )
         let requirement = Bytecode.ImportRequirement(
             id: importID,
             key: importKey,
-            signature: descriptor.signature,
-            effects: descriptor.effects,
+            descriptor: descriptor.nativeCall,
             contract: descriptor.contract,
             requiredCapability: descriptor.capability
         )
@@ -269,10 +264,9 @@ struct StandardLibraryImports {
                 .init(
                     id: importID,
                     key: importKey,
+                    descriptor: descriptor.nativeCall,
                     parameterTypes: descriptor.parameterTypes,
                     resultType: descriptor.resultType,
-                    signature: descriptor.signature,
-                    effects: descriptor.effects,
                     contract: descriptor.contract,
                     capability: descriptor.capability
                 ),
@@ -283,7 +277,7 @@ struct StandardLibraryImports {
             shell: shell,
             policy: .init(
                 acceptedCapabilities: compiled.module.capabilities,
-                allowedNativeImports: [importID]
+                allowedNativeCalls: [importKey]
             )
         )
         let catalog = try VM.NativeCatalog([

@@ -106,31 +106,31 @@ public enum NativeImportABIAdapter: String, Codable, Hashable, Sendable {
 
 public struct NativeImportRecord: Codable, Hashable, Sendable {
     public var id: Core.NativeImportID?
-    public var key: Core.NativeImportKey
-    public var canonicalCallee: String
+    public var key: Core.NativeCall.Key
+    public var descriptor: Core.NativeCall.Descriptor
     /// Exact canonical-SIL symbols accepted for this typed native import.
     /// These stay server-side and never become runtime symbol lookup authority.
     public var silMangledNames: [String]
     public var parameterTypes: [Bytecode.ValueType]
     public var parameterProjection: InterfaceArchive.NativeImportParameterProjection
     public var resultType: Bytecode.ValueType
-    public var signature: Core.LoweredSignature
-    public var effects: Core.Effects
-    public var contract: Core.NativeImportContract
+    public var contract: Core.NativeImportContract {
+        didSet {
+            descriptor.replaceCallbackLifetimes(contract.callbacks)
+        }
+    }
     public var capability: Core.Capability
     public var isEmittedToDevice: Bool
     public var abiAdapter: InterfaceArchive.NativeImportABIAdapter
 
     public init(
         id: Core.NativeImportID?,
-        key: Core.NativeImportKey,
-        canonicalCallee: String,
+        key: Core.NativeCall.Key,
+        descriptor: Core.NativeCall.Descriptor,
         silMangledNames: [String],
         parameterTypes: [Bytecode.ValueType],
         parameterProjection: InterfaceArchive.NativeImportParameterProjection? = nil,
         resultType: Bytecode.ValueType,
-        signature: Core.LoweredSignature,
-        effects: Core.Effects,
         contract: Core.NativeImportContract,
         capability: Core.Capability = .nativeImportsV1,
         isEmittedToDevice: Bool,
@@ -138,18 +138,31 @@ public struct NativeImportRecord: Codable, Hashable, Sendable {
     ) {
         self.id = id
         self.key = key
-        self.canonicalCallee = canonicalCallee
+        self.descriptor = descriptor
         self.silMangledNames = silMangledNames.sorted()
         self.parameterTypes = parameterTypes
         self.parameterProjection = parameterProjection
             ?? .identity(parameterCount: parameterTypes.count)
         self.resultType = resultType
-        self.signature = signature
-        self.effects = effects
         self.contract = contract
         self.capability = capability
         self.isEmittedToDevice = isEmittedToDevice
         self.abiAdapter = abiAdapter
+    }
+
+    public var canonicalCallee: String { descriptor.canonicalCallee }
+    public var signature: Core.LoweredSignature {
+        get { descriptor.loweredSignature }
+        set {
+            descriptor.replaceLogicalSignature(
+                newValue,
+                callbacks: contract.callbacks
+            )
+        }
+    }
+    public var effects: Core.Effects {
+        get { descriptor.effects }
+        set { descriptor.effects = newValue }
     }
 }
 
@@ -647,24 +660,23 @@ public struct Archive: Codable, Hashable, Sendable {
                     "native import signature, effects, or physical parameter projection disagree"
                 )
             }
-            let expected = try Core.NativeImportKey.derive(
-                namespace: metadata.shellNamespaceID,
-                canonicalCallee: item.canonicalCallee,
-                signature: item.signature,
-                effects: item.effects,
-                contract: item.contract
-            )
-            guard expected == item.key else {
-                throw InterfaceArchive.Error.invalidArchive("native import key derivation mismatch")
-            }
             if item.isEmittedToDevice, !capabilities.contains(item.capability) {
                 throw InterfaceArchive.Error.invalidArchive("emitted native import capability is absent")
             }
             do {
-                try item.contract.validate(effects: item.effects)
+                try item.descriptor.validate(contract: item.contract)
+                guard try Core.NativeCall.Key.derive(
+                    descriptor: item.descriptor
+                ) == item.key else {
+                    throw InterfaceArchive.Error.invalidArchive(
+                        "native import key derivation mismatch"
+                    )
+                }
+            } catch let error as InterfaceArchive.Error {
+                throw error
             } catch {
                 throw InterfaceArchive.Error.invalidArchive(
-                    "native import contract is invalid: \(error)"
+                    "native import descriptor or contract is invalid: \(error)"
                 )
             }
             guard item.capability == .nativeImportsV1 else {
@@ -1017,10 +1029,9 @@ public struct Archive: Codable, Hashable, Sendable {
                 return .init(
                     id: id,
                     key: item.key,
+                    descriptor: item.descriptor,
                     parameterTypes: item.parameterTypes,
                     resultType: item.resultType,
-                    signature: item.signature,
-                    effects: item.effects,
                     contract: item.contract,
                     capability: item.capability
                 )
@@ -1087,11 +1098,10 @@ private struct DeviceEntry: Codable {
 
 private struct DeviceImport: Codable {
     var id: Core.NativeImportID
-    var key: Core.NativeImportKey
+    var key: Core.NativeCall.Key
+    var descriptor: Core.NativeCall.Descriptor
     var parameterTypes: [Bytecode.ValueType]
     var resultType: Bytecode.ValueType
-    var signature: Core.LoweredSignature
-    var effects: Core.Effects
     var contract: Core.NativeImportContract
     var capability: Core.Capability
 }

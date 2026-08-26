@@ -326,13 +326,31 @@ struct SemanticVerifier {
                 .init(parameterIndex: 0, lifetime: .nonescaping),
             ]
         )
+        let callDescriptor = try Core.NativeCall.Descriptor(
+            target: .init(
+                backend: .swiftAdapter,
+                module: "Fixture",
+                member: "invalidCallbackContract()",
+                entryPoint: "Fixture.invalidCallbackContract()",
+                dispatch: .global
+            ),
+            logicalSignature: .init(
+                parameters: [],
+                result: .init(type: "Swift.Void")
+            ),
+            physicalSignature: .init(
+                callingConvention: .swiftAdapter,
+                parameters: [],
+                result: .void
+            ),
+            effects: .init()
+        )
         let descriptor = Verification.ResolvedNativeImport(
             id: .init(rawValue: 0),
-            key: .init(rawValue: .sha256("invalid-native-signature")),
+            key: try .derive(descriptor: callDescriptor),
+            descriptor: callDescriptor,
             parameterTypes: [.closure(callback)],
             resultType: .void,
-            signature: .init(parameters: [], result: "Swift.Void"),
-            effects: .init(),
             contract: contract
         )
 
@@ -4794,14 +4812,17 @@ struct SemanticVerifier {
             parameters: ["Swift.Int", "Swift.Int"],
             result: "Swift.Int"
         )
-        let key = Core.NativeImportKey(
-            rawValue: .sha256("verifier-native-closure")
+        let descriptor = try Core.NativeCall.Descriptor.swiftAdapter(
+            canonicalCallee: "Fixture.combine(_:_:)",
+            signature: signature,
+            effects: effects,
+            contract: contract
         )
+        let key = try Core.NativeCall.Key.derive(descriptor: descriptor)
         let requirement = Bytecode.ImportRequirement(
             id: importID,
             key: key,
-            signature: signature,
-            effects: effects,
+            descriptor: descriptor,
             contract: contract
         )
         fixture.module.functions[0].blocks[0].instructions[0] = .makeClosure(
@@ -4813,17 +4834,16 @@ struct SemanticVerifier {
         fixture.shell.imports[importID] = .init(
             id: importID,
             key: key,
+            descriptor: descriptor,
             parameterTypes: [.int64, .int64],
             resultType: .int64,
-            signature: signature,
-            effects: effects,
             contract: contract
         )
         let capabilities: Set<Core.Capability> = [.nativeImportsV1]
         fixture.module.capabilities.formUnion(capabilities)
         fixture.shell.capabilities.formUnion(capabilities)
         fixture.policy.acceptedCapabilities.formUnion(capabilities)
-        fixture.policy.allowedNativeImports.insert(importID)
+        fixture.policy.allowedNativeCalls.insert(key)
 
         _ = try Verification.Engine().verify(
             bytes: Bytecode.Encoder.encode(fixture.module),

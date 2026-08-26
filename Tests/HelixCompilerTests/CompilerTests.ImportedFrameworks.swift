@@ -84,7 +84,7 @@ struct ImportedFrameworks {
             reference: "#UIView.setNeedsLayout!foreign",
             loweredType: loweredType
         )
-        let requirement = importRequirement(id: 4)
+        let requirement = try importRequirement(id: 4)
         let calls = try CanonicalSIL.DirectCallTable([
             .init(
                 mangledName: symbol,
@@ -141,7 +141,7 @@ struct ImportedFrameworks {
             reference: "#UILabel.text!setter.foreign",
             loweredType: physicalType
         )
-        let requirement = importRequirement(id: 41)
+        let requirement = try importRequirement(id: 41)
         let calls = try CanonicalSIL.DirectCallTable([
             .init(
                 mangledName: symbol,
@@ -292,7 +292,7 @@ struct ImportedFrameworks {
             reference: "#Consumer.consume!foreign",
             loweredType: physicalType
         )
-        let requirement = importRequirement(id: 31)
+        let requirement = try importRequirement(id: 31)
         let calls = try CanonicalSIL.DirectCallTable([
             .init(
                 mangledName: symbol,
@@ -426,7 +426,7 @@ struct ImportedFrameworks {
     func ownsBorrowedNativeReturn() throws {
         let viewType = Core.TypeID(rawValue: .sha256("UIKit.UIView"))
         let loweredType = "@convention(objc_method) (UIView) -> ()"
-        let requirement = importRequirement(id: 27)
+        let requirement = try importRequirement(id: 27)
         let calls = try CanonicalSIL.DirectCallTable([
             .init(
                 mangledName: CanonicalSIL.NativeBridgeSymbols.foreignCall(
@@ -623,8 +623,8 @@ struct ImportedFrameworks {
     func lowersSameTypeReceiverCast() throws {
         let controllerType = Core.TypeID(rawValue: .sha256("Fixture.Controller"))
         let viewControllerType = Core.TypeID(rawValue: .sha256("UIKit.UIViewController"))
-        let upcastRequirement = importRequirement(id: 5)
-        let superRequirement = importRequirement(id: 6)
+        let upcastRequirement = try importRequirement(id: 5)
+        let superRequirement = try importRequirement(id: 6)
         let loweredSuperType = "@convention(objc_method) (UIViewController) -> ()"
         let calls = try CanonicalSIL.DirectCallTable([
             .init(
@@ -725,7 +725,7 @@ struct ImportedFrameworks {
             from: labelType,
             to: objectType
         )
-        let upcastRequirement = importRequirement(id: 6)
+        let upcastRequirement = try importRequirement(id: 6)
         let calls = try CanonicalSIL.DirectCallTable([
             .init(
                 mangledName: upcastSymbol,
@@ -792,7 +792,7 @@ struct ImportedFrameworks {
     func preservesOwnedNativeUpcastSourceAcrossLaterUses() throws {
         let stackType = Core.TypeID(rawValue: .sha256("UIKit.UIStackView"))
         let viewType = Core.TypeID(rawValue: .sha256("UIKit.UIView"))
-        let requirement = importRequirement(id: 26)
+        let requirement = try importRequirement(id: 26)
         let calls = try CanonicalSIL.DirectCallTable([
             .init(
                 mangledName: CanonicalSIL.NativeBridgeSymbols.upcast(
@@ -878,7 +878,7 @@ struct ImportedFrameworks {
             from: labelType,
             to: objectType
         )
-        let upcastRequirement = importRequirement(id: 7)
+        let upcastRequirement = try importRequirement(id: 7)
         let calls = try CanonicalSIL.DirectCallTable([
             .init(
                 mangledName: upcastSymbol,
@@ -936,7 +936,7 @@ struct ImportedFrameworks {
     func forwardsRetainedOwnersAcrossNativeUpcastAliases() throws {
         let labelType = Core.TypeID(rawValue: .sha256("UIKit.UILabel"))
         let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
-        let requirement = importRequirement(id: 27)
+        let requirement = try importRequirement(id: 27)
         let calls = try CanonicalSIL.DirectCallTable([
             .init(
                 mangledName: CanonicalSIL.NativeBridgeSymbols.upcast(
@@ -1126,7 +1126,7 @@ struct ImportedFrameworks {
         let objectType = Core.TypeID(rawValue: .sha256("Foundation.NSObject"))
         let globalSymbol = "$s7Fixture12sharedObjectSo8NSObjectCvp"
         let loweredGlobalType = "NSObject"
-        let requirement = importRequirement(id: 28)
+        let requirement = try importRequirement(id: 28)
         let calls = try CanonicalSIL.DirectCallTable([
             .init(
                 mangledName: CanonicalSIL.NativeBridgeSymbols.importedGlobal(
@@ -1185,7 +1185,7 @@ struct ImportedFrameworks {
         let globalSymbol = "$s7Fixture12sharedObjectSo8NSObjectCvp"
         let loweredGlobalType = "NSObject"
         let inspectSymbol = "$s7Fixture7inspectyySo8NSObjectCF"
-        let requirement = importRequirement(id: 29)
+        let requirement = try importRequirement(id: 29)
         let calls = try CanonicalSIL.DirectCallTable([
             .init(
                 mangledName: CanonicalSIL.NativeBridgeSymbols.importedGlobal(
@@ -1253,7 +1253,7 @@ struct ImportedFrameworks {
     func transfersBorrowedNativeUpcastIntoOptional() throws {
         let labelType = Core.TypeID(rawValue: .sha256("UIKit.UILabel"))
         let objectType = Core.TypeID(rawValue: .sha256("Swift.AnyObject"))
-        let requirement = importRequirement(id: 8)
+        let requirement = try importRequirement(id: 8)
         let calls = try CanonicalSIL.DirectCallTable([
             .init(
                 mangledName: CanonicalSIL.NativeBridgeSymbols.upcast(
@@ -1305,7 +1305,7 @@ struct ImportedFrameworks {
     @Test("Objective-C value bridges reuse the frozen AnyObject boxing import")
     func bridgesStringValueToAnyObject() throws {
         let objectType = Core.TypeID(rawValue: .sha256("Swift.AnyObject"))
-        let requirement = importRequirement(id: 29, kind: .staticMethod)
+        let requirement = try importRequirement(id: 29, kind: .staticMethod)
         let calls = try CanonicalSIL.DirectCallTable([
             .init(
                 mangledName: CanonicalSIL.NativeBridgeSymbols.anyObjectBridge(
@@ -1385,7 +1385,7 @@ struct ImportedFrameworks {
     @Test("Opened Any values use the frozen Objective-C boxing import")
     func bridgesOpenedAnyToAnyObject() throws {
         let objectType = Core.TypeID(rawValue: .sha256("Swift.AnyObject"))
-        let requirement = importRequirement(id: 17, kind: .staticMethod)
+        let requirement = try importRequirement(id: 17, kind: .staticMethod)
         let calls = try CanonicalSIL.DirectCallTable([
             .init(
                 mangledName: CanonicalSIL.NativeBridgeSymbols.anyObjectBridge(
@@ -1739,7 +1739,7 @@ struct ImportedFrameworks {
             loweredType: loweredType,
             genericArguments: ["NSLayoutXAxisAnchor"]
         )
-        let requirement = importRequirement(id: 5)
+        let requirement = try importRequirement(id: 5)
         let calls = try CanonicalSIL.DirectCallTable([
             .init(
                 mangledName: symbol,
@@ -1788,8 +1788,8 @@ struct ImportedFrameworks {
             + "(NSLayoutAnchor<τ_0_0>, NSLayoutAnchor<τ_0_0>) "
             + "-> @autoreleased NSLayoutConstraint"
         let reference = "#NSLayoutAnchor.constraint!foreign"
-        let xRequirement = importRequirement(id: 13)
-        let yRequirement = importRequirement(id: 14)
+        let xRequirement = try importRequirement(id: 13)
+        let yRequirement = try importRequirement(id: 14)
         let calls = try CanonicalSIL.DirectCallTable([
             .init(
                 mangledName: CanonicalSIL.NativeBridgeSymbols.foreignCall(
@@ -1857,8 +1857,8 @@ struct ImportedFrameworks {
             rawValue: .sha256("UIKit.UIButton.Configuration")
         )
         let buttonType = Core.TypeID(rawValue: .sha256("UIKit.UIButton"))
-        let filled = importRequirement(id: 15)
-        let setter = importRequirement(id: 16)
+        let filled = try importRequirement(id: 15)
+        let setter = try importRequirement(id: 16)
         let filledSymbol = "$sSo8UIButtonC5UIKitE13ConfigurationV6filledAEyFZ"
         let setterSymbol = "$sSo8UIButtonC5UIKitE13configurationAbCE13ConfigurationVSgvs"
         let calls = try CanonicalSIL.DirectCallTable([
@@ -1948,8 +1948,8 @@ struct ImportedFrameworks {
         )
         let makeSymbol = "$s7Fixture11makeOptionsSo06UIViewE0VyF"
         let consumeSymbol = "$s7Fixture14consumeOptionsyySo06UIViewE0VF"
-        let make = importRequirement(id: 41)
-        let consume = importRequirement(id: 42)
+        let make = try importRequirement(id: 41)
+        let consume = try importRequirement(id: 42)
         let calls = try CanonicalSIL.DirectCallTable([
             .init(
                 mangledName: makeSymbol,
@@ -2473,7 +2473,7 @@ struct ImportedFrameworks {
             reference: "#FileManager.removeItem!foreign",
             loweredType: physicalType
         )
-        let requirement = importRequirement(
+        let requirement = try importRequirement(
             id: 28,
             effects: effects,
             kind: .instanceMethod
@@ -2555,19 +2555,45 @@ struct ImportedFrameworks {
         id: UInt32,
         effects: Core.Effects = .init(),
         kind: Core.NativeImportKind = .globalFunction
-    ) -> Bytecode.ImportRequirement {
-        .init(
-            id: .init(rawValue: id),
-            key: .init(rawValue: .sha256("import-\(id)")),
-            signature: .init(parameters: [], result: "Swift.Void"),
+    ) throws -> Bytecode.ImportRequirement {
+        let contract = Core.NativeImportContract.bounded(
+            kind: kind,
+            domain: .application,
+            access: effects.hasExternalSideEffects ? .write : .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        let isInstance = [
+            Core.NativeImportKind.instanceMethod,
+            .instanceGetter,
+            .instanceSetter,
+            .instanceSubscriptGetter,
+            .instanceSubscriptSetter,
+        ].contains(kind)
+        let signature = Core.LoweredSignature(
+            parameters: isInstance ? ["Fixture.Receiver"] : [],
+            result: "Swift.Void",
+            isThrowing: effects.mayThrow,
+            isAsync: effects.isAsync,
+            isolation: effects.requiresMainActor ? "MainActor" : nil
+        )
+        let owner = isInstance || [
+            Core.NativeImportKind.staticMethod,
+            .staticGetter,
+            .staticSetter,
+            .initializer,
+        ].contains(kind) ? "Receiver." : ""
+        let descriptor = try Core.NativeCall.Descriptor.swiftAdapter(
+            canonicalCallee: "Fixture.\(owner)import\(id)()",
+            signature: signature,
             effects: effects,
-            contract: .bounded(
-                kind: kind,
-                domain: .application,
-                access: effects.hasExternalSideEffects ? .write : .pure,
-                maximumDurationMicroseconds: 500,
-                allowsMainThread: true
-            )
+            contract: contract
+        )
+        return .init(
+            id: .init(rawValue: id),
+            key: try Core.NativeCall.Key.derive(descriptor: descriptor),
+            descriptor: descriptor,
+            contract: contract
         )
     }
 }

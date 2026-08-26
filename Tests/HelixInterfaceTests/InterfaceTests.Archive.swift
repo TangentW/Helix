@@ -62,7 +62,6 @@ struct Archive {
     @Test("Server-only candidates do not enter the device interface hash")
     func candidateImportIsNotDeviceAuthority() throws {
         let original = try fixture()
-        let namespace = original.metadata.shellNamespaceID
         let signature = Core.LoweredSignature(parameters: [], result: "Swift.Int")
         let contract = Core.NativeImportContract.bounded(
             kind: .globalFunction,
@@ -71,24 +70,22 @@ struct Archive {
             maximumDurationMicroseconds: 500,
             allowsMainThread: true
         )
-        let key = try Core.NativeImportKey.derive(
-            namespace: namespace,
+        let descriptor = try Core.NativeCall.Descriptor.swiftAdapter(
             canonicalCallee: "Secret.unapproved()",
             signature: signature,
             effects: .init(),
             contract: contract
         )
+        let key = try Core.NativeCall.Key.derive(descriptor: descriptor)
         var candidate = original
         candidate.nativeImports.append(
             .init(
                 id: nil,
                 key: key,
-                canonicalCallee: "Secret.unapproved()",
+                descriptor: descriptor,
                 silMangledNames: ["$s6Secret10unapprovedSiyF"],
                 parameterTypes: [],
                 resultType: .int64,
-                signature: signature,
-                effects: .init(),
                 contract: contract,
                 isEmittedToDevice: false
             )
@@ -410,13 +407,23 @@ struct Archive {
             allowsMainThread: true,
             callbacks: [.init(parameterIndex: 0, lifetime: .escaping)]
         )
-        let key = try Core.NativeImportKey.derive(
-            namespace: archive.metadata.shellNamespaceID,
+        let descriptor = try Core.NativeCall.Descriptor.swiftAdapter(
             canonicalCallee: "Fixture.install(_:)",
             signature: signature,
             effects: .init(),
-            contract: contract
+            contract: contract,
+            physicalParameterTypes: [
+                "Swift.Any",
+                "Swift.Optional<Swift.Int>",
+                signature.parameters[0],
+            ],
+            physicalArgumentSources: [
+                .defaultGenerator("$s7Fixture7installFfA_"),
+                .optionalNone,
+                .argument(0),
+            ]
         )
+        let key = try Core.NativeCall.Key.derive(descriptor: descriptor)
         archive.capabilities += [
             .nativeImportsV1, .closureValuesV1, .escapingClosureValuesV1,
         ]
@@ -435,13 +442,11 @@ struct Archive {
             .init(
                 id: .init(rawValue: 0),
                 key: key,
-                canonicalCallee: "Fixture.install(_:)",
+                descriptor: descriptor,
                 silMangledNames: ["$s7Fixture7installyyySbccF"],
                 parameterTypes: [.closure(callback)],
                 parameterProjection: projection,
                 resultType: .void,
-                signature: signature,
-                effects: .init(),
                 contract: contract,
                 isEmittedToDevice: true
             ),
@@ -466,12 +471,8 @@ struct Archive {
         returning.nativeImports[0].signature.parameters = [
             "@escaping (Swift.Bool) -> Swift.Bool",
         ]
-        returning.nativeImports[0].key = try Core.NativeImportKey.derive(
-            namespace: returning.metadata.shellNamespaceID,
-            canonicalCallee: returning.nativeImports[0].canonicalCallee,
-            signature: returning.nativeImports[0].signature,
-            effects: returning.nativeImports[0].effects,
-            contract: returning.nativeImports[0].contract
+        returning.nativeImports[0].key = try Core.NativeCall.Key.derive(
+            descriptor: returning.nativeImports[0].descriptor
         )
         returning.shellInterfaceHash = try returning.computeShellInterfaceHash()
         try returning.validate()
@@ -485,12 +486,8 @@ struct Archive {
         returning.nativeImports[0].signature.parameters = [
             "@escaping (Swift.Bool) -> UnsupportedNativeResult",
         ]
-        returning.nativeImports[0].key = try Core.NativeImportKey.derive(
-            namespace: returning.metadata.shellNamespaceID,
-            canonicalCallee: returning.nativeImports[0].canonicalCallee,
-            signature: returning.nativeImports[0].signature,
-            effects: returning.nativeImports[0].effects,
-            contract: returning.nativeImports[0].contract
+        returning.nativeImports[0].key = try Core.NativeCall.Key.derive(
+            descriptor: returning.nativeImports[0].descriptor
         )
         returning.shellInterfaceHash = try returning.computeShellInterfaceHash()
         #expect(throws: InterfaceArchive.Error.invalidArchive(
@@ -578,12 +575,8 @@ struct Archive {
         errorCallback.nativeImports[0].signature.parameters = [
             "@escaping ((any Swift.Error)?) -> Swift.Void",
         ]
-        errorCallback.nativeImports[0].key = try Core.NativeImportKey.derive(
-            namespace: errorCallback.metadata.shellNamespaceID,
-            canonicalCallee: errorCallback.nativeImports[0].canonicalCallee,
-            signature: errorCallback.nativeImports[0].signature,
-            effects: errorCallback.nativeImports[0].effects,
-            contract: errorCallback.nativeImports[0].contract
+        errorCallback.nativeImports[0].key = try Core.NativeCall.Key.derive(
+            descriptor: errorCallback.nativeImports[0].descriptor
         )
         errorCallback.shellInterfaceHash = try errorCallback
             .computeShellInterfaceHash()
@@ -595,12 +588,8 @@ struct Archive {
             "(any Swift.Error)?",
         ]
         ordinaryError.nativeImports[0].contract.callbacks = []
-        ordinaryError.nativeImports[0].key = try Core.NativeImportKey.derive(
-            namespace: ordinaryError.metadata.shellNamespaceID,
-            canonicalCallee: ordinaryError.nativeImports[0].canonicalCallee,
-            signature: ordinaryError.nativeImports[0].signature,
-            effects: ordinaryError.nativeImports[0].effects,
-            contract: ordinaryError.nativeImports[0].contract
+        ordinaryError.nativeImports[0].key = try Core.NativeCall.Key.derive(
+            descriptor: ordinaryError.nativeImports[0].descriptor
         )
         ordinaryError.shellInterfaceHash = try ordinaryError
             .computeShellInterfaceHash()
@@ -646,25 +635,31 @@ struct Archive {
             allowsMainThread: true,
             callbacks: [.init(parameterIndex: 0, lifetime: .escaping)]
         )
-        let omittedKey = try Core.NativeImportKey.derive(
-            namespace: archive.metadata.shellNamespaceID,
+        let omittedDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
             canonicalCallee: "Fixture.schedule()",
             signature: omittedSignature,
             effects: .init(),
-            contract: omittedContract
+            contract: omittedContract,
+            physicalParameterTypes: [explicitSignature.parameters[0]],
+            physicalArgumentSources: [.optionalNone]
         )
-        let explicitKey = try Core.NativeImportKey.derive(
-            namespace: archive.metadata.shellNamespaceID,
+        let explicitDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
             canonicalCallee: "Fixture.schedule(completion:)",
             signature: explicitSignature,
             effects: .init(),
             contract: explicitContract
         )
+        let omittedKey = try Core.NativeCall.Key.derive(
+            descriptor: omittedDescriptor
+        )
+        let explicitKey = try Core.NativeCall.Key.derive(
+            descriptor: explicitDescriptor
+        )
         archive.nativeImports = [
             .init(
                 id: .init(rawValue: 0),
                 key: omittedKey,
-                canonicalCallee: "Fixture.schedule()",
+                descriptor: omittedDescriptor,
                 silMangledNames: [symbol],
                 parameterTypes: [],
                 parameterProjection: .init(
@@ -675,20 +670,16 @@ struct Archive {
                     ]
                 ),
                 resultType: .void,
-                signature: omittedSignature,
-                effects: .init(),
                 contract: omittedContract,
                 isEmittedToDevice: true
             ),
             .init(
                 id: .init(rawValue: 1),
                 key: explicitKey,
-                canonicalCallee: "Fixture.schedule(completion:)",
+                descriptor: explicitDescriptor,
                 silMangledNames: [symbol],
                 parameterTypes: [.optional(.closure(callback))],
                 resultType: .void,
-                signature: explicitSignature,
-                effects: .init(),
                 contract: explicitContract,
                 isEmittedToDevice: true
             ),
@@ -717,14 +708,13 @@ struct Archive {
             maximumDurationMicroseconds: 500,
             allowsMainThread: true
         )
-        let key = try Core.NativeImportKey.derive(
-            namespace: archive.metadata.shellNamespaceID,
-            canonicalCallee: "Fixture.HelixExternal.UIApplication."
-                + "backgroundTimeRemaining.get",
+        let descriptor = try Core.NativeCall.Descriptor.swiftAdapter(
+            canonicalCallee: "UIKit.UIApplication.backgroundTimeRemaining.getter",
             signature: signature,
             effects: effects,
             contract: contract
         )
+        let key = try Core.NativeCall.Key.derive(descriptor: descriptor)
         archive.capabilities += [.nativeImportsV1, .nativeTypesV1]
         archive.nativeTypes = [
             .init(
@@ -742,13 +732,10 @@ struct Archive {
             .init(
                 id: .init(rawValue: 0),
                 key: key,
-                canonicalCallee: "Fixture.HelixExternal.UIApplication."
-                    + "backgroundTimeRemaining.get",
+                descriptor: descriptor,
                 silMangledNames: ["$s7Fixture33backgroundTimeRemainingImportSdyF"],
                 parameterTypes: [.native(typeID)],
                 resultType: .float(bitWidth: 64),
-                signature: signature,
-                effects: effects,
                 contract: contract,
                 isEmittedToDevice: true
             ),

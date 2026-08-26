@@ -477,11 +477,6 @@ struct AsyncExecution {
 
     @Test("Sync and async NativeImport catalogs reject crossed effects")
     func rejectsCrossedNativeCatalogEffects() throws {
-        let namespace = Core.ShellNamespaceID.derive(
-            bundleID: "dev.helix.vm.async-catalog",
-            buildNumber: "1",
-            seed: "fixture"
-        )
         let asyncEffects = Core.Effects(isAsync: true)
         let asyncContract = Core.NativeImportContract.suspending(
             kind: .globalFunction,
@@ -495,12 +490,14 @@ struct AsyncExecution {
             result: "Swift.Int",
             isAsync: true
         )
-        let key = try Core.NativeImportKey.derive(
-            namespace: namespace,
+        let callDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
             canonicalCallee: "Fixture.value()",
             signature: signature,
             effects: asyncEffects,
             contract: asyncContract
+        )
+        let key = try Core.NativeCall.Key.derive(
+            descriptor: callDescriptor
         )
         let crossedSync = VM.ClosureNativeInvoker(
             id: .init(rawValue: 0),
@@ -565,7 +562,7 @@ struct AsyncExecution {
     private struct AsyncFixture {
         var image: Verification.Image
         var importID: Core.NativeImportID
-        var importKey: Core.NativeImportKey
+        var importKey: Core.NativeCall.Key
         var importEffects: Core.Effects
         var importContract: Core.NativeImportContract
     }
@@ -617,12 +614,14 @@ struct AsyncExecution {
             allowsMainThread: true
         )
         let importID = Core.NativeImportID(rawValue: 0)
-        let importKey = try Core.NativeImportKey.derive(
-            namespace: namespace,
+        let callDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
             canonicalCallee: "Fixture.awaited(_:)",
             signature: importSignature,
             effects: importEffects,
             contract: contract
+        )
+        let importKey = try Core.NativeCall.Key.derive(
+            descriptor: callDescriptor
         )
         let capabilities = Set<Core.Capability>([
             .baselineV1, .nativeImportsV1, .sequentialAsyncV1,
@@ -630,17 +629,15 @@ struct AsyncExecution {
         let requirement = Bytecode.ImportRequirement(
             id: importID,
             key: importKey,
-            signature: importSignature,
-            effects: importEffects,
+            descriptor: callDescriptor,
             contract: contract
         )
         let descriptor = Verification.ResolvedNativeImport(
             id: importID,
             key: importKey,
+            descriptor: callDescriptor,
             parameterTypes: importParameterTypes,
             resultType: .int64,
-            signature: importSignature,
-            effects: importEffects,
             contract: contract
         )
         let module = Bytecode.Module(
@@ -684,7 +681,7 @@ struct AsyncExecution {
             policy: .init(
                 acceptedCapabilities: capabilities,
                 resourceCeiling: limits,
-                allowedNativeImports: [importID]
+                allowedNativeCalls: [importKey]
             )
         )
         return .init(

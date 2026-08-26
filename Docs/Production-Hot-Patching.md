@@ -74,8 +74,9 @@ App build:
 
 - another function included in the same HLBC image;
 - an eligible Shell entry identified by `FunctionKey` and `EntryIndex`;
-- a `NativeImportID` backed by a generated, exact-signature Swift factory in
-  the installed App.
+- a stable `NativeCallKey` whose descriptor and executable binding are present
+  in the installed App; `NativeImportID` is the compact slot used to dispatch
+  that call inside this particular Shell.
 
 The patch compiler closes over reachable same-module implementation functions.
 Consequently, a patch may add an ordinary top-level helper or a private class
@@ -88,11 +89,15 @@ later change produces a distinct generation even when the root call site stays
 textually unchanged.
 
 Hub discovers native imports automatically from the successful build and
-expands them into individual canonical descriptors and generated invokers; the
+expands them into individual canonical descriptors, stable keys, and generated
+invokers; the
 device never interprets a project-wide wildcard. An explicit list remains only
 as a lower-level standalone compiler input. Adding a call in a patch works only
 when the released App already contains the matching generated capability and
 its effects are allowed by policy.
+
+The full version 1 identity, Catalog, and trust-boundary rules are documented
+in [Native call identity and catalog](Native-Calls.md).
 
 This design avoids relying on unstable Swift symbol lookup, metadata guessing,
 or an unrestricted `dlsym` API. It also means that expanding the callable

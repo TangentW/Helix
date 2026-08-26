@@ -133,7 +133,9 @@ struct Pipeline {
             runtimePolicy: .init(
                 acceptedCapabilities: artifact.compilation.module.capabilities,
                 resourceCeiling: artifact.compilation.module.requestedResources,
-                allowedNativeImports: Set(fixture.archive.nativeImports.compactMap(\.id)),
+                allowedNativeCalls: Set(
+                    fixture.archive.nativeImports.filter(\.isEmittedToDevice).map(\.key)
+                ),
                 allowMainActorEntries: artifact.compilation.module.capabilities
                     .contains(.mainActorIsolationV1)
             ),

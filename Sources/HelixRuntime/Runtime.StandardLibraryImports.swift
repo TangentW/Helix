@@ -36,7 +36,7 @@ public enum StandardLibraryImports {
     /// Creates the frozen NativeImport used for ordinary Swift `print` calls.
     public static func makePrint(
         id: Core.NativeImportID,
-        key: Core.NativeImportKey
+        key: Core.NativeCall.Key
     ) -> any VM.NativeInvoker {
         makePrint(id: id, key: key) { output in
             Swift.print(output, terminator: "")
@@ -45,7 +45,7 @@ public enum StandardLibraryImports {
 
     static func makePrint(
         id: Core.NativeImportID,
-        key: Core.NativeImportKey,
+        key: Core.NativeCall.Key,
         emit: @escaping @Sendable (String) -> Void
     ) -> any VM.NativeInvoker {
         makeVariadicOutput(
@@ -60,7 +60,7 @@ public enum StandardLibraryImports {
     /// Creates the frozen NativeImport used for Swift `debugPrint` calls.
     public static func makeDebugPrint(
         id: Core.NativeImportID,
-        key: Core.NativeImportKey
+        key: Core.NativeCall.Key
     ) -> any VM.NativeInvoker {
         makeDebugPrint(id: id, key: key) { output in
             Swift.print(output, terminator: "")
@@ -69,7 +69,7 @@ public enum StandardLibraryImports {
 
     static func makeDebugPrint(
         id: Core.NativeImportID,
-        key: Core.NativeImportKey,
+        key: Core.NativeCall.Key,
         emit: @escaping @Sendable (String) -> Void
     ) -> any VM.NativeInvoker {
         makeVariadicOutput(
@@ -84,7 +84,7 @@ public enum StandardLibraryImports {
     /// Creates the fixed Any bridge for Swift's generic describing initializer.
     public static func makeStringDescribing(
         id: Core.NativeImportID,
-        key: Core.NativeImportKey
+        key: Core.NativeCall.Key
     ) -> any VM.NativeInvoker {
         makeStringRendering(
             id: id,
@@ -97,7 +97,7 @@ public enum StandardLibraryImports {
     /// Creates the fixed Any bridge for Swift's generic reflecting initializer.
     public static func makeStringReflecting(
         id: Core.NativeImportID,
-        key: Core.NativeImportKey
+        key: Core.NativeCall.Key
     ) -> any VM.NativeInvoker {
         makeStringRendering(
             id: id,
@@ -109,7 +109,7 @@ public enum StandardLibraryImports {
 
     private static func makeVariadicOutput(
         id: Core.NativeImportID,
-        key: Core.NativeImportKey,
+        key: Core.NativeCall.Key,
         descriptor: Bytecode.StandardLibraryImports.Descriptor,
         style: VariadicRenderingStyle,
         emit: @escaping @Sendable (String) -> Void
@@ -141,7 +141,7 @@ public enum StandardLibraryImports {
 
     private static func makeStringRendering(
         id: Core.NativeImportID,
-        key: Core.NativeImportKey,
+        key: Core.NativeCall.Key,
         descriptor: Bytecode.StandardLibraryImports.Descriptor,
         style: StringRenderingStyle
     ) -> any VM.NativeInvoker {

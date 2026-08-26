@@ -32,9 +32,10 @@ public struct BridgeProviderGenerator: Sendable {
         let moduleName = archive.metadata.frontendInvocation.moduleName
         let bridgeType = "\(moduleName)Bridge"
         let target = try parseTarget(archive.metadata.targetTriple)
-        let imports = archive.nativeImports.compactMap { record -> String? in
-            guard record.isEmittedToDevice, let id = record.id else { return nil }
-            return "Core.NativeImportID(rawValue: \(id.rawValue))"
+        let calls = archive.nativeImports.compactMap { record -> String? in
+            guard record.isEmittedToDevice, record.id != nil else { return nil }
+            return "Core.NativeCall.Key(rawValue: try Core.Digest(hex: "
+                + "\(String(reflecting: record.key.rawValue.hex))))"
         }.sorted()
         let capabilities = archive.capabilities.sorted().map {
             "Core.Capability(rawValue: \(String(reflecting: $0.rawValue)))"
@@ -58,7 +59,7 @@ public struct BridgeProviderGenerator: Sendable {
                         minimumOSVersion: \(render(archive.metadata.minimumOS)),
                         compatibility: \(render(archive.compatibility)),
                         capabilities: Set(\(renderArray(capabilities))),
-                        nativeImportIDs: Set(\(renderArray(imports))),
+                        nativeCallKeys: Set(\(renderArray(calls))),
                         platform: .\(target.platformCase),
                         architecture: \(String(reflecting: target.architecture)),
                         xcodeBuild: \(String(reflecting: archive.metadata.xcodeBuild)),

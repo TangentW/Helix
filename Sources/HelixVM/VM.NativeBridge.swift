@@ -12,7 +12,7 @@ public enum NativeInvocationResult: Equatable, Sendable {
 
 public protocol NativeInvoker: Sendable {
     var id: Core.NativeImportID { get }
-    var key: Core.NativeImportKey { get }
+    var key: Core.NativeCall.Key { get }
     var parameterTypes: [Bytecode.ValueType] { get }
     var resultType: Bytecode.ValueType { get }
     var effects: Core.Effects { get }
@@ -28,7 +28,7 @@ public protocol NativeInvoker: Sendable {
 /// or accidentally enter an async implementation.
 public protocol AsyncNativeInvoker: Sendable {
     var id: Core.NativeImportID { get }
-    var key: Core.NativeImportKey { get }
+    var key: Core.NativeCall.Key { get }
     var parameterTypes: [Bytecode.ValueType] { get }
     var resultType: Bytecode.ValueType { get }
     var effects: Core.Effects { get }
@@ -306,7 +306,7 @@ public struct NativeInvocationContext: Sendable {
 public protocol NativeImportFactory {
     static func make(
         id: Core.NativeImportID,
-        key: Core.NativeImportKey
+        key: Core.NativeCall.Key
     ) -> any VM.NativeInvoker
 }
 
@@ -314,7 +314,7 @@ public protocol NativeImportFactory {
 public protocol AsyncNativeImportFactory {
     static func make(
         id: Core.NativeImportID,
-        key: Core.NativeImportKey
+        key: Core.NativeCall.Key
     ) -> any VM.AsyncNativeInvoker
 }
 
@@ -322,7 +322,7 @@ public protocol AsyncNativeImportFactory {
 /// dedicated nominal type. Descriptor checks still occur before execution.
 public struct ClosureNativeInvoker: VM.NativeInvoker {
     public let id: Core.NativeImportID
-    public let key: Core.NativeImportKey
+    public let key: Core.NativeCall.Key
     public let parameterTypes: [Bytecode.ValueType]
     public let resultType: Bytecode.ValueType
     public let effects: Core.Effects
@@ -334,7 +334,7 @@ public struct ClosureNativeInvoker: VM.NativeInvoker {
 
     public init(
         id: Core.NativeImportID,
-        key: Core.NativeImportKey,
+        key: Core.NativeCall.Key,
         parameterTypes: [Bytecode.ValueType],
         resultType: Bytecode.ValueType,
         effects: Core.Effects = .init(),
@@ -364,7 +364,7 @@ public struct ClosureNativeInvoker: VM.NativeInvoker {
 /// Closure-backed async invoker used by generated exact NativeImport adapters.
 public struct ClosureAsyncNativeInvoker: VM.AsyncNativeInvoker {
     public let id: Core.NativeImportID
-    public let key: Core.NativeImportKey
+    public let key: Core.NativeCall.Key
     public let parameterTypes: [Bytecode.ValueType]
     public let resultType: Bytecode.ValueType
     public let effects: Core.Effects
@@ -376,7 +376,7 @@ public struct ClosureAsyncNativeInvoker: VM.AsyncNativeInvoker {
 
     public init(
         id: Core.NativeImportID,
-        key: Core.NativeImportKey,
+        key: Core.NativeCall.Key,
         parameterTypes: [Bytecode.ValueType],
         resultType: Bytecode.ValueType,
         effects: Core.Effects,

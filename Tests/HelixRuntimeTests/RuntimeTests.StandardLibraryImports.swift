@@ -95,12 +95,8 @@ struct StandardLibraryImports {
             seed: "fixture"
         )
         let importID = Core.NativeImportID(rawValue: 0)
-        let importKey = try Core.NativeImportKey.derive(
-            namespace: namespace,
-            canonicalCallee: descriptor.canonicalCallee,
-            signature: descriptor.signature,
-            effects: descriptor.effects,
-            contract: descriptor.contract
+        let importKey = try Core.NativeCall.Key.derive(
+            descriptor: descriptor.nativeCall
         )
         let output = OutputBox()
         let invoker = Runtime.StandardLibraryImports.makePrint(
@@ -142,12 +138,8 @@ struct StandardLibraryImports {
             seed: "fixture"
         )
         let importID = Core.NativeImportID(rawValue: 0)
-        let importKey = try Core.NativeImportKey.derive(
-            namespace: namespace,
-            canonicalCallee: descriptor.canonicalCallee,
-            signature: descriptor.signature,
-            effects: descriptor.effects,
-            contract: descriptor.contract
+        let importKey = try Core.NativeCall.Key.derive(
+            descriptor: descriptor.nativeCall
         )
         let invoker = Runtime.StandardLibraryImports.makeStringDescribing(
             id: importID,
@@ -213,7 +205,7 @@ struct StandardLibraryImports {
     private func makeFixture(
         namespace: Core.ShellNamespaceID,
         importID: Core.NativeImportID,
-        importKey: Core.NativeImportKey,
+        importKey: Core.NativeCall.Key,
         descriptor: Bytecode.StandardLibraryImports.Descriptor =
             Bytecode.StandardLibraryImports.swiftPrint
     ) throws -> Fixture {
@@ -279,8 +271,7 @@ struct StandardLibraryImports {
         let requirement = Bytecode.ImportRequirement(
             id: importID,
             key: importKey,
-            signature: descriptor.signature,
-            effects: descriptor.effects,
+            descriptor: descriptor.nativeCall,
             contract: descriptor.contract,
             requiredCapability: descriptor.capability
         )
@@ -317,10 +308,9 @@ struct StandardLibraryImports {
                 .init(
                     id: importID,
                     key: importKey,
+                    descriptor: descriptor.nativeCall,
                     parameterTypes: descriptor.parameterTypes,
                     resultType: descriptor.resultType,
-                    signature: descriptor.signature,
-                    effects: descriptor.effects,
                     contract: descriptor.contract,
                     capability: descriptor.capability
                 ),
@@ -331,7 +321,7 @@ struct StandardLibraryImports {
             shell: shell,
             policy: .init(
                 acceptedCapabilities: capabilities,
-                allowedNativeImports: [importID]
+                allowedNativeCalls: [importKey]
             )
         )
         return .init(entry: entry, image: image)

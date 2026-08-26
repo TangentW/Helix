@@ -379,9 +379,7 @@ public struct Adapter: Sendable {
             )
         }
 
-        let builtinNativeImports = try NativeImportCatalog.Builtins.records(
-            metadata: request.metadata
-        )
+        let builtinNativeImports = try NativeImportCatalog.Builtins.records()
         applyNativeImportEffectEnvelope(
             builtinNativeImports,
             to: &drafts,
@@ -399,8 +397,7 @@ public struct Adapter: Sendable {
                 metadata: request.metadata,
                 configuration: effectiveConfiguration,
                 nativeTypes: nativeTypeIDs
-            ),
-            metadata: request.metadata
+            )
         )
         let sourceRecords = sourceStates.map {
             InterfaceArchive.SourceRecord(
@@ -1062,7 +1059,7 @@ extension FrontendReceipt.Adapter {
         }
 
         var records: [InterfaceArchive.NativeImportRecord] = []
-        var keys = Set<Core.NativeImportKey>()
+        var keys = Set<Core.NativeCall.Key>()
         for candidate in catalog.candidates {
             let parameterTypes = try candidate.signature.parameters.map { spelling in
                 guard let type = FrontendReceipt.ValueTypeParser.parse(
@@ -1086,12 +1083,8 @@ extension FrontendReceipt.Adapter {
                         + candidate.signature.result
                 )
             }
-            let key = try Core.NativeImportKey.derive(
-                namespace: metadata.shellNamespaceID,
-                canonicalCallee: candidate.canonicalCallee,
-                signature: candidate.signature,
-                effects: candidate.effects,
-                contract: candidate.contract
+            let key = try Core.NativeCall.Key.derive(
+                descriptor: candidate.descriptor
             )
             guard keys.insert(key).inserted else {
                 throw FrontendReceipt.Error.invalidRequest(
@@ -1102,12 +1095,10 @@ extension FrontendReceipt.Adapter {
                 .init(
                     id: nil,
                     key: key,
-                    canonicalCallee: candidate.canonicalCallee,
+                    descriptor: candidate.descriptor,
                     silMangledNames: candidate.silMangledNames,
                     parameterTypes: parameterTypes,
                     resultType: resultType,
-                    signature: candidate.signature,
-                    effects: candidate.effects,
                     contract: candidate.contract,
                     capability: candidate.capability,
                     isEmittedToDevice: true
@@ -1205,7 +1196,7 @@ extension FrontendReceipt.Adapter {
         archive: InterfaceArchive.Archive
     ) -> [ShellBuildReceipt.NativeImportBinding] {
         let emitted = Dictionary(uniqueKeysWithValues: archive.nativeImports.compactMap {
-            item -> (Core.NativeImportKey, InterfaceArchive.NativeImportRecord)? in
+            item -> (Core.NativeCall.Key, InterfaceArchive.NativeImportRecord)? in
             guard item.isEmittedToDevice, item.id != nil else { return nil }
             return (item.key, item)
         })
@@ -1477,14 +1468,10 @@ extension FrontendReceipt.Adapter {
         catalog: NativeImportCatalog.Document,
         archive: InterfaceArchive.Archive
     ) throws -> [ShellBuildReceipt.NativeImportBinding] {
-        var catalogByKey: [Core.NativeImportKey: NativeImportCatalog.Candidate] = [:]
+        var catalogByKey: [Core.NativeCall.Key: NativeImportCatalog.Candidate] = [:]
         for candidate in catalog.candidates {
-            let key = try Core.NativeImportKey.derive(
-                namespace: archive.metadata.shellNamespaceID,
-                canonicalCallee: candidate.canonicalCallee,
-                signature: candidate.signature,
-                effects: candidate.effects,
-                contract: candidate.contract
+            let key = try Core.NativeCall.Key.derive(
+                descriptor: candidate.descriptor
             )
             catalogByKey[key] = candidate
         }
@@ -1498,7 +1485,7 @@ extension FrontendReceipt.Adapter {
             }
             let expression = "\(candidate.factoryType).make("
                 + "id: Core.NativeImportID(rawValue: \(id.rawValue)), "
-                + "key: Core.NativeImportKey(rawValue: try! Core.Digest(hex: "
+                + "key: Core.NativeCall.Key(rawValue: try! Core.Digest(hex: "
                 + "\(String(reflecting: item.key.rawValue.hex)))))"
             return .init(
                 key: item.key,

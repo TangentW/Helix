@@ -872,8 +872,10 @@ exhaustive API list.
   They are not approximated as `withExtendedLifetime` or as no-op closure calls.
 - Unrestricted pointers, `unsafeBitCast`, arbitrary Objective-C selector/IMP,
   `dlopen`/`dlsym`, Mirror-driven field mutation, and unknown builtins.
-- A native call that does not have an exact `NativeImportID` in the target
-  Shell, even if a similarly named Swift function exists. A production patch
+- A native call whose stable `NativeCallKey`, exact descriptor, and executable
+  binding are absent from the target Shell, even if a similarly named Swift
+  function exists. The accompanying `NativeImportID` is only that Shell's
+  compact dispatch slot. A production patch
   also cannot add a framework or use an SDK operation absent from the App after
   that build was released. The broad managed-Debug surface above works because
   those concrete IDs are generated automatically during the normal Debug build.

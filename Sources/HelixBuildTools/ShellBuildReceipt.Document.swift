@@ -137,13 +137,13 @@ public struct Root: Codable, Hashable, Sendable {
 }
 
 public struct NativeImportBinding: Codable, Hashable, Sendable {
-    public var key: Core.NativeImportKey
+    public var key: Core.NativeCall.Key
     public var invokerExpression: String
     public var importedModules: [String]
     public var generated: ShellBuildReceipt.GeneratedNativeImport?
 
     public init(
-        key: Core.NativeImportKey,
+        key: Core.NativeCall.Key,
         invokerExpression: String,
         importedModules: [String] = [],
         generated: ShellBuildReceipt.GeneratedNativeImport? = nil

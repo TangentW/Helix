@@ -1761,27 +1761,27 @@ public struct EntryPoint: Codable, Hashable, Sendable {
 
 public struct ImportRequirement: Codable, Hashable, Sendable {
     public var id: Core.NativeImportID
-    public var key: Core.NativeImportKey
-    public var signature: Core.LoweredSignature
-    public var effects: Core.Effects
+    public var key: Core.NativeCall.Key
+    public var descriptor: Core.NativeCall.Descriptor
     public var contract: Core.NativeImportContract
     public var requiredCapability: Core.Capability
 
     public init(
         id: Core.NativeImportID,
-        key: Core.NativeImportKey,
-        signature: Core.LoweredSignature,
-        effects: Core.Effects,
+        key: Core.NativeCall.Key,
+        descriptor: Core.NativeCall.Descriptor,
         contract: Core.NativeImportContract,
         requiredCapability: Core.Capability = .nativeImportsV1
     ) {
         self.id = id
         self.key = key
-        self.signature = signature
-        self.effects = effects
+        self.descriptor = descriptor
         self.contract = contract
         self.requiredCapability = requiredCapability
     }
+
+    public var signature: Core.LoweredSignature { descriptor.loweredSignature }
+    public var effects: Core.Effects { descriptor.effects }
 }
 
 public struct SourceMapEntry: Codable, Hashable, Sendable {

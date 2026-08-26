@@ -24,14 +24,21 @@ struct DefaultArguments {
         )
         func requirement(
             id: UInt32,
-            parameters: [String]
-        ) -> Bytecode.ImportRequirement {
-            .init(
+            parameters: [String],
+            physicalTypes: [String],
+            sources: [Core.NativeCall.ArgumentSource]
+        ) throws -> Bytecode.ImportRequirement {
+            try nativeRequirement(
                 id: .init(rawValue: id),
-                key: .init(rawValue: .sha256("default-variant-\(id)")),
-                signature: .init(parameters: parameters, result: "Swift.Void"),
+                canonicalCallee: "Fixture.invoke(_:_:)",
+                signature: .init(
+                    parameters: parameters,
+                    result: "Swift.Void"
+                ),
                 effects: effects,
-                contract: contract
+                contract: contract,
+                physicalParameterTypes: physicalTypes,
+                physicalArgumentSources: sources
             )
         }
         let omittedID = Core.NativeImportID(rawValue: 0)
@@ -51,18 +58,22 @@ struct DefaultArguments {
                     ]
                 ),
                 resultType: .void,
-                target: .nativeImport(requirement(
+                target: .nativeImport(try requirement(
                     id: omittedID.rawValue,
-                    parameters: ["Swift.Int"]
+                    parameters: ["Swift.Int"],
+                    physicalTypes: ["Swift.Int", "Swift.Int"],
+                    sources: [.defaultGenerator(helper), .argument(0)]
                 ))
             ),
             .init(
                 mangledName: symbol,
                 parameterTypes: [.int64, .int64],
                 resultType: .void,
-                target: .nativeImport(requirement(
+                target: .nativeImport(try requirement(
                     id: explicitID.rawValue,
-                    parameters: ["Swift.Int", "Swift.Int"]
+                    parameters: ["Swift.Int", "Swift.Int"],
+                    physicalTypes: ["Swift.Int", "Swift.Int"],
+                    sources: [.argument(0), .argument(1)]
                 ))
             ),
         ])
@@ -112,15 +123,19 @@ struct DefaultArguments {
             maximumDurationMicroseconds: 500,
             allowsMainThread: true
         )
-        let requirement = Bytecode.ImportRequirement(
+        let requirement = try nativeRequirement(
             id: importID,
-            key: .init(rawValue: .sha256("projected-indirect-default")),
+            canonicalCallee: "Fixture.invoke(_:_:)",
             signature: .init(
                 parameters: ["Swift.Int"],
                 result: "Swift.Void"
             ),
             effects: .init(),
-            contract: contract
+            contract: contract,
+            physicalParameterTypes: ["Fixture.Payload", "Swift.Int"],
+            physicalArgumentSources: [
+                .defaultGenerator(helper), .argument(0),
+            ]
         )
         let calls = try CanonicalSIL.DirectCallTable([
             .init(
@@ -199,20 +214,27 @@ struct DefaultArguments {
             maximumDurationMicroseconds: 500,
             allowsMainThread: true
         )
-        func requirement(_ rawID: UInt32) -> Bytecode.ImportRequirement {
-            .init(
+        func requirement(
+            _ rawID: UInt32,
+            helper: String,
+            physicalType: String
+        ) throws -> Bytecode.ImportRequirement {
+            try nativeRequirement(
                 id: .init(rawValue: rawID),
-                key: .init(rawValue: .sha256("borrowed-default-\(rawID)")),
+                canonicalCallee: "Fixture.acceptDefault\(rawID)()",
                 signature: .init(parameters: [], result: "Swift.Void"),
                 effects: effects,
-                contract: contract
+                contract: contract,
+                physicalParameterTypes: [physicalType],
+                physicalArgumentSources: [.defaultGenerator(helper)]
             )
         }
         func binding(
             owner: String,
             helper: String,
-            id: UInt32
-        ) -> CanonicalSIL.DirectCallBinding {
+            id: UInt32,
+            physicalType: String
+        ) throws -> CanonicalSIL.DirectCallBinding {
             .init(
                 mangledName: owner,
                 parameterTypes: [],
@@ -229,12 +251,26 @@ struct DefaultArguments {
                 ),
                 resultType: .void,
                 effects: effects,
-                target: .nativeImport(requirement(id))
+                target: .nativeImport(try requirement(
+                    id,
+                    helper: helper,
+                    physicalType: physicalType
+                ))
             )
         }
         let calls = try CanonicalSIL.DirectCallTable([
-            binding(owner: stringOwner, helper: stringHelper, id: 0),
-            binding(owner: closureOwner, helper: closureHelper, id: 1),
+            try binding(
+                owner: stringOwner,
+                helper: stringHelper,
+                id: 0,
+                physicalType: "Swift.String"
+            ),
+            try binding(
+                owner: closureOwner,
+                helper: closureHelper,
+                id: 1,
+                physicalType: "() -> Swift.Void"
+            ),
         ])
         let stringHelperType = "@convention(thin) () -> @owned String"
         let stringOwnerType = "@convention(thin) (@guaranteed String) -> ()"
@@ -295,19 +331,24 @@ struct DefaultArguments {
             maximumDurationMicroseconds: 500,
             allowsMainThread: true
         )
-        let requirement = Bytecode.ImportRequirement(
+        let requirement = try nativeRequirement(
             id: importID,
-            key: .init(rawValue: .sha256("projected-native-default")),
+            canonicalCallee: "Fixture.invoke(_:_:)",
             signature: .init(
                 parameters: ["Foundation.NSObject"],
                 result: "Swift.Void"
             ),
             effects: effects,
-            contract: contract
+            contract: contract,
+            physicalParameterTypes: [
+                "Swift.Optional<Foundation.NSObject>",
+                "Foundation.NSObject",
+            ],
+            physicalArgumentSources: [.optionalNone, .argument(0)]
         )
-        let explicitRequirement = Bytecode.ImportRequirement(
+        let explicitRequirement = try nativeRequirement(
             id: explicitImportID,
-            key: .init(rawValue: .sha256("explicit-native-default")),
+            canonicalCallee: "Fixture.invoke(_:_:)",
             signature: .init(
                 parameters: [
                     "Swift.Optional<Foundation.NSObject>",
@@ -418,21 +459,27 @@ struct DefaultArguments {
         let symbol = "$s7Fixture6invokeyySo8NSObjectCSg_AEtF"
         let importID = Core.NativeImportID(rawValue: 0)
         let effects = Core.Effects(mayAllocate: true)
-        let requirement = Bytecode.ImportRequirement(
+        let contract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        let requirement = try nativeRequirement(
             id: importID,
-            key: .init(rawValue: .sha256("projected-borrowed-native-default")),
+            canonicalCallee: "Fixture.invoke(_:_:)",
             signature: .init(
                 parameters: ["Foundation.NSObject"],
                 result: "Swift.Void"
             ),
             effects: effects,
-            contract: .bounded(
-                kind: .globalFunction,
-                domain: .application,
-                access: .pure,
-                maximumDurationMicroseconds: 500,
-                allowsMainThread: true
-            )
+            contract: contract,
+            physicalParameterTypes: [
+                "Swift.Optional<Foundation.NSObject>",
+                "Foundation.NSObject",
+            ],
+            physicalArgumentSources: [.optionalNone, .argument(0)]
         )
         let calls = try CanonicalSIL.DirectCallTable([
             .init(
@@ -502,9 +549,16 @@ struct DefaultArguments {
         let symbol = "$s7Fixture6invokeyySaySo16NSURLResourceKeyaGSgF"
         let importID = Core.NativeImportID(rawValue: 0)
         let effects = Core.Effects(mayAllocate: true)
-        let requirement = Bytecode.ImportRequirement(
+        let contract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        let requirement = try nativeRequirement(
             id: importID,
-            key: .init(rawValue: .sha256("explicit-linear-optional-none")),
+            canonicalCallee: "Fixture.invoke(_:)",
             signature: .init(
                 parameters: [
                     "Swift.Optional<Swift.Array<Foundation.URLResourceKey>>",
@@ -512,13 +566,7 @@ struct DefaultArguments {
                 result: "Swift.Void"
             ),
             effects: effects,
-            contract: .bounded(
-                kind: .globalFunction,
-                domain: .application,
-                access: .pure,
-                maximumDurationMicroseconds: 500,
-                allowsMainThread: true
-            )
+            contract: contract
         )
         let logicalType = Bytecode.ValueType.optional(
             .array(.native(keyType))
@@ -909,6 +957,31 @@ struct DefaultArguments {
                 result: "Swift.Int"
             ),
             role: .function
+        )
+    }
+
+    private func nativeRequirement(
+        id: Core.NativeImportID,
+        canonicalCallee: String,
+        signature: Core.LoweredSignature,
+        effects: Core.Effects,
+        contract: Core.NativeImportContract,
+        physicalParameterTypes: [String]? = nil,
+        physicalArgumentSources: [Core.NativeCall.ArgumentSource]? = nil
+    ) throws -> Bytecode.ImportRequirement {
+        let descriptor = try Core.NativeCall.Descriptor.swiftAdapter(
+            canonicalCallee: canonicalCallee,
+            signature: signature,
+            effects: effects,
+            contract: contract,
+            physicalParameterTypes: physicalParameterTypes,
+            physicalArgumentSources: physicalArgumentSources
+        )
+        return .init(
+            id: id,
+            key: try Core.NativeCall.Key.derive(descriptor: descriptor),
+            descriptor: descriptor,
+            contract: contract
         )
     }
 }

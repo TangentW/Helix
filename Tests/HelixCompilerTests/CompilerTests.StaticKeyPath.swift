@@ -362,21 +362,44 @@ struct StaticKeyPath {
         let nativeMethodType =
             "@convention(objc_method) (NSObject) "
             + "-> @autoreleased Optional<NSString>"
+        let contract = Core.NativeImportContract.bounded(
+            kind: .instanceGetter,
+            domain: .foundation,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        let callDescriptor = try Core.NativeCall.Descriptor(
+            target: .init(
+                backend: .objectiveCMessage,
+                module: "Foundation",
+                owner: "NSObject",
+                member: "description.getter",
+                entryPoint: "description",
+                dispatch: .instance,
+                receiverArgumentIndex: 0
+            ),
+            logicalSignature: .init(
+                parameters: [.init(type: "Foundation.NSObject")],
+                result: .init(type: "Swift.String")
+            ),
+            physicalSignature: .init(
+                callingConvention: .objectiveC,
+                parameters: [],
+                result: .init(
+                    kind: .object,
+                    canonicalName: "Foundation.NSString",
+                    encoding: "@",
+                    isNullable: true
+                )
+            ),
+            effects: .init()
+        )
         let requirement = Bytecode.ImportRequirement(
             id: .init(rawValue: 91),
-            key: .init(rawValue: .sha256("Foundation.NSObject.description")),
-            signature: .init(
-                parameters: ["Foundation.NSObject"],
-                result: "Swift.String"
-            ),
-            effects: .init(),
-            contract: .bounded(
-                kind: .instanceGetter,
-                domain: .foundation,
-                access: .pure,
-                maximumDurationMicroseconds: 500,
-                allowsMainThread: true
-            )
+            key: try .derive(descriptor: callDescriptor),
+            descriptor: callDescriptor,
+            contract: contract
         )
         let directCalls = try CanonicalSIL.DirectCallTable([
             .init(
@@ -461,10 +484,9 @@ struct StaticKeyPath {
                 .init(
                     id: requirement.id,
                     key: requirement.key,
+                    descriptor: requirement.descriptor,
                     parameterTypes: [.native(typeID)],
                     resultType: .string,
-                    signature: requirement.signature,
-                    effects: requirement.effects,
                     contract: requirement.contract
                 ),
             ],
@@ -486,7 +508,7 @@ struct StaticKeyPath {
             shell: shell,
             policy: .init(
                 acceptedCapabilities: compiled.module.capabilities,
-                allowedNativeImports: [requirement.id]
+                allowedNativeCalls: [requirement.key]
             )
         )
     }

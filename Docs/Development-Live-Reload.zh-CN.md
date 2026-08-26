@@ -62,7 +62,7 @@ sequenceDiagram
 1. 为当前 module 构建上下文中的全部源码捕获同一个稳定 revision。
 2. 重新 type-check 完整 module，并拒绝 interface、stored layout、source membership、依赖或 Build Settings 变化。
 3. 通过声明身份与 implementation fingerprint 确定变化的 eligible root，再让捕获的 Swift 编译器产出 SIL。
-4. 构造闭合调用表：patch-local 函数优先，其次是 eligible Shell `EntryIndex`，最后是 Dev Shell 在构建期实际生成的精确 `NativeImportID` 能力。
+4. 构造闭合调用表：patch-local 函数优先，其次是 eligible Shell `EntryIndex`，最后是 Dev Shell 在构建期实际安装、由稳定 `NativeCallKey` 标识的精确原生调用能力；`NativeImportID` 只承担本次 Shell 内的紧凑派发。
 5. 只把受支持的 canonical SIL 降成强类型 HLIR 与 HLBC，并在 Mac 端运行独立结构和语义 Verifier。
 6. 发送一个不可变、绑定本次会话的 live artifact。App 在原子激活前重新检查 session、revision、target、Shell identity、hash、大小、capability 与字节码合法性。
 

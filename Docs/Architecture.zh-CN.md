@@ -42,7 +42,7 @@ flowchart TB
 - Objective-C overlay alias 只在 mangled type 本身就是精确的顶层 Objective-C nominal 时成立；`Timer.TimerPublisher` 这类嵌套 Swift 类型不会被错误折叠成外层 Objective-C class identity。
 - `FunctionKey` 标识 Swift callable，并纳入 Helix 关心的 ABI 与 effect 信息。
 - `EntryIndex` 是生产 Bridge 使用的紧凑 Shell 路由。
-- `TypeID` 与 `NativeImportID` 标识预先声明的类型操作和原生调用能力，补丁中不保存进程地址。
+- `TypeID` 标识已捕获的类型操作；`NativeCallKey` 是 canonical 原生调用 Descriptor 的稳定、与项目无关的身份；`NativeImportID` 只是在单个 Shell 或 image 内使用的紧凑派发下标。Patch 会同时携带 Key 和下标，不保存进程地址，也不会把临时下标当成权限。详见[原生调用身份与 Catalog](Native-Calls.zh-CN.md)。
 - interface fingerprint 与传递 implementation fingerprint 用于区分函数体修改和 ABI、布局、源文件成员关系或依赖变化。
 - Eligible 的 Shell 已有 struct/enum 使用已记录的逻辑值合同，而不是 Swift 私有 ABI layout。Archive 会记录精确的源码限定 identity、stored field 或 enum case、label 与顺序、递归 Bridge type、copyability、受支持的 conformance 事实，以及同时纳入 device hash 的确定性 layout fingerprint。构建阶段会在声明同一源码作用域生成 private 构造 hook，使 private storage 也能按 Swift 访问控制合法重建；生成的 Bridge 则经普通、有界的 value codec 流式编解码 field 与 case。Release 和 Patch 编译会分别从源码独立推导 shape，Verifier 只有在定义完全一致时，才允许 ordinary、`borrowing`、`consuming` 或 `mutating` value receiver 成为 root。同步 Entry 可以暴露恰好一个逻辑 `inout` 区域，包括可变 `self`。生成的 Bridge 会先快照该值，只在 HLVM invocation 内建立 address，再校验唯一且类型精确的 writeback；normal 与已声明 error continuation 提交写回，VM trap 不提交任何写回，Original route 使用同一结果合同。多个或 async `inout` 会因生成边界无法证明 alias identity 而 fail closed。反射、裸内存投影、运行时 metadata、VM address 与 Swift layout 假设都不会跨边界。
 - 工具链、SDK、target triple、编译参数、module 源文件集合与二进制身份把每个产物绑定到对应 Shell。
