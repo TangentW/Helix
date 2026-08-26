@@ -7,7 +7,8 @@ enum DirectCalls {
     static func make(
         archive: InterfaceArchive.Archive,
         localFunctionIDs: [Core.FunctionKey: Bytecode.FunctionID],
-        additionalBindings: [CanonicalSIL.DirectCallBinding] = []
+        additionalBindings: [CanonicalSIL.DirectCallBinding] = [],
+        developmentNativeImports: [InterfaceArchive.NativeImportRecord] = []
     ) throws -> CanonicalSIL.DirectCallTable {
         var bindings: [CanonicalSIL.DirectCallBinding] = []
         var functionSymbols = Set<String>()
@@ -60,7 +61,9 @@ enum DirectCalls {
             ))
         }
 
-        for item in archive.nativeImports where item.isEmittedToDevice {
+        func appendNativeImport(
+            _ item: InterfaceArchive.NativeImportRecord
+        ) throws {
             guard let id = item.id else {
                 throw CanonicalSIL.LoweringError.invalidCallTable(
                     "emitted native import \(item.canonicalCallee) has no ID"
@@ -103,6 +106,40 @@ enum DirectCalls {
                 ))
                 emittedNativeSymbols.insert(mangledName)
             }
+        }
+        for item in archive.nativeImports where item.isEmittedToDevice {
+            try appendNativeImport(item)
+        }
+
+        let archivedCandidates = Dictionary(
+            uniqueKeysWithValues: archive.nativeImports.map { ($0.key, $0) }
+        )
+        let baselineIDs = Set(
+            archive.nativeImports.compactMap { $0.isEmittedToDevice ? $0.id : nil }
+        )
+        guard Set(developmentNativeImports.map(\.key)).count
+                == developmentNativeImports.count,
+              Set(developmentNativeImports.compactMap(\.id)).count
+                == developmentNativeImports.count,
+              developmentNativeImports.allSatisfy({ candidate in
+                  guard candidate.isEmittedToDevice,
+                        let id = candidate.id,
+                        !baselineIDs.contains(id),
+                        var archived = archivedCandidates[candidate.key],
+                        !archived.isEmittedToDevice,
+                        archived.id == nil
+                  else { return false }
+                  archived.id = id
+                  archived.isEmittedToDevice = true
+                  return archived == candidate
+              })
+        else {
+            throw CanonicalSIL.LoweringError.invalidCallTable(
+                "development NativeImports do not exactly promote cataloged HLXI candidates"
+            )
+        }
+        for item in developmentNativeImports {
+            try appendNativeImport(item)
         }
         for item in archive.nativeImports where !item.isEmittedToDevice {
             for mangledName in item.silMangledNames

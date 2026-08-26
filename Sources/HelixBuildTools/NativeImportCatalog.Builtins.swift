@@ -90,9 +90,7 @@ enum Builtins {
             let key = try Core.NativeCall.Key.derive(
                 descriptor: descriptor.nativeCall
             )
-            guard let record = byKey[key], record.isEmittedToDevice
-            else { return nil }
-            guard let id = record.id,
+            guard let record = byKey[key],
                   record.silMangledNames == descriptor.silMangledNames,
                   record.parameterTypes == descriptor.parameterTypes,
                   record.resultType == descriptor.resultType,
@@ -108,10 +106,7 @@ enum Builtins {
             return ShellBuildReceipt.NativeImportBinding(
                 key: record.key,
                 strategy: .factory,
-                factoryExpression: definition.invokerFactory + "("
-                    + "id: Core.NativeImportID(rawValue: \(id.rawValue)), "
-                    + "key: Core.NativeCall.Key(rawValue: try! Core.Digest(hex: "
-                    + "\(String(reflecting: record.key.rawValue.hex)))))",
+                factoryReference: definition.invokerFactory,
                 importedModules: definition.importedModules
             )
         }.sorted { $0.key.rawValue < $1.key.rawValue }

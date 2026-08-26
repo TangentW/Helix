@@ -298,6 +298,7 @@ public struct Adapter: Sendable {
             let measuredManagedOperations = managedSurface.operations.compactMap {
                 operation -> FrontendReceipt.Adapter.ImportedOperation? in
                 var operation = operation
+                operation.isEmittedToDevice = false
                 operation.silReferences.removeAll(
                     where: observedCallbackSymbols.contains
                 )
@@ -655,7 +656,7 @@ public struct Adapter: Sendable {
             )
         }
         let receipt = ShellBuildReceipt.Document(
-            metadata: request.metadata,
+            metadata: indexed.archive.metadata,
             compatibility: compatibility,
             configuration: resolvedConfiguration,
             capabilities: Set(indexed.archive.capabilities),
@@ -1325,13 +1326,11 @@ extension FrontendReceipt.Adapter {
         _ candidates: [NativeImportDiscovery.Candidate],
         archive: InterfaceArchive.Archive
     ) -> [ShellBuildReceipt.NativeImportBinding] {
-        let emitted = Dictionary(uniqueKeysWithValues: archive.nativeImports.compactMap {
-            item -> (Core.NativeCall.Key, InterfaceArchive.NativeImportRecord)? in
-            guard item.isEmittedToDevice, item.id != nil else { return nil }
-            return (item.key, item)
-        })
+        let cataloged = Dictionary(
+            uniqueKeysWithValues: archive.nativeImports.map { ($0.key, $0) }
+        )
         return candidates.compactMap { candidate in
-            guard let record = emitted[candidate.record.key], record.id != nil else {
+            guard let record = cataloged[candidate.record.key] else {
                 return nil
             }
             let generated = candidate.generatedBinding
@@ -1693,22 +1692,12 @@ extension FrontendReceipt.Adapter {
             )
             catalogByKey[key] = candidate
         }
-        return try archive.nativeImports.compactMap { item in
-            guard item.isEmittedToDevice else { return nil }
+        return archive.nativeImports.compactMap { item in
             guard let candidate = catalogByKey[item.key] else { return nil }
-            guard let id = item.id else {
-                throw FrontendReceipt.Error.invalidRequest(
-                    "emitted NativeImport \(item.canonicalCallee) has no deterministic factory binding"
-                )
-            }
-            let expression = "\(candidate.factoryType).make("
-                + "id: Core.NativeImportID(rawValue: \(id.rawValue)), "
-                + "key: Core.NativeCall.Key(rawValue: try! Core.Digest(hex: "
-                + "\(String(reflecting: item.key.rawValue.hex)))))"
             return .init(
                 key: item.key,
                 strategy: .factory,
-                factoryExpression: expression,
+                factoryReference: "\(candidate.factoryType).make",
                 importedModules: candidate.importedModules
             )
         }.sorted { $0.key.rawValue < $1.key.rawValue }

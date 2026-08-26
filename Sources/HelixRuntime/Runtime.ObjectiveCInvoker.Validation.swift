@@ -1,7 +1,17 @@
 import HelixBytecode
 import HelixCore
+import HelixVM
 
 extension Runtime.ObjectiveCInvoker {
+    /// Rejects a descriptor that cannot be executed by the generic invoker.
+    /// Development activation calls this before publishing a generation so an
+    /// unsupported ABI shape cannot become a deferred first-call failure.
+    public func validateConfiguration() throws {
+        if let constructionFailure {
+            throw VM.RuntimeTrap.nativeFailure(constructionFailure)
+        }
+    }
+
     static func validate(
         key: Core.NativeCall.Key,
         descriptor: Core.NativeCall.Descriptor,

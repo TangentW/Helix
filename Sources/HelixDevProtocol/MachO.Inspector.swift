@@ -26,6 +26,26 @@ public struct Descriptor: Codable, Hashable, Sendable {
 
     public var isDynamicLibrary: Bool { fileType == 6 }
     public var isCodeSigned: Bool { codeSignature != nil }
+
+    public init(
+        architecture: MachO.Architecture,
+        fileType: UInt32,
+        uuid: UUID? = nil,
+        installName: String? = nil,
+        dependencies: [String] = [],
+        platform: MachO.Platform? = nil,
+        hasWritableExecutableSegment: Bool = false,
+        codeSignature: MachO.CodeSignature? = nil
+    ) {
+        self.architecture = architecture
+        self.fileType = fileType
+        self.uuid = uuid
+        self.installName = installName
+        self.dependencies = dependencies
+        self.platform = platform
+        self.hasWritableExecutableSegment = hasWritableExecutableSegment
+        self.codeSignature = codeSignature
+    }
 }
 
 public struct CodeSignature: Codable, Hashable, Sendable {

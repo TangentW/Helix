@@ -206,6 +206,7 @@ struct DevConnectionBootstrap {
                 platform: .iOSSimulator,
                 architecture: "arm64",
                 xcodeBuild: "17F113",
+                sdkBuild: "22A1",
                 swiftCompilerFingerprint: "swift-6.3.3-fixture",
                 liveReloadIndexHash: .sha256("reload-index")
             )
@@ -237,6 +238,7 @@ struct DevConnectionBootstrap {
             platform: .iOSSimulator,
             architecture: "arm64",
             xcodeBuild: "17F113",
+            sdkBuild: "22A1",
             swiftCompilerFingerprint: "swift-6.3.3-fixture",
             liveReloadIndexHash: .sha256("reload-index")
         )

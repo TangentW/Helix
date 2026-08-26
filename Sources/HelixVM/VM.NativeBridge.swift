@@ -444,6 +444,28 @@ public struct NativeCatalog: Sendable {
     public subscript(id: Core.NativeImportID) -> (any VM.NativeInvoker)? {
         invokers[id]
     }
+
+    /// Returns a new immutable table containing the current entries and the
+    /// supplied session-local additions. An ID collision is rejected even when
+    /// both invokers describe the same key; compact IDs are part of the Shell
+    /// execution contract and must have one publisher.
+    public func appending(
+        _ additions: [any VM.NativeInvoker]
+    ) throws -> VM.NativeCatalog {
+        var table = invokers
+        for invoker in additions {
+            guard table[invoker.id] == nil else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "duplicate native import \(invoker.id)"
+                )
+            }
+            table[invoker.id] = invoker
+        }
+        return try VM.NativeCatalog(Array(table.values))
+    }
+
+    /// Compact IDs published by this immutable table.
+    public var ids: Set<Core.NativeImportID> { Set(invokers.keys) }
 }
 
 /// Immutable async NativeImport table. Synchronous and suspending descriptors
@@ -482,6 +504,25 @@ public struct AsyncNativeCatalog: Sendable {
     public subscript(id: Core.NativeImportID) -> (any VM.AsyncNativeInvoker)? {
         invokers[id]
     }
+
+    /// Returns a new immutable table with collision-checked session additions.
+    public func appending(
+        _ additions: [any VM.AsyncNativeInvoker]
+    ) throws -> VM.AsyncNativeCatalog {
+        var table = invokers
+        for invoker in additions {
+            guard table[invoker.id] == nil else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "duplicate async native import \(invoker.id)"
+                )
+            }
+            table[invoker.id] = invoker
+        }
+        return try VM.AsyncNativeCatalog(Array(table.values))
+    }
+
+    /// Compact IDs published by this immutable table.
+    public var ids: Set<Core.NativeImportID> { Set(invokers.keys) }
 }
 
 public typealias EntryInvocation = @Sendable (

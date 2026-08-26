@@ -286,25 +286,7 @@ func privatePathsForPreparedShell(
 }
 
 func xcodeBuildCacheStore() -> BuildCache.Store? {
-    let processEnvironment = environment
-    let root: URL
-    if let configured = processEnvironment["HELIX_BUILD_CACHE_DIR"]?
-        .trimmingCharacters(in: .whitespacesAndNewlines),
-       !configured.isEmpty,
-       configured.hasPrefix("/"),
-       !configured.contains("\n"),
-       !configured.contains("\r") {
-        root = URL(fileURLWithPath: configured, isDirectory: true)
-    } else {
-        guard let caches = FileManager.default.urls(
-            for: .cachesDirectory,
-            in: .userDomainMask
-        ).first else { return nil }
-        root = caches
-            .appendingPathComponent("Helix", isDirectory: true)
-            .appendingPathComponent("BuildFacts", isDirectory: true)
-    }
-    return try? BuildCache.Store(rootURL: root)
+    BuildCache.defaultStore(environment: environment)
 }
 
 func bridgeGeneratedSourcesMatch(

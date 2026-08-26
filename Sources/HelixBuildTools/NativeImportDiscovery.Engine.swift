@@ -60,6 +60,10 @@ extension NativeImportDiscovery {
             .ordinary
         var objectiveC: FrontendReceipt.ObjectiveCABI.Evidence? = nil
         var c: FrontendReceipt.CABI.Evidence? = nil
+        /// True only when the current source baseline (or explicit policy)
+        /// requires this operation in the linked Shell. Managed development
+        /// discovery keeps future-use operations as exact data-only records.
+        var isEmittedToDevice: Bool = true
     }
 
     struct GeneratedBinding: Hashable, Sendable {
@@ -318,7 +322,7 @@ extension NativeImportDiscovery {
                             resultType: declaration.resultType,
                             contract: contract,
                             capability: .nativeImportsV1,
-                            isEmittedToDevice: true,
+                            isEmittedToDevice: declaration.isEmittedToDevice,
                             abiAdapter: declaration.abiAdapter
                         ),
                         generatedBinding: .init(

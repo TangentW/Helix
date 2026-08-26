@@ -9,7 +9,7 @@ share compiler facts and identity contracts; they do not share a delivery
 channel.
 
 This document describes the implementation available in the repository as of
-August 26, 2026. It does not turn unfinished qualification work into a product
+August 27, 2026. It does not turn unfinished qualification work into a product
 claim.
 
 ## The two workflows
@@ -17,12 +17,15 @@ claim.
 | Workflow | Artifact | Execution | Lifetime | Intended use |
 | --- | --- | --- | --- | --- |
 | Production hot patch | Signed `.hlxp` containing HLBC | Preinstalled verifier and HLVM | Persisted, rollback-capable generations | A controlled response to a defect in a released Shell |
-| Development Live Reload | Session-bound authenticated HLBC live artifact | The development verifier and HLVM path | Current Debug process only | Save a supported function body and update the running page |
+| Development Live Reload | Authenticated version-1 `DevelopmentPayload` containing HLBC and optional exact Adapter images | Development verifier/HLVM plus the bounded development-image loader | Current Debug process only | Save a supported function body and update the running page |
 
-Neither product path downloads Swift source or native machine code into the
-App. Production accepts a persistable, policy-bound signed package; development
-accepts an ephemeral artifact bound to one authenticated Dev Session. This
-distinction is structural, not a runtime configuration toggle.
+Neither product path downloads Swift source, a compiler, a linker, or JIT
+input into the App. Production accepts a persistable, policy-bound signed HLBC
+package and has no development image-loading path. Development accepts an
+ephemeral artifact bound to one authenticated Dev Session; on qualified
+Simulator/macOS targets it may contain an exact, signed on-demand Swift Adapter
+image. Physical iOS rejects that image path. This distinction is structural,
+not a runtime configuration toggle.
 
 Xcode-side `prepare`, `bridge`, `finalize`, and `patch` operations emit a local
 schema-1 `BuildPerformance.<operation>.json` under the active profile's
@@ -48,8 +51,9 @@ flowchart TB
     PKG --> PR["HelixAppIntegration · production path"]
 
     D --> DSIL["Exact-toolchain canonical SIL"]
-    DSIL --> DHLBC["HLIR → authenticated development HLBC"]
-    DHLBC --> DR["HelixDevSupport · development path"]
+    DSIL --> DHLBC["HLIR → HLBC + exact native-candidate plan"]
+    DHLBC --> DP["Authenticated DevelopmentPayload"]
+    DP --> DR["HelixDevSupport · development path"]
     DR --> UI["Automatic UIKit instance invalidation or SwiftUI pulse"]
 ```
 
@@ -65,6 +69,12 @@ Both workflows depend on stable, build-specific identities:
   `NativeImportID` is only the compact per-Shell/per-image dispatch slot. A
   patch carries both rather than embedding a process pointer or treating the
   compact slot as authority. See [Native call identity and catalog](Native-Calls.md).
+- A managed-Debug Build Receipt keeps baseline-used native bindings separate
+  from dormant, data-only Catalog candidates. An authenticated first use assigns
+  a deterministic session-local compact ID after the linked prefix without
+  changing the Shell interface hash. Every generation and escaping callback
+  pins one immutable capability snapshot; later saves cannot expand it in
+  place.
 - Supported Objective-C imports share one descriptor-driven Runtime invoker
   instead of one generated Swift function per selector. Compiler evidence fixes
   the declaration class, a separate class/initializer dispatch class where
@@ -75,12 +85,15 @@ Both workflows depend on stable, build-specific identities:
   overlays and ABI shapes retain the exact generated-adapter route. This is a
   reusable execution mechanism, not wildcard selector authority.
 - Compiler-proven C functions within the finite scalar/Apple-geometry ABI
-  matrix share one AOT Runtime invoker. The permanent Bridge supplies the
-  address of the exact imported declaration; Runtime performs no symbol lookup
-  and downloaded code cannot choose a pointer. Remaining Swift declarations
-  are grouped by native module into deterministic Adapter Packs with separately
-  cached source and validated Mach-O objects. This generated type-erasure
-  boundary does not expose Swift's private generic ABI.
+  matrix share one AOT Runtime invoker. A permanent Bridge binding supplies the
+  address of the exact imported declaration. Development first use may resolve
+  only the Catalog Descriptor's fixed entry point from the already linked
+  process; downloaded code cannot choose a symbol or pointer. Remaining Swift
+  declarations use generated type erasure: baseline-used entries are grouped
+  by native module into deterministic Adapter Packs, while a dormant
+  development entry compiles only its actually imported body. Both paths have
+  separately cached source and validated Mach-O objects and never expose
+  Swift's private generic ABI.
 - Interface and transitive implementation fingerprints distinguish a body
   edit from an ABI, layout, source-membership, or dependency change.
 - Eligible existing Shell structs and enums use a captured logical-value
@@ -891,21 +904,33 @@ object with the validated stable objects. The stricter final Bridge identity
 still includes the current invitation, so object reuse cannot accidentally
 carry pairing authority from an earlier build.
 
+Managed-Debug candidates that the baseline does not call are not expanded into
+Bridge machine code. They remain exact Descriptor/Key records in the
+authenticated receipt. If a later HLBC generation first references one, the
+compiler assigns its deterministic session ID; Objective-C and supported C use
+their generic invokers, while only a missing pure-Swift body enters the
+on-demand Adapter compiler and cache.
+
 The Xcode integration captures the frontend, link, SDK, module, source, and
 target facts from a real Debug build. A source monitor turns editor writes and
 atomic renames into a stable, monotonically numbered snapshot. The development
 compiler rechecks the transaction in the original module context. Automatic
 routing prefers a fresh native Swift Dynamic Replacement image on a qualified
 iOS Simulator and otherwise lowers the supported canonical SIL used by the
-release compiler into an immutable HLBC generation. The authenticated daemon
-transports the selected bounded artifact; the Debug App validates it before
-atomic activation.
+release compiler into immutable HLBC, computes the exact native-capability
+delta, and packages any required Adapter image in one canonical
+`DevelopmentPayload`. The authenticated daemon transports the selected bounded
+artifact; the Debug App validates its compiler/SDK/Shell identity, imports,
+Mach-O images, and bytecode before atomically publishing one generation and its
+capability snapshot.
 
 There is no mutable dynamic library to which source files are appended: every
 native generation is a separate signed image and already loaded images remain
 immutable. Native loading is a Debug/Simulator capability with process-lifetime
-count and byte budgets. Physical devices retain HLBC by default, and production
-Hot Patch has no development image-loading path.
+count and byte budgets shared by Dynamic Replacement and development Adapter
+images. Physical devices retain HLBC with their already linked capability set
+by default; an unlinked Swift Adapter requires a normal rebuild. Production Hot
+Patch has no development image-loading path.
 
 The Debug App activates code first and refreshes UI second. `ReloadIndex`
 metadata maps changed roots to stable nominal type IDs. UIKit reconstructs those

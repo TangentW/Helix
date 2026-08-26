@@ -568,6 +568,16 @@ struct NativeCall {
         #expect(throws: Core.NativeCall.DescriptorError.self) {
             try malformedStructure.validate(contract: contract)
         }
+
+        var unerasedObject = descriptor
+        unerasedObject.physicalSignature.parameters[0].type = .init(
+            kind: .object,
+            canonicalName: "Foundation.NSArray<τ_0_0>",
+            encoding: "@"
+        )
+        #expect(throws: Core.NativeCall.DescriptorError.self) {
+            try unerasedObject.validate(contract: contract)
+        }
     }
 
     @Test("Objective-C ownership families cannot be hidden by a false convention")

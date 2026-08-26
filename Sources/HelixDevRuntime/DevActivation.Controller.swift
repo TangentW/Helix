@@ -7,6 +7,7 @@ import HelixDevProtocol
 import HelixLiveReloadAPI
 import HelixRuntime
 import HelixVerifier
+import HelixVM
 #endif
 
 /// Validation, transfer, and activation primitives for development generations.
@@ -32,7 +33,7 @@ public struct Limits: Hashable, Sendable {
     /// Creates resource ceilings with conservative development defaults.
     public init(
         maximumNativePayloadBytes: Int = 64 * 1_024 * 1_024,
-        maximumHLBCPayloadBytes: Int = 16 * 1_024 * 1_024,
+        maximumHLBCPayloadBytes: Int = 64 * 1_024 * 1_024,
         maximumNativeImageCount: Int = 80,
         nativeImageSoftWarningCount: Int = 50,
         maximumNativeMappedBytes: Int = 256 * 1_024 * 1_024
@@ -49,6 +50,7 @@ public struct Limits: Hashable, Sendable {
         guard maximumNativePayloadBytes > 0,
               maximumHLBCPayloadBytes > 0,
               maximumNativeImageCount > 0,
+              maximumNativeImageCount <= Int(UInt32.max),
               nativeImageSoftWarningCount > 0,
               nativeImageSoftWarningCount <= maximumNativeImageCount,
               maximumNativeMappedBytes >= maximumNativePayloadBytes
@@ -64,12 +66,15 @@ public enum ConfigurationError: Swift.Error, Equatable, Sendable, CustomStringCo
     case invalidLimits
     /// The native image cache is not a non-empty local file URL.
     case invalidCacheDirectory
+    /// Runtime and generated Shell do not share the same interface/registry.
+    case runtimeMismatch
 
     /// Human-readable configuration failure detail.
     public var description: String {
         switch self {
         case .invalidLimits: "Dev activation limits are inconsistent or nonpositive"
         case .invalidCacheDirectory: "Dev activation cache must be a local file URL"
+        case .runtimeMismatch: "Dev activation Runtime does not match the generated Shell"
         }
     }
 }
@@ -82,9 +87,9 @@ public struct Snapshot: Hashable, Sendable {
     public var highestAppliedRevision: DevProtocol.SourceRevision
     /// Generation that currently supplies active development routes.
     public var activeGenerationID: DevProtocol.GenerationID?
-    /// Total native image count, including images loaded before a reconnect.
+    /// Dynamic Replacement image count, including images loaded before a reconnect.
     public var loadedNativeImageCount: Int
-    /// Total mapped native image bytes, including images loaded before reconnect.
+    /// Dynamic Replacement bytes, including images loaded before reconnect.
     public var loadedNativeBytes: Int
     /// Whether the configured soft image-count threshold has been reached.
     public var nativeImageSoftLimitReached: Bool
@@ -96,6 +101,12 @@ public struct Snapshot: Hashable, Sendable {
     public var pendingGenerationID: DevProtocol.GenerationID?
     /// Current backend selection for every function with an active override.
     public var activeFunctionRoutes: [DevProtocol.ActiveFunctionRoute]
+    /// NativeCall keys published by successful development HLBC transactions.
+    public var activeDevelopmentNativeCallKeys: [Core.NativeCall.Key]
+    /// Swift Adapter images mapped for development HLBC, including orphaned
+    /// images from transactions rejected after mapping.
+    public var loadedDevelopmentAdapterCount: Int
+    public var loadedDevelopmentAdapterBytes: Int
     /// HLBC generations retained for rollback or in-flight invocations.
     public var retainedHLBCGenerationIDs: [Runtime.GenerationID]
     /// Highest HLBC generation identity activated in this process.
@@ -133,20 +144,32 @@ public actor Controller {
     public let shell: Verification.ShellInterface
     /// Runtime resource and execution policy used for HLBC verification.
     public let runtimePolicy: Core.RuntimePolicy
-    /// Generation registry that atomically switches HLBC dispatch routes.
-    public let registry: Runtime.GenerationRegistry
+    /// Runtime that verifies native bindings and atomically switches dispatch.
+    public let runtime: Runtime.Engine
+    public var registry: Runtime.GenerationRegistry { runtime.registry }
     /// Private local directory used for incoming and mapped development artifacts.
     public let cacheDirectory: URL
     /// Resource ceilings enforced before bytes are accepted or mapped.
     public let limits: DevActivation.Limits
 
     private let nativeLoader: any NativeImage.Loading
+    private let developmentAdapterLoader: any DevelopmentAdapter.Loading
     private let reloadHandler: ReloadHandler
     private var highestOfferedRevision = DevProtocol.SourceRevision(rawValue: 0)
     private var highestAppliedRevision: DevProtocol.SourceRevision
     private var activeGenerationID: DevProtocol.GenerationID?
     private var pending: PendingTransfer?
     private var loadedNativeImages: [NativeImage.LoadedImage] = []
+    private var loadedDevelopmentAdapters: [DevelopmentAdapter.LoadedImage] = []
+    private var developmentImports: [
+        Core.NativeImportID: DevProtocol.DevelopmentPayload.NativeImport
+    ] = [:]
+    private var developmentNativeInvokers: [
+        Core.NativeImportID: any VM.NativeInvoker
+    ] = [:]
+    private var developmentAsyncNativeInvokers: [
+        Core.NativeImportID: any VM.AsyncNativeInvoker
+    ] = [:]
     private let initialNativeImageCount: Int
     private let initialNativeImageBytes: Int
     private var nativeStateUncertain = false
@@ -154,19 +177,17 @@ public actor Controller {
 
     /// Creates an explicitly assembled activation controller.
     ///
-    /// - Important: `registry` must be the registry installed on the runtime
-    ///   executing instrumented calls.
+    /// - Important: `runtime` must be the engine executing instrumented calls.
     public init(
         identity: DevProtocol.SessionIdentity,
         shell: Verification.ShellInterface,
         runtimePolicy: Core.RuntimePolicy,
-        registry: Runtime.GenerationRegistry = .init(
-            maximumGenerationCount: 512,
-            maximumEstimatedBytes: 256 * 1_024 * 1_024
-        ),
+        runtime: Runtime.Engine,
         cacheDirectory: URL,
         limits: DevActivation.Limits = .init(),
         nativeLoader: any NativeImage.Loading = NativeImage.SystemLoader(),
+        developmentAdapterLoader: any DevelopmentAdapter.Loading =
+            DevelopmentAdapter.SystemLoader(),
         reloadHandler: @escaping ReloadHandler = { _, _ in .notRequested }
     ) throws {
         try identity.validate()
@@ -174,13 +195,17 @@ public actor Controller {
         guard cacheDirectory.isFileURL, !cacheDirectory.path.isEmpty else {
             throw DevActivation.ConfigurationError.invalidCacheDirectory
         }
+        guard runtime.registry.snapshot().activeGenerationID == nil,
+              runtime.shellInterfaceHash == shell.interfaceHash
+        else { throw DevActivation.ConfigurationError.runtimeMismatch }
         self.identity = identity
         self.shell = shell
         self.runtimePolicy = runtimePolicy
-        self.registry = registry
+        self.runtime = runtime
         self.cacheDirectory = cacheDirectory
         self.limits = limits
         self.nativeLoader = nativeLoader
+        self.developmentAdapterLoader = developmentAdapterLoader
         self.reloadHandler = reloadHandler
         guard let initialBytes = Int(exactly: identity.loadedNativeImageBytes) else {
             throw DevActivation.ConfigurationError.invalidLimits
@@ -195,6 +220,12 @@ public actor Controller {
                 ($0.functionKey, $0.backend)
             }
         )
+        guard identity.activeDevelopmentNativeCallKeys.isEmpty,
+              identity.loadedDevelopmentAdapterCount == 0,
+              identity.loadedDevelopmentAdapterBytes == 0
+        else {
+            throw DevActivation.ConfigurationError.runtimeMismatch
+        }
     }
 
     /// Validates an offer and opens its bounded, contiguous payload transfer.
@@ -447,6 +478,30 @@ public actor Controller {
                     ? "restart the App; no further Native injection is safe"
                     : "use HLBC or fix signing/dependencies"
             )
+        } catch let error as DevelopmentAdapter.Error {
+            if error.isStateUncertain { nativeStateUncertain = true }
+            return rejection(
+                code: error.isStateUncertain ? "HLXLR503" : "HLXLR507",
+                message: error.description,
+                offer: pending.offer,
+                previousCodeRemainsActive: true,
+                nextAction: error.isStateUncertain
+                    ? "restart the App before loading another native Adapter; the previous generation remains active"
+                    : "fix the cataloged native call or Adapter; the previous generation remains active"
+            )
+        } catch var diagnostic as DevProtocol.Diagnostic {
+            diagnostic.sourceRevision = diagnostic.sourceRevision
+                ?? pending.offer.sourceRevision
+            diagnostic.generationID = diagnostic.generationID
+                ?? pending.offer.generationID
+            diagnostic.backend = diagnostic.backend ?? pending.offer.backend
+            return .init(
+                sourceRevision: pending.offer.sourceRevision,
+                generationID: pending.offer.generationID,
+                codeStatus: .rejected,
+                reloadStatus: .notRequested,
+                diagnostic: diagnostic
+            )
         } catch {
             return rejection(
                 code: "HLXLR505",
@@ -492,11 +547,18 @@ public actor Controller {
             loadedNativeImageCount: totalNativeImageCount,
             loadedNativeBytes: totalNativeImageBytes,
             nativeImageSoftLimitReached:
-                totalNativeImageCount >= limits.nativeImageSoftWarningCount,
+                totalMappedNativeImageCount
+                    >= limits.nativeImageSoftWarningCount,
             nativeStateUncertain: nativeStateUncertain,
             hasPendingTransfer: pending != nil,
             pendingGenerationID: pending?.offer.generationID,
             activeFunctionRoutes: activeRoutes(),
+            activeDevelopmentNativeCallKeys:
+                developmentImports.values.map(\.key).sorted(),
+            loadedDevelopmentAdapterCount:
+                loadedDevelopmentAdapters.count,
+            loadedDevelopmentAdapterBytes:
+                loadedDevelopmentAdapters.reduce(0) { $0 + $1.byteCount },
             retainedHLBCGenerationIDs: registrySnapshot.loadedGenerationIDs,
             highestActivatedHLBCGenerationID:
                 registrySnapshot.highestActivatedGenerationID,
@@ -513,10 +575,18 @@ public actor Controller {
         current.highestAppliedSourceRevision = highestAppliedRevision
         current.activeGenerationID = activeGenerationID
         current.activeFunctionRoutes = activeRoutes()
+        current.activeDevelopmentNativeCallKeys = developmentImports.values
+            .map(\.key).sorted()
+        current.loadedDevelopmentAdapterCount = UInt32(
+            loadedDevelopmentAdapters.count
+        )
+        current.loadedDevelopmentAdapterBytes = UInt64(
+            loadedDevelopmentAdapters.reduce(0) { $0 + $1.byteCount }
+        )
         current.loadedNativeImageCount = UInt32(totalNativeImageCount)
         current.loadedNativeImageBytes = UInt64(totalNativeImageBytes)
         current.nativeImageSoftLimitReached =
-            totalNativeImageCount >= limits.nativeImageSoftWarningCount
+            totalMappedNativeImageCount >= limits.nativeImageSoftWarningCount
         current.nativeStateUncertain = nativeStateUncertain
         return current
     }
@@ -542,19 +612,116 @@ public actor Controller {
                 removedEntries: removedEntries,
                 estimatedByteCount: 0
             )
-            _ = try registry.activate(generation, expectedActiveID: parent)
+            _ = try runtime.activate(generation, expectedActiveID: parent)
             return
         }
+        let artifact = try DevProtocol.DevelopmentPayload.Artifact.decode(
+            bytes,
+            maximumPayloadBytes: limits.maximumHLBCPayloadBytes
+        )
+        guard artifact.manifest.shellInterfaceHash == shell.interfaceHash,
+              artifact.manifest.compilerFingerprint
+                == identity.swiftCompilerFingerprint,
+              artifact.manifest.sdkBuild == identity.sdkBuild,
+              targetTriple(
+                artifact.manifest.targetTriple,
+                matches: identity
+              )
+        else {
+            throw DevProtocol.Diagnostic(
+                code: "HLXLR304",
+                message: "development payload toolchain, target, or Shell identity does not match the running App",
+                sourceRevision: offer.sourceRevision,
+                generationID: offer.generationID,
+                backend: .hlbc,
+                nextAction: "discard this payload and rebuild the exact Dev Shell"
+            )
+        }
+
+        let baselineKeys = Set(shell.imports.values.map(\.key))
+        var candidateImports = developmentImports
+        var newImports: [DevProtocol.DevelopmentPayload.NativeImport] = []
+        for nativeImport in artifact.manifest.nativeImports {
+            guard shell.imports[nativeImport.id] == nil,
+                  !baselineKeys.contains(nativeImport.key)
+            else {
+                throw DevProtocol.Error.invalidArtifact(
+                    "development NativeImport collides with the linked Shell"
+                )
+            }
+            if let existing = candidateImports[nativeImport.id] {
+                // A newer save can finish compiling while the transaction
+                // that first publishes this Adapter is still in flight. Once
+                // that earlier transaction activates, the newer payload is a
+                // deterministic replay of the same capability. Accept it and
+                // ignore its now-redundant image instead of rejecting a valid
+                // latest-wins update or mapping the dylib twice.
+                guard sessionEquivalent(existing, nativeImport) else {
+                    throw DevProtocol.Error.invalidArtifact(
+                        "development NativeImport changed after session publication"
+                    )
+                }
+                continue
+            }
+            guard !candidateImports.values.contains(where: {
+                $0.key == nativeImport.key
+            }) else {
+                throw DevProtocol.Error.invalidArtifact(
+                    "development NativeCallKey collides with another compact ID"
+                )
+            }
+            switch nativeImport.binding {
+            case .swiftAdapter:
+                guard nativeImport.imageIndex != nil,
+                      nativeImport.exportSymbol != nil
+                else {
+                    throw DevProtocol.Error.invalidArtifact(
+                        "a new Swift NativeImport has no Adapter image"
+                    )
+                }
+            case .objectiveCInvoker, .cInvoker:
+                guard nativeImport.imageIndex == nil,
+                      nativeImport.exportSymbol == nil
+                else {
+                    throw DevProtocol.Error.invalidArtifact(
+                        "a generic native invoker unexpectedly references an Adapter image"
+                    )
+                }
+            }
+            candidateImports[nativeImport.id] = normalized(nativeImport)
+            newImports.append(nativeImport)
+        }
+        var effectiveCapabilities = shell.capabilities
+        if !candidateImports.isEmpty {
+            effectiveCapabilities.insert(.nativeImportsV1)
+        }
+        let effectiveShell = try Verification.ShellInterface(
+            interfaceHash: shell.interfaceHash,
+            compatibility: shell.compatibility,
+            capabilities: effectiveCapabilities,
+            entries: Array(shell.entries.values),
+            imports: Array(shell.imports.values)
+                + candidateImports.values.map(resolvedImport),
+            types: Array(shell.types.values),
+            frozenValueTypes: Array(shell.frozenValueTypes.values)
+        )
+        var developmentPolicy = runtimePolicy
+        if !candidateImports.isEmpty {
+            developmentPolicy.acceptedCapabilities.insert(.nativeImportsV1)
+        }
+        developmentPolicy.allowedNativeCalls.formUnion(
+            candidateImports.values.map(\.key)
+        )
         let image = try Verification.Engine().verify(
-            bytes: bytes,
-            shell: shell,
-            policy: runtimePolicy
+            bytes: artifact.bytecode,
+            shell: effectiveShell,
+            policy: developmentPolicy
         )
         let patchedFunctions = Set(offer.changedFunctions)
             .subtracting(offer.restoredFunctions)
         guard Set(image.module.entries.map(\.functionKey)) == patchedFunctions else {
             throw DevProtocol.Diagnostic(
-                code: "HLXLR503",
+                code: "HLXLR505",
                 message: "HLBC entries do not match the offered FunctionKeys",
                 sourceRevision: offer.sourceRevision,
                 generationID: offer.generationID,
@@ -562,6 +729,129 @@ public actor Controller {
                 nextAction: "rebuild the Dev artifact from the latest snapshot"
             )
         }
+
+        var candidateNativeInvokers = developmentNativeInvokers
+        var candidateAsyncInvokers = developmentAsyncNativeInvokers
+        for nativeImport in newImports {
+            switch nativeImport.binding {
+            case .objectiveCInvoker:
+                let invoker = Runtime.ObjectiveCInvoker(
+                    id: nativeImport.id,
+                    key: nativeImport.key,
+                    descriptor: nativeImport.descriptor,
+                    parameterTypes: nativeImport.parameterTypes,
+                    resultType: nativeImport.resultType,
+                    effects: nativeImport.descriptor.effects,
+                    contract: nativeImport.contract
+                )
+                try invoker.validateConfiguration()
+                guard candidateNativeInvokers.updateValue(
+                    invoker,
+                    forKey: nativeImport.id
+                ) == nil else {
+                    throw DevProtocol.Error.invalidArtifact(
+                        "development native invoker ID is duplicated"
+                    )
+                }
+            case .cInvoker:
+                let invoker = try developmentAdapterLoader.makeCInvoker(
+                    for: nativeImport
+                )
+                guard candidateNativeInvokers.updateValue(
+                    invoker,
+                    forKey: nativeImport.id
+                ) == nil else {
+                    throw DevProtocol.Error.invalidArtifact(
+                        "development C invoker ID is duplicated"
+                    )
+                }
+            case .swiftAdapter:
+                break
+            }
+        }
+        let imageIndexesToLoad = Set(newImports.compactMap {
+            $0.imageIndex.map(Int.init)
+        })
+        if !imageIndexesToLoad.isEmpty {
+            guard !nativeStateUncertain else {
+                throw DevProtocol.Diagnostic(
+                    code: "HLXLR502",
+                    message: "development Adapter loading is unavailable after an uncertain native mapping",
+                    sourceRevision: offer.sourceRevision,
+                    generationID: offer.generationID,
+                    backend: .hlbc,
+                    nextAction: "restart the Dev App before loading another native Adapter"
+                )
+            }
+            try enforceDevelopmentAdapterBudget(
+                additionalImages: imageIndexesToLoad.count,
+                additionalBytes: imageIndexesToLoad.reduce(0) {
+                    $0 + artifact.images[$1].count
+                },
+                offer: offer
+            )
+        }
+        for index in imageIndexesToLoad.sorted() {
+            let imageImports = newImports.filter {
+                $0.imageIndex.map(Int.init) == index
+            }
+            let loaded = try developmentAdapterLoader.load(
+                bytes: artifact.images[index],
+                descriptor: artifact.manifest.images[index],
+                imports: imageImports,
+                identity: identity,
+                cacheDirectory: cacheDirectory.appendingPathComponent(
+                    "Adapters",
+                    isDirectory: true
+                )
+            )
+            // Mapping cannot be undone safely after factories return executable
+            // closures, so charge it even if the later generation CAS rejects.
+            loadedDevelopmentAdapters.append(loaded)
+            for invoker in loaded.nativeInvokers {
+                guard candidateNativeInvokers.updateValue(
+                    invoker,
+                    forKey: invoker.id
+                ) == nil else {
+                    throw DevProtocol.Error.invalidArtifact(
+                        "development Adapter returned a duplicate synchronous ID"
+                    )
+                }
+            }
+            for invoker in loaded.asyncNativeInvokers {
+                guard candidateAsyncInvokers.updateValue(
+                    invoker,
+                    forKey: invoker.id
+                ) == nil else {
+                    throw DevProtocol.Error.invalidArtifact(
+                        "development Adapter returned a duplicate async ID"
+                    )
+                }
+            }
+        }
+        for nativeImport in newImports {
+            if nativeImport.descriptor.effects.isAsync {
+                guard candidateAsyncInvokers[nativeImport.id].map({
+                    invokerMatches($0, nativeImport)
+                }) == true else {
+                    throw DevProtocol.Error.invalidArtifact(
+                        "development async Adapter does not match its descriptor"
+                    )
+                }
+            } else {
+                guard candidateNativeInvokers[nativeImport.id].map({
+                    invokerMatches($0, nativeImport)
+                }) == true else {
+                    throw DevProtocol.Error.invalidArtifact(
+                        "development native invoker does not match its descriptor"
+                    )
+                }
+            }
+        }
+        let nativeCapabilities = try runtime.baselineNativeCapabilities.appending(
+            nativeInvokers: Array(candidateNativeInvokers.values),
+            asyncNativeInvokers: Array(candidateAsyncInvokers.values)
+        )
         let parent = registry.activeLease()?.generation.id
         let generation = try Runtime.Generation(
             id: .init(rawValue: offer.generationID.rawValue),
@@ -570,9 +860,115 @@ public actor Controller {
             packageHash: offer.payloadSHA256,
             images: [image],
             removedEntries: removedEntries,
-            estimatedByteCount: bytes.count
+            nativeCapabilities: nativeCapabilities,
+            // Adapter images have their own process-lifetime mapped-image
+            // budget. The generation registry retains only verified HLBC.
+            estimatedByteCount: artifact.bytecode.count
         )
-        _ = try registry.activate(generation, expectedActiveID: parent)
+        _ = try runtime.activate(generation, expectedActiveID: parent)
+        developmentImports = candidateImports
+        developmentNativeInvokers = candidateNativeInvokers
+        developmentAsyncNativeInvokers = candidateAsyncInvokers
+    }
+
+    private func normalized(
+        _ nativeImport: DevProtocol.DevelopmentPayload.NativeImport
+    ) -> DevProtocol.DevelopmentPayload.NativeImport {
+        var value = nativeImport
+        value.imageIndex = nil
+        value.exportSymbol = nil
+        return value
+    }
+
+    private func sessionEquivalent(
+        _ lhs: DevProtocol.DevelopmentPayload.NativeImport,
+        _ rhs: DevProtocol.DevelopmentPayload.NativeImport
+    ) -> Bool {
+        normalized(lhs) == normalized(rhs)
+    }
+
+    private func resolvedImport(
+        _ nativeImport: DevProtocol.DevelopmentPayload.NativeImport
+    ) -> Verification.ResolvedNativeImport {
+        .init(
+            id: nativeImport.id,
+            key: nativeImport.key,
+            descriptor: nativeImport.descriptor,
+            parameterTypes: nativeImport.parameterTypes,
+            resultType: nativeImport.resultType,
+            contract: nativeImport.contract,
+            capability: nativeImport.capability
+        )
+    }
+
+    private func invokerMatches(
+        _ invoker: any VM.NativeInvoker,
+        _ nativeImport: DevProtocol.DevelopmentPayload.NativeImport
+    ) -> Bool {
+        invoker.id == nativeImport.id
+            && invoker.key == nativeImport.key
+            && invoker.parameterTypes == nativeImport.parameterTypes
+            && invoker.resultType == nativeImport.resultType
+            && invoker.effects == nativeImport.descriptor.effects
+            && invoker.contract == nativeImport.contract
+    }
+
+    private func invokerMatches(
+        _ invoker: any VM.AsyncNativeInvoker,
+        _ nativeImport: DevProtocol.DevelopmentPayload.NativeImport
+    ) -> Bool {
+        invoker.id == nativeImport.id
+            && invoker.key == nativeImport.key
+            && invoker.parameterTypes == nativeImport.parameterTypes
+            && invoker.resultType == nativeImport.resultType
+            && invoker.effects == nativeImport.descriptor.effects
+            && invoker.contract == nativeImport.contract
+    }
+
+    private func targetTriple(
+        _ target: String,
+        matches identity: DevProtocol.SessionIdentity
+    ) -> Bool {
+        let lowered = target.lowercased()
+        guard target.hasPrefix("\(identity.architecture)-")
+            || (identity.architecture == "arm64e"
+                && target.hasPrefix("arm64-"))
+        else { return false }
+        switch identity.platform {
+        case .iOS:
+            return lowered.contains("-apple-ios")
+                && !lowered.contains("simulator")
+        case .iOSSimulator:
+            return lowered.contains("-apple-ios")
+                && lowered.contains("simulator")
+        case .macOS:
+            return lowered.contains("-apple-macos")
+        }
+    }
+
+    private func enforceDevelopmentAdapterBudget(
+        additionalImages: Int,
+        additionalBytes: Int,
+        offer: DevProtocol.PatchOffer
+    ) throws {
+        let candidateCount = totalMappedNativeImageCount
+            .addingReportingOverflow(additionalImages)
+        let candidateBytes = totalMappedNativeImageBytes
+            .addingReportingOverflow(additionalBytes)
+        guard !candidateCount.overflow,
+              !candidateBytes.overflow,
+              candidateCount.partialValue <= limits.maximumNativeImageCount,
+              candidateBytes.partialValue <= limits.maximumNativeMappedBytes
+        else {
+            throw DevProtocol.Diagnostic(
+                code: "HLXLR701",
+                message: "development Adapter count or mapped-byte budget is exhausted",
+                sourceRevision: offer.sourceRevision,
+                generationID: offer.generationID,
+                backend: .hlbc,
+                nextAction: "restart the Dev App to reclaim development Adapter images"
+            )
+        }
     }
 
     private func restoredEntries(
@@ -586,7 +982,7 @@ public actor Controller {
         )
         guard entries.count == keys.count else {
             throw DevProtocol.Diagnostic(
-                code: "HLXLR503",
+                code: "HLXLR505",
                 message: "restore-originals offer references an unknown FunctionKey",
                 sourceRevision: offer.sourceRevision,
                 generationID: offer.generationID,
@@ -601,9 +997,10 @@ public actor Controller {
         additionalBytes: Int,
         offer: DevProtocol.PatchOffer
     ) throws {
-        let bytes = totalNativeImageBytes
-        let newBytes = bytes.addingReportingOverflow(additionalBytes)
-        guard totalNativeImageCount < limits.maximumNativeImageCount,
+        let newBytes = totalMappedNativeImageBytes.addingReportingOverflow(
+            additionalBytes
+        )
+        guard totalMappedNativeImageCount < limits.maximumNativeImageCount,
               !newBytes.overflow,
               newBytes.partialValue <= limits.maximumNativeMappedBytes
         else {
@@ -637,6 +1034,15 @@ public actor Controller {
 
     private var totalNativeImageBytes: Int {
         initialNativeImageBytes + loadedNativeImages.reduce(0) { $0 + $1.byteCount }
+    }
+
+    private var totalMappedNativeImageCount: Int {
+        totalNativeImageCount + loadedDevelopmentAdapters.count
+    }
+
+    private var totalMappedNativeImageBytes: Int {
+        totalNativeImageBytes
+            + loadedDevelopmentAdapters.reduce(0) { $0 + $1.byteCount }
     }
 
     private func rejection(

@@ -509,6 +509,7 @@ private struct ProtocolFixture {
             architecture: "arm64",
             operatingSystemBuild: "22A",
             xcodeBuild: "17F113",
+            sdkBuild: "22A1",
             swiftCompilerFingerprint: "swift-6.3.3",
             liveReloadIndexHash: .sha256("index"),
             supportedBackends: [.hlbc, .nativeDynamicReplacement],

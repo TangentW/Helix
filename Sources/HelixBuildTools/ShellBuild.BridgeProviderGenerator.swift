@@ -63,6 +63,7 @@ public struct BridgeProviderGenerator: Sendable {
                         platform: .\(target.platformCase),
                         architecture: \(String(reflecting: target.architecture)),
                         xcodeBuild: \(String(reflecting: archive.metadata.xcodeBuild)),
+                        sdkBuild: \(String(reflecting: archive.metadata.sdkBuild)),
                         liveReloadIndexHash: try Core.Digest(
                             hex: \(String(reflecting: reloadIndexHash.hex))
                         ),

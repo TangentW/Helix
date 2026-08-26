@@ -45,6 +45,8 @@ public struct BridgeDescriptor: Hashable, Sendable {
     public var architecture: String
     /// Xcode build identifier used to produce the generated artifacts.
     public var xcodeBuild: String
+    /// SDK build identifier whose imported API and ABI surface was cataloged.
+    public var sdkBuild: String
     /// Hash of the generated Live Reload index installed in the App.
     public var liveReloadIndexHash: Core.Digest
     /// Identity used to reject duplicate or incompatible Runtime images.
@@ -66,6 +68,7 @@ public struct BridgeDescriptor: Hashable, Sendable {
         platform: Platform,
         architecture: String,
         xcodeBuild: String,
+        sdkBuild: String,
         liveReloadIndexHash: Core.Digest,
         runtimeImageIdentity: Core.RuntimeImageIdentity = .current
     ) {
@@ -80,6 +83,7 @@ public struct BridgeDescriptor: Hashable, Sendable {
         self.platform = platform
         self.architecture = architecture
         self.xcodeBuild = xcodeBuild
+        self.sdkBuild = sdkBuild
         self.liveReloadIndexHash = liveReloadIndexHash
         self.runtimeImageIdentity = runtimeImageIdentity
     }
@@ -87,7 +91,7 @@ public struct BridgeDescriptor: Hashable, Sendable {
     /// Validates required strings, supported architecture, and runtime identity.
     public func validate() throws {
         let values = [
-            bundleID, buildNumber, architecture, xcodeBuild,
+            bundleID, buildNumber, architecture, xcodeBuild, sdkBuild,
             compatibility.compilerFingerprint,
         ]
         guard values.allSatisfy({

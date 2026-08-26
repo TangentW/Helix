@@ -59,6 +59,9 @@ public final class Generation: @unchecked Sendable {
     public let images: [Verification.Image]
     /// Most restrictive signed resource limits across all images.
     public let resourceLimits: Core.ResourceLimits
+    /// Full native capability snapshot for this generation. Nil selects the
+    /// linked baseline, or inherits the parent's development snapshot.
+    public let nativeCapabilities: Runtime.NativeCapabilities?
     /// Conservative memory estimate charged to the generation registry.
     public let estimatedByteCount: Int
 
@@ -73,6 +76,7 @@ public final class Generation: @unchecked Sendable {
         packageHash: Core.Digest,
         images: [Verification.Image],
         removedEntries: Set<Core.EntryIndex> = [],
+        nativeCapabilities: Runtime.NativeCapabilities? = nil,
         estimatedByteCount: Int,
         createdAt: Date = Date()
     ) throws {
@@ -111,6 +115,7 @@ public final class Generation: @unchecked Sendable {
         self.routes = routes
         self.removedEntries = removedEntries
         self.images = images
+        self.nativeCapabilities = nativeCapabilities
         self.estimatedByteCount = estimatedByteCount
         self.resourceLimits = images.dropFirst().reduce(images.first?.effectiveResourceLimits ?? .init()) {
             $0.constrained(by: $1.effectiveResourceLimits)
@@ -149,6 +154,10 @@ public final class GenerationLease: @unchecked Sendable {
     var resourceLimits: Core.ResourceLimits {
         snapshot.resourceLimits
     }
+
+    var nativeCapabilities: Runtime.NativeCapabilities? {
+        snapshot.nativeCapabilities
+    }
 }
 
 /// Materialized routing state owned by the registry and active leases.
@@ -166,6 +175,7 @@ final class GenerationSnapshot: @unchecked Sendable {
     let routes: [Core.EntryIndex: OwnedRoute]
     let entryEffects: [Core.EntryIndex: Core.Effects]
     let resourceLimits: Core.ResourceLimits
+    let nativeCapabilities: Runtime.NativeCapabilities?
     let artifactByteCounts: [Runtime.GenerationID: Int]
 
     private let leaseLock = NSLock()
@@ -211,6 +221,8 @@ final class GenerationSnapshot: @unchecked Sendable {
         self.routes = routes
         self.entryEffects = effects
         self.resourceLimits = limits
+        nativeCapabilities = generation.nativeCapabilities
+            ?? parent?.nativeCapabilities
         self.artifactByteCounts = artifactByteCounts
     }
 

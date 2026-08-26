@@ -205,6 +205,82 @@ struct NativeCallback {
         #expect(observed.values == [42])
     }
 
+    @Test("An escaping callback pins its generation-local native capability snapshot")
+    func callbackPinsDevelopmentNativeCapabilities() throws {
+        let fixture = try Fixture()
+        let callbackBox = CallbackBox()
+        let observed = IntegerBox()
+        let export = VM.ClosureNativeInvoker(
+            id: fixture.exportID,
+            key: fixture.exportKey,
+            parameterTypes: [.closure(fixture.callbackBoundarySignature)],
+            resultType: .void,
+            effects: fixture.effects,
+            contract: fixture.exportContract,
+            invoke: { arguments, context in
+                callbackBox.value = try context.makeCallback(
+                    parameterIndex: 0,
+                    from: arguments[0]
+                )
+                return .returned(nil)
+            }
+        )
+        let observation = VM.ClosureNativeInvoker(
+            id: fixture.observationID,
+            key: fixture.observationKey,
+            parameterTypes: [.int64],
+            resultType: .void,
+            effects: fixture.effects,
+            contract: fixture.observationContract,
+            invoke: { arguments, _ in
+                guard case let .integer(value) = arguments[0] else {
+                    throw VM.RuntimeTrap.typeMismatch(
+                        expected: .int64,
+                        actual: arguments[0].type
+                    )
+                }
+                observed.append(value.signedValue)
+                return .returned(nil)
+            }
+        )
+        let generationCapabilities = Runtime.NativeCapabilities(
+            nativeCatalog: try .init([export, observation]),
+            asyncNativeCatalog: .init(),
+            nativeTypeCatalog: .init()
+        )
+        let runtime = try Runtime.Engine(
+            originals: fixture.originals(observed: observed)
+        )
+        let first = try fixture.generation(
+            id: 1,
+            nativeCapabilities: generationCapabilities
+        )
+        _ = try runtime.activate(first, expectedActiveID: nil)
+        #expect(runtime.invoke(entry: fixture.entry, arguments: []) == .returned(nil))
+        let callback = try #require(callbackBox.value)
+
+        let second = try Runtime.Generation(
+            id: .init(rawValue: 2),
+            parentID: first.id,
+            packageID: "HLX-runtime-native-callback-2",
+            packageHash: .sha256("generation-without-development-imports"),
+            images: [],
+            removedEntries: [fixture.entry],
+            nativeCapabilities: .init(
+                nativeCatalog: .init(),
+                asyncNativeCatalog: .init(),
+                nativeTypeCatalog: .init()
+            ),
+            estimatedByteCount: 0
+        )
+        _ = try runtime.activate(second, expectedActiveID: first.id)
+
+        callback.invokeVoid {
+            [.integer(try VM.Integer(signed: 73, bitWidth: 64, isSigned: true))]
+        }
+        #expect(observed.values == [73])
+    }
+
     @Test("Verifier rejects a lexical closure at an escaping callback boundary")
     func lexicalClosureCannotEscape() throws {
         let fixture = try Fixture()
@@ -431,7 +507,8 @@ struct NativeCallback {
             restrictCallbackToMainActor: Bool = false,
             wrapsCallback: Bool = false,
             wrapsCallbackInArray: Bool = false,
-            target: CallbackTarget = .image
+            target: CallbackTarget = .image,
+            nativeCapabilities: Runtime.NativeCapabilities? = nil
         ) throws -> Runtime.Generation {
             precondition(
                 [
@@ -741,6 +818,7 @@ struct NativeCallback {
                 packageID: "HLX-runtime-native-callback-\(id)",
                 packageHash: .sha256(bytes),
                 images: [image],
+                nativeCapabilities: nativeCapabilities,
                 estimatedByteCount: bytes.count
             )
         }

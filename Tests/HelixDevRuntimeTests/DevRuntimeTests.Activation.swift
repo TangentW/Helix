@@ -25,13 +25,34 @@ struct ActivationController {
                 maximumNativeMappedBytes: 64
             ).validate()
         }
+        #expect(throws: DevActivation.ConfigurationError.invalidLimits) {
+            try DevActivation.Limits(
+                maximumNativeImageCount: Int(UInt32.max) + 1
+            ).validate()
+        }
         let fixture = try DevRuntimeFixture()
+        var adapterIdentity = fixture.identity
+        adapterIdentity.loadedDevelopmentAdapterCount = 1
+        adapterIdentity.loadedDevelopmentAdapterBytes = 1_024
+        adapterIdentity.nativeImageSoftLimitReached = true
+        adapterIdentity.nativeStateUncertain = true
+        try adapterIdentity.validate()
+        adapterIdentity.supportedBackends = [.nativeDynamicReplacement]
+        #expect(throws: DevProtocol.Error.self) {
+            try adapterIdentity.validate()
+        }
         let directory = try temporaryRuntimeDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let controller = try DevActivation.Controller(
             identity: fixture.identity,
             shell: fixture.shell,
             runtimePolicy: .init(),
+            runtime: try fixture.makeRuntime(
+                registry: .init(
+                    maximumGenerationCount: 512,
+                    maximumEstimatedBytes: 256 * 1_024 * 1_024
+                )
+            ),
             cacheDirectory: directory
         )
         #expect(await controller.registry.maximumGenerationCount == 512)
@@ -49,7 +70,7 @@ struct ActivationController {
             identity: fixture.identity,
             shell: fixture.shell,
             runtimePolicy: .init(),
-            registry: registry,
+            runtime: try fixture.makeRuntime(registry: registry),
             cacheDirectory: directory,
             reloadHandler: { context, _ in
                 await recorder.record(context)
@@ -106,6 +127,169 @@ struct ActivationController {
         }
     }
 
+    @Test("Development Adapters publish atomically, reuse the session Registry, and preserve active code on failure")
+    func activatesDevelopmentAdapterAtomically() async throws {
+        let fixture = try DevRuntimeFixture()
+        let directory = try temporaryRuntimeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let runtime = try fixture.makeRuntime()
+        let adapter = FakeDevelopmentAdapterLoader()
+        let controller = try DevActivation.Controller(
+            identity: fixture.identity,
+            shell: fixture.shell,
+            runtimePolicy: .init(),
+            runtime: runtime,
+            cacheDirectory: directory,
+            limits: .init(
+                maximumNativeImageCount: 3,
+                nativeImageSoftWarningCount: 2
+            ),
+            developmentAdapterLoader: adapter
+        )
+        let firstImport = try fixture.developmentImport(
+            id: .init(rawValue: 0),
+            callee: "Fixture.identityThroughAdapter(_:)"
+        )
+        let firstPayload = try fixture.nativePayload(
+            nativeImport: firstImport,
+            includesAdapterImage: true
+        )
+        let firstResult = await DevRuntimeTests.transfer(
+            firstPayload,
+            revision: 1,
+            generation: 1,
+            fixture: fixture,
+            controller: controller
+        )
+        #expect(firstResult.codeStatus == .codeActive)
+        #expect(adapter.loadCount == 1)
+        #expect(
+            await controller.snapshot().activeDevelopmentNativeCallKeys
+                == [firstImport.key]
+        )
+
+        let input = try VM.Integer(signed: 19, bitWidth: 64, isSigned: true)
+        #expect(
+            runtime.invoke(entry: fixture.entry, arguments: [.integer(input)])
+                == .returned(.integer(input))
+        )
+
+        // Model two saves compiled before the first activation result reached
+        // the host. The second payload still carries the now-published image;
+        // activation must treat it as an idempotent capability replay.
+        let overlappingResult = await DevRuntimeTests.transfer(
+            firstPayload,
+            revision: 2,
+            generation: 2,
+            fixture: fixture,
+            controller: controller
+        )
+        #expect(overlappingResult.codeStatus == .codeActive)
+        #expect(adapter.loadCount == 1)
+        #expect((await controller.snapshot()).loadedDevelopmentAdapterCount == 1)
+
+        var reusedImport = firstImport
+        reusedImport.imageIndex = nil
+        reusedImport.exportSymbol = nil
+        let reusedPayload = try fixture.nativePayload(
+            nativeImport: reusedImport,
+            includesAdapterImage: false
+        )
+        let reusedResult = await DevRuntimeTests.transfer(
+            reusedPayload,
+            revision: 3,
+            generation: 3,
+            fixture: fixture,
+            controller: controller
+        )
+        #expect(reusedResult.codeStatus == .codeActive)
+        #expect(adapter.loadCount == 1)
+
+        let rejectedImport = try fixture.developmentImport(
+            id: .init(rawValue: 1),
+            callee: "Fixture.secondAdapter(_:)"
+        )
+        adapter.returnEmptyInvokerSetOnce()
+        let rejectedPayload = try fixture.nativePayload(
+            nativeImport: rejectedImport,
+            includesAdapterImage: true
+        )
+        let rejected = await DevRuntimeTests.transfer(
+            rejectedPayload,
+            revision: 4,
+            generation: 4,
+            fixture: fixture,
+            controller: controller
+        )
+        #expect(rejected.codeStatus == .rejected)
+        #expect(runtime.registry.snapshot().activeGenerationID == .init(rawValue: 3))
+        let snapshot = await controller.snapshot()
+        #expect(snapshot.activeDevelopmentNativeCallKeys == [firstImport.key])
+        #expect(snapshot.loadedDevelopmentAdapterCount == 2)
+        #expect(snapshot.nativeImageSoftLimitReached)
+        #expect(
+            runtime.invoke(entry: fixture.entry, arguments: [.integer(input)])
+                == .returned(.integer(input))
+        )
+
+        adapter.throwStateUncertainOnce()
+        let uncertain = await DevRuntimeTests.transfer(
+            rejectedPayload,
+            revision: 5,
+            generation: 5,
+            fixture: fixture,
+            controller: controller
+        )
+        #expect(uncertain.codeStatus == .nativeStateUncertain)
+        #expect(uncertain.diagnostic?.code == "HLXLR503")
+        #expect((await controller.snapshot()).nativeStateUncertain)
+        #expect(adapter.loadCount == 3)
+
+        let blocked = await DevRuntimeTests.transfer(
+            rejectedPayload,
+            revision: 6,
+            generation: 6,
+            fixture: fixture,
+            controller: controller
+        )
+        #expect(blocked.codeStatus == .rejected)
+        #expect(blocked.diagnostic?.code == "HLXLR502")
+        #expect(adapter.loadCount == 3)
+        #expect(runtime.registry.snapshot().activeGenerationID == .init(rawValue: 3))
+        let reconnect = await controller.currentSessionIdentity()
+        #expect(reconnect.activeDevelopmentNativeCallKeys == [firstImport.key])
+        #expect(reconnect.loadedDevelopmentAdapterCount == 2)
+        #expect(reconnect.nativeImageSoftLimitReached)
+        #expect(reconnect.nativeStateUncertain)
+    }
+
+    @Test("HLBC identity failures retain their actionable diagnostic")
+    func preservesHLBCIdentityDiagnostic() async throws {
+        let fixture = try DevRuntimeFixture()
+        let directory = try temporaryRuntimeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let controller = try DevActivation.Controller(
+            identity: fixture.identity,
+            shell: fixture.shell,
+            runtimePolicy: .init(),
+            runtime: try fixture.makeRuntime(),
+            cacheDirectory: directory
+        )
+        let payload = try fixture.payload(sdkBuild: "different-sdk")
+        let result = await DevRuntimeTests.transfer(
+            payload,
+            revision: 1,
+            generation: 1,
+            fixture: fixture,
+            controller: controller
+        )
+        #expect(result.codeStatus == .rejected)
+        #expect(result.diagnostic?.code == "HLXLR304")
+        #expect(result.diagnostic?.sourceRevision == .init(rawValue: 1))
+        #expect(result.diagnostic?.generationID == .init(rawValue: 1))
+        #expect(result.diagnostic?.backend == .hlbc)
+    }
+
     @Test("A corrupt transfer cannot replace the current generation")
     func rejectsCorruptPayload() async throws {
         let fixture = try DevRuntimeFixture()
@@ -116,7 +300,7 @@ struct ActivationController {
             identity: fixture.identity,
             shell: fixture.shell,
             runtimePolicy: .init(),
-            registry: registry,
+            runtime: try fixture.makeRuntime(registry: registry),
             cacheDirectory: directory
         )
         let offer = fixture.offer(revision: 1, generation: 1)
@@ -144,7 +328,7 @@ struct ActivationController {
             identity: fixture.identity,
             shell: fixture.shell,
             runtimePolicy: .init(),
-            registry: registry,
+            runtime: try fixture.makeRuntime(registry: registry),
             cacheDirectory: directory
         )
 
@@ -251,7 +435,7 @@ struct ActivationController {
             identity: fixture.identity,
             shell: fixture.shell,
             runtimePolicy: .init(),
-            registry: registry,
+            runtime: try fixture.makeRuntime(registry: registry),
             cacheDirectory: directory
         )
 
@@ -360,6 +544,7 @@ struct ActivationController {
             architecture: architecture,
             operatingSystemBuild: "fixture",
             xcodeBuild: "fixture",
+            sdkBuild: "fixture-sdk",
             swiftCompilerFingerprint: "fixture",
             liveReloadIndexHash: .sha256("index"),
             supportedBackends: [.nativeDynamicReplacement],
@@ -428,6 +613,7 @@ struct ActivationController {
             identity: fixture.identity,
             shell: fixture.shell,
             runtimePolicy: .init(),
+            runtime: try fixture.makeRuntime(),
             cacheDirectory: directory,
             reloadHandler: { context, _ in
                 await recorder.record(context)
@@ -544,6 +730,131 @@ private actor ReloadRecorder {
     }
 }
 
+private static func transfer(
+    _ payload: Data,
+    revision: UInt64,
+    generation: UInt64,
+    fixture: DevRuntimeFixture,
+    controller: DevActivation.Controller
+) async -> DevProtocol.ActivationResult {
+    do {
+        let offer = fixture.offer(
+            revision: revision,
+            generation: generation,
+            payload: payload
+        )
+        let token = try await controller.accept(offer)
+        try await controller.append(
+            .init(token: token, offset: 0, bytes: payload)
+        )
+        return await controller.commit(token)
+    } catch {
+        return .init(
+            sourceRevision: .init(rawValue: revision),
+            generationID: .init(rawValue: generation),
+            codeStatus: .rejected,
+            reloadStatus: .notRequested,
+            diagnostic: .init(
+                code: "TEST",
+                message: String(describing: error),
+                sourceRevision: .init(rawValue: revision),
+                generationID: .init(rawValue: generation),
+                backend: .hlbc,
+                nextAction: "inspect test failure"
+            )
+        )
+    }
+}
+
+private final class FakeDevelopmentAdapterLoader:
+    DevelopmentAdapter.Loading, @unchecked Sendable
+{
+    private let lock = NSLock()
+    private var loads = 0
+    private var returnsEmptyOnce = false
+    private var throwsStateUncertainOnce = false
+
+    var loadCount: Int {
+        lock.withLock { loads }
+    }
+
+    func returnEmptyInvokerSetOnce() {
+        lock.withLock { returnsEmptyOnce = true }
+    }
+
+    func throwStateUncertainOnce() {
+        lock.withLock { throwsStateUncertainOnce = true }
+    }
+
+    func load(
+        bytes: Data,
+        descriptor: DevProtocol.DevelopmentPayload.Image,
+        imports: [DevProtocol.DevelopmentPayload.NativeImport],
+        identity: DevProtocol.SessionIdentity,
+        cacheDirectory: URL
+    ) throws -> DevelopmentAdapter.LoadedImage {
+        let mode = lock.withLock {
+            loads += 1
+            defer {
+                returnsEmptyOnce = false
+                throwsStateUncertainOnce = false
+            }
+            return (returnsEmptyOnce, throwsStateUncertainOnce)
+        }
+        if mode.1 {
+            throw DevelopmentAdapter.Error.stateUncertain(
+                "test image was mapped before its factory failed"
+            )
+        }
+        let invokers: [any VM.NativeInvoker] = mode.0 ? [] : imports.map {
+            nativeImport in
+            Runtime.NativeAdapterBody { arguments, _ in
+                guard let value = arguments.first else {
+                    throw VM.RuntimeTrap.nativeFailure(
+                        "test Adapter received no argument"
+                    )
+                }
+                return .returned(value)
+            }.makeInvoker(
+                id: nativeImport.id,
+                key: nativeImport.key,
+                parameterTypes: nativeImport.parameterTypes,
+                resultType: nativeImport.resultType,
+                effects: nativeImport.descriptor.effects,
+                contract: nativeImport.contract
+            )
+        }
+        let architecture: MachO.Architecture = identity.architecture == "x86_64"
+            ? .x86_64 : .arm64
+        let platform: MachO.Platform = switch identity.platform {
+        case .iOS: .iOS
+        case .iOSSimulator: .iOSSimulator
+        case .macOS: .macOS
+        }
+        return .init(
+            fileURL: cacheDirectory.appendingPathComponent("FakeAdapter.dylib"),
+            byteCount: bytes.count,
+            descriptor: .init(
+                architecture: architecture,
+                fileType: 6,
+                uuid: descriptor.uuid,
+                installName: descriptor.installName,
+                platform: platform,
+                codeSignature: .init(dataOffset: 1, dataSize: 1)
+            ),
+            nativeInvokers: invokers
+        )
+    }
+
+    func makeCInvoker(
+        for nativeImport: DevProtocol.DevelopmentPayload.NativeImport
+    ) throws -> any VM.NativeInvoker {
+        throw DevelopmentAdapter.Error.invalidImage(
+            "unexpected C invoker in Swift Adapter test"
+        )
+    }
+}
+
 private struct DevRuntimeFixture {
     let sessionID = UUID(uuidString: "3CF22EF2-CE41-4A6F-8B6B-A56FFCA1AC86")!
     let shellHash = Core.Digest.sha256("dev-runtime-shell")
@@ -589,7 +900,7 @@ private struct DevRuntimeFixture {
                 ),
             ]
         )
-        bytecode = try Bytecode.Encoder.encode(
+        let encodedBytecode = try Bytecode.Encoder.encode(
             .init(
                 name: "DevRuntimeFixture",
                 shellInterfaceHash: shellHash,
@@ -599,6 +910,11 @@ private struct DevRuntimeFixture {
                     .init(entryIndex: entry, functionKey: functionKey, functionID: function.id),
                 ]
             )
+        )
+        bytecode = try Self.developmentPayload(
+            bytecode: encodedBytecode,
+            shellHash: shellHash,
+            compilerFingerprint: compatibility.compilerFingerprint
         )
         shell = try .init(
             interfaceHash: shellHash,
@@ -622,6 +938,7 @@ private struct DevRuntimeFixture {
             architecture: "arm64",
             operatingSystemBuild: "22A",
             xcodeBuild: "17F113",
+            sdkBuild: "22A",
             swiftCompilerFingerprint: "swift-dev-runtime",
             liveReloadIndexHash: .sha256("index"),
             supportedBackends: [.hlbc],
@@ -672,7 +989,7 @@ private struct DevRuntimeFixture {
                 ),
             ]
         )
-        return try Bytecode.Encoder.encode(
+        let encodedBytecode = try Bytecode.Encoder.encode(
             .init(
                 name: "DevRuntimeFixture-\(value)",
                 shellInterfaceHash: shellHash,
@@ -687,6 +1004,163 @@ private struct DevRuntimeFixture {
                 ]
             )
         )
+        return try Self.developmentPayload(
+            bytecode: encodedBytecode,
+            shellHash: shellHash,
+            compilerFingerprint: compatibility.compilerFingerprint
+        )
+    }
+
+    func payload(sdkBuild: String) throws -> Data {
+        let artifact = try DevProtocol.DevelopmentPayload.Artifact.decode(
+            bytecode
+        )
+        return try DevProtocol.DevelopmentPayload.Artifact(
+            shellInterfaceHash: shellHash,
+            compilerFingerprint: compatibility.compilerFingerprint,
+            sdkBuild: sdkBuild,
+            targetTriple: artifact.manifest.targetTriple,
+            bytecode: artifact.bytecode
+        ).encoded()
+    }
+
+    func developmentImport(
+        id: Core.NativeImportID,
+        callee: String
+    ) throws -> DevProtocol.DevelopmentPayload.NativeImport {
+        let contract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .read,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: false
+        )
+        let descriptor = try Core.NativeCall.Descriptor.swiftAdapter(
+            canonicalCallee: callee,
+            signature: .init(
+                parameters: ["Swift.Int"],
+                result: "Swift.Int"
+            ),
+            effects: .init(),
+            contract: contract
+        )
+        let key = try Core.NativeCall.Key.derive(descriptor: descriptor)
+        return .init(
+            id: id,
+            key: key,
+            descriptor: descriptor,
+            parameterTypes: [.int64],
+            resultType: .int64,
+            contract: contract,
+            binding: .swiftAdapter,
+            imageIndex: 0,
+            exportSymbol: "hlx_swift_adapter_body_v1_\(key.rawValue.hex)"
+        )
+    }
+
+    func nativePayload(
+        nativeImport: DevProtocol.DevelopmentPayload.NativeImport,
+        includesAdapterImage: Bool
+    ) throws -> Data {
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "nativeIdentity",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .int64,
+            registerTypes: [.int64, .int64],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .nativeApply(
+                            result: .init(rawValue: 1),
+                            importID: nativeImport.id,
+                            arguments: [.init(rawValue: 0)]
+                        ),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ]
+        )
+        let requirement = Bytecode.ImportRequirement(
+            id: nativeImport.id,
+            key: nativeImport.key,
+            descriptor: nativeImport.descriptor,
+            contract: nativeImport.contract
+        )
+        let encodedBytecode = try Bytecode.Encoder.encode(
+            .init(
+                name: "DevRuntimeNativeFixture",
+                shellInterfaceHash: shellHash,
+                compatibility: compatibility,
+                capabilities: [.baselineV1, .nativeImportsV1],
+                functions: [function],
+                entries: [
+                    .init(
+                        entryIndex: entry,
+                        functionKey: functionKey,
+                        functionID: function.id
+                    ),
+                ],
+                imports: [requirement]
+            )
+        )
+        let image = Data("fake-signed-adapter-\(nativeImport.key)".utf8)
+        let descriptor = DevProtocol.DevelopmentPayload.Image(
+            installName: "@rpath/HLXDevAdapter-\(nativeImport.key.rawValue.hex).dylib",
+            uuid: UUID(),
+            byteLength: UInt64(image.count),
+            sha256: .sha256(image)
+        )
+        var transactionImport = nativeImport
+        transactionImport.imageIndex = includesAdapterImage ? 0 : nil
+        transactionImport.exportSymbol = includesAdapterImage
+            ? "hlx_swift_adapter_body_v1_\(nativeImport.key.rawValue.hex)"
+            : nil
+        return try DevProtocol.DevelopmentPayload.Artifact(
+            shellInterfaceHash: shellHash,
+            compilerFingerprint: compatibility.compilerFingerprint,
+            sdkBuild: "22A",
+            targetTriple: "arm64-apple-ios17.0-simulator",
+            bytecode: encodedBytecode,
+            nativeImports: [transactionImport],
+            imageDescriptors: includesAdapterImage ? [descriptor] : [],
+            images: includesAdapterImage ? [image] : []
+        ).encoded()
+    }
+
+    func makeRuntime(
+        registry: Runtime.GenerationRegistry = .init()
+    ) throws -> Runtime.Engine {
+        let originals = try Runtime.OriginalCatalog([
+            .init(
+                index: entry,
+                parameterTypes: [.int64],
+                resultType: .int64,
+                invoke: { arguments in .returned(arguments[0]) }
+            ),
+        ])
+        return Runtime.Engine(
+            registry: registry,
+            originals: originals,
+            shellInterfaceHash: shellHash
+        )
+    }
+
+    private static func developmentPayload(
+        bytecode: Data,
+        shellHash: Core.Digest,
+        compilerFingerprint: String
+    ) throws -> Data {
+        try DevProtocol.DevelopmentPayload.Artifact(
+            shellInterfaceHash: shellHash,
+            compilerFingerprint: compilerFingerprint,
+            sdkBuild: "22A",
+            targetTriple: "arm64-apple-ios17.0-simulator",
+            bytecode: bytecode
+        ).encoded()
     }
 }
 

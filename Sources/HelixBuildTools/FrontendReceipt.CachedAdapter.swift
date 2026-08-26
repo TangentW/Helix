@@ -280,9 +280,20 @@ public struct CachedAdapter: Sendable {
         sourceImports: FrontendReceipt.SourceImports.Result
     ) throws -> Payload {
         let payload = try JSONDecoder().decode(Payload.self, from: data)
+        var expectedMetadata = request.metadata
+        var sourceBaseline = Core.StableHasher(
+            domain: "HLXI.SourceBaseline.v1"
+        )
+        for source in expectedSources.sorted(by: {
+            $0.logicalPath < $1.logicalPath
+        }) {
+            sourceBaseline.append(source.logicalPath)
+            sourceBaseline.append(source.contentHash)
+        }
+        expectedMetadata.sourceBaselineHash = sourceBaseline.finalize()
         guard payload.schemaVersion == 1,
               payload.toolchain == toolchain,
-              payload.receipt.metadata == request.metadata,
+              payload.receipt.metadata == expectedMetadata,
               payload.receipt.compatibility.compilerFingerprint
                   == toolchain.fingerprint,
               payload.receipt.sources == expectedSources,

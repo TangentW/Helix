@@ -24,6 +24,7 @@ override; the normal owner-local location is
 | Hot Patch Prepare | Complete generated Shell tree and function counts | Exact Prepare identity plus exact paths, bytes, modes, and absence of unexpected entries |
 | Adapter Pack source | Deterministic Swift adapters grouped by native module | Compiler fingerprint, SDK/target/deployment, transform pipeline, module, ordered imported modules, and ordered stable call keys |
 | Adapter Pack object | Validated Mach-O for one module Pack | Pack source identity plus toolchain, Xcode build, normalized compiler invocation, complete non-SDK compiler-input snapshot, and module maps |
+| Development Adapter image | Signed Mach-O containing only first-used missing Swift Adapter bodies | Compiler/Xcode/SDK identities, target/deployment/platform/architecture, dependency graph, module, normalized semantic and preserved link arguments, exact generated sources, ordered Descriptor/Key/type/contract records |
 | Application Bridge object | Stable validated Mach-O excluding the one-time Hub contract | Profile, toolchain, Xcode/SDK builds, transform pipeline, normalized compiler arguments, stable generated sources, compiler inputs, and module maps |
 | Final Bridge state | Linked Bridge and C bootstrap Mach-O objects | Every generated source including the Hub contract, application/Pack inputs, Clang binary, and bootstrap source |
 
@@ -77,9 +78,11 @@ Every cached value is decoded and semantically validated by its consumer:
   metadata and toolchain identities;
 - symbol graphs and measured operations pass the same checks as fresh output;
 - Prepare state compares the entire generated tree, including permissions;
-- Adapter Pack, application Bridge, and final Bridge state revalidate Mach-O
-  architecture/platform; final state also hashes the published objects before
-  reuse.
+- Adapter Pack, development Adapter, application Bridge, and final Bridge state
+  revalidate Mach-O architecture/platform. A development Adapter additionally
+  rechecks its deterministic install name, UUID, code-signature command, and
+  dependency prefixes; final Bridge state also hashes the published objects
+  before reuse.
 
 Sources and compiler interfaces are confirmed again before newly produced
 module, Prepare, or Bridge state is published. If an editor or another build
@@ -131,6 +134,20 @@ The stable application Bridge is compiled without the one-time Hub contract
 and has its own content-addressed Mach-O cache. A Live Reload build compiles the
 small current Hub contract separately and relocatably links it with the stable
 application object and Pack objects. Hot Patch has no Hub-contract source.
+
+Unused managed-Debug candidates remain data-only receipt records and do not
+inflate the stable Bridge or Pack objects. After HLBC is built, Helix inspects
+its exact import table. Objective-C and supported C first uses need no new
+machine code. Only newly referenced Swift Adapter keys are rendered into one
+minimal development image; identical requests reuse the owner-local cache after
+full Mach-O validation. The cache remains an optimization: the authenticated
+payload carries the image and exact metadata, and the App independently
+revalidates them before publishing a capability snapshot.
+
+The patch compiler requests the additional typed-AST declaration map only when
+the selected optimized or semantic SIL actually contains a foreign call. A
+pure-Swift edit therefore does not pay another whole-module frontend launch just
+because the Shell catalog happens to contain Objective-C candidates.
 
 The final Bridge state remains stricter: it includes every generated source,
 including the current invitation. A new Live Reload reservation therefore

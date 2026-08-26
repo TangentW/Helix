@@ -205,6 +205,27 @@ struct ContextRegistry {
         }
     }
 
+    @Test("Persistent startup quarantines invalid reconstructible context state")
+    func persistentRecoveryQuarantinesInvalidState() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HelixContextRecovery-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("BuildContexts.json")
+        let store = DevSession.ContextStore(url: url)
+        try store.save([try makeContext(index: 1, registeredAt: 100)])
+
+        try Data("{\"schemaVersion\":1,\"contexts\":[{}]}".utf8).write(to: url)
+        #expect(throws: DevSession.ContextError.self) {
+            _ = try store.load()
+        }
+        #expect(try store.loadOrQuarantineInvalidDocument().isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: url.path))
+        let quarantined = try FileManager.default.contentsOfDirectory(
+            atPath: directory.path
+        ).filter { $0.hasPrefix(".BuildContexts.json.invalid-") }
+        #expect(quarantined.count == 1)
+    }
+
     @Test("Context persistence rejects broad permissions and symbolic links")
     func persistenceSecurity() throws {
         let directory = FileManager.default.temporaryDirectory
@@ -218,6 +239,10 @@ struct ContextRegistry {
         #expect(throws: DevSession.ContextError.self) {
             _ = try store.load()
         }
+        #expect(throws: DevSession.ContextError.self) {
+            _ = try store.loadOrQuarantineInvalidDocument()
+        }
+        #expect(FileManager.default.fileExists(atPath: url.path))
         #expect(chmod(url.path, 0o600) == 0)
 
         let link = directory.appendingPathComponent("BuildContexts.link.json")
@@ -228,6 +253,14 @@ struct ContextRegistry {
         #expect(throws: DevSession.ContextError.self) {
             _ = try DevSession.ContextStore(url: link).load()
         }
+        #expect(throws: DevSession.ContextError.self) {
+            _ = try DevSession.ContextStore(url: link)
+                .loadOrQuarantineInvalidDocument()
+        }
+        #expect(
+            FileManager.default.fileExists(atPath: url.path)
+                && FileManager.default.fileExists(atPath: link.path)
+        )
     }
 
     @Test("A failed persistent registration restores the complete in-memory index")
@@ -292,6 +325,7 @@ private func makeContext(
         platform: .iOS,
         architecture: "arm64",
         xcodeBuild: "18A1",
+        sdkBuild: "22A1",
         swiftCompilerFingerprint: "swift-\(index)",
         liveReloadIndexHash: .sha256("index-\(index)")
     )

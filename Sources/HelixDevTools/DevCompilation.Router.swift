@@ -1,4 +1,5 @@
 import Foundation
+import HelixBuildTools
 import HelixCore
 import HelixDevProtocol
 import HelixInterface
@@ -122,6 +123,7 @@ public actor Router {
         identity: DevProtocol.SessionIdentity,
         archive: InterfaceArchive.Archive,
         manifest: DevBuildManifest.Document,
+        receipt: ShellBuildReceipt.Document,
         reloadIndex: ReloadIndex.Document,
         compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
         nativeOutputDirectory: URL,
@@ -145,10 +147,16 @@ public actor Router {
             let builder = DevCompilation.BytecodeBuilder(
                 archive: archive,
                 manifest: manifest,
+                receipt: receipt,
                 compilerURL: compilerURL,
+                adapterOutputDirectory: nativeOutputDirectory
+                    .appendingPathComponent("Adapters", isDirectory: true),
+                adapterCache: BuildCache.defaultStore(),
                 initiallyActiveFunctions: Set(routes.compactMap {
                     $0.value == .hlbc ? $0.key : nil
-                })
+                }),
+                initiallyActiveDevelopmentKeys:
+                    Set(identity.activeDevelopmentNativeCallKeys)
             )
             compilers.append(.bytecode(builder, eligibleFunctionKeys: eligible))
         }

@@ -350,6 +350,7 @@ private func serviceContext() throws -> DevSession.BuildContext {
         platform: .iOS,
         architecture: "arm64",
         xcodeBuild: "18A1",
+        sdkBuild: "22A1",
         swiftCompilerFingerprint: "swift-service",
         liveReloadIndexHash: .sha256("service-index")
     )

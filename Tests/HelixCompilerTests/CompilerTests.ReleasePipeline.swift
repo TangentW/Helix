@@ -752,10 +752,7 @@ struct ReleasePipeline {
             id: nativeImportID,
             key: nativeImportKey,
             strategy: .factory,
-            factoryExpression: "FixtureIncrementFactory.make("
-                + "id: Core.NativeImportID(rawValue: \(nativeImportID.rawValue)), "
-                + "key: Core.NativeCall.Key(rawValue: try! Core.Digest(hex: "
-                + "\(String(reflecting: nativeImportKey.rawValue.hex)))))"
+            factoryReference: "FixtureIncrementFactory.make"
         )
         let typeBinding = BridgeGeneration.NativeTypeBinding(
             id: nativeTypeID,
@@ -790,7 +787,26 @@ struct ReleasePipeline {
                         id: nativeImportID,
                         key: .init(rawValue: .sha256("wrong native import")),
                         strategy: .factory,
-                        factoryExpression: "FixtureIncrementInvoker()"
+                        factoryReference: "FixtureIncrementInvoker.make"
+                    ),
+                ],
+                nativeTypes: [typeBinding]
+            )
+        }
+        #expect(throws: BridgeGeneration.Error.generatedNativeImportBindingMismatch(
+            nativeImportID,
+            "explicit factory strategy"
+        )) {
+            try BridgeGeneration.Generator().generate(
+                archive: decoded,
+                moduleName: "Fixture",
+                roots: bridgeRoots,
+                nativeImports: [
+                    .init(
+                        id: nativeImportID,
+                        key: nativeImportKey,
+                        strategy: .factory,
+                        factoryReference: "Fixture.make); fatalError() //"
                     ),
                 ],
                 nativeTypes: [typeBinding]

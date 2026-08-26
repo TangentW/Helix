@@ -1107,19 +1107,49 @@ extension FrontendReceipt.ManagedDebugSurface {
         candidate: Candidate
     ) throws -> [FrontendReceipt.Adapter.ImportedOperation] {
         let payload = try JSONDecoder().decode(ProbeCachePayload.self, from: data)
-        guard payload.schemaVersion == 1,
-              payload.candidate == ProbeCandidate(candidate),
-              payload.operations.count <= 4,
-              payload.operations.allSatisfy({
-                  operation($0, matches: candidate)
-                      && $0.sourceFileLogicalID.isEmpty
-                      && $0.importedModules == candidate.importedModules.sorted()
-                      && $0.witnessFunctions.isEmpty
-              }),
-              try Core.CanonicalJSON.encode(payload) == data
-        else {
+        var invalidFacts: [String] = []
+        if payload.schemaVersion != 1 { invalidFacts.append("schema") }
+        if payload.candidate != ProbeCandidate(candidate) {
+            invalidFacts.append("candidate identity")
+        }
+        if payload.operations.count > 4 { invalidFacts.append("operation count") }
+        for value in payload.operations {
+            if !operation(value, matches: candidate) {
+                invalidFacts.append(
+                    "operation \(value.ownerType).\(value.baseName)"
+                        + " dispatch=\(value.dispatch.rawValue)"
+                        + " labels=\(value.argumentLabels)"
+                        + " parameters=\(value.parameterSwiftTypes)"
+                        + " mainActor=\(value.requiresMainActor)"
+                        + " throws=\(value.mayThrow)"
+                        + " usr=\(value.declarationUSR ?? "none")"
+                        + "; expected dispatch=\(candidate.dispatch.rawValue)"
+                        + " labels=\(candidate.argumentLabels)"
+                        + " parameterCount=\(candidate.parameterTypes.count)"
+                        + " mainActor=\(candidate.requiresMainActor)"
+                        + " throws=\(candidate.mayThrow)"
+                        + " usr=\(candidate.preciseIdentifier)"
+                )
+            }
+            if !value.sourceFileLogicalID.isEmpty {
+                invalidFacts.append("source identity")
+            }
+            if value.importedModules != candidate.importedModules.sorted() {
+                invalidFacts.append("import modules")
+            }
+            if !value.witnessFunctions.isEmpty {
+                invalidFacts.append("witness functions")
+            }
+        }
+        if try Core.CanonicalJSON.encode(payload) != data {
+            invalidFacts.append("canonical encoding")
+        }
+        guard invalidFacts.isEmpty else {
             throw FrontendReceipt.Error.frontendFailed(
-                "managed Debug probe cache payload is invalid"
+                "managed Debug probe cache payload is invalid for "
+                    + "\(candidate.moduleName).\(candidate.ownerType)."
+                    + "\(candidate.memberName): "
+                    + invalidFacts.joined(separator: ", ")
             )
         }
         return payload.operations
@@ -1144,11 +1174,41 @@ extension FrontendReceipt.ManagedDebugSurface {
     ) -> Bool {
         let expectedParameterCount = candidate.parameterTypes.count
             + (isInstanceDispatch(candidate.dispatch) ? 1 : 0)
+        let declarationMatches: Bool
+        if candidate.preciseIdentifier.hasSuffix(
+            "#zero-argument-construction"
+        ) {
+            declarationMatches = operation.ownerType == candidate.ownerType
+                && operation.dispatch == .initializer
+                && operation.argumentLabels.isEmpty
+        } else if operation.objectiveC != nil {
+            // Inherited methods are invoked through the candidate receiver but
+            // belong to the compiler-resolved declaring type. Their exact USR,
+            // not receiver spelling equality, authenticates the cached fact.
+            declarationMatches = operation.declarationUSR
+                == candidate.preciseIdentifier
+        } else {
+            // Swift protocol extensions and imported newtype wrappers may
+            // resolve a candidate member to a different generic declaration
+            // USR and overlay owner. The probe witness already pairs the exact
+            // candidate with this operation; validate its complete callable
+            // shape below instead of requiring textual identity equality.
+            declarationMatches = true
+        }
         return operation.dispatch == candidate.dispatch
-            && operation.ownerType == candidate.ownerType
+            && declarationMatches
             && operation.baseName == candidate.memberName
             && operation.argumentLabels == candidate.argumentLabels
             && operation.parameterSwiftTypes.count == expectedParameterCount
+            && FrontendReceipt.SwiftTypeSpelling.isGeneratedType(
+                operation.ownerType
+            )
+            && operation.parameterSwiftTypes.allSatisfy(
+                FrontendReceipt.SwiftTypeSpelling.isGeneratedType
+            )
+            && FrontendReceipt.SwiftTypeSpelling.isGeneratedType(
+                operation.resultSwiftType
+            )
             && operation.requiresMainActor == candidate.requiresMainActor
             && operation.mayThrow == candidate.mayThrow
     }
@@ -1360,7 +1420,11 @@ extension FrontendReceipt.ManagedDebugSurface {
                     measured.objectiveC = evidence
                 }
             }
-            measured.ownerType = candidate.ownerType
+            // The compiler-resolved declaration owner is authoritative. A
+            // probe may be invoked through a subclass or type alias while the
+            // member is declared by a generic superclass; replacing that
+            // owner with the probe receiver would manufacture a different
+            // logical ABI for the same SIL symbol.
             measured.parameterSwiftTypes = operation.parameterSwiftTypes.map {
                 FrontendReceipt.SwiftTypeSpelling.replacingNominalAliases(
                     in: $0,

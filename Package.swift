@@ -85,7 +85,12 @@ let package = Package(
         // Shared only inside the Dev graph. It is intentionally not a
         // standalone product and must never enter HelixAppIntegration.
         .target(name: "HelixLiveReloadAPI", dependencies: ["HelixCore"]),
-        .target(name: "HelixDevProtocol", dependencies: ["HelixCore", "HelixLiveReloadAPI"]),
+        .target(
+            name: "HelixDevProtocol",
+            dependencies: [
+                "HelixCore", "HelixBytecode", "HelixLiveReloadAPI",
+            ]
+        ),
         .target(
             name: "HelixBuildTools",
             dependencies: [
@@ -97,7 +102,7 @@ let package = Package(
             name: "HelixDevTools",
             dependencies: [
                 "HelixCore", "HelixCompiler", "HelixInterface", "HelixPatch", "HelixRuntime",
-                "HelixDevProtocol", "HelixLiveReloadAPI",
+                "HelixBuildTools", "HelixDevProtocol", "HelixLiveReloadAPI",
             ]
         ),
         .target(
@@ -192,13 +197,17 @@ let package = Package(
         ),
         .testTarget(
             name: "HelixDevProtocolTests",
-            dependencies: ["HelixDevProtocol", "HelixLiveReloadAPI", "HelixCore"]
+            dependencies: [
+                "HelixDevProtocol", "HelixLiveReloadAPI", "HelixBytecode",
+                "HelixCore",
+            ]
         ),
         .testTarget(
             name: "HelixDevToolsTests",
             dependencies: [
                 "HelixDevTools", "HelixDevProtocol", "HelixLiveReloadAPI",
-                "HelixCompiler", "HelixInterface", "HelixBytecode", "HelixCore",
+                "HelixBuildTools", "HelixCompiler", "HelixInterface",
+                "HelixBytecode", "HelixCore",
             ]
         ),
         .testTarget(

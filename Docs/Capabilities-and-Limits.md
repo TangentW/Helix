@@ -14,9 +14,9 @@ current practical boundary.
 | --- | --- | --- |
 | Release Shell | Exact frontend indexing, Derived Sources, interface archive, permanent bridge, NativeImport discovery, Xcode integration, bundle leakage audit | Broad real-application migration and long-running CI matrix |
 | Production HLBC | HLBC 1.0 / HLXI 1.0 compiler path, verifier, HLVM, signed package, safe installation, immutable activation, rollback and revocation; checked-in business corpus | App Store distribution approval, external top-200 corpus, long fuzz/sanitizer campaigns, real-device macro performance, and hosted UIKit-page soak |
-| Development Live Reload | Exact build capture, stable snapshots, automatic native-Swift/HLBC routing, authenticated transfer, atomic activation, UIKit/SwiftUI refresh, logical source maps, an eight-native-generation/five-scenario UIKit Simulator acceptance matrix, and a 128-generation HLBC in-process soak | Physical-iPhone matrix, long-duration device soak, interactive bytecode stepping, large-project latency qualification |
+| Development Live Reload | Exact build capture, stable snapshots, automatic native-Swift/HLBC routing, authenticated canonical payloads, data-only native candidates, deterministic first-use promotion, Simulator/macOS on-demand Swift Adapters, generation-local capability snapshots, atomic activation, UIKit/SwiftUI refresh, logical source maps, eight-update/five-scenario UIKit Simulator acceptance runs through both automatic native routing and forced HLBC, and a 128-generation HLBC in-process soak | Physical-iPhone on-demand-Adapter qualification, long-duration device soak, interactive bytecode stepping, large-project latency qualification |
 | Helix Hub | SwiftUI status-bar app, project discovery, transactional Hot Patch/Live Reload onboarding, secure helper discovery, unified service, exact Build Context registry, Xcode automatic invitation, and manual four-character pairing | Distribution signing/notarization and broad third-party project migration matrix |
-| Development native backend | Automatic qualified-Simulator routing, exact Swift compilation, signed immutable images, loader/recursion/chaining coverage, dSYM generation, and process-lifetime resource limits | Physical-device qualification, automatic process restart, and production use (intentionally unavailable) |
+| Development native backend | Automatic qualified-Simulator routing, exact Swift compilation, signed immutable Dynamic Replacement and on-demand Adapter images, loader/recursion/chaining coverage, dSYM generation, and shared process-lifetime resource limits | Physical-device qualification, automatic process restart, and production use (intentionally unavailable) |
 | Control plane | Client-side package and policy contracts | Production Registry, HSM operations, approval, rollout, telemetry, and fleet coordination services |
 
 The full SwiftPM suite, warnings-as-errors build, optimized Release build, iOS
@@ -726,12 +726,17 @@ does not by itself certify a physical device or distribution channel.
   does not generate a selector-specific Swift function. Object/Optional object,
   exact scalar, common structure, property, initializer, supported
   `NSError **`, and reusable Block shapes take this route. Swift-only overlays
-  or ABI shapes outside that matrix retain an exact generated Swift adapter,
-  now grouped into a deterministic, separately cached Adapter Pack for its
-  native module. A compiler-proven imported C function uses the shared
-  restricted C invoker when it fits the finite homogeneous-scalar or supported
-  Apple-geometry AOT matrix; the Bridge supplies the exact declaration address,
-  and there is no `dlsym` or arbitrary pointer path.
+  or ABI shapes outside that matrix retain an exact generated Swift adapter.
+  A baseline-used adapter is grouped into a deterministic, separately cached
+  per-module Pack; an unused candidate remains data-only until a later HLBC
+  image actually imports it, at which point qualified Simulator/macOS Live
+  Reload compiles and caches only that exact body. A compiler-proven imported C
+  function uses the shared restricted C invoker when it fits the finite
+  homogeneous-scalar or supported Apple-geometry AOT matrix. Baseline imports
+  use a Bridge-bound declaration address; authenticated development first use
+  may resolve only the candidate Descriptor's fixed entry point from the
+  already linked process. There is no caller-selected `dlsym` or arbitrary
+  pointer path.
   The full declaration recovers only omitted outer `@escaping`/`@autoclosure`
   parameter markers. Concrete generic owners are substituted and probed per
   proven specialization without ambiguous unspecialized aliases. Non-Sendable
@@ -889,14 +894,16 @@ exhaustive API list.
   compact dispatch slot. A production patch
   also cannot add a framework or use an SDK operation absent from the App after
   that build was released. The broad managed-Debug surface above works because
-  those concrete IDs are generated automatically during the normal Debug build.
+  a normal Debug build records exact candidate Descriptors; a session may
+  promote only those records and must still establish an executable binding.
 
 ## Development Live Reload boundary
 
 The default Live Reload path uses the same canonical SIL, verifier, and HLVM
 core as production. Development changes the session, transport, lifetime, and
-diagnostic policy; it does not replace unsupported bytecode with downloaded
-machine code.
+diagnostic policy. A signed on-demand Adapter implements an exact imported
+Swift boundary on qualified Simulator/macOS targets; it is not a fallback for
+unsupported bytecode syntax or arbitrary native code.
 
 | Edit | Current result |
 | --- | --- |
@@ -906,8 +913,8 @@ machine code.
 | Change an existing computed property or subscript | Supported for exact synchronous getter/setter roots when the receiver, parameters, result, effects, and body are representable. This includes `mutating get`, `nonmutating set`, static/class/global forms, source extensions, per-accessor access control, and normal/declared-error value writeback. Explicit `_read`/`_modify`, async, typed throws, availability-constrained or generic declarations/contexts, unnameable private nested receivers, and recursive Native accessor replacement remain fail-closed |
 | Change an existing stored-property `willSet` or `didSet` body | Directly declared synchronous global, eligible captured struct, and source reference-class observers are independently patchable through an exact hashed in-place wrapper in the derived source. Implicit/custom old/new-value names, baseline fallback, private same-file access, direct value-storage mutation, and transactional value-receiver writeback are preserved. Static/class, inherited, lazy/wrapped, weak/unowned/Objective-C, availability/generic, actor/global-actor, baseline-magic-literal, old/new-value ABI-shape changes, and direct self-property assignment from a reference observer fail closed; observer Native replacement is never emitted |
 | Use explicit `inout`, mutate an actor root, or change an existing native static/class method | One synchronous eligible Shell `inout` parameter is supported. Multiple/async regions remain rejected; actor executors and native metatype ABI are not implemented |
-| Call an existing private/internal/public declaration from that body | Supported only when it resolves to a same-image function, eligible Shell Entry, or exact emitted NativeImport |
-| First use a public SDK member in a managed Debug body | Supported automatically for a uniquely measured, nondeprecated synchronous initializer, instance/static method, or readable/writable property when every boundary type is representable and the declaration is valid at the App minimum OS. Supported Objective-C ABI shapes use the shared invoker and emit only a descriptor; supported C shapes use the restricted C invoker; other representable Swift/overlay shapes retain an exact adapter in a cached per-module Pack. This includes a separately compiler-proven zero-argument `Type()` construction and members of a concrete SDK generic specialization already proven by the build; no project API list is edited. Other inherited implicit constructors, project-subclass constructors, and open/unspecialized generic owners do not expand the source boundary. Closure-bearing members require the exact synchronous, nonthrowing bridge-and-failure-value profile above; declaration-level `@escaping`/`@autoclosure` and inherited MainActor restrictions are preserved. Async SDK declarations, completion-handler conversion, unfamiliar error bridges, subscripts, unsupported actor hops, and unrepresentable signatures require a full build; suspending NativeImports currently come from exact project-source discovery or the lower-level explicit catalog |
+| Call an existing private/internal/public declaration from that body | Supported only when it resolves to a same-image function, eligible Shell Entry, a linked exact NativeImport, or an exact managed-Debug receipt candidate that the authenticated transaction can bind |
+| First use a public SDK member in a managed Debug body | Supported automatically for a uniquely measured, nondeprecated synchronous initializer, instance/static method, or readable/writable property when every boundary type is representable and the declaration is valid at the App minimum OS. The normal Debug build records eligible unused calls as data-only candidates. On first actual import, supported Objective-C shapes use the shared invoker, supported C shapes use the restricted invoker with the Descriptor-fixed linked symbol, and a representable Swift/overlay shape compiles only its exact Adapter body on qualified Simulator/macOS. The resulting key receives a deterministic session-local ID and is transferred in one authenticated `DevelopmentPayload`; physical iOS requires a rebuild for a missing Swift Adapter. This includes a separately compiler-proven zero-argument `Type()` construction and members of a concrete SDK generic specialization already proven by the build; no project API list is edited. Other inherited implicit constructors, project-subclass constructors, and open/unspecialized generic owners do not expand the source boundary. Closure-bearing members require the exact synchronous, nonthrowing bridge-and-failure-value profile above; declaration-level `@escaping`/`@autoclosure` and inherited MainActor restrictions are preserved. Async SDK declarations, completion-handler conversion, unfamiliar error bridges, subscripts, unsupported actor hops, and unrepresentable signatures require a full build; suspending NativeImports currently come from exact project-source discovery or the lower-level explicit catalog |
 | Add an ordinary top-level helper, private class instance method, or computed accessor in an existing source file | Supported when reachable from a changed root and its concrete signature/body fit HLBC; it remains private to that image |
 | Ordinary direct recursion | Resolves to the function in the same immutable HLBC image |
 | Deliberately call the previous generation from source | Not supported by HLBC; save/activate a restoring generation instead |
@@ -932,16 +939,19 @@ compile time even when ordinary Swift would allow it.
 
 Simulator and device share the authenticated transaction protocol, while the
 automatic execution backend is platform-qualified. The checked-in Simulator
-E2E applies eight native Swift generations in one App process: changed/restored
-layout bodies, target-action view construction and Auto Layout, an escaping
-configuration handler, nonescaping/escaping animation callbacks, controller
-presentation/dismissal callbacks, and final source restoration. It asserts
-persisted UIKit/App state and retains screenshots rather than treating
-compilation or activation as success. A separate 128-generation in-process soak proves bounded active,
-rollback, failed-save, high-water, and compaction behavior. A physical-iPhone
-run and long-duration memory-pressure soak are still required before device
-behavior is listed as qualified. Physical devices retain verified HLBC by
-default; the native backend is never available to production Hot Patch.
+E2E applies the same eight updates through automatic native routing and forced
+HLBC. Both runs cover changed/restored layout bodies, target-action view
+construction and Auto Layout, an escaping configuration handler,
+nonescaping/escaping animation callbacks, controller presentation/dismissal
+callbacks, and final source restoration. The forced HLBC run additionally
+proves first use of a dormant pure-Swift SDK candidate and signed on-demand
+Adapter loading. The test asserts persisted UIKit/App state and retains
+screenshots rather than treating compilation or activation as success. A
+separate 128-generation in-process soak proves bounded active, rollback,
+failed-save, high-water, and compaction behavior. A physical-iPhone run and
+long-duration memory-pressure soak are still required before device behavior is
+listed as qualified. Physical devices retain verified HLBC by default; the
+native backend is never available to production Hot Patch.
 
 ## UI refresh boundary
 

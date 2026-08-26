@@ -156,6 +156,9 @@ struct CInvoker {
             keyOverride: .init(rawValue: .sha256("wrong C key"))
         )
         #expect(throws: VM.RuntimeTrap.self) {
+            try valid.invoker.validateConfiguration()
+        }
+        #expect(throws: VM.RuntimeTrap.self) {
             _ = try fixture.invoke(
                 valid,
                 arguments: [fixture.integer(1), fixture.integer(2)]
@@ -176,6 +179,9 @@ struct CInvoker {
             physicalParameters: [fixture.doubleABI, fixture.int64ABI],
             physicalResult: fixture.doubleABI
         )
+        #expect(throws: VM.RuntimeTrap.self) {
+            try mixed.invoker.validateConfiguration()
+        }
         #expect(throws: VM.RuntimeTrap.self) {
             _ = try fixture.invoke(
                 mixed,

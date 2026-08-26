@@ -391,16 +391,31 @@ struct NativeImportCatalogPipeline {
         })
         #expect(emittedIncrement.id != nil)
         #expect(emittedIncrement.isEmittedToDevice)
-        #expect(receipt.nativeImportCandidates.first {
+        let dormantRecord = try #require(receipt.nativeImportCandidates.first {
             $0.canonicalCallee == dormantCallee
-        }?.id == nil)
-        #expect(receipt.nativeImportBindings.count == 5)
+        })
+        #expect(dormantRecord.id == nil)
+        #expect(!dormantRecord.isEmittedToDevice)
+        #expect(receipt.nativeImportBindings.count == 6)
+        #expect(
+            Set(receipt.nativeImportBindings.map(\.key))
+                == Set(receipt.nativeImportCandidates.map(\.key))
+        )
         #expect(receipt.nativeImportBindings.contains {
             $0.importedModules == ["NativeSupport"]
         })
         #expect(receipt.nativeImportBindings.contains {
             $0.importedModules == ["HelixRuntime"]
         })
+        let dormantBinding = try #require(receipt.nativeImportBindings.first {
+            $0.key == dormantRecord.key
+        })
+        #expect(dormantBinding.strategy == .factory)
+        #expect(
+            dormantBinding.factoryReference
+                == "DormantSupport.DormantFactory.make"
+        )
+        #expect(dormantBinding.importedModules == ["DormantSupport"])
         #expect(receipt.capabilities.contains(.nativeImportsV1))
 
         let shell = try ShellBuild.Materializer().materialize(

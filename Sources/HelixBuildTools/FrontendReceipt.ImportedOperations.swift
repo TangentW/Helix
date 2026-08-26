@@ -61,6 +61,9 @@ extension FrontendReceipt.Adapter {
         var witnessFunctions: [String] = []
         var compilerOperation: CompilerOperation? = nil
         var isolationEvidence: IsolationEvidence = .enclosingContext
+        /// Source-observed operations enter the linked baseline. Managed SDK
+        /// probes set this to false so first-use candidates remain data-only.
+        var isEmittedToDevice: Bool = true
     }
 
     private struct ImportedOperationIdentity: Hashable {
@@ -444,7 +447,8 @@ extension FrontendReceipt.Adapter {
                     ? .mutatingValueReceiver : .direct,
                 foreignDispatch: operation.foreignDispatch,
                 objectiveC: operation.objectiveC,
-                c: operation.c
+                c: operation.c,
+                isEmittedToDevice: operation.isEmittedToDevice
             )
         }
     }
@@ -527,6 +531,9 @@ extension FrontendReceipt.Adapter {
                 values.flatMap(\.witnessFunctions)
             )).sorted()
             selected.importedModules = Array(Set(values.flatMap(\.importedModules))).sorted()
+            selected.isEmittedToDevice = values.contains(
+                where: \.isEmittedToDevice
+            )
             selected.sourceFileLogicalID = values.map(\.sourceFileLogicalID).min()
                 ?? selected.sourceFileLogicalID
             return selected
@@ -1422,6 +1429,15 @@ extension FrontendReceipt.Adapter {
                 dispatchClassName: objectiveCDispatchClassName
             )
         }
+        if objectiveC != nil {
+            references = references.map {
+                CanonicalSIL.NativeBridgeSymbols
+                    .declarationQualifiedForeignCall(
+                        symbol: $0,
+                        declarationUSR: usr
+                    )
+            }
+        }
         operations.append(
             .init(
                 silReferences: references,
@@ -1435,6 +1451,7 @@ extension FrontendReceipt.Adapter {
                 resultSwiftType: resultType,
                 requiresMainActor: requiresMainActor,
                 foreignDispatch: foreignDispatch,
+                declarationUSR: usr,
                 objectiveC: objectiveC,
                 witnessFunctions: [function.mangledName]
             )
@@ -1857,9 +1874,15 @@ extension FrontendReceipt.Adapter {
             )
         }
 
+        let silSymbol = objectiveC.map { evidence in
+            CanonicalSIL.NativeBridgeSymbols.declarationQualifiedForeignCall(
+                symbol: call.symbol,
+                declarationUSR: evidence.declarationUSR
+            )
+        } ?? call.symbol
         operations.append(
             .init(
-                silReferences: [call.symbol],
+                silReferences: [silSymbol],
                 sourceFileLogicalID: source.logicalPath,
                 importedModules: importedModules,
                 dispatch: dispatch,
@@ -4059,6 +4082,8 @@ extension FrontendReceipt.Adapter {
                 existing.importedModules = Array(Set(
                     existing.importedModules + value.importedModules
                 )).sorted()
+                existing.isEmittedToDevice = existing.isEmittedToDevice
+                    || value.isEmittedToDevice
                 existing.sourceFileLogicalID = min(
                     existing.sourceFileLogicalID,
                     value.sourceFileLogicalID

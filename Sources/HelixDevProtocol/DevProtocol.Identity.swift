@@ -47,6 +47,8 @@ public struct PeerBuildIdentity: Codable, Hashable, Sendable {
     public var architecture: String
     /// Xcode build version used to produce the Shell.
     public var xcodeBuild: String
+    /// SDK build version whose imported declarations were cataloged.
+    public var sdkBuild: String
     /// Stable fingerprint of the Swift compiler invocation.
     public var swiftCompilerFingerprint: String
     /// Digest of the linked Live Reload entry-point index.
@@ -59,6 +61,7 @@ public struct PeerBuildIdentity: Codable, Hashable, Sendable {
         platform: DevProtocol.ApplePlatform,
         architecture: String,
         xcodeBuild: String,
+        sdkBuild: String,
         swiftCompilerFingerprint: String,
         liveReloadIndexHash: Core.Digest
     ) {
@@ -68,6 +71,7 @@ public struct PeerBuildIdentity: Codable, Hashable, Sendable {
         self.platform = platform
         self.architecture = architecture
         self.xcodeBuild = xcodeBuild
+        self.sdkBuild = sdkBuild
         self.swiftCompilerFingerprint = swiftCompilerFingerprint
         self.liveReloadIndexHash = liveReloadIndexHash
     }
@@ -76,7 +80,8 @@ public struct PeerBuildIdentity: Codable, Hashable, Sendable {
     public func validate() throws {
         guard protocolVersion == DevProtocol.Metadata.currentProtocolVersion,
               !Self.isZero(executableUUID),
-              [bundleID, architecture, xcodeBuild, swiftCompilerFingerprint].allSatisfy({
+              [bundleID, architecture, xcodeBuild, sdkBuild,
+               swiftCompilerFingerprint].allSatisfy({
                   !$0.isEmpty && $0.utf8.count <= 4_096
                       && !$0.unicodeScalars.contains(where: { $0.value == 0 })
               })

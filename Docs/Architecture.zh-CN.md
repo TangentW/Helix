@@ -4,16 +4,16 @@
 
 Helix 的核心思路只有一套：工程师修改普通 Swift 源码；但生产热补丁与开发期热重载必须使用不同的产物、信任边界和生命周期。它们共享编译器事实与身份合同，不共享下发通道。
 
-本文描述截至 2026 年 8 月 26 日仓库中已经存在的实现，不把尚未完成的资格验证写成产品承诺。
+本文描述截至 2026 年 8 月 27 日仓库中已经存在的实现，不把尚未完成的资格验证写成产品承诺。
 
 ## 两条工作流
 
 | 工作流 | 产物 | 执行方式 | 生命周期 | 用途 |
 | --- | --- | --- | --- | --- |
 | 生产热补丁 | 内含 HLBC 的签名 `.hlxp` | App 内预装的 Verifier 与 HLVM | 可持久化、可回滚的 generation | 处理已发布 Shell 中的线上缺陷 |
-| 开发期热重载 | 会话绑定、经过认证的 HLBC live artifact | 开发期 Verifier 与 HLVM | 仅当前 Debug 进程 | 保存受支持的函数体后刷新正在运行的页面 |
+| 开发期热重载 | 经过认证的版本 1 `DevelopmentPayload`，包含 HLBC 与可选精确 Adapter image | 开发期 Verifier/HLVM 与受限开发 image loader | 仅当前 Debug 进程 | 保存受支持的函数体后刷新正在运行的页面 |
 
-两条产品路径都不会把 Swift 源码或原生机器码下载进 App。生产路径接受可持久化、绑定策略的签名包；开发路径接受仅绑定一次认证 Dev Session 的临时 artifact。这一隔离是架构边界，不是一个可随意切换的运行时开关。
+两条产品路径都不会把 Swift 源码、compiler、linker 或 JIT 输入下载进 App。生产路径接受可持久化、绑定策略的签名 HLBC 包，不具备开发 image 加载入口；开发路径接受仅绑定一次认证 Dev Session 的临时 artifact，在经过资格验证的 Simulator/macOS 上可以包含精确、签名的按需 Swift Adapter image，物理 iOS 会拒绝这条路径。这一隔离是架构边界，不是一个可随意切换的运行时开关。
 
 Xcode 侧的 `prepare`、`bridge`、`finalize` 与 `patch` 会在当前 profile 的 DerivedData 输出目录写入 schema 1 的 `BuildPerformance.<operation>.json`。报告使用单调时钟，聚合具名阶段、脱敏后的 frontend 子进程事实、计数与产物大小；它只作为本地诊断证据，不进入 HLBC、HLXI、补丁签名输入、Shell identity、Release baseline identity 或 App bundle。阶段允许嵌套，不能直接累加。实测基线与解释规则见[构建性能观测与基线](Build-Performance-Baseline.zh-CN.md)，缓存 identity、校验、工作流快路径和按内容发布规则见[增量构建事实与产物发布](Incremental-Build-Facts.zh-CN.md)。
 
@@ -29,8 +29,9 @@ flowchart TB
     PKG --> PR["HelixAppIntegration · 生产路径"]
 
     D --> DSIL["精确工具链的 canonical SIL"]
-    DSIL --> DHLBC["HLIR → 认证开发期 HLBC"]
-    DHLBC --> DR["HelixDevSupport · 开发路径"]
+    DSIL --> DHLBC["HLIR → HLBC + 精确原生候选计划"]
+    DHLBC --> DP["认证 DevelopmentPayload"]
+    DP --> DR["HelixDevSupport · 开发路径"]
     DR --> UI["自动 UIKit 实例 invalidation 或 SwiftUI pulse"]
 ```
 
@@ -43,8 +44,9 @@ flowchart TB
 - `FunctionKey` 标识 Swift callable，并纳入 Helix 关心的 ABI 与 effect 信息。
 - `EntryIndex` 是生产 Bridge 使用的紧凑 Shell 路由。
 - `TypeID` 标识已捕获的类型操作；`NativeCallKey` 是 canonical 原生调用 Descriptor 的稳定、与项目无关的身份；`NativeImportID` 只是在单个 Shell 或 image 内使用的紧凑派发下标。Patch 会同时携带 Key 和下标，不保存进程地址，也不会把临时下标当成权限。详见[原生调用身份与 Catalog](Native-Calls.zh-CN.md)。
+- 受管 Debug Build Receipt 会把 baseline 已使用绑定与未使用、纯数据的 Catalog 候选分开。认证事务首次使用候选时，会在已链接前缀之后确定性分配 session-local 紧凑 ID，不改变 Shell interface hash。每个 generation 与 escaping callback 都固定一份不可变能力 snapshot，后续保存不能原地扩张它。
 - 落在支持矩阵内的 Objective-C import 共用一个由 Descriptor 驱动的 Runtime 调用器，不再为每个 selector 生成一段 Swift 函数。编译器证据会分别固定声明 class 与类方法/initializer 的实际派发 class、精确 selector/property accessor identity、物理 ABI、Block 生命周期、method family 与错误约定；Objective-C shim 在 `NSInvocation` 前再次核对 class 继承关系、真实 method encoding 和 storage kind。无法安全表示的 Swift overlay 或 ABI shape 仍走精确生成的 Adapter。这是可复用执行机制，不是 wildcard selector 权限。
-- 编译器已经证明、且落在有限标量/Apple geometry ABI 矩阵内的 C function 共用一个 AOT Runtime Invoker。永久 Bridge 提供精确 imported declaration 的函数地址；Runtime 不做 symbol lookup，下载代码也不能选择 pointer。其余 Swift 声明按原生 module 归入确定性 Adapter Pack，source 与已验证的 Mach-O object 分别缓存。这是生成边界上的类型擦除，不会暴露 Swift 私有泛型 ABI。
+- 编译器已经证明、且落在有限标量/Apple geometry ABI 矩阵内的 C function 共用一个 AOT Runtime Invoker。永久 Bridge binding 提供精确 imported declaration 的函数地址；开发期首次使用只能从当前已链接进程解析 Catalog Descriptor 固定的 entry point，下载代码不能选择 symbol 或 pointer。其余 Swift 声明使用生成边界上的类型擦除：baseline 已使用项按原生 module 归入确定性 Adapter Pack，未使用开发候选只在 HLBC 真正 import 时编译精确 body。两条路径的 source 与已验证 Mach-O object 都可独立缓存，不会暴露 Swift 私有泛型 ABI。
 - interface fingerprint 与传递 implementation fingerprint 用于区分函数体修改和 ABI、布局、源文件成员关系或依赖变化。
 - Eligible 的 Shell 已有 struct/enum 使用已记录的逻辑值合同，而不是 Swift 私有 ABI layout。Archive 会记录精确的源码限定 identity、stored field 或 enum case、label 与顺序、递归 Bridge type、copyability、受支持的 conformance 事实，以及同时纳入 device hash 的确定性 layout fingerprint。构建阶段会在声明同一源码作用域生成 private 构造 hook，使 private storage 也能按 Swift 访问控制合法重建；生成的 Bridge 则经普通、有界的 value codec 流式编解码 field 与 case。Release 和 Patch 编译会分别从源码独立推导 shape，Verifier 只有在定义完全一致时，才允许 ordinary、`borrowing`、`consuming` 或 `mutating` value receiver 成为 root。同步 Entry 可以暴露恰好一个逻辑 `inout` 区域，包括可变 `self`。生成的 Bridge 会先快照该值，只在 HLVM invocation 内建立 address，再校验唯一且类型精确的 writeback；normal 与已声明 error continuation 提交写回，VM trap 不提交任何写回，Original route 使用同一结果合同。多个或 async `inout` 会因生成边界无法证明 alias identity 而 fail closed。反射、裸内存投影、运行时 metadata、VM address 与 Swift layout 假设都不会跨边界。
 - 工具链、SDK、target triple、编译参数、module 源文件集合与二进制身份把每个产物绑定到对应 Shell。
@@ -121,9 +123,11 @@ Live Reload phase 把已处理的 App plist 声明为构建输入，在 Xcode �
 
 Bridge 编译也会把稳定工作与会话工作拆开。大型 application Bridge 和每个原生 module Adapter Pack 都有精确的内容寻址 object identity。Live Reload 获取新 invitation 时，只生成并编译一份很小的 Hub-contract source，再与已验证的稳定 object 做 relocatable link。更严格的最终 Bridge identity 仍包含当前 invitation，因此 object 复用不会把上一轮构建的配对权限带入新 App。
 
-Xcode 集成会从一次真实 Debug Build 中捕获 frontend、link、SDK、module、源码和 target 事实。源码监控器把编辑器写入与原子 rename 整理成稳定、单调递增编号的快照。开发编译器在原 module 上下文中重新检查整个 transaction：自动路由在经过资格验证的 iOS Simulator 上优先生成新的原生 Swift Dynamic Replacement image，其他情况则把与 Release 编译器相同的受支持 canonical SIL 降成不可变 HLBC generation。认证 daemon 传输选定的有界 artifact，Debug App 校验后再原子激活。
+受管 Debug 中 baseline 没有调用的候选不会提前展开成 Bridge 机器码，而是以精确 Descriptor/Key 记录保留在认证 Receipt。后续 HLBC 第一次引用时，Compiler 才确定性分配 session ID；Objective-C 与受支持 C 直接走通用调用器，只有缺失的纯 Swift body 进入按需 Adapter 编译与缓存。
 
-Helix 不会维护一个可变动态库并不断追加 Swift 文件；每个原生 generation 都是独立签名 image，已经加载的 image 保持不可变。原生加载只属于 Debug/Simulator，并受进程生命周期数量与字节预算约束。物理设备默认继续使用 HLBC，生产 Hot Patch 不存在开发期 image 加载路径。
+Xcode 集成会从一次真实 Debug Build 中捕获 frontend、link、SDK、module、源码和 target 事实。源码监控器把编辑器写入与原子 rename 整理成稳定、单调递增编号的快照。开发编译器在原 module 上下文中重新检查整个 transaction：自动路由在经过资格验证的 iOS Simulator 上优先生成新的原生 Swift Dynamic Replacement image，其他情况则把与 Release 编译器相同的受支持 canonical SIL 降成不可变 HLBC、计算精确原生能力增量，并把必要 Adapter image 放进一份规范化 `DevelopmentPayload`。认证 daemon 传输选定的有界 artifact；Debug App 会重新验证 compiler/SDK/Shell identity、import、Mach-O image 与 bytecode，再原子发布 generation 及其能力 snapshot。
+
+Helix 不会维护一个可变动态库并不断追加 Swift 文件；每个原生 generation 都是独立签名 image，已经加载的 image 保持不可变。原生加载只属于 Debug/Simulator；Dynamic Replacement 与开发 Adapter image 共用进程生命周期数量与字节预算。物理设备默认继续使用 HLBC 及其已链接能力集合，未链接 Swift Adapter 必须正常重建；生产 Hot Patch 不存在开发期 image 加载路径。
 
 Debug App 先激活代码，再刷新 UI。`ReloadIndex` 把变化 root 映射为稳定 nominal type ID。UIKit 会从已展示 controller/view class（包括 superclass 链）还原这些 ID，无需业务注册表即可执行推导出的 invalidation；SwiftUI 使用显式 pulse boundary。没有安全刷新策略或存活目标时，Helix 会明确报告“代码已激活，但需要手动刷新”，不会猜测并重放任意生命周期方法。
 

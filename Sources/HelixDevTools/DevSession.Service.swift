@@ -180,7 +180,7 @@ public actor Service {
         let identityStore = try NetworkTransport.HostIdentityStore.applicationSupportStore()
         let contextStore = try DevSession.ContextStore.applicationSupportStore()
         let rendezvousStore = try HubControl.RendezvousStore.applicationSupportStore()
-        let contexts = try contextStore.load()
+        let contexts = try contextStore.loadOrQuarantineInvalidDocument()
         let registry = try DevSession.ContextRegistry(contexts: contexts)
         let authority = try Pairing.Authority(configuration: authorityConfiguration)
         let broker = DevSession.ConnectionBroker(registry: registry, authority: authority)

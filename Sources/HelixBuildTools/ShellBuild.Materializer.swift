@@ -10,7 +10,7 @@ public enum ShellBuild {
     /// native-call descriptor semantics change. This invalidates local build
     /// facts without changing a shipped protocol or schema version.
     public static let transformPipelineHash = Core.Digest.sha256(
-        "Helix.ShellBuild.DynamicSourceTransform.v1:declaration-groups:frozen-value-hooks:source-body-dispatch:async-original-thunks:native-call-descriptor-v1:objective-c-invoker:c-invoker-main-actor-unqualified-reference:swift-adapter-pack-v1:exact-module-imports:separate-hub-contract-object"
+        "Helix.ShellBuild.DynamicSourceTransform.v1:declaration-groups:frozen-value-hooks:source-body-dispatch:async-original-thunks:native-call-descriptor-v1:objective-c-invoker:objective-c-lightweight-generic-erasure:c-invoker-main-actor-unqualified-reference:swift-adapter-pack-v1:development-native-candidate-emission:indexed-source-baseline-metadata:objective-c-declaration-qualified-sil:property-declaration-identity:exact-module-imports:separate-hub-contract-object"
     )
 }
 
@@ -743,65 +743,14 @@ public struct Materializer: Sendable {
     ) throws -> [BridgeGeneration.NativeImportBinding] {
         let emitted = archive.nativeImports.filter(\.isEmittedToDevice)
         let byKey = Dictionary(uniqueKeysWithValues: receiptBindings.map { ($0.key, $0) })
-        guard Set(emitted.map(\.key)) == Set(byKey.keys) else {
+        guard Set(emitted.map(\.key)).isSubset(of: Set(byKey.keys)) else {
             throw ShellBuild.Error.nativeImportBindingMismatch
         }
         return try emitted.map { item in
-            guard let id = item.id, let binding = byKey[item.key] else {
+            guard let binding = byKey[item.key] else {
                 throw ShellBuild.Error.nativeImportBindingMismatch
             }
-            let strategy: BridgeGeneration.NativeImportBinding.Strategy = switch
-                binding.strategy
-            {
-            case .factory: .factory
-            case .generatedSwiftAdapter: .generatedSwiftAdapter
-            case .objectiveCInvoker: .objectiveCInvoker
-            case .cInvoker: .cInvoker
-            }
-            return .init(
-                id: id,
-                key: item.key,
-                strategy: strategy,
-                factoryExpression: binding.factoryExpression,
-                importedModules: binding.importedModules,
-                generated: binding.generated.map { generated in
-                    let dispatch: BridgeGeneration.GeneratedNativeImport.Dispatch =
-                        switch generated.dispatch {
-                        case .globalFunction: .globalFunction
-                        case .initializer: .initializer
-                        case .staticMethod: .staticMethod
-                        case .nativeUpcast: .nativeUpcast
-                        case .anyObjectBridge: .anyObjectBridge
-                        case .staticGetter: .staticGetter
-                        case .staticSetter: .staticSetter
-                        case .instanceMethod: .instanceMethod
-                        case .instanceGetter: .instanceGetter
-                        case .instanceSetter: .instanceSetter
-                        case .instanceValueSetter: .instanceValueSetter
-                        }
-                    return BridgeGeneration.GeneratedNativeImport(
-                        declarationMangledName: generated.declarationMangledName,
-                        sourceFileLogicalID: generated.sourceFileLogicalID,
-                        dispatch: dispatch,
-                        ownerType: generated.ownerType,
-                        baseName: generated.baseName,
-                        argumentLabels: generated.argumentLabels,
-                        parameterSwiftTypes: generated.parameterSwiftTypes,
-                        invocationParameterSwiftTypes:
-                            generated.invocationParameterSwiftTypes,
-                        resultSwiftType: generated.resultSwiftType,
-                        nativeModuleName: generated.nativeModuleName
-                    )
-                },
-                cFunction: binding.cFunction.map {
-                    .init(
-                        moduleName: $0.moduleName,
-                        swiftName: $0.swiftName,
-                        parameterSwiftTypes: $0.parameterSwiftTypes,
-                        resultSwiftType: $0.resultSwiftType
-                    )
-                }
-            )
+            return try binding.bridgeBinding(for: item)
         }
     }
 

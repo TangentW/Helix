@@ -95,6 +95,7 @@ struct BridgeProvider {
             platform: .iOSSimulator,
             architecture: "arm64",
             xcodeBuild: "18A1",
+            sdkBuild: "22A1",
             liveReloadIndexHash: .sha256("reload-index")
         )
     }

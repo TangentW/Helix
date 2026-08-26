@@ -20,6 +20,8 @@ Xcode lifecycle 传递的是身份，不是凭据：
 4. Xcode 用默认 Apple debugger 启动 App。隐藏 bootstrap 自动启动 `HelixDevSupport`；进程开始时，`DevRuntime.LaunchMode.current()` 只调用一次 Darwin `sysctl` 并检查 `P_TRACED`。被跟踪的进程进入 `automaticXcode`；探测失败会保守进入 `manual`。
 5. Automatic 模式发现唯一服务、校验编译进 Bridge 的 Host pin、证明精确 App/Shell identity，再通过 pinned TLS 兑换邀请。后续认证通道传输源码诊断、HLBC generation、激活结果与 reconnect lease。
 
+持久 Build Context registry 是可以由 Xcode 重建的开发状态，不是兼容数据库。如果 owner-only 普通文件无法被当前 build 解码或验证，Hub 会先把它移到隔离文件供排障，再以空 registry 启动；下一次正常 Xcode Build 会发布当前 context。symbolic link、过宽权限或其他不安全 filesystem 形态仍会阻止启动，不会被静默替换。
+
 模式在整个进程周期内固定。开发者 Stop Xcode 后，从桌面直接打开同一个已安装包会产生 manual 新进程：输入 Mac Helix 当前四位码并确认前，它不浏览 Bonjour，也不请求本地网络。之后再 attach debugger 也不能把进程切成 automatic。
 
 四位码大小写不敏感，字符集是 `ABCDEFGHJKMNPQRSTUVWXYZ23456789`，默认两分钟过期且只能兑换一次；连续五次失败会触发配置的限流。短码只代表用户在场，连接仍须同时通过 P-256 Host Identity pin、精确注册的 Build Context、TLS transcript 与 App process identity。只有相同 bundle ID 并不足以配对。
@@ -41,10 +43,11 @@ sequenceDiagram
     M->>M: "Debounce 并捕获稳定快照"
     M->>C: "单调递增 sourceRevision"
     C->>C: "精确 module type-check 与 body-only 差分"
-    C->>C: "降低受支持 SIL，构建一个 HLBC generation"
-    C->>D: "Offer、hash、metadata 与 payload"
+    C->>C: "降低 SIL 并解析精确原生候选"
+    C->>C: "只构建缺失的 Swift Adapter body"
+    C->>D: "规范化 DevelopmentPayload"
     D->>A: "认证分块传输"
-    A->>A: "验证并激活代码"
+    A->>A: "验证 import/image 并原子激活"
     A->>U: "变化 root 与 reload hint"
     U-->>E: "已刷新或需要手动刷新"
 ```
@@ -62,15 +65,16 @@ sequenceDiagram
 1. 为当前 module 构建上下文中的全部源码捕获同一个稳定 revision。
 2. 重新 type-check 完整 module，并拒绝 interface、stored layout、source membership、依赖或 Build Settings 变化。
 3. 通过声明身份与 implementation fingerprint 确定变化的 eligible root，再让捕获的 Swift 编译器产出 SIL。
-4. 构造闭合调用表：patch-local 函数优先，其次是 eligible Shell `EntryIndex`，最后是 Dev Shell 在构建期实际安装、由稳定 `NativeCallKey` 标识的精确原生调用能力；`NativeImportID` 只承担本次 Shell 内的紧凑派发。
-5. 只把受支持的 canonical SIL 降成强类型 HLIR 与 HLBC，并在 Mac 端运行独立结构和语义 Verifier。
-6. 发送一个不可变、绑定本次会话的 live artifact。App 在原子激活前重新检查 session、revision、target、Shell identity、hash、大小、capability 与字节码合法性。
+4. 构造闭合调用表：patch-local 函数优先，其次是 eligible Shell `EntryIndex`、Shell 已链接的原生 import，以及认证 Build Receipt 中的精确未使用候选。首次使用的候选会在已链接前缀之后确定性获得 session-local ID，Shell interface hash 不变；`NativeImportID` 只承担紧凑派发，不是权限凭据。
+5. 只把受支持的 canonical SIL 降成强类型 HLIR 与 HLBC，运行独立 Verifier，再检查产物真正使用的 import。Objective-C 与受支持 C 候选直接复用通用 Runtime 调用器；只有缺失的纯 Swift 候选才会让 Hub 依据捕获的真实 compiler job 编译精确 Adapter body，并使用内容寻址缓存。
+6. 把 HLBC、提升的 import、Adapter image 描述、hash 与 image bytes 组成一个规范化的版本 1 `DevelopmentPayload`，再通过认证 session 传输。
+7. App 重新检查 session/revision、compiler 与 SDK identity、target、Shell identity、每个 Descriptor/Key、Mach-O identity/签名/依赖、大小、capability 与字节码，然后构造一份不可变原生能力快照；全部成功后才原子发布 generation。
 
-iOS 进程不会接收或执行 Swift 编译器、linker、JIT、dylib 或源文件。Release 与开发路径复用编译器、Verifier 与 HLVM 核心，但开发 artifact 是临时的，并由一次性 Dev Session 认证，而不是使用生产包信任链。
+App 进程不会接收或执行 Swift 编译器、linker、JIT 或源文件。经过资格验证的 Simulator/macOS 开发进程可以接收一份签名、精确的按需 Swift Adapter image；物理 iOS 会拒绝这条 image 路径并要求正常重建。Release 与开发路径复用编译器、Verifier 与 HLVM 核心，但开发 artifact 是临时的，并由一次性 Dev Session 认证，而不是使用生产包信任链。即使无需 Adapter，开发传输也不接受裸 HLBC。
 
 ## 原生调用、实例 `self` 与递归
 
-一个 Swift 符号仅仅存在于进程中，并不代表 HLBC 可以随意调用它。调用必须精确解析到同一 bytecode image 中的函数、eligible Shell Entry，或者已生成进 Shell 的精确 NativeImport。Entry 路由优先，因此可补丁 App 函数之间的普通调用仍然感知 generation；NativeImport 用来承载必须离开 HLVM 执行的有界原生 API。
+一个 Swift 符号仅仅存在于进程中，并不代表 HLBC 可以随意调用它。调用必须精确解析到同一 bytecode image 中的函数、eligible Shell Entry、已链接的精确 NativeImport，或由认证开发事务提升的精确 Build Receipt 候选。Entry 路由优先，因此可补丁 App 函数之间的普通调用仍然感知 generation；NativeImport 用来承载必须离开 HLVM 执行的有界原生 API。补丁 bytes 不能自行提交新的 selector、C/Swift symbol、ABI 或进程地址。
 
 标准库 API 也遵循同一执行边界。受管集合算法使用通用、Verifier 可见的 HLBC 语义计划与 callback，不会按源码 API 一项配一个 opcode；状态属于原生 Runtime 的具体 framework member 使用实测得到的精确 NativeImport；patch-local Swift 实现仍是普通同 image 调用。表示转换、ownership、effect、重入和资源预算都会在这些明确边界上验证，而不会隐藏到按名字分发的原生调用后面。没有 payload 的 `nil` 会从已经验证的 bytecode 上下文恢复 wrapped type，因此同一套 Array/Dictionary builder、mutation/sort/split state 与 VM equality 可直接服务所有可表示的 `Optional<T>`，不需要类型特例。泛型间接结果也统一写入 compiler address，包括尚在构造中的 Array 字面量整体 element 与 Tuple 字段。
 
@@ -102,7 +106,7 @@ Swift 失败 helper 也在同一边界归一化。当前 frontend 为 `precondit
 
 新 Dev Shell 会自动包含 `Swift.print`、`Swift.debugPrint`、`String(describing:)` 与 `String(reflecting:)` 的精确 NativeImport，因此在受支持 body 中新增这些操作不需要开发者配置 Catalog。Compiler 会把 variadic 参数降成 VM-owned `Array<Any>`，把省略的 separator/terminator 作为通用默认参数 generator 链入同一 image，并为两个泛型 String initializer 应用固定 `Any` 适配层。其他函数的完全具体默认参数使用同一机制；非 eligible 调用点、泛型 metadata 或跨 module public/package 默认值无法证明完整覆盖时，保存事务会明确失败并要求正常构建。
 
-受管 Debug Shell 还会审计当前 App 构建已经证明的 imported native type 所属 module 的公开成员。Helix 从捕获的同一 Swift toolchain 与精确 SDK 读取 symbol graph；extractor 只接收它支持的 module loading/search 参数，编译条件和 frontend transform 等 source-only flag 仍留在 typed AST/SIL 路径。随后按 Shell minimum OS 和声明隔离过滤候选，并排除 deprecated 或 unavailable 声明，再把生成的探针送入项目源码共用的 typed AST 与 canonical SIL 流程。只有唯一测得且 Bridge-compatible 的同步 initializer、实例/静态 method、可读/可写 property，才会成为精确 NativeImport。若编译器证明其 Objective-C ABI 落在支持矩阵内，这条 NativeImport 只保存紧凑 Descriptor 并绑定共用 Objective-C 调用器，不再生成 selector 专属 Swift wrapper；编译器证明的 C function 若落在有限 AOT ABI 矩阵，则绑定受限 C Invoker，并由 Bridge 提供精确声明地址，不做运行时 symbol lookup；无法使用通用边界、但仍可表示的 overlay/ABI shape 会保留精确 Swift Adapter，并按 module 归入 source/object 可独立缓存的确定性 Adapter Pack。这条通路同时覆盖 Swift、Objective-C 与受支持 C API，包括 boundary type 已可表示时的 `UIColor.black`、`UIColor.init(white:alpha:)`、`UIViewController()`、`UIView.isHidden`、`UIView.alpha`、`UIView.setNeedsLayout()`、`UIView.setAnimationsEnabled(_:)`、`URLCache.shared`、`Bundle.main`、`Bundle.path(forResource:ofType:)` 与 `CACurrentMediaTime()`。对每个这类 imported SDK type，即使 symbol graph 没有列出继承或 importer 合成的无参 initializer，Helix 也会额外提名一次精确 `Type()` 表达式；只有同一 frontend 探针证明该调用及 ABI 后才会纳入，因此必须传参的类型不会被误收。对于捕获 SIL 已证明为 canonical Clang-importer `NSError **` 形状的调用（例如 `FileManager.removeItem(atPath:)`），还会保留逻辑 Swift `throws`；任何陌生的 pointer、sentinel、cleanup 或错误转换形状都会 fail closed。`Bundle` 等 Swift overlay 名与 `CGFloat` 等物理 alias 都来自编译器 identity 和源码位置证据，而不是猜测 Objective-C runtime 拼写；这些 Compiler 已证明的 Swift/SIL 拼写会作为同一原生 identity 的 server-side alias 保留下来，供后续补丁编译使用。有歧义的 alias 会被忽略，且不会进入设备 interface。frontend 为项目子类合成的其他继承型隐式 constructor 不属于源码边界；除上述单独证明的 SDK 类型无参构造外，其 `Bundle`/`Coder` 参数不会仅因 superclass 声明而进入生成 interface。编译器已证明的 Objective-C protocol 参数继续使用 v1 `AnyObject` 逻辑边界 identity，物理 Descriptor 则保留精确 protocol existential；通用调用器会在消息发送前检查运行时 conformance，并在操作受 MainActor 隔离时把检查与调用一起放在 actor 内。普通 `Any`/`AnyObject` 不会被猜成 protocol。这仍是有界的 Live Reload 便利能力：生产 Shell 不会得到这组扩张，它本身不会引入新的 boundary type；Runtime 只执行当前 Shell 中由精确 Descriptor 固定的原生调用，补丁不能提供或拼接 selector、symbol 或 pointer。
+受管 Debug Shell 还会审计当前 App 构建已经证明的 imported native type 所属 module 的公开成员。Helix 从捕获的同一 Swift toolchain 与精确 SDK 读取 symbol graph；extractor 只接收它支持的 module loading/search 参数，编译条件和 frontend transform 等 source-only flag 仍留在 typed AST/SIL 路径。随后按 Shell minimum OS 和声明隔离过滤候选，并排除 deprecated 或 unavailable 声明，再把生成的探针送入项目源码共用的 typed AST 与 canonical SIL 流程。只有唯一测得且 Bridge-compatible 的同步 initializer、实例/静态 method、可读/可写 property，才会成为精确 Catalog 候选。baseline 已使用的调用进入已链接 NativeImport；未使用候选只作为数据保存在认证 Build Receipt。若编译器证明其 Objective-C ABI 落在支持矩阵内，这条 NativeImport 只保存紧凑 Descriptor 并绑定共用 Objective-C 调用器，不再生成 selector 专属 Swift wrapper。编译器证明的 C function 若落在有限 AOT ABI 矩阵，则绑定受限 C Invoker：baseline import 使用 Bridge 绑定的声明地址，开发期首次使用则只能按 Receipt Descriptor 固定的 entry point 在当前已链接进程中解析，调用方不能选择 symbol。无法使用通用边界、但仍可表示的 overlay/ABI shape 会保留精确 Swift Adapter；baseline 已使用项按 module 归入可独立缓存的确定性 Adapter Pack，未使用项直到后续 HLBC 真正引用时才按需编译和缓存。这条通路同时覆盖 Swift、Objective-C 与受支持 C API，包括 boundary type 已可表示时的 `UIColor.black`、`UIColor.init(white:alpha:)`、`UIViewController()`、`UIView.isHidden`、`UIView.alpha`、`UIView.setNeedsLayout()`、`UIView.setAnimationsEnabled(_:)`、`URLCache.shared`、`Bundle.main`、`Bundle.path(forResource:ofType:)` 与 `CACurrentMediaTime()`。对每个这类 imported SDK type，即使 symbol graph 没有列出继承或 importer 合成的无参 initializer，Helix 也会额外提名一次精确 `Type()` 表达式；只有同一 frontend 探针证明该调用及 ABI 后才会纳入，因此必须传参的类型不会被误收。对于捕获 SIL 已证明为 canonical Clang-importer `NSError **` 形状的调用（例如 `FileManager.removeItem(atPath:)`），还会保留逻辑 Swift `throws`；任何陌生的 pointer、sentinel、cleanup 或错误转换形状都会 fail closed。`Bundle` 等 Swift overlay 名与 `CGFloat` 等物理 alias 都来自编译器 identity 和源码位置证据，而不是猜测 Objective-C runtime 拼写；这些 Compiler 已证明的 Swift/SIL 拼写会作为同一原生 identity 的 server-side alias 保留下来，供后续补丁编译使用。有歧义的 alias 会被忽略，且不会进入设备 interface。frontend 为项目子类合成的其他继承型隐式 constructor 不属于源码边界；除上述单独证明的 SDK 类型无参构造外，其 `Bundle`/`Coder` 参数不会仅因 superclass 声明而进入生成 interface。编译器已证明的 Objective-C protocol 参数继续使用 v1 `AnyObject` 逻辑边界 identity，物理 Descriptor 则保留精确 protocol existential；通用调用器会在消息发送前检查运行时 conformance，并在操作受 MainActor 隔离时把检查与调用一起放在 actor 内。普通 `Any`/`AnyObject` 不会被猜成 protocol。这仍是有界的 Live Reload 便利能力：生产 Shell 不会得到这组扩张，它本身不会引入新的 boundary type；Runtime 只执行当前 Shell 或认证 session snapshot 中由精确 Descriptor 固定的原生调用，补丁不能提供或拼接 selector、symbol 或 pointer。
 
 探针前会把 symbol-graph function signature 与完整 declaration 对齐，只恢复 signature 视图允许省略的声明级 `@escaping`/`@autoclosure`；其他缺失 attribute 继续拒绝。若当前构建已经证明 SDK 泛型 owner 的具体 specialization，Helix 会替换 owner generic parameter，只记录该具体 member ABI，并且不会把未 specialization 的 owner 拼写同时设为多个具体类型的 alias。由此，`UIView.performWithoutAnimation(_:)`、`UIView.animate(withDuration:animations:completion:)`、`UIButton.configurationUpdateHandler` 与具体 X/Y `NSLayoutAnchor` member 都可走同一测量路径。MainActor 隔离声明中的非 Sendable callback 会保留外围 MainActor 限制，即便 SDK typealias 的打印结果省略了该信息；显式 `@Sendable` callback 则保留自身声明的 executor 合同，最终 ABI 仍以精确 frontend 探针为准。async、未 specialization/开放式 generic SDK member，以及不受支持的 actor executor hop 仍会 fail closed。
 
@@ -120,11 +124,15 @@ Imported Optional property 在比较或复制时还会产生 address-form SIL。
 
 ## Generation、传输与生命周期
 
-每个成功 transaction 都是一个不可变开发 generation。经过资格验证的 Simulator build 使用新编译并签名的原生 Swift image；设备或原生替换不可用时使用验证后的 HLBC。Helix 不会修改已经加载的 image。Daemon 通过认证 Dev Session 发送 offer manifest 与有界 payload，App 验证完整 artifact 后才激活。HLBC 恢复 baseline 时可以没有 bytecode，只携带停止继承旧 route 的信息。
+每个成功 transaction 都是一个不可变开发 generation。经过资格验证的 Simulator build 使用新编译并签名的原生 Swift image；设备或原生替换不可用时使用验证后的 HLBC，经过资格验证的 Simulator/macOS HLBC 事务还可以带上精确开发 Adapter image。Helix 不会修改已经加载的 image。Daemon 通过认证 Dev Session 发送 offer manifest 与一份有界规范 payload，App 验证完整事务后才激活。HLBC 恢复 baseline 时可以没有 bytecode，只携带停止继承旧 route 的信息。
 
 默认单个 live HLBC payload 上限为 16 MiB。激活会把继承 route 展平成一个不可变、自包含 snapshot，因此路由查询不依赖一条无限增长的祖先链。Registry 默认强保留当前 snapshot 与直接回滚前代；更旧 snapshot 只有在已开始调用或显式诊断 lease 仍固定它时才继续存活。lease 自身携带完成调用所需的已解析 route 与已验证 image。
 
 数量上限与去重后的 artifact 字节预算会把这些执行中 snapshot 一并计算。如果所有可淘汰项都被固定，新 generation 会以 transaction 方式失败，旧 generation 保持活动，不会为了接收新代码而破坏执行中的调用。lease 释放后，下一次 Registry 操作会压缩旧 snapshot。独立的全进程 generation ID 高水位保证已压缩 ID 不能复用。开发 generation 不进入生产补丁存储；重启 App 后回到 Dev Shell baseline。
+
+每个 HLBC generation 都会固定一份不可变原生能力 snapshot，其中包含已链接 baseline 和本 session 已发布的开发候选。escaping 原生 callback lease 会继续持有同一份 snapshot，因此后续保存不能改变该 callback 能调用什么。开发 Adapter image 不能安全卸载，其数量与映射字节会和 Dynamic Replacement generation 共用全进程原生 image 预算。失败 image 不会发布；若 loader 状态无法证明干净，App 会标记 native state uncertain，并在重启前拒绝后续带 image 的 payload。重连 identity 会报告已发布开发 Key 与已映射 image inventory，Hub 可以复用现有 session 状态。
+
+两次保存可能在 Hub 编译同一个首次使用的 Swift Adapter 时重叠。如果较早事务先完成发布，App 会把后一份 Descriptor 完全相同的 session import 当作幂等重放，不会再次映射或重复计费其中已经多余的 image；只要 ID、Key、Descriptor、ABI、contract 或 binding 有任何变化，整个事务仍会被拒绝。一份 payload 同时包含已发布 import 与真正的新 import 时，只会加载新 import 实际需要的 image，再激活新 generation。
 
 仓库内 soak 会激活 128 个真实验证后 HLBC generation，验证一次失败保存不会改变 active generation，并覆盖 rollback、调用结果以及压缩后只强保留 active/直接前代 snapshot。这是确定性的进程内证据；真机长时间内存压力和前后台循环仍需真机资格验证。
 
@@ -132,7 +140,7 @@ Imported Optional property 在比较或复制时还会产生 address-form SIL。
 
 `.automatic` 是生成配置和公开 API 的默认值。经过资格验证的 iOS Simulator 会优先选择原生 Swift Dynamic Replacement，直接保留 Swift 编译器的普通函数体语义，避免把 HLBC 语法覆盖变成日常热重载上限；只要变化 root 不能全部使用该后端，就回退到验证后的 HLBC。物理设备默认仍选择 HLBC，除非另有明确通过的 device/native 矩阵；生产 Hot Patch 不具备这项开发期 image 加载权限。
 
-仓库 Simulator E2E 已在同一个 App 进程中应用八代原生 generation，验证五个可观察 UIKit 场景和最终源码恢复。原生 image 无法安全卸载，因此数量和累计映射字节仍是进程生命周期资源边界，接近边界时会明确要求重启 App；另一个 128 代确定性 soak 继续独立验证 HLBC 生命周期。
+仓库 Simulator E2E 会把同一套八次更新、五个 UIKit 场景分别通过自动原生路由和强制 HLBC 各执行一轮。强制 HLBC 轮次会验证纯 Swift SDK 候选从 dormant 状态首次使用、签名按需 Adapter 加载、generation 激活和最终源码恢复，全程无需重新安装 Shell。原生 image 无法安全卸载，因此数量和累计映射字节仍是进程生命周期资源边界，接近边界时会明确要求重启 App；另一个 128 代确定性 soak 独立验证 HLBC 生命周期。
 
 ## 为什么代码激活后页面不会天然重绘
 

@@ -100,6 +100,7 @@ struct ServiceControllerTests {
             platform: .iOS,
             architecture: "arm64",
             xcodeBuild: "18A1",
+            sdkBuild: "22A1",
             swiftCompilerFingerprint: "swift-hub",
             liveReloadIndexHash: .sha256("hub-index")
         )

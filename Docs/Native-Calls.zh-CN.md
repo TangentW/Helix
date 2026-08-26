@@ -1,6 +1,6 @@
 # 原生调用身份与 Catalog
 
-本文记录 Helix 已实现的版本 1 原生调用基线：HLBC 要调用 App 中已有代码时，如何描述这次调用、如何确定稳定身份，以及每一层如何验证权限。稳定 Descriptor、Key、Catalog、Archive、Bytecode、Verifier、Objective-C 通用消息调用器、受限 C 调用器与可复用 Swift Adapter Pack 都已经落地；基于 Catalog 的开发期按需 Adapter 和签名 Release capability 投影仍属于后续阶段。
+本文记录 Helix 已实现的版本 1 原生调用基线：HLBC 要调用 App 中已有代码时，如何描述这次调用、如何确定稳定身份，以及每一层如何验证权限。稳定 Descriptor、Key、Catalog、Archive、Bytecode、Verifier、Objective-C 通用消息调用器、受限 C 调用器与可复用 Swift Adapter Pack 都已经落地；基于 Catalog 的开发期按需 Adapter 也已用于认证后的 Simulator/macOS Live Reload，签名 Release capability 投影仍属于后续阶段。
 
 ## 两种 ID，各做一件事
 
@@ -66,13 +66,15 @@ Release Archive 保存完整 Descriptor 和 Contract；设备投影保留相同�
 
 Swift 层先把已经验证的 VM value 和 callback 权限投影成 ABI slot；一个很小的 Objective-C shim 再到 Catalog 指定的声明 class（或已固定的词法 superclass）上解析精确 selector，逐项比较运行时 type encoding 和 storage kind，并验证另行记录的 class 派发目标确实继承该声明 class，然后通过 `NSInvocation` 调用实际 receiver。这样既保留普通 Objective-C override 的动态派发，也不会让只存在于意外动态子类上的 selector 扩张 Catalog 权限。receiver 继承关系直接从 Objective-C runtime 的真实 class hierarchy 读取，不依赖可被对象重写的 `isKindOfClass:`；普通动态 override 的完整 ABI 也必须与目录声明一致后才能执行。属性调用直接使用编译器已经证明的 accessor selector，不要求系统运行时一定保留可选的 Objective-C property metadata；UIKit 等系统 Framework 即使裁掉这类元数据也能正常调用。Shim 还会捕获 Objective-C exception，处理 initializer 与 retained/autoreleased method family，并在一个明确的 ownership 边界把 object result 交回 Swift。Runtime 解码前会再次检查 receiver class、平台 availability、nilability、struct encoding/size/alignment、deadline、MainActor 入口、临时存储上限和返回长度。
 
-这条路径消除了受支持 Objective-C 调用的逐方法可执行 Bridge，但它绝不是任意 selector 入口：每次调用仍必须对应当前 Shell 已发出的精确 Descriptor。源码已经出现的调用和当前 managed Debug SDK surface 现在可以使用通用 binding；仅仅因为 Runtime 有通用调用器，并不会让当前 Shell 中从未发出的公开 API 自动获得权限。完整的 Catalog 开发期查询和签名 Release capability 投影在后续阶段完成。
+这条路径消除了受支持 Objective-C 调用的逐方法可执行 Bridge，但它绝不是任意 selector 入口：每次调用仍必须有编译器证明的精确 Descriptor。已链接 Shell 用紧凑 ID 保存实际使用项，认证 Build Receipt 则保存尚未使用的 managed-Debug 候选。开发代码第一次使用候选时，Compiler 会在已链接前缀之后确定性分配 session-local ID，App 再从 Descriptor 构造同一个通用 Invoker；Shell interface hash 不会变化。这种 Registry 增长只允许发生在认证开发事务中，生产环境仍只能使用随 Release 发布的能力投影。
 
 ## 受限 C 通用调用路径
 
 当编译器证据能够证明物理 ABI 落在支持矩阵内时，imported C function 不再需要每个 symbol 各生成一个执行器。发现阶段会记录声明的 Clang USR、所属 module、精确 C entry point、逻辑 Swift signature、calling convention、layout、effect 与 availability。生成 Bridge 会直接取得这个已导入声明的 `@convention(c)` 函数地址，再交给同一个 `Runtime.CInvoker`；Runtime 不会拿源码字符串去进程里搜索 symbol。
 
 实现使用有限、预先编译的 trampoline 矩阵，而不是 `dlsym`、`libffi`、由 Descriptor 驱动的 `unsafeBitCast` 或调用方提供的任意 pointer。生成 Bridge 只会把已经通过 Swift 编译器精确类型检查的 imported `@convention(c)` function 做一次地址擦除；它不会借此凭空构造调用签名。当前矩阵覆盖最多四个参数的有界同类标量调用，以及 Bridge 明确验证的常见 Apple geometry value shape。真正调用前会逐项检查 calling convention、字节宽度、alignment、参数个数、结果 shape、availability、deadline 与 MainActor 入口。混合 ABI、variadic、pointer、间接结果、throwing、callback 或其他陌生形状会保留精确 Swift Adapter，或明确拒绝，绝不会猜测执行。
+
+开发期第一次使用 C API 时，只有“地址绑定”这一步不同：认证编译器先选中 Receipt 中的精确候选，App 才可以按该 Descriptor 固定的 C entry point 在当前已链接进程中解析地址，再交给同一套有限 `Runtime.CInvoker`。Patch 字节不能提交任意 symbol 或 ABI；Descriptor/Key 重算、SDK/target 身份、进程链接状态和 Runtime ABI 检查必须全部通过。Release 路径仍使用发布 Bridge/能力表在构建时绑定的地址。
 
 真实 UIKit Demo 保留了一次不改变行为的 `CACurrentMediaTime()` 探针，因此普通 Xcode Build 会完整经过 C Descriptor、精确函数地址、通用 Runtime Invoker、MainActor policy、返回值解码与最终 object link。
 
@@ -82,6 +84,14 @@ Swift 层先把已经验证的 VM value 和 callback 权限投影成 ABI slot；
 
 Pack source 与 Pack object 是两层独立的内容寻址事实。source identity 包含 compiler、SDK、target、deployment、transform 环境、module、精确有序的 imported module 集合和精确有序 Key；object identity 另外包含工具链二进制、Xcode build、规范化编译参数、完整非 SDK compiler-input 快照、module map 与 source hash。缓存 object 每次 materialize 都会重新校验 Mach-O 架构和平台；损坏条目会隔离并重建。不同 module 的 Pack 分别编译，最后与稳定 application Bridge 做 relocatable link，因此一个 Pack 变化不会迫使其他 module Pack 一起重编。
 
-这里做的是“生成边界上的类型擦除”，不是动态调用 Swift 私有泛型 ABI。当前 Shell 仍必须拥有精确 Descriptor 与对应 Pack entry。后续开发期按需 Adapter 可以根据 Catalog 证明生成缺失条目，但公共 Runtime 不能只凭函数名凭空构造任意 Swift ABI。
+这里做的是“生成边界上的类型擦除”，不是动态调用 Swift 私有泛型 ABI。Release 执行仍必须拥有精确 Descriptor 与随 App 发布的 Pack entry；公共 Runtime 不能只凭函数名凭空构造任意 Swift ABI。
+
+认证 Live Reload 会把未使用候选保留为纯数据，不把它们提前展开成永久 Bridge 机器码。新 HLBC 确实引用到缺失 Swift 候选时，Hub 才使用捕获到的真实 compiler job，仅生成这些 Key 对应的 Adapter body，签名并校验一份确定性的 Mach-O image。缓存身份包含 compiler、Xcode/SDK、target、deployment、依赖图、规范化编译/链接参数、生成源码、Descriptor 与 Contract；Objective-C 和 C 候选不会进入这条编译路径。
+
+版本 1 `DevelopmentPayload` 会把 HLBC、精确提升的 import、Adapter image 描述、hash 和 image bytes 组成一个认证事务。App 会重新检查 compiler fingerprint、SDK build、target、Shell hash、Descriptor/Key、Mach-O 架构/平台/install name/UUID、代码签名、依赖规则与导出 symbol。随后先构造“baseline + 当前 session”的候选原生表，用它验证 HLBC，最后才原子激活 generation。失败事务即使已经映射了不可卸载 image，也只会把它计入进程预算，不会发布 import，更不会替换当前代码。每个 generation 以及 escaping callback 的 lease 都固定一份不可变能力快照。
+
+两次重叠保存可能在彼此尚未激活时分别编译同一个缺失 Adapter。对 session 内完全等价的 import，发布是幂等的：第二次激活会复用已经发布的 invoker，不再映射或重复计费多余 image。这不是按名字兜底；identity、Descriptor、ABI、contract 或 binding 只要有任何差异就会 fail closed，而混合事务仍会在发布前加载真正新增 import 所需的全部 image。
+
+当前只认证 Simulator 与 macOS 的按需 Swift Adapter；物理 iOS 会明确拒绝并要求重新构建 App，直到开发签名与加载矩阵有独立证据。开发传输也不再接受裸 HLBC：即使没有 Adapter，仍使用版本 1 envelope。重连 identity 会报告已发布的开发 Key 与已映射 Adapter 资源，Hub 可以复用同一 session Registry，而不重复编译已经激活的 Adapter。
 
 产品、协议、Catalog、Archive 和 Bytecode 版本全部保持为 1。

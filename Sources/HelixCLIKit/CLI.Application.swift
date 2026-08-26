@@ -267,7 +267,7 @@ public struct Application: Sendable {
             valueOptions: [
                 "activity-log", "working-directory", "workspace", "scheme",
                 "configuration", "bundle-id", "module", "executable",
-                "reload-index", "archive", "output", "manifest-output",
+                "reload-index", "archive", "receipt", "output", "manifest-output",
                 "compiler", "source-map", "link-argument", "product",
                 "code-sign-identity", "team-identifier", "entitlements",
                 "native-output-directory", "backend",
@@ -358,6 +358,9 @@ public struct Application: Sendable {
             manifestPath: manifestPath,
             reloadIndexPath: request.reloadIndexURL.path,
             interfaceArchivePath: request.interfaceArchiveURL.path,
+            shellBuildReceiptPath: files.resolve(
+                try options.require("receipt")
+            ).path,
             compilerPath: prepared.compilerURL.path,
             nativeOutputDirectory: nativeOutputDirectory,
             backendPreference: backend,

@@ -8,6 +8,14 @@ if [[ $# -ne 1 ]]; then
 fi
 
 simulator_udid="$1"
+backend="${HELIX_E2E_BACKEND:-automatic}"
+case "$backend" in
+    automatic|hlbc|native) ;;
+    *)
+        echo "HELIX_E2E_BACKEND must be automatic, hlbc, or native." >&2
+        exit 2
+        ;;
+esac
 script_directory="$(cd "$(dirname "$0")" && pwd -P)"
 repository_root="$(cd "$script_directory/../../.." && pwd -P)"
 generated_directory="$script_directory/.helix-e2e"
@@ -111,6 +119,10 @@ if [[ "$(grep -Fc 'HELIX_E2E_SCENARIO_BEGIN' "$source_file")" -ne 1 ]] \
     echo "The fixture source has an invalid scenario replacement region." >&2
     exit 1
 fi
+if [[ "$(grep -Fc 'HELIX_E2E_DORMANT_SWIFT_ADAPTER' "$source_file")" -ne 1 ]]; then
+    echo "The fixture source has an invalid dormant Adapter marker." >&2
+    exit 1
+fi
 
 wait_for_log() {
     local pattern="$1"
@@ -129,6 +141,33 @@ wait_for_log() {
         fi
         sleep 0.1
     done
+}
+
+wait_for_log_after() {
+    local first_line="$1"
+    local pattern="$2"
+    local timeout_seconds="$3"
+    local started=$SECONDS
+    while ! tail -n "+$first_line" "$hub_log" 2>/dev/null \
+        | grep -Fq "$pattern"; do
+        if [[ -n "$hub_pid" ]] && ! kill -0 "$hub_pid" 2>/dev/null; then
+            echo "Helix Hub exited before a new event containing: $pattern" >&2
+            tail -n 80 "$hub_log" >&2 || true
+            exit 1
+        fi
+        if (( SECONDS - started >= timeout_seconds )); then
+            echo "Timed out waiting for a new event containing: $pattern" >&2
+            tail -n 80 "$hub_log" >&2 || true
+            exit 1
+        fi
+        sleep 0.1
+    done
+}
+
+next_log_line() {
+    local line_count
+    line_count="$(wc -l < "$hub_log" | tr -d ' ')"
+    echo $((line_count + 1))
 }
 
 wait_for_evidence() {
@@ -181,13 +220,15 @@ install_scenario() {
 }
 
 activate_scenario() {
-    local revision="$1"
+    local command_revision="$1"
     local scenario_name="$2"
     local expected_evidence="$3"
+    local first_line
+    first_line="$(next_log_line)"
     install_scenario "$scenario_directory/$scenario_name.swiftbody"
-    wait_for_log "r$revision/g$revision: codeActive" 90
+    wait_for_log_after "$first_line" "codeActive" 90
     kill -0 "$app_pid"
-    touch "$data_container/Documents/HelixE2ERun-$revision"
+    touch "$data_container/Documents/HelixE2ERun-$command_revision"
     wait_for_evidence "$expected_evidence" 15
     kill -0 "$app_pid"
 }
@@ -247,7 +288,22 @@ if grep -Fq 'HelixBuildTrigger_' "$shell_receipt"; then
     echo "Helix leaked its compiler scheduling source into the application Shell." >&2
     exit 1
 fi
-
+if [[ "$backend" == "hlbc" ]]; then
+    if ! /usr/bin/jq -e '
+        .nativeImportCandidates[]
+        | select(
+            .descriptor.target.module == "Foundation"
+            and .descriptor.target.owner == "Date.addingTimeInterval(_:)"
+            and .descriptor.target.member == "call"
+            and .descriptor.target.backend == "swiftAdapter"
+            and .isEmittedToDevice == false
+            and .id == null
+        )
+    ' "$shell_receipt" >/dev/null; then
+        echo "Helix did not preserve Date.addingTimeInterval as a dormant Swift Adapter candidate." >&2
+        exit 1
+    fi
+fi
 xcodebuild \
     -project "$project" \
     -scheme "$scheme" \
@@ -282,7 +338,8 @@ env \
     "$helix" xcode phase \
         --plan "$script_directory/HostPlan.json" \
         --profile live \
-        --phase live-register
+        --phase live-register \
+        --backend "$backend"
 
 xcrun simctl terminate "$simulator_udid" "$bundle_id" >/dev/null 2>&1 || true
 xcrun simctl install "$simulator_udid" "$app"
@@ -296,12 +353,28 @@ xcrun lldb --batch \
 debugger_pid=$!
 wait_for_log "Connected process $app_pid on iOSSimulator/arm64." 20
 
+first_edit_log_line="$(next_log_line)"
 sed -i '' 's/"HELIX BASELINE"/"HELIX PATCHED"/' "$source_file"
-wait_for_log "r1/g1: codeActive, UI refreshed." 30
+sed -i '' \
+    's/_ = epoch \/\/ HELIX_E2E_DORMANT_SWIFT_ADAPTER/_ = epoch.addingTimeInterval(1) \/\/ HELIX_E2E_DORMANT_SWIFT_ADAPTER/' \
+    "$source_file"
+wait_for_log_after "$first_edit_log_line" "codeActive, UI refreshed." 30
 kill -0 "$app_pid"
+if [[ "$backend" == "hlbc" ]]; then
+    adapter_count="$(find "$data_container/Library/Caches/HelixDev" \
+        -type f -name 'HLXDevAdapter-*.dylib' 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ "$adapter_count" -lt 1 ]]; then
+        echo "HLBC activation did not map the first-use Swift Adapter image." >&2
+        exit 1
+    fi
+fi
 
+rollback_log_line="$(next_log_line)"
 sed -i '' 's/"HELIX PATCHED"/"HELIX BASELINE"/' "$source_file"
-wait_for_log "r2/g2: codeActive, UI refreshed." 30
+sed -i '' \
+    's/_ = epoch.addingTimeInterval(1) \/\/ HELIX_E2E_DORMANT_SWIFT_ADAPTER/_ = epoch \/\/ HELIX_E2E_DORMANT_SWIFT_ADAPTER/' \
+    "$source_file"
+wait_for_log_after "$rollback_log_line" "codeActive, UI refreshed." 30
 kill -0 "$app_pid"
 
 activate_scenario 3 ViewHierarchy "transient=true"
@@ -320,14 +393,15 @@ activate_scenario 7 Dismissal "state=dismissed"
 xcrun simctl io "$simulator_udid" screenshot \
     "$generated_directory/Dismissal.png" >/dev/null
 
+baseline_log_line="$(next_log_line)"
 restore_baseline_source
-wait_for_log "r8/g8: codeActive" 90
+wait_for_log_after "$baseline_log_line" "codeActive" 90
 kill -0 "$app_pid"
 touch "$data_container/Documents/HelixE2ERun-8"
 wait_for_evidence "state=baseline-action-6" 15
 kill -0 "$app_pid"
 
-echo "LiveReloadE2E passed eight generations and five UI scenarios in process $app_pid."
+echo "LiveReloadE2E passed eight scripted $backend updates and five UI scenarios in process $app_pid."
 echo "Hub log: $hub_log"
 echo "Debugger log: $debugger_log"
 echo "Scenario screenshots: $generated_directory"

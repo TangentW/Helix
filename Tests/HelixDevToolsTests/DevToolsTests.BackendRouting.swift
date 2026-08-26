@@ -233,6 +233,7 @@ private struct RoutingFixture {
             architecture: "arm64",
             operatingSystemBuild: "22A",
             xcodeBuild: "17A",
+            sdkBuild: "22A1",
             swiftCompilerFingerprint: "swift-routing",
             liveReloadIndexHash: try resolvedIndex.contentHash(),
             supportedBackends: [.hlbc, .nativeDynamicReplacement],

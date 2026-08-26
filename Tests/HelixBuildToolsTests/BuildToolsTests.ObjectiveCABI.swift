@@ -444,6 +444,28 @@ struct ObjectiveCABI {
         #expect(optionalView?.parameters.first?.type.kind == .object)
         #expect(optionalView?.parameters.first?.type.isNullable == true)
 
+        let genericObject = FrontendReceipt.ObjectiveCABI.physicalSignature(
+            evidence: makeEvidence(
+                parameters: [
+                    .init(
+                        swiftABIType:
+                            "@guaranteed __C.NSLayoutAnchor<τ_0_0>",
+                        source: .argument(0)
+                    ),
+                ],
+                result: "@autoreleased __C.NSArray<__C.NSString>"
+            ),
+            logicalParameterTypes: [.native(view)],
+            logicalResultType: .native(view),
+            nativeTypeKinds: [view: .reference],
+            targetTriple: "arm64-apple-ios15.0-simulator"
+        )
+        #expect(
+            genericObject?.parameters.first?.type.canonicalName
+                == "NSLayoutAnchor"
+        )
+        #expect(genericObject?.result.canonicalName == "NSArray")
+
         let noescapeBlock = FrontendReceipt.ObjectiveCABI.physicalSignature(
             evidence: makeEvidence(
                 parameters: [

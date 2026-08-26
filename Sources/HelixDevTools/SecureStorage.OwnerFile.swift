@@ -99,6 +99,50 @@ struct OwnerFile {
         removeTemporary = false
     }
 
+    /// Moves an owner-only regular file aside without following a symbolic
+    /// link. Callers use this only for reconstructible local state whose
+    /// contents failed semantic decoding; insecure filesystem objects remain a
+    /// hard failure.
+    static func quarantine(_ url: URL) throws -> URL {
+        let directory = url.deletingLastPathComponent()
+        try prepareDirectory(directory)
+        let descriptor = url.path.withCString {
+            Darwin.open($0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        }
+        guard descriptor >= 0 else {
+            if errno == ENOENT { throw Error.unavailable }
+            throw Error.insecure
+        }
+        defer { _ = Darwin.close(descriptor) }
+
+        var opened = stat()
+        var current = stat()
+        guard fstat(descriptor, &opened) == 0,
+              url.path.withCString({ lstat($0, &current) }) == 0,
+              opened.st_uid == geteuid(),
+              opened.st_mode & S_IFMT == S_IFREG,
+              opened.st_mode & 0o077 == 0,
+              current.st_mode & S_IFMT == S_IFREG,
+              current.st_dev == opened.st_dev,
+              current.st_ino == opened.st_ino
+        else {
+            throw Error.insecure
+        }
+
+        let destination = directory.appendingPathComponent(
+            ".\(url.lastPathComponent).invalid-\(UUID().uuidString)"
+        )
+        guard url.path.withCString({ source in
+            destination.path.withCString { target in
+                Darwin.rename(source, target)
+            }
+        }) == 0 else {
+            if errno == ENOENT { throw Error.unavailable }
+            throw Error.io("cannot quarantine invalid owner-only file")
+        }
+        return destination
+    }
+
     static func prepareDirectory(_ directory: URL) throws {
         do {
             try FileManager.default.createDirectory(

@@ -87,6 +87,8 @@ struct NativeImportDiscoveryTests {
 
     @Test("Generated Swift type syntax accepts nested collections and rejects code")
     func validatesGeneratedSwiftTypeSyntax() {
+        #expect(FrontendReceipt.SwiftTypeSpelling.isGeneratedType("()"))
+        #expect(FrontendReceipt.SwiftTypeSpelling.isGeneratedType("Swift.Void"))
         #expect(FrontendReceipt.SwiftTypeSpelling.isGeneratedType("[Swift.String: [UIKit.UIView?]]"))
         #expect(FrontendReceipt.SwiftTypeSpelling.isGeneratedType(
             "Swift.Dictionary<Swift.String, Swift.Array<Foundation.Date>>"
@@ -110,6 +112,7 @@ struct NativeImportDiscoveryTests {
         ))
         #expect(FrontendReceipt.SwiftTypeSpelling.isGeneratedType("(Foundation.Date, UIKit.UIView?)"))
         #expect(!FrontendReceipt.SwiftTypeSpelling.isGeneratedType("UIKit.UIView; fatalError()"))
+        #expect(!FrontendReceipt.SwiftTypeSpelling.isGeneratedType("UIKit..UIView"))
         #expect(!FrontendReceipt.SwiftTypeSpelling.isGeneratedType("[Swift.String:]"))
         #expect(!FrontendReceipt.SwiftTypeSpelling.isGeneratedType("Swift.Array<UIKit.UIView"))
         #expect(!FrontendReceipt.SwiftTypeSpelling.isGeneratedType("() async -> Swift.Void"))
@@ -774,7 +777,7 @@ struct NativeImportDiscoveryTests {
             compilerInputHash: .sha256("overload-test-compiler-inputs")
         )
         let overloads = first.operations.filter {
-            $0.ownerType == "Overloaded"
+            $0.ownerType == "\(moduleName).Overloaded"
                 && $0.baseName == "transform"
                 && $0.argumentLabels == ["_"]
         }
@@ -1081,6 +1084,7 @@ struct NativeImportDiscoveryTests {
                 in: animationCompletion
             )?.lifetime == .escaping
         )
+        var constraintSymbols = Set<String>()
         for axis in ["NSLayoutXAxisAnchor", "NSLayoutYAxisAnchor"] {
             let owner = "NSLayoutAnchor<\(axis)>"
             let constraint = try #require(expansion.operations.first {
@@ -1090,12 +1094,20 @@ struct NativeImportDiscoveryTests {
                     && $0.argumentLabels == ["equalTo"]
             })
             #expect(constraint.parameterSwiftTypes == [owner, owner])
+            #expect(!constraint.silReferences.isEmpty)
+            for symbol in constraint.silReferences {
+                #expect(constraintSymbols.insert(symbol).inserted)
+            }
             let frozenType = try #require(expansion.importedTypes.first {
                 $0.swiftType == owner
             })
             #expect(!frozenType.aliases.contains("NSLayoutAnchor"))
             #expect(!frozenType.aliases.contains("UIKit.NSLayoutAnchor"))
         }
+        let allConstraintSymbols = expansion.operations
+            .filter { $0.baseName == "constraint" }
+            .flatMap(\.silReferences)
+        #expect(Set(allConstraintSymbols).count == allConstraintSymbols.count)
         #expect(!expansion.operations.contains {
             $0.ownerType == "UIUserInterfaceStyle"
                 && $0.dispatch == .initializer
@@ -2548,6 +2560,18 @@ struct NativeImportDiscoveryTests {
         #expect(overriddenBinding.importedModules == ["OverrideSupport"])
         #expect(overridden.diagnostics.contains { $0.code == "HLXNID008" })
 
+        var injectedFactory = output.receipt
+        let factoryIndex = try #require(
+            injectedFactory.nativeImportBindings.firstIndex {
+                $0.strategy == .factory
+            }
+        )
+        injectedFactory.nativeImportBindings[factoryIndex].factoryReference =
+            "Fixture.make); fatalError() //"
+        #expect(throws: ShellBuildReceipt.Error.self) {
+            try injectedFactory.validate()
+        }
+
         var tampered = output.receipt
         tampered.nativeImportBindings[0].strategy = .factory
         #expect(throws: ShellBuildReceipt.Error.invalid(
@@ -3416,10 +3440,23 @@ struct NativeImportDiscoveryTests {
         let objectiveCConstraintImports = constraintImports.filter {
             $0.descriptor.target.backend == .objectiveCMessage
         }
-        #expect(objectiveCConstraintImports.count == 2)
-        #expect(Set(objectiveCConstraintImports.map {
+        let emittedObjectiveCConstraints = objectiveCConstraintImports.filter(
+            \.isEmittedToDevice
+        )
+        #expect(emittedObjectiveCConstraints.count == 2)
+        #expect(Set(emittedObjectiveCConstraints.map {
             $0.descriptor.target.entryPoint
         }) == ["constraintEqualToAnchor:"])
+        #expect(Set(objectiveCConstraintImports.map {
+            $0.descriptor.target.entryPoint
+        }).isSuperset(of: [
+            "constraintEqualToAnchor:",
+            "constraintEqualToAnchor:constant:",
+            "constraintGreaterThanOrEqualToAnchor:",
+            "constraintGreaterThanOrEqualToAnchor:constant:",
+            "constraintLessThanOrEqualToAnchor:",
+            "constraintLessThanOrEqualToAnchor:constant:",
+        ]))
         #expect(Set(objectiveCConstraintImports.map {
             $0.descriptor.target.module
         }) == ["UIKit"])
@@ -3736,11 +3773,15 @@ struct NativeImportDiscoveryTests {
                     + "                }"
             )
         try Data(changed.utf8).write(to: sourceURL)
+        let developmentImports = try promotedDevelopmentImports(
+            in: shell.archive
+        )
         let patch = try ReleaseCompiler.Driver().build(
             .init(
                 archive: shell.archive,
                 sourceFiles: [sourceURL],
-                compilerURL: compilerURL
+                compilerURL: compilerURL,
+                developmentNativeImports: developmentImports
             )
         )
         #expect(patch.changedFunctions.map(\.canonicalDeclaration).contains {
@@ -3763,17 +3804,118 @@ struct NativeImportDiscoveryTests {
             patch.disassembly.components(separatedBy: "native_apply").count - 1 >= 6
         )
         #expect(patch.disassembly.contains("convert_closure"))
+        let developmentShell = try shellIncludingDevelopmentImports(
+            baseline: Verification.ShellInterface(archive: shell.archive),
+            records: developmentImports
+        )
         _ = try Verification.Engine().verify(
             bytes: patch.bytecode,
-            shell: Verification.ShellInterface(archive: shell.archive),
+            shell: developmentShell,
             policy: .init(
                 acceptedCapabilities: Set(shell.archive.capabilities),
                 allowedNativeCalls: Set(
                     shell.archive.nativeImports.filter(\.isEmittedToDevice).map(\.key)
+                        + developmentImports.map(\.key)
                 ),
                 allowMainActorEntries: true
             )
         )
+    }
+
+    @Test("Managed Debug keeps unused generic SDK overloads dormant")
+    func preservesDormantGenericSDKOverloads() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-managed-generic-overload-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = directory.appendingPathComponent("Constraints.swift")
+        try Data(
+            """
+            import UIKit
+
+            @MainActor
+            public func baselineConstraints(
+                x: NSLayoutXAxisAnchor,
+                otherX: NSLayoutXAxisAnchor,
+                y: NSLayoutYAxisAnchor,
+                otherY: NSLayoutYAxisAnchor
+            ) -> [NSLayoutConstraint] {
+                [
+                    x.constraint(equalTo: otherX, constant: 1),
+                    y.constraint(equalTo: otherY, constant: 1),
+                ]
+            }
+            """.utf8
+        ).write(to: sourceURL)
+
+        let compilerURL = URL(fileURLWithPath: "/usr/bin/swiftc")
+        let frontend = SwiftFrontend.Driver(compilerURL: compilerURL)
+        let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        let moduleName = "ManagedGenericOverloadFixture"
+        let target = "arm64-apple-ios15.0-simulator"
+        let configuration = try PatchConfiguration.Document.parse(yaml: """
+        schema: 1
+        modules:
+          \(moduleName):
+            include:
+              - Constraints.swift
+            entrypoints: all
+        """)
+        let invocation = InterfaceArchive.FrontendInvocation(
+            moduleName: moduleName,
+            targetTriple: target,
+            sdkName: sdk.name,
+            sdkBuild: sdk.buildVersion,
+            optimization: "-Onone",
+            semanticArguments: ["-parse-as-library"]
+        )
+        let output = try FrontendReceipt.Adapter().generate(
+            .init(
+                metadata: .init(
+                    bundleID: "dev.helix.managed-generic-overload",
+                    buildNumber: "1",
+                    shellNamespaceID: .derive(
+                        bundleID: "dev.helix.managed-generic-overload",
+                        buildNumber: "1",
+                        seed: "fixture"
+                    ),
+                    machOUUIDs: [],
+                    targetTriple: target,
+                    minimumOS: .init(15),
+                    xcodeBuild: "integration-test",
+                    sdkBuild: sdk.buildVersion,
+                    frontendInvocation: invocation,
+                    transformPipelineHash: ShellBuild.transformPipelineHash,
+                    sourceBaselineHash: .sha256("computed by indexer")
+                ),
+                configuration: configuration,
+                sources: [
+                    .init(logicalPath: "Constraints.swift", url: sourceURL),
+                ],
+                compilerURL: compilerURL,
+                callingSurfacePolicy: .managedDebugModule
+            )
+        )
+        let imports = output.receipt.nativeImportCandidates
+        let dormant = imports.filter {
+            $0.descriptor.target.member == "constraint(equalTo:)"
+        }
+        #expect(dormant.count == 2)
+        #expect(dormant.allSatisfy {
+            !$0.isEmittedToDevice && $0.id == nil
+        })
+        let baseline = imports.filter {
+            $0.descriptor.target.member == "constraint(equalTo:constant:)"
+        }
+        #expect(baseline.count == 2)
+        #expect(baseline.allSatisfy {
+            $0.isEmittedToDevice && $0.id != nil
+        })
     }
 
     @Test("Managed Debug captures measured SDK members generically")
@@ -3986,7 +4128,13 @@ struct NativeImportDiscoveryTests {
             "Foundation.ProcessInfo.processInfo.get",
         ]
         for name in firstUseNames {
-            #expect(managedNames.contains(name))
+            let candidate = try #require(
+                managed.receipt.nativeImportCandidates.first {
+                    $0.canonicalCallee == name
+                }
+            )
+            #expect(!candidate.isEmittedToDevice)
+            #expect(candidate.id == nil)
         }
         let callableNames = [
             "UIKit.UIView.isHidden.get",
@@ -3999,7 +4147,13 @@ struct NativeImportDiscoveryTests {
             "Foundation.FileManager.removeItem(atPath:)",
         ]
         for name in callableNames {
-            #expect(managedNames.contains(name))
+            let candidate = try #require(
+                managed.receipt.nativeImportCandidates.first {
+                    $0.canonicalCallee == name
+                }
+            )
+            #expect(!candidate.isEmittedToDevice)
+            #expect(candidate.id == nil)
         }
         #expect(managedNames.contains(
             "UIKit.UIColor.systemMint.get"
@@ -4021,6 +4175,8 @@ struct NativeImportDiscoveryTests {
             $0.canonicalCallee
                 == "UIKit.UIColor.systemBlue.get"
         })
+        #expect(systemBlue.isEmittedToDevice)
+        #expect(systemBlue.id != nil)
         #expect(!systemBlue.effects.requiresMainActor)
         let application = try #require(managed.receipt.nativeImportCandidates.first {
             $0.canonicalCallee == firstUseNames[2]
@@ -4054,9 +4210,12 @@ struct NativeImportDiscoveryTests {
             $0.swiftType == "NSBundle" || $0.swiftType == "NSProcessInfo"
         })
 
+        let developmentImports = try promotedDevelopmentImports(
+            in: managed.receipt.nativeImportCandidates
+        )
         let firstUseIDs = try Dictionary(uniqueKeysWithValues: firstUseNames.map { name in
             let candidate = try #require(
-                managed.receipt.nativeImportCandidates.first {
+                developmentImports.first {
                     $0.canonicalCallee == name
                 }
             )
@@ -4064,7 +4223,7 @@ struct NativeImportDiscoveryTests {
         })
         let callableIDs = try Dictionary(uniqueKeysWithValues: callableNames.map { name in
             let candidate = try #require(
-                managed.receipt.nativeImportCandidates.first {
+                developmentImports.first {
                     $0.canonicalCallee == name
                 }
             )
@@ -4076,8 +4235,8 @@ struct NativeImportDiscoveryTests {
             sourceRoot: directory
         )
         let generated = shell.bridge.sourceFiles.values.joined(separator: "\n")
-        #expect(generated.contains("runtimeClassName: \"NSBundle\""))
-        #expect(generated.contains("runtimeClassName: \"NSProcessInfo\""))
+        #expect(!generated.contains("runtimeClassName: \"NSBundle\""))
+        #expect(!generated.contains("runtimeClassName: \"NSProcessInfo\""))
         #expect(!generated.contains("UIColor.black"))
         #expect(!generated.contains("UIColor.systemMint"))
         #expect(!generated.contains("UIScreen.main"))
@@ -4174,7 +4333,8 @@ struct NativeImportDiscoveryTests {
             .init(
                 archive: shell.archive,
                 sourceFiles: [sourceURL],
-                compilerURL: compilerURL
+                compilerURL: compilerURL,
+                developmentNativeImports: developmentImports
             )
         )
         for name in firstUseNames {
@@ -4201,16 +4361,79 @@ struct NativeImportDiscoveryTests {
                 "patch did not call \(name) (#\(id.rawValue))"
             )
         }
+        let baselineShell = try Verification.ShellInterface(
+            archive: shell.archive
+        )
+        let developmentShell = try shellIncludingDevelopmentImports(
+            baseline: baselineShell,
+            records: developmentImports
+        )
         _ = try Verification.Engine().verify(
             bytes: patch.bytecode,
-            shell: Verification.ShellInterface(archive: shell.archive),
+            shell: developmentShell,
             policy: .init(
                 acceptedCapabilities: Set(shell.archive.capabilities),
                 allowedNativeCalls: Set(
                     shell.archive.nativeImports.filter(\.isEmittedToDevice).map(\.key)
+                        + developmentImports.map(\.key)
                 ),
                 allowMainActorEntries: true
             )
+        )
+    }
+
+    private func promotedDevelopmentImports(
+        in archive: InterfaceArchive.Archive
+    ) throws -> [InterfaceArchive.NativeImportRecord] {
+        try promotedDevelopmentImports(in: archive.nativeImports)
+    }
+
+    private func promotedDevelopmentImports(
+        in records: [InterfaceArchive.NativeImportRecord]
+    ) throws -> [InterfaceArchive.NativeImportRecord] {
+        let baselineCount = records.filter(\.isEmittedToDevice).count
+        var promoted = records.filter { !$0.isEmittedToDevice }
+            .sorted { $0.key < $1.key }
+        for index in promoted.indices {
+            guard let rawID = UInt32(exactly: baselineCount + index) else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "test development NativeImport catalog is oversized"
+                )
+            }
+            promoted[index].id = .init(rawValue: rawID)
+            promoted[index].isEmittedToDevice = true
+        }
+        return promoted
+    }
+
+    private func shellIncludingDevelopmentImports(
+        baseline: Verification.ShellInterface,
+        records: [InterfaceArchive.NativeImportRecord]
+    ) throws -> Verification.ShellInterface {
+        let imports = try records.map { item in
+            guard let id = item.id else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "test development NativeImport has no compact ID"
+                )
+            }
+            return Verification.ResolvedNativeImport(
+                id: id,
+                key: item.key,
+                descriptor: item.descriptor,
+                parameterTypes: item.parameterTypes,
+                resultType: item.resultType,
+                contract: item.contract,
+                capability: item.capability
+            )
+        }
+        return try Verification.ShellInterface(
+            interfaceHash: baseline.interfaceHash,
+            compatibility: baseline.compatibility,
+            capabilities: baseline.capabilities,
+            entries: Array(baseline.entries.values),
+            imports: Array(baseline.imports.values) + imports,
+            types: Array(baseline.types.values),
+            frozenValueTypes: Array(baseline.frozenValueTypes.values)
         )
     }
 
@@ -4857,7 +5080,7 @@ struct NativeImportDiscoveryTests {
         #expect(bindings.count == objectiveCRecords.count)
         #expect(bindings.allSatisfy {
             $0.strategy == .objectiveCInvoker
-                && $0.factoryExpression == nil
+                && $0.factoryReference == nil
                 && $0.generated == nil
                 && $0.importedModules.isEmpty
         })

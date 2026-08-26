@@ -25,6 +25,20 @@ Tests/Fixtures/LiveReloadE2E/run-simulator-e2e.sh \
   AF763A53-66CF-405B-AE92-F5A9CDECE0CE
 ```
 
+The default run exercises automatic backend selection. The same scenario can
+force the verified HLBC path without changing product configuration:
+
+```bash
+HELIX_E2E_BACKEND=hlbc \
+Tests/Fixtures/LiveReloadE2E/run-simulator-e2e.sh \
+  AF763A53-66CF-405B-AE92-F5A9CDECE0CE
+```
+
+That mode additionally proves that `Date.addingTimeInterval(_:)` is data-only
+in the baseline Receipt, first appears in changed HLBC, compiles as one signed
+on-demand Swift Adapter, maps in the App, and restores without reinstalling the
+Shell. `automatic` and `native` remain available for backend-routing evidence.
+
 The script validates the checked-in hidden Xcode Integration Kit without
 rewriting Hub's installation ownership state, starts the same persistent-service
 implementation used by Helix Hub, builds the Feature and App, performs an

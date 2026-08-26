@@ -1,5 +1,6 @@
 import Foundation
 import HelixBytecode
+import HelixBuildTools
 import HelixCompiler
 import HelixCore
 import HelixDevProtocol
@@ -42,7 +43,11 @@ struct DevSessionConfiguration {
         var manifest = fixture.manifest
         manifest.executableUUID = UUID()
         try Core.CanonicalJSON.encode(manifest).write(to: fixture.manifestURL)
-        #expect(throws: DevSession.ConfigurationError.identityMismatch) {
+        #expect(
+            throws: DevSession.ConfigurationError.identityMismatch(
+                "executable UUID"
+            )
+        ) {
             _ = try DevSession.PreparedConfiguration.load(
                 configurationURL: fixture.configurationURL
             )
@@ -58,6 +63,7 @@ private struct DaemonFixture {
     let manifestURL: URL
     let indexURL: URL
     let archiveURL: URL
+    let receiptURL: URL
     let configurationURL: URL
     let manifest: DevBuildManifest.Document
 
@@ -71,6 +77,7 @@ private struct DaemonFixture {
         manifestURL = directory.appendingPathComponent("DevManifest.json")
         indexURL = directory.appendingPathComponent("ReloadIndex.json")
         archiveURL = directory.appendingPathComponent("Shell.hlxi")
+        receiptURL = directory.appendingPathComponent("ShellBuildReceipt.json")
         configurationURL = directory.appendingPathComponent("HelixDev.json")
 
         let sourceBytes = Data("public func value() -> Int { 1 }\n".utf8)
@@ -116,7 +123,7 @@ private struct DaemonFixture {
                     sdkBuild: sdkBuild,
                     optimization: "-Onone"
                 ),
-                transformPipelineHash: .sha256("transform"),
+                transformPipelineHash: ShellBuild.transformPipelineHash,
                 sourceBaselineHash: .sha256(sourceBytes)
             ),
             compatibility: .init(
@@ -151,6 +158,45 @@ private struct DaemonFixture {
         let index = ReloadIndex.Document(
             sourceRoots: [.init(sourceFileID: sourceID, roots: [functionKey])],
             roots: [.init(functionKey: functionKey, nominalTypeID: nil, role: .modelOrService)]
+        )
+        var receiptMetadata = archive.metadata
+        receiptMetadata.machOUUIDs = []
+        let declaration = ReleaseCompiler.DeclarationCandidate(
+            moduleName: module,
+            sourceFileLogicalID: logicalPath,
+            canonicalDeclaration: "func value() -> Int",
+            mangledName: "$s13DaemonFixture5valueSiyF",
+            role: .function,
+            loweredSignature: signature,
+            parameterTypes: [],
+            resultType: .int64,
+            interface: .init(
+                declarationKind: "func",
+                baseName: "value",
+                accessLevel: "public",
+                canonicalFormalType: "() -> Swift.Int",
+                loweredSILType: "@convention(thin) () -> Swift.Int"
+            ),
+            canonicalSILBody: "return 1"
+        )
+        let receipt = ShellBuildReceipt.Document(
+            metadata: receiptMetadata,
+            compatibility: archive.compatibility,
+            configuration: .automaticProjectPolicy(moduleName: module),
+            capabilities: Set(archive.capabilities),
+            sources: [
+                .init(
+                    logicalPath: logicalPath,
+                    contentHash: .sha256(sourceBytes)
+                ),
+            ],
+            declarations: [declaration],
+            roots: [],
+            nativeImportCandidates: archive.nativeImports,
+            nativeImportBindings: [],
+            nativeTypes: archive.nativeTypes,
+            frozenValueTypes: archive.frozenValueTypes,
+            nativeTypeBindings: []
         )
         let indexHash = try index.contentHash()
         manifest = .init(
@@ -197,11 +243,13 @@ private struct DaemonFixture {
             manifestPath: manifestURL.lastPathComponent,
             reloadIndexPath: indexURL.lastPathComponent,
             interfaceArchivePath: archiveURL.lastPathComponent,
+            shellBuildReceiptPath: receiptURL.lastPathComponent,
             nativeOutputDirectory: "Native"
         )
         try Core.CanonicalJSON.encode(manifest).write(to: manifestURL)
         try Core.CanonicalJSON.encode(index).write(to: indexURL)
         try InterfaceArchive.Codec.encode(archive).write(to: archiveURL)
+        try ShellBuildReceipt.Codec.encode(receipt).write(to: receiptURL)
         try Core.CanonicalJSON.encode(configuration).write(to: configurationURL)
     }
 

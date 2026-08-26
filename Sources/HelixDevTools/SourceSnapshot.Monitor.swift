@@ -47,8 +47,13 @@ private struct WorkspaceScanner: Sendable {
                 source.absolutePath,
                 maximumSourceBytes: maximumSourceBytes
             )
-            if fingerprints[source.absolutePath] != current {
-                fingerprints[source.absolutePath] = current
+            let previous = fingerprints[source.absolutePath]
+            fingerprints[source.absolutePath] = current
+            // Atomic editor saves and indexers can replace an inode or touch
+            // metadata more than once for one source body. Only bytes affect
+            // Swift compilation, so metadata-only noise must not supersede an
+            // in-flight build of the same content.
+            if previous?.contentHash != current.contentHash {
                 changed.insert(source.absolutePath)
             }
         }

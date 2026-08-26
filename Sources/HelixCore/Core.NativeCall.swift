@@ -1053,6 +1053,9 @@ public struct Descriptor: Codable, Hashable, Sendable {
                       $0.kind == .void || $0.encoding != nil
                   }),
                   physicalTypes.allSatisfy(Self.objectiveCEncodingMatchesKind),
+                  physicalTypes.allSatisfy(
+                    Self.objectiveCPhysicalNameIsRuntimeResolvable
+                  ),
                   Self.isObjectiveCSelector(target.entryPoint),
                   target.entryPoint.filter({ $0 == ":" }).count
                     == physicalSignature.parameters.count,
@@ -1157,6 +1160,17 @@ private extension Core.NativeCall.Descriptor {
                 || $0 >= 0x61 && $0 <= 0x7a
                 || $0 >= 0x30 && $0 <= 0x39
         }
+    }
+
+    static func objectiveCPhysicalNameIsRuntimeResolvable(
+        _ type: Core.NativeCall.ABIType
+    ) -> Bool {
+        guard type.kind == .object else { return true }
+        guard let name = type.canonicalName else { return false }
+        // Clang lightweight-generic arguments are compile-time information;
+        // retaining them here would turn an erased Objective-C class lookup
+        // into a runtime spelling guess.
+        return !name.contains("<") && !name.contains(">")
     }
 
     static func cABITypeIsSupported(

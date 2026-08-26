@@ -68,7 +68,7 @@ public struct NativeImportBinding: Hashable, Sendable {
     public var id: Core.NativeImportID
     public var key: Core.NativeCall.Key
     public var strategy: Strategy
-    public var factoryExpression: String?
+    public var factoryReference: String?
     public var importedModules: [String]
     public var generated: BridgeGeneration.GeneratedNativeImport?
     public var cFunction: BridgeGeneration.CFunctionBinding?
@@ -77,7 +77,7 @@ public struct NativeImportBinding: Hashable, Sendable {
         id: Core.NativeImportID,
         key: Core.NativeCall.Key,
         strategy: Strategy,
-        factoryExpression: String? = nil,
+        factoryReference: String? = nil,
         importedModules: [String] = [],
         generated: BridgeGeneration.GeneratedNativeImport? = nil,
         cFunction: BridgeGeneration.CFunctionBinding? = nil
@@ -85,7 +85,7 @@ public struct NativeImportBinding: Hashable, Sendable {
         self.id = id
         self.key = key
         self.strategy = strategy
-        self.factoryExpression = factoryExpression
+        self.factoryReference = factoryReference
         self.importedModules = importedModules.sorted()
         self.generated = generated
         self.cFunction = cFunction
@@ -300,6 +300,85 @@ public struct AdapterPack: Hashable, Sendable {
 public struct Generator: Sendable {
     public init() {}
 
+    /// Renders only the compiler-generated Swift Adapter bodies required by one
+    /// trusted development transaction. The output uses the same exported Body
+    /// ABI as a release Adapter Pack; compact import IDs remain outside the
+    /// executable image and are bound by the App-side session Registry.
+    public func generateDevelopmentAdapterFiles(
+        applicationModuleName: String,
+        bindings: [BridgeGeneration.NativeImportBinding],
+        records: [InterfaceArchive.NativeImportRecord]
+    ) throws -> [String: String] {
+        guard BridgeGeneration.isValidSwiftIdentifier(applicationModuleName),
+              !bindings.isEmpty,
+              bindings.count == records.count,
+              Set(bindings.map(\.id)).count == bindings.count,
+              Set(bindings.map(\.key)).count == bindings.count,
+              Set(records.compactMap(\.id)).count == records.count
+        else { throw BridgeGeneration.Error.incompleteNativeImportBindings }
+        let recordsByID = Dictionary(
+            uniqueKeysWithValues: records.compactMap { record in
+                record.id.map { ($0, record) }
+            }
+        )
+        guard bindings.allSatisfy({ binding in
+            guard binding.strategy == .generatedSwiftAdapter,
+                  binding.factoryReference == nil,
+                  binding.cFunction == nil,
+                  let generated = binding.generated,
+                  let record = recordsByID[binding.id]
+            else { return false }
+            return record.key == binding.key
+                && record.descriptor.target.backend == .swiftAdapter
+                && (generated.nativeModuleName == nil
+                    || generated.nativeModuleName == record.descriptor.target.module)
+        }) else {
+            throw BridgeGeneration.Error.incompleteNativeImportBindings
+        }
+
+        let generated = bindings.compactMap { binding in
+            binding.generated.map { (binding, $0) }
+        }
+        guard generated.count == bindings.count else {
+            throw BridgeGeneration.Error.incompleteNativeImportBindings
+        }
+        let applicationGroups = Dictionary(
+            grouping: generated.filter { $0.1.nativeModuleName == nil },
+            by: { $0.1.sourceFileLogicalID }
+        )
+        var files: [String: String] = [:]
+        for (source, values) in applicationGroups.sorted(by: { $0.key < $1.key }) {
+            let path = "Development/Application_"
+                + Core.Digest.sha256(source).hex + ".swift"
+            files[path] = try renderGeneratedNativeImportFile(
+                sourceFileLogicalID: source,
+                moduleName: applicationModuleName,
+                bindings: values.map(\.0),
+                records: recordsByID,
+                exportsBodies: true
+            )
+        }
+        let moduleValues = generated.compactMap { binding, value in
+            value.nativeModuleName.map { ($0, binding) }
+        }
+        for (module, values) in Dictionary(
+            grouping: moduleValues,
+            by: { $0.0 }
+        ).sorted(by: { $0.key < $1.key }) {
+            let path = "Development/Pack_"
+                + Core.Digest.sha256("v1:\(module)").hex + ".swift"
+            files[path] = try renderAdapterPackFile(
+                nativeModuleName: module,
+                bindings: values.map(\.1),
+                records: recordsByID
+            )
+        }
+        guard !files.isEmpty else {
+            throw BridgeGeneration.Error.incompleteNativeImportBindings
+        }
+        return files
+    }
+
     /// Returns the stable source path for the replacement entries associated
     /// with one original Swift file. The path depends only on the logical
     /// source identity, so Xcode can reference it before a Shell is indexed.
@@ -513,6 +592,11 @@ public struct Generator: Sendable {
         )? in
             binding.generated.map { (binding, $0) }
         }
+        let nativeImportRecordsByID = Dictionary(
+            uniqueKeysWithValues: archive.nativeImports.compactMap { record in
+                record.id.map { ($0, record) }
+            }
+        )
         let applicationGeneratedImports = generatedImports.filter {
             $0.1.nativeModuleName == nil
         }
@@ -527,7 +611,7 @@ public struct Generator: Sendable {
                 sourceFileLogicalID: source,
                 moduleName: moduleName,
                 bindings: values.map(\.0),
-                archive: archive
+                records: nativeImportRecordsByID
             )
         }
         let adapterPackValues: [(
@@ -554,7 +638,7 @@ public struct Generator: Sendable {
             files[path] = try renderAdapterPackFile(
                 nativeModuleName: nativeModuleName,
                 bindings: values.map(\.binding),
-                archive: archive
+                records: nativeImportRecordsByID
             )
         }
         for source in archive.sources.map(\.logicalPath)
@@ -2292,11 +2376,9 @@ public struct Generator: Sendable {
         sourceFileLogicalID: String,
         moduleName: String,
         bindings: [BridgeGeneration.NativeImportBinding],
-        archive: InterfaceArchive.Archive
+        records: [Core.NativeImportID: InterfaceArchive.NativeImportRecord],
+        exportsBodies: Bool = false
     ) throws -> String {
-        let records = Dictionary(uniqueKeysWithValues: archive.nativeImports.compactMap { record in
-            record.id.map { ($0, record) }
-        })
         let groupName = BridgeGeneration.GeneratedNativeImport.groupName(
             sourceFileLogicalID: sourceFileLogicalID
         )
@@ -2339,6 +2421,12 @@ public struct Generator: Sendable {
             )
         }
         lines.append("}")
+        if exportsBodies {
+            lines.append(contentsOf: renderAdapterExports(
+                bindings: sorted,
+                groupName: groupName
+            ))
+        }
         lines.append("")
         return lines.joined(separator: "\n")
     }
@@ -2346,13 +2434,8 @@ public struct Generator: Sendable {
     private func renderAdapterPackFile(
         nativeModuleName: String,
         bindings: [BridgeGeneration.NativeImportBinding],
-        archive: InterfaceArchive.Archive
+        records: [Core.NativeImportID: InterfaceArchive.NativeImportRecord]
     ) throws -> String {
-        let records = Dictionary(
-            uniqueKeysWithValues: archive.nativeImports.compactMap { record in
-                record.id.map { ($0, record) }
-            }
-        )
         let imports = adapterPackImports(
             nativeModuleName: nativeModuleName,
             bindings: bindings
@@ -2390,7 +2473,22 @@ public struct Generator: Sendable {
             ))
         }
         lines.append("}")
-        for binding in sorted {
+        lines.append(contentsOf: renderAdapterExports(
+            bindings: sorted,
+            groupName: BridgeGeneration.GeneratedNativeImport.packGroupName(
+                moduleName: nativeModuleName
+            )
+        ))
+        lines.append("")
+        return lines.joined(separator: "\n")
+    }
+
+    private func renderAdapterExports(
+        bindings: [BridgeGeneration.NativeImportBinding],
+        groupName: String
+    ) -> [String] {
+        var lines: [String] = []
+        for binding in bindings {
             let symbol = BridgeGeneration.GeneratedNativeImport.exportSymbol(
                 key: binding.key
             )
@@ -2407,13 +2505,12 @@ public struct Generator: Sendable {
             )
             lines.append(
                 "    Unmanaged.passRetained("
-                    + "\(BridgeGeneration.GeneratedNativeImport.packGroupName(moduleName: nativeModuleName)).\(factory)()"
+                    + "\(groupName).\(factory)()"
                     + ").toOpaque()"
             )
             lines.append("}")
         }
-        lines.append("")
-        return lines.joined(separator: "\n")
+        return lines
     }
 
     private func adapterPackImports(
@@ -3299,7 +3396,7 @@ public struct Generator: Sendable {
             }
             switch binding.strategy {
             case .factory:
-                guard binding.factoryExpression.map(isUsableExpression) == true,
+                guard binding.factoryReference.map(isValidModulePath) == true,
                       binding.generated == nil,
                       binding.cFunction == nil
                 else {
@@ -3309,7 +3406,7 @@ public struct Generator: Sendable {
                     )
                 }
             case .generatedSwiftAdapter:
-                guard binding.factoryExpression == nil,
+                guard binding.factoryReference == nil,
                       binding.generated != nil,
                       binding.cFunction == nil,
                       record.descriptor.target.backend == .swiftAdapter,
@@ -3323,7 +3420,7 @@ public struct Generator: Sendable {
                     )
                 }
             case .objectiveCInvoker:
-                guard binding.factoryExpression == nil,
+                guard binding.factoryReference == nil,
                       binding.generated == nil,
                       binding.cFunction == nil,
                       binding.importedModules.isEmpty,
@@ -3336,7 +3433,7 @@ public struct Generator: Sendable {
                     )
                 }
             case .cInvoker:
-                guard binding.factoryExpression == nil,
+                guard binding.factoryReference == nil,
                       binding.generated == nil,
                       record.descriptor.target.backend == .cFunction,
                       !record.effects.isAsync,
@@ -3834,14 +3931,18 @@ public struct Generator: Sendable {
     }
 
     private func isValidModulePath(_ value: String) -> Bool {
-        !value.isEmpty && value.split(separator: ".").allSatisfy { component in
-            guard let first = component.first, first == "_" || first.isLetter else {
-                return false
+        !value.isEmpty && value.utf8.count <= 512
+            && value.split(
+                separator: ".",
+                omittingEmptySubsequences: false
+            ).allSatisfy { component in
+                guard let first = component.first,
+                      first == "_" || first.isLetter
+                else { return false }
+                return component.dropFirst().allSatisfy {
+                    $0 == "_" || $0.isLetter || $0.isNumber
+                }
             }
-            return component.dropFirst().allSatisfy {
-                $0 == "_" || $0.isLetter || $0.isNumber
-            }
-        }
     }
 
     private func renderShellFactory(archive: InterfaceArchive.Archive) -> String {
@@ -4036,13 +4137,15 @@ public struct Generator: Sendable {
     ) throws -> String {
         switch binding.strategy {
         case .factory:
-            guard let expression = binding.factoryExpression else {
+            guard let reference = binding.factoryReference else {
                 throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
                     binding.id,
                     "missing explicit factory"
                 )
             }
-            return expression
+            return reference + "(id: Core.NativeImportID(rawValue: "
+                + "\(binding.id.rawValue)), key: Core.NativeCall.Key(rawValue: "
+                + "\(render(binding.key.rawValue))))"
         case .generatedSwiftAdapter:
             guard let generated = binding.generated else {
                 throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(

@@ -668,7 +668,14 @@ private extension FrontendReceipt.ObjectiveCABI {
         // Preserve a compiler-proven Objective-C protocol existential. Its
         // machine encoding is still `@`, but treating it as unrestricted `id`
         // would lose the declaration's runtime conformance requirement.
-        return value
+        guard !value.hasPrefix("any "),
+              let genericArguments = value.firstIndex(of: "<")
+        else { return value }
+        // Objective-C lightweight generics affect Swift's logical type only.
+        // The message ABI and runtime class lookup are always erased to the
+        // declaration class before crossing the generic invoker boundary.
+        return String(value[..<genericArguments])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     static func leafName(_ raw: String) -> String {

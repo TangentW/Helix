@@ -20,6 +20,7 @@ struct NSErrorBridgePlan: Sendable {
 
     static func analyze(
         body: String,
+        function: CanonicalSIL.Function,
         directCalls: CanonicalSIL.DirectCallTable
     ) throws -> Self {
         let lines = body.split(
@@ -53,11 +54,15 @@ struct NSErrorBridgePlan: Sendable {
                   reference[3].contains("AutoreleasingUnsafeMutablePointer<Optional<NSError>>"),
                   reference[3].contains("-> ObjCBool")
             else { continue }
-            let symbol = CanonicalSIL.NativeBridgeSymbols.foreignCall(
+            let rawSymbol = CanonicalSIL.NativeBridgeSymbols.foreignCall(
                 reference: reference[2],
                 loweredType: reference[3],
                 dispatch: reference[1] == "objc_super_method"
                     ? .superclass : .ordinary
+            )
+            let symbol = directCalls.resolvedForeignSymbol(
+                rawSymbol,
+                at: function.sourceLocation(atBodyLine: referenceLine + 1)
             )
             guard let binding = directCalls.binding(for: symbol),
                   binding.effects.mayThrow,

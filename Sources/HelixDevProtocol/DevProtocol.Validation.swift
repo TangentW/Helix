@@ -9,8 +9,10 @@ extension DevProtocol.BuildIdentity {
         guard protocolVersion == DevProtocol.SessionIdentity.currentProtocolVersion,
               !sessionID.isZero,
               !executableUUID.isZero,
-              [bundleID, architecture, xcodeBuild, swiftCompilerFingerprint].allSatisfy({
+              [bundleID, architecture, xcodeBuild, sdkBuild,
+               swiftCompilerFingerprint].allSatisfy({
                   !$0.isEmpty && $0.utf8.count <= 4_096
+                      && !$0.unicodeScalars.contains(where: { $0.value == 0 })
               })
         else {
             throw DevProtocol.Error.malformedMessage("captured build identity is invalid")
@@ -36,9 +38,13 @@ extension DevProtocol.SessionIdentity {
             throw DevProtocol.Error.malformedMessage("processID must be positive")
         }
         let requiredStrings = [
-            bundleID, architecture, operatingSystemBuild, xcodeBuild, swiftCompilerFingerprint,
+            bundleID, architecture, operatingSystemBuild, xcodeBuild,
+            sdkBuild, swiftCompilerFingerprint,
         ]
-        guard requiredStrings.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 4_096 }) else {
+        guard requiredStrings.allSatisfy({
+            !$0.isEmpty && $0.utf8.count <= 4_096
+                && !$0.unicodeScalars.contains(where: { $0.value == 0 })
+        }) else {
             throw DevProtocol.Error.malformedMessage("build identity contains an invalid string")
         }
         guard !supportedBackends.isEmpty,
@@ -83,12 +89,49 @@ extension DevProtocol.SessionIdentity {
                 "active function routes require an active generation"
             )
         }
-        if loadedNativeImageCount > 0 || loadedNativeImageBytes > 0
-            || nativeImageSoftLimitReached || nativeStateUncertain
+        guard activeDevelopmentNativeCallKeys.count <= 65_536,
+              Set(activeDevelopmentNativeCallKeys).count
+                == activeDevelopmentNativeCallKeys.count,
+              activeDevelopmentNativeCallKeys
+                == activeDevelopmentNativeCallKeys.sorted(),
+              activeDevelopmentNativeCallKeys.isEmpty
+                || supportedBackends.contains(.hlbc)
+        else {
+            throw DevProtocol.Error.malformedMessage(
+                "development NativeCall keys are duplicated, unordered, oversized, or HLBC is disabled"
+            )
+        }
+        if !activeDevelopmentNativeCallKeys.isEmpty, activeGenerationID == nil {
+            throw DevProtocol.Error.malformedMessage(
+                "development NativeCall keys require an active generation"
+            )
+        }
+        if (loadedDevelopmentAdapterCount == 0)
+            != (loadedDevelopmentAdapterBytes == 0)
         {
+            throw DevProtocol.Error.malformedMessage(
+                "development Adapter count and bytes must both be zero or nonzero"
+            )
+        }
+        if loadedDevelopmentAdapterCount > 0,
+           !supportedBackends.contains(.hlbc) {
+            throw DevProtocol.Error.malformedMessage(
+                "development Adapter state is present while HLBC is disabled"
+            )
+        }
+        if loadedNativeImageCount > 0 || loadedNativeImageBytes > 0 {
             guard supportedBackends.contains(.nativeDynamicReplacement) else {
                 throw DevProtocol.Error.malformedMessage(
                     "Native runtime state is present while the Native backend is disabled"
+                )
+            }
+        }
+        if nativeImageSoftLimitReached || nativeStateUncertain {
+            guard supportedBackends.contains(.nativeDynamicReplacement)
+                    || supportedBackends.contains(.hlbc)
+            else {
+                throw DevProtocol.Error.malformedMessage(
+                    "mapped-image state is present while image-capable backends are disabled"
                 )
             }
         }

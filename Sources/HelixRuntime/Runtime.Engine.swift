@@ -98,6 +98,17 @@ public final class Engine: @unchecked Sendable {
         self.bridgeInputLimits = bridgeInputLimits
     }
 
+    /// Native tables linked into the App before any development generation is
+    /// activated. Development activation derives immutable supersets from this
+    /// value; the Engine's baseline itself never mutates.
+    public var baselineNativeCapabilities: Runtime.NativeCapabilities {
+        .init(
+            nativeCatalog: nativeCatalog,
+            asyncNativeCatalog: asyncNativeCatalog,
+            nativeTypeCatalog: nativeTypeCatalog
+        )
+    }
+
     /// Validates and activates a verified generation with stale-state protection.
     @discardableResult
     public func activate(_ generation: Runtime.Generation, expectedActiveID: Runtime.GenerationID?) throws -> Runtime.GenerationLease {
@@ -573,10 +584,11 @@ public final class Engine: @unchecked Sendable {
         budget: VM.InvocationBudget,
         trapObserver: @escaping VM.TrapObserver
     ) -> VM.Interpreter {
-        VM.Interpreter(
-            nativeCatalog: nativeCatalog,
-            asyncNativeCatalog: asyncNativeCatalog,
-            nativeTypeCatalog: nativeTypeCatalog,
+        let capabilities = nativeCapabilities(for: context.lease)
+        return VM.Interpreter(
+            nativeCatalog: capabilities.nativeCatalog,
+            asyncNativeCatalog: capabilities.asyncNativeCatalog,
+            nativeTypeCatalog: capabilities.nativeTypeCatalog,
             entryInvocation: { [weak self, weak context]
                 nestedEntry, nestedArguments, nestedBudget in
                 guard let self, let context else {
@@ -670,10 +682,11 @@ public final class Engine: @unchecked Sendable {
                     )
                 )
             }
+            let capabilities = nativeCapabilities(for: lease)
             let interpreter = VM.Interpreter(
-                nativeCatalog: nativeCatalog,
-                asyncNativeCatalog: asyncNativeCatalog,
-                nativeTypeCatalog: nativeTypeCatalog,
+                nativeCatalog: capabilities.nativeCatalog,
+                asyncNativeCatalog: capabilities.asyncNativeCatalog,
+                nativeTypeCatalog: capabilities.nativeTypeCatalog,
                 entryInvocation: { [weak self, weak context] nestedEntry, nestedArguments, nestedBudget in
                     guard let self, let context else {
                         return .trapped(
@@ -806,10 +819,11 @@ public final class Engine: @unchecked Sendable {
             Runtime.ExecutionContext,
             VM.InvocationBudget
         ) -> VM.ExecutionResult = { [self] context, budget in
+            let capabilities = nativeCapabilities(for: lease)
             let interpreter = VM.Interpreter(
-                nativeCatalog: nativeCatalog,
-                asyncNativeCatalog: asyncNativeCatalog,
-                nativeTypeCatalog: nativeTypeCatalog,
+                nativeCatalog: capabilities.nativeCatalog,
+                asyncNativeCatalog: capabilities.asyncNativeCatalog,
+                nativeTypeCatalog: capabilities.nativeTypeCatalog,
                 entryInvocation: { [weak self, weak context] entry, values, nestedBudget in
                     guard let self, let context else {
                         return .trapped(
@@ -1200,10 +1214,17 @@ public final class Engine: @unchecked Sendable {
     }
 
     private func validateForActivation(_ generation: Runtime.Generation) throws {
+        let inherited = registry.activeLease().flatMap { lease in
+            lease.generation.id == generation.parentID
+                ? lease.nativeCapabilities : nil
+        }
+        let capabilities = generation.nativeCapabilities
+            ?? inherited
+            ?? baselineNativeCapabilities
         let interpreter = VM.Interpreter(
-            nativeCatalog: nativeCatalog,
-            asyncNativeCatalog: asyncNativeCatalog,
-            nativeTypeCatalog: nativeTypeCatalog
+            nativeCatalog: capabilities.nativeCatalog,
+            asyncNativeCatalog: capabilities.asyncNativeCatalog,
+            nativeTypeCatalog: capabilities.nativeTypeCatalog
         )
         for image in generation.images {
             if let shellInterfaceHash,
@@ -1214,7 +1235,7 @@ public final class Engine: @unchecked Sendable {
                 try interpreter.validate(image: image)
                 try Runtime.HostedClasses.validateBindings(
                     image: image,
-                    nativeTypeCatalog: nativeTypeCatalog
+                    nativeTypeCatalog: capabilities.nativeTypeCatalog
                 )
             } catch {
                 throw Runtime.ActivationError.invalidGeneration("native catalog binding failed: \(error)")
@@ -1245,6 +1266,12 @@ public final class Engine: @unchecked Sendable {
                 "original-route tombstone references unknown entry \(entry)"
             )
         }
+    }
+
+    private func nativeCapabilities(
+        for lease: Runtime.GenerationLease
+    ) -> Runtime.NativeCapabilities {
+        lease.nativeCapabilities ?? baselineNativeCapabilities
     }
 
     private func isRuntimeInvariantViolation(_ trap: VM.RuntimeTrap) -> Bool {

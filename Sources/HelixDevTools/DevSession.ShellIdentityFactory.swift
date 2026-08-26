@@ -60,6 +60,7 @@ public struct ShellIdentityFactory: Sendable {
                 platform: manifest.platform,
                 architecture: manifest.architecture,
                 xcodeBuild: manifest.xcodeBuild,
+                sdkBuild: manifest.sdkBuild,
                 swiftCompilerFingerprint: manifest.swiftCompilerFingerprint,
                 liveReloadIndexHash: manifest.liveReloadIndexHash
             )

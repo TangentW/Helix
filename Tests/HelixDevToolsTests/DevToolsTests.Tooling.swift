@@ -982,6 +982,28 @@ struct Tooling {
         #expect(await recorder.changedPaths == [fixture.sourceURL.path])
     }
 
+    @Test("Atomic replacement with identical bytes does not supersede a build")
+    func monitorIgnoresMetadataOnlySourceReplacement() async throws {
+        let directory = try temporaryDirectory("helix-save-monitor-dedup")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fixture = try PipelineFixture(directory: directory)
+        let recorder = MonitorRecorder()
+        let monitor = try SourceSnapshot.Monitor(
+            manifest: fixture.manifest,
+            debounceNanoseconds: 20_000_000
+        ) { event in
+            await recorder.record(event)
+        }
+        await monitor.start()
+        let unchanged = try Data(contentsOf: fixture.sourceURL)
+        try unchanged.write(to: fixture.sourceURL, options: .atomic)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        await monitor.stop()
+
+        #expect(await recorder.deliveryCount == 0)
+        #expect(await recorder.changedPaths.isEmpty)
+    }
+
     @Test("A monitor catches source edits made before a test App connects")
     func monitorReconcilesFrozenShellBaseline() async throws {
         let directory = try temporaryDirectory("helix-late-connect-monitor")
@@ -1175,9 +1197,11 @@ private actor ArtifactRecorder {
 
 private actor MonitorRecorder {
     private(set) var changedPaths = Set<String>()
+    private(set) var deliveryCount = 0
 
     func record(_ event: SourceSnapshot.MonitorEvent) {
         if case let .changed(paths) = event {
+            deliveryCount += 1
             changedPaths.formUnion(paths)
         }
     }
@@ -1338,6 +1362,7 @@ private struct PipelineFixture {
             architecture: manifest.architecture,
             operatingSystemBuild: "22A",
             xcodeBuild: manifest.xcodeBuild,
+            sdkBuild: manifest.sdkBuild,
             swiftCompilerFingerprint: manifest.swiftCompilerFingerprint,
             liveReloadIndexHash: indexHash,
             supportedBackends: [.hlbc],

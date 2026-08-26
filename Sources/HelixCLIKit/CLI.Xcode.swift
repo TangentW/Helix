@@ -370,7 +370,7 @@ func executeXcodePhase(_ arguments: [String]) async throws -> CLI.Result {
     }
     let options = try CLI.Arguments(
         arguments,
-        valueOptions: ["plan", "profile", "phase"],
+        valueOptions: ["plan", "profile", "phase", "backend"],
         flagOptions: []
     )
     try requireNoXcodePositionals(options, command: "xcode phase")
@@ -387,6 +387,22 @@ func executeXcodePhase(_ arguments: [String]) async throws -> CLI.Result {
         throw CLI.Error.usage(
             "phase \(phase.rawValue) is unavailable for \(profile.workflow.rawValue)"
         )
+    }
+    let backendPreference: DevBackendSelection.Preference
+    if let backend = try options.value("backend") {
+        guard phase == .liveRegister else {
+            throw CLI.Error.usage(
+                "--backend is available only for the live-register phase"
+            )
+        }
+        guard let parsed = DevBackendSelection.Preference(rawValue: backend) else {
+            throw CLI.Error.usage(
+                "--backend must be automatic, native, or hlbc"
+            )
+        }
+        backendPreference = parsed
+    } else {
+        backendPreference = .automatic
     }
     let context: XcodeIntegration.BuildContext
     do {
@@ -419,7 +435,10 @@ func executeXcodePhase(_ arguments: [String]) async throws -> CLI.Result {
                 + "Mach-O UUIDs: \(archive.metadata.machOUUIDs.map(\.uuidString).joined(separator: ", "))\n"
         )
     case .liveRegister:
-        return try await registerXcodeLiveSession(context)
+        return try await registerXcodeLiveSession(
+            context,
+            backendPreference: backendPreference
+        )
     case .audit:
         let product = try resolveXcodeProduct(context)
         _ = try finalizeXcodeShell(context, product: product)
@@ -946,7 +965,8 @@ private func performFinalizeXcodeShell(
 }
 
 private func registerXcodeLiveSession(
-    _ context: XcodeIntegration.BuildContext
+    _ context: XcodeIntegration.BuildContext,
+    backendPreference: DevBackendSelection.Preference
 ) async throws -> CLI.Result {
     let product = try resolveXcodeProduct(context)
     _ = try finalizeXcodeShell(context, product: product)
@@ -991,9 +1011,11 @@ private func registerXcodeLiveSession(
         reloadIndexPath: context.environment.shellOutputURL
             .appendingPathComponent("ReloadIndex.json").path,
         interfaceArchivePath: context.environment.finalArchiveURL.path,
+        shellBuildReceiptPath: context.environment.shellOutputURL
+            .appendingPathComponent("ShellBuildReceipt.json").path,
         compilerPath: prepared.compilerURL.path,
         nativeOutputDirectory: nativeOutput.path,
-        backendPreference: .automatic,
+        backendPreference: backendPreference,
         deviceNativeMatrixQualified: false,
         debounceMilliseconds: 120,
         maximumSourceBytes: 8 * 1_024 * 1_024,
@@ -1459,7 +1481,9 @@ private func performPrepareXcodeShell(
     )
     let artifacts = try performance.measure("prepare.encode_artifacts") {
         var artifacts = try materialized.artifacts()
-        artifacts["ReleaseMetadata.json"] = try Core.CanonicalJSON.encode(metadata)
+        artifacts["ReleaseMetadata.json"] = try Core.CanonicalJSON.encode(
+            indexed.receipt.metadata
+        )
         artifacts["ShellBuildReceipt.json"] = try ShellBuildReceipt.Codec.encode(
             indexed.receipt
         )
@@ -2875,11 +2899,12 @@ the active Feature target compile.
 """ + "\n"
 
 static let xcodePhaseHelp = """
-Usage: helix xcode phase --plan HostPlan.json --profile ID --phase PHASE
+Usage: helix xcode phase --plan HostPlan.json --profile ID --phase PHASE [--backend automatic|native|hlbc]
 
 Phases: prepare, bridge, finalize, audit, patch, live-register. This command is
 designed for generated Xcode scripts and reads volatile build facts only from
-the active Xcode environment.
+the active Xcode environment. --backend is a live-register diagnostic override;
+generated integration uses automatic selection by default.
 """ + "\n"
 
 static let xcodePostCompileHelp = """

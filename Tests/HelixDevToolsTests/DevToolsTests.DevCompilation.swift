@@ -1,4 +1,5 @@
 import Foundation
+import HelixBuildTools
 import HelixBytecode
 import HelixCompiler
 import HelixCore
@@ -118,7 +119,12 @@ struct DevCompilationTests {
             fixture.request(revision: 1, generation: 1)
         )
         let patch = try #require(outcome.patch)
-        let module = try Bytecode.Decoder.decode(patch.payload).module
+        let developmentPayload = try DevProtocol.DevelopmentPayload.Artifact.decode(
+            patch.payload
+        )
+        let module = try Bytecode.Decoder.decode(
+            developmentPayload.bytecode
+        ).module
 
         #expect(patch.backend == .hlbc)
         #expect(patch.changedFunctions == [fixture.function.key])
@@ -170,7 +176,12 @@ struct DevCompilationTests {
             fixture.request(revision: 1, generation: 1)
         )
         let patch = try #require(outcome.patch)
-        let module = try Bytecode.Decoder.decode(patch.payload).module
+        let developmentPayload = try DevProtocol.DevelopmentPayload.Artifact.decode(
+            patch.payload
+        )
+        let module = try Bytecode.Decoder.decode(
+            developmentPayload.bytecode
+        ).module
         let disassembly = Bytecode.Disassembler.disassemble(module)
 
         #expect(patch.backend == .hlbc)
@@ -223,7 +234,12 @@ struct DevCompilationTests {
             fixture.request(revision: 1, generation: 1)
         )
         let patch = try #require(outcome.patch)
-        let module = try Bytecode.Decoder.decode(patch.payload).module
+        let developmentPayload = try DevProtocol.DevelopmentPayload.Artifact.decode(
+            patch.payload
+        )
+        let module = try Bytecode.Decoder.decode(
+            developmentPayload.bytecode
+        ).module
         let disassembly = Bytecode.Disassembler.disassemble(module)
 
         #expect(patch.backend == .hlbc)
@@ -290,6 +306,181 @@ struct DevCompilationTests {
         let diagnostic = try #require(outcome.rebuildDiagnostic)
         #expect(diagnostic.code == "HLXLR301")
         try diagnostic.validate()
+    }
+
+    @Test("Development NativeImports use stable post-Shell IDs and exact descriptors")
+    func plansDevelopmentNativeImports() throws {
+        let fixture = try Fixture.make()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let baseline = try fixture.nativeImport(
+            name: "baseline",
+            id: .init(rawValue: 0),
+            isEmittedToDevice: true
+        )
+        let firstCandidate = try fixture.nativeImport(
+            name: "firstCandidate",
+            id: nil,
+            isEmittedToDevice: false
+        )
+        let secondCandidate = try fixture.nativeImport(
+            name: "secondCandidate",
+            id: nil,
+            isEmittedToDevice: false
+        )
+        let archive = try fixture.archive(
+            nativeImports: [secondCandidate, baseline, firstCandidate]
+        )
+        let baselineArchive = try fixture.archive(nativeImports: [baseline])
+        let receipt = try fixture.receipt(
+            archive: archive,
+            bindings: archive.nativeImports.map {
+                .init(
+                    key: $0.key,
+                    strategy: .factory,
+                    factoryReference: "FixtureNativeImportFactory.make"
+                )
+            }
+        )
+
+        let plan = try DevCompilation.NativeCapabilityPlan(
+            archive: archive,
+            receipt: receipt
+        )
+        let promoted = plan.developmentImports
+        #expect(promoted.map(\.id) == [
+            .init(rawValue: 1), .init(rawValue: 2),
+        ])
+        #expect(promoted.map(\.key) == [firstCandidate.key, secondCandidate.key].sorted())
+        #expect(promoted.allSatisfy { $0.isEmittedToDevice })
+        #expect(plan.baselineKeys == [baseline.key])
+        #expect(archive.shellInterfaceHash == baselineArchive.shellInterfaceHash)
+        #expect(try archive.archiveDigest() != baselineArchive.archiveDigest())
+
+        let exact = try #require(promoted.first)
+        let requirement = Bytecode.ImportRequirement(
+            id: try #require(exact.id),
+            key: exact.key,
+            descriptor: exact.descriptor,
+            contract: exact.contract
+        )
+        #expect(try plan.record(for: requirement) == exact)
+        #expect(try plan.binding(for: exact).key == exact.key)
+
+        var wrongID = requirement
+        wrongID.id = .init(rawValue: UInt32.max)
+        #expect(throws: DevCompilation.NativeCapabilityError.self) {
+            _ = try plan.record(for: wrongID)
+        }
+
+        let unrelated = try fixture.nativeImport(
+            name: "unrelated",
+            id: nil,
+            isEmittedToDevice: false
+        )
+        let mismatchedArchive = try fixture.archive(
+            nativeImports: [baseline, firstCandidate, unrelated]
+        )
+        let mismatchedReceipt = try fixture.receipt(
+            archive: mismatchedArchive,
+            bindings: mismatchedArchive.nativeImports.map {
+                .init(
+                    key: $0.key,
+                    strategy: .factory,
+                    factoryReference: "FixtureNativeImportFactory.make"
+                )
+            }
+        )
+        do {
+            _ = try DevCompilation.NativeCapabilityPlan(
+                archive: archive,
+                receipt: mismatchedReceipt
+            )
+            Issue.record("expected receipt mismatch")
+        } catch let error as DevCompilation.NativeCapabilityError {
+            #expect(error == .receiptMismatch)
+        }
+    }
+
+    @Test("Development Adapter inputs fail closed before compilation")
+    func rejectsUnsafeDevelopmentAdapterInputs() throws {
+        let fixture = try Fixture.make()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let record = try fixture.nativeImport(
+            name: "adapter",
+            id: .init(rawValue: 0),
+            isEmittedToDevice: true
+        )
+        let generated = BridgeGeneration.GeneratedNativeImport(
+            declarationMangledName: fixture.function.mangledName,
+            sourceFileLogicalID: "Patch.swift",
+            dispatch: .globalFunction,
+            baseName: "transform",
+            argumentLabels: [],
+            parameterSwiftTypes: [],
+            resultSwiftType: "Swift.Int"
+        )
+        let binding = BridgeGeneration.NativeImportBinding(
+            id: try #require(record.id),
+            key: record.key,
+            strategy: .generatedSwiftAdapter,
+            generated: generated
+        )
+        let generatedSources = try BridgeGeneration.Generator()
+            .generateDevelopmentAdapterFiles(
+                applicationModuleName: fixture.manifest.moduleName,
+                bindings: [binding],
+                records: [record]
+            )
+        let generatedSource = try #require(generatedSources.values.first)
+        #expect(generatedSources.count == 1)
+        #expect(generatedSource.contains(
+            "@_cdecl(\"\(BridgeGeneration.GeneratedNativeImport.exportSymbol(key: record.key))\")"
+        ))
+        #expect(generatedSource.contains("Runtime.NativeAdapterBody"))
+        #expect(
+            try BridgeGeneration.Generator().generateDevelopmentAdapterFiles(
+                applicationModuleName: fixture.manifest.moduleName,
+                bindings: [binding],
+                records: [record]
+            ) == generatedSources
+        )
+        let builder = DevCompilation.AdapterBuilder(
+            runner: ProcessExecution.Runner()
+        )
+        let output = fixture.directory.appendingPathComponent("Adapters")
+        #expect(
+            throws: DevCompilation.NativeCapabilityError.deviceAdapterUnqualified
+        ) {
+            _ = try builder.build(.init(
+                manifest: fixture.manifest,
+                compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc"),
+                outputDirectory: output,
+                records: [record],
+                bindings: [binding]
+            ))
+        }
+
+        var simulatorManifest = fixture.manifest
+        let simulatorTarget = "arm64-apple-ios15.0-simulator"
+        simulatorManifest.targetTriple = simulatorTarget
+        simulatorManifest.platform = .iOSSimulator
+        let targetIndex = try #require(
+            simulatorManifest.frontendArguments.firstIndex(of: "-target")
+        )
+        simulatorManifest.frontendArguments[targetIndex + 1] = simulatorTarget
+        try simulatorManifest.validate()
+        #expect(
+            throws: DevCompilation.NativeCapabilityError.invalidAdapterRequest
+        ) {
+            _ = try builder.build(.init(
+                manifest: simulatorManifest,
+                compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc"),
+                outputDirectory: output,
+                records: [record, record],
+                bindings: [binding, binding]
+            ))
+        }
+        #expect(!FileManager.default.fileExists(atPath: output.path))
     }
 
     @Test("A saved Swift body becomes a signed Native image and baseline restore remains a replacement")
@@ -370,6 +561,8 @@ private struct Fixture {
     let archive: InterfaceArchive.Archive
     let manifest: DevBuildManifest.Document
     let function: InterfaceArchive.FunctionRecord
+    let configuration: PatchConfiguration.Document
+    let declaration: ReleaseCompiler.DeclarationCandidate
 
     static func make() throws -> Self {
         let directory = FileManager.default.temporaryDirectory
@@ -510,7 +703,9 @@ private struct Fixture {
                 sourceID: sourceID,
                 archive: archive,
                 manifest: manifest,
-                function: function
+                function: function,
+                configuration: configuration,
+                declaration: declaration
             )
         } catch {
             try? FileManager.default.removeItem(at: directory)
@@ -564,6 +759,80 @@ private struct Fixture {
             restoredFunctions: Array(patch.restoredFunctions),
             mode: patch.mode
         )
+    }
+
+    func nativeImport(
+        name: String,
+        id: Core.NativeImportID?,
+        isEmittedToDevice: Bool
+    ) throws -> InterfaceArchive.NativeImportRecord {
+        let contract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .read,
+            maximumDurationMicroseconds: 1_000,
+            allowsMainThread: false
+        )
+        let descriptor = try Core.NativeCall.Descriptor.swiftAdapter(
+            canonicalCallee: "Fixture.\(name)()",
+            signature: .init(parameters: [], result: "Swift.Int"),
+            effects: .init(),
+            contract: contract
+        )
+        return .init(
+            id: id,
+            key: try .derive(descriptor: descriptor),
+            descriptor: descriptor,
+            silMangledNames: ["$s7Fixture_\(name)"],
+            parameterTypes: [],
+            resultType: .int64,
+            contract: contract,
+            isEmittedToDevice: isEmittedToDevice
+        )
+    }
+
+    func archive(
+        nativeImports: [InterfaceArchive.NativeImportRecord]
+    ) throws -> InterfaceArchive.Archive {
+        var metadata = archive.metadata
+        metadata.transformPipelineHash = ShellBuild.transformPipelineHash
+        return try InterfaceArchive.Archive.make(
+            metadata: metadata,
+            compatibility: archive.compatibility,
+            capabilities: Set(archive.capabilities).union([.nativeImportsV1]),
+            sources: archive.sources,
+            functions: archive.functions,
+            nativeImports: nativeImports,
+            nativeTypes: archive.nativeTypes,
+            frozenValueTypes: archive.frozenValueTypes,
+            bridgeRegistrationCount: archive.bridgeRegistrationCount
+        )
+    }
+
+    func receipt(
+        archive: InterfaceArchive.Archive,
+        bindings: [ShellBuildReceipt.NativeImportBinding]
+    ) throws -> ShellBuildReceipt.Document {
+        var metadata = archive.metadata
+        metadata.machOUUIDs = []
+        metadata.transformPipelineHash = ShellBuild.transformPipelineHash
+        let receipt = ShellBuildReceipt.Document(
+            metadata: metadata,
+            compatibility: archive.compatibility,
+            configuration: configuration,
+            capabilities: Set(archive.capabilities),
+            sources: archive.sources.map {
+                .init(logicalPath: $0.logicalPath, contentHash: $0.contentHash)
+            },
+            declarations: [declaration],
+            roots: [],
+            nativeImportCandidates: archive.nativeImports,
+            nativeImportBindings: bindings,
+            nativeTypes: archive.nativeTypes,
+            frozenValueTypes: archive.frozenValueTypes
+        )
+        try receipt.validate()
+        return receipt
     }
 }
 

@@ -23,6 +23,8 @@ public struct BuildContract: Hashable, Sendable {
     public var architecture: String
     /// Xcode build identifier used for compilation.
     public var xcodeBuild: String
+    /// SDK build identifier used for imported declarations and API catalogs.
+    public var sdkBuild: String
     /// Canonical Swift compiler fingerprint.
     public var swiftCompilerFingerprint: String
     /// Hash of the Reload Index installed in the App.
@@ -36,6 +38,7 @@ public struct BuildContract: Hashable, Sendable {
         platform: DevProtocol.ApplePlatform,
         architecture: String,
         xcodeBuild: String,
+        sdkBuild: String,
         swiftCompilerFingerprint: String,
         liveReloadIndexHash: Core.Digest,
         runtimeImageIdentity: Core.RuntimeImageIdentity = .current
@@ -44,6 +47,7 @@ public struct BuildContract: Hashable, Sendable {
         self.platform = platform
         self.architecture = architecture
         self.xcodeBuild = xcodeBuild
+        self.sdkBuild = sdkBuild
         self.swiftCompilerFingerprint = swiftCompilerFingerprint
         self.liveReloadIndexHash = liveReloadIndexHash
         self.runtimeImageIdentity = runtimeImageIdentity
@@ -64,6 +68,7 @@ public struct BuildContract: Hashable, Sendable {
             platform: platform,
             architecture: descriptor.architecture,
             xcodeBuild: descriptor.xcodeBuild,
+            sdkBuild: descriptor.sdkBuild,
             swiftCompilerFingerprint: descriptor.compatibility.compilerFingerprint,
             liveReloadIndexHash: descriptor.liveReloadIndexHash,
             runtimeImageIdentity: descriptor.runtimeImageIdentity
@@ -72,7 +77,8 @@ public struct BuildContract: Hashable, Sendable {
 
     /// Validates required build identities before opening a Dev connection.
     public func validate() throws {
-        guard [bundleID, architecture, xcodeBuild, swiftCompilerFingerprint].allSatisfy({
+        guard [bundleID, architecture, xcodeBuild, sdkBuild,
+               swiftCompilerFingerprint].allSatisfy({
                   !$0.isEmpty && $0.utf8.count <= 4_096
                       && !$0.unicodeScalars.contains(where: { $0.value == 0 })
               })
@@ -255,6 +261,7 @@ public struct IdentityFactory: Sendable {
             platform: process.platform,
             architecture: process.architecture,
             xcodeBuild: build.xcodeBuild,
+            sdkBuild: build.sdkBuild,
             swiftCompilerFingerprint: build.swiftCompilerFingerprint,
             liveReloadIndexHash: build.liveReloadIndexHash
         )
@@ -287,6 +294,7 @@ public struct IdentityFactory: Sendable {
             architecture: build.architecture,
             operatingSystemBuild: peer.operatingSystemBuild,
             xcodeBuild: build.xcodeBuild,
+            sdkBuild: build.sdkBuild,
             swiftCompilerFingerprint: build.swiftCompilerFingerprint,
             liveReloadIndexHash: build.liveReloadIndexHash,
             supportedBackends: peer.supportedBackends,
@@ -724,7 +732,7 @@ public final class Bootstrap: @unchecked Sendable {
                 identity: identity,
                 shell: shell,
                 runtimePolicy: runtimePolicy,
-                registry: runtime.registry,
+                runtime: runtime,
                 cacheDirectory: directory,
                 limits: limits,
                 reloadHandler: reloadHandler

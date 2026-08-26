@@ -1,8 +1,17 @@
 import HelixCRuntimeSupport
 import HelixBytecode
 import HelixCore
+import HelixVM
 
 extension Runtime.CInvoker {
+/// Rejects a descriptor or function address that the finite C trampoline
+/// matrix cannot execute. Development activation uses this before publication.
+public func validateConfiguration() throws {
+    if let constructionFailure {
+        throw VM.RuntimeTrap.nativeFailure(constructionFailure)
+    }
+}
+
 static func validate(
     key: Core.NativeCall.Key,
     descriptor: Core.NativeCall.Descriptor,

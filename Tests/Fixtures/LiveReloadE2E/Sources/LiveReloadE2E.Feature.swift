@@ -1,4 +1,5 @@
 import QuartzCore
+import Foundation
 import UIKit
 
 public enum LiveReloadE2E {}
@@ -58,6 +59,8 @@ public final class HostViewController: UIViewController {
     public override func viewDidLayoutSubviews() {
         let title = "HELIX BASELINE"
         titleLabel.textAlignment = .center
+        let epoch = Date(timeIntervalSince1970: 0)
+        _ = epoch // HELIX_E2E_DORMANT_SWIFT_ADAPTER
         let timestamp = CACurrentMediaTime()
         print("Helix Live Reload title: \(title) at \(timestamp)")
         applyTitle(title)

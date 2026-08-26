@@ -54,6 +54,7 @@ enum SwiftTypeSpelling {
         _ value: String,
         allowsImplicitlyUnwrappedOptional: Bool = false
     ) -> Bool {
+        if isVoid(value) { return true }
         if let function = FrontendReceipt.FunctionTypeSpelling.parse(value) {
             guard function.isSynchronousNonthrowing,
                   let parameters = FrontendReceipt.FunctionTypeSpelling
@@ -170,7 +171,10 @@ enum SwiftTypeSpelling {
     }
 
     private static func isModulePath(_ value: String) -> Bool {
-        !value.isEmpty && value.split(separator: ".").allSatisfy { component in
+        !value.isEmpty && value.split(
+            separator: ".",
+            omittingEmptySubsequences: false
+        ).allSatisfy { component in
             guard let first = component.first, first == "_" || first.isLetter else {
                 return false
             }

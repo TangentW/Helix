@@ -5,7 +5,8 @@ authorizing calls from HLBC into code already installed with an application.
 The stable identity, catalog, archive, bytecode, verifier, generic Objective-C
 message invoker, restricted C invoker, and reusable Swift Adapter Packs
 described here are implemented. Catalog-backed on-demand development adapters
-and signed Release capability projection remain separate later stages.
+are also implemented for authenticated Simulator and macOS Live Reload; signed
+Release capability projection remains a separate later stage.
 
 ## Two IDs with different jobs
 
@@ -157,11 +158,13 @@ storage, and result length before decoding the result.
 
 This removes per-method executable Bridge code for supported Objective-C calls;
 it does not permit arbitrary selectors. Every executable call must still be an
-exact descriptor emitted into the current Shell. Source-observed calls and the
-current managed-Debug SDK surface can use the generic binding now. A public API
-that was not emitted into that Shell is not yet made available merely because
-the invoker exists; full Catalog-backed development lookup and the signed
-Release capability projection are later stages.
+exact compiler-proved descriptor. The linked Shell keeps used imports in its
+compact baseline and the authenticated build receipt keeps unused managed-Debug
+candidates. On first use, the development compiler deterministically assigns a
+session-local slot after the linked prefix and the App constructs the same
+generic invoker from that descriptor. The Shell interface hash does not change.
+This growth is permitted only by the authenticated development transaction;
+production still accepts only its published capability projection.
 
 ## Restricted C execution
 
@@ -172,6 +175,15 @@ logical Swift signature, calling convention, layouts, effects, and
 availability. Generated Bridge code takes the address of that exact imported
 declaration as an `@convention(c)` function and registers it with one
 `Runtime.CInvoker`; the runtime never searches the process by a source string.
+
+The development-only first-use path has a deliberately different binding
+step: after the authenticated compiler selects an exact receipt candidate, the
+App may resolve that candidate's fixed C entry point in the already linked
+process and feed the address into the same finite `Runtime.CInvoker` matrix.
+Patch bytes cannot provide a free-form symbol or ABI. Descriptor/key
+rederivation, target/SDK identity, process linkage, and the runtime ABI checks
+must all succeed. Release execution continues to use the address bound by the
+published Bridge/capability table.
 
 The implementation uses a finite ahead-of-time trampoline matrix rather than
 `dlsym`, `libffi`, a descriptor-driven `unsafeBitCast`, or a user-supplied
@@ -214,9 +226,43 @@ Bridge, so adding or changing one Pack does not force all other module Packs to
 recompile.
 
 This is type erasure at a generated boundary, not generic invocation of the
-private Swift runtime. An API still needs an exact descriptor and generated
-Pack entry in the current Shell. A future development-stage on-demand adapter
-may generate a missing entry from Catalog proof, but the common runtime cannot
-invent an arbitrary Swift ABI from a name.
+private Swift runtime. Release execution still needs an exact descriptor and a
+Pack entry published with the App; the common runtime cannot invent an
+arbitrary Swift ABI from a name.
+
+For authenticated Live Reload, unused receipt candidates remain data-only and
+do not bloat the permanent Bridge. If newly compiled HLBC actually references
+a missing Swift candidate, Hub renders only those exact Adapter bodies with the
+captured compiler job, signs and Mach-O-validates one deterministic image, and
+caches it by compiler, Xcode/SDK, target, deployment, dependency graph,
+normalized compile/link inputs, generated source, descriptor, and contract.
+Objective-C and C candidates never enter this compiler path.
+
+The canonical `DevelopmentPayload` frames the HLBC, exact promoted imports,
+Adapter image descriptors, hashes, and image bytes into one authenticated
+transaction. The App rechecks compiler fingerprint, SDK build, target, Shell
+hash, descriptor/key identity, image architecture/platform/install name/UUID,
+code signature, dependency policy, and required exports. It builds a candidate
+baseline-plus-session native table, verifies HLBC against that table, and only
+then atomically activates a generation. A failure may leave an already mapped
+image charged to the process budget, but it never publishes the import or
+replaces active code. Each generation and every escaping callback lease pin an
+immutable native-capability snapshot.
+
+Overlapping saves can independently compile the same missing Adapter before
+either activation completes. Publication is therefore idempotent for an exact
+session-equivalent import: the second activation reuses the published invoker
+and does not map or charge its redundant image. This is not a name-based
+fallback; any identity, Descriptor, ABI, contract, or binding difference fails
+closed, and mixed transactions still load every image required by genuinely new
+imports before publication.
+
+Simulator and macOS are the currently qualified on-demand Swift Adapter
+targets. Physical iOS rejects this path and asks for an App rebuild until its
+development signing/loading matrix is separately demonstrated. Raw HLBC is no
+longer accepted by this development transport: even an adapter-free generation
+uses the version-1 development envelope. Reconnect identity reports published
+development keys and mapped Adapter inventory so Hub can reuse the session
+Registry without recompiling an already active Adapter.
 
 All product, protocol, catalog, archive, and bytecode versions remain 1.

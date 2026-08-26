@@ -146,9 +146,10 @@ public struct NativeImportBinding: Codable, Hashable, Sendable {
 
     public var key: Core.NativeCall.Key
     public var strategy: Strategy
-    /// Trusted factory expression from the explicit Catalog. Generated and
-    /// generic invokers are rendered solely from structured archive metadata.
-    public var factoryExpression: String?
+    /// Trusted dotted callable reference from the explicit Catalog. The Bridge
+    /// supplies the release-specific compact ID and stable Key when rendering
+    /// the invocation; arbitrary Swift expressions are never persisted here.
+    public var factoryReference: String?
     public var importedModules: [String]
     public var generated: ShellBuildReceipt.GeneratedNativeImport?
     public var cFunction: ShellBuildReceipt.CFunctionBinding?
@@ -156,14 +157,14 @@ public struct NativeImportBinding: Codable, Hashable, Sendable {
     public init(
         key: Core.NativeCall.Key,
         strategy: Strategy,
-        factoryExpression: String? = nil,
+        factoryReference: String? = nil,
         importedModules: [String] = [],
         generated: ShellBuildReceipt.GeneratedNativeImport? = nil,
         cFunction: ShellBuildReceipt.CFunctionBinding? = nil
     ) {
         self.key = key
         self.strategy = strategy
-        self.factoryExpression = factoryExpression
+        self.factoryReference = factoryReference
         self.importedModules = importedModules.sorted()
         self.generated = generated
         self.cFunction = cFunction
@@ -543,7 +544,7 @@ public struct Document: Codable, Hashable, Sendable {
                         )
                     } == true
             }), Set(nativeImportBindings.map(\.key))
-                == Set(nativeImportCandidates.filter(\.isEmittedToDevice).map(\.key))
+                == Set(nativeImportCandidates.map(\.key))
         else {
             throw ShellBuildReceipt.Error.invalid(
                 "native import candidates or bindings are duplicated, unordered, or empty"
@@ -851,11 +852,11 @@ public struct Document: Codable, Hashable, Sendable {
     ) -> Bool {
         switch binding.strategy {
         case .factory:
-            return binding.factoryExpression.map(isBoundExpression) == true
+            return binding.factoryReference.map(isModulePath) == true
                 && binding.generated == nil
                 && binding.cFunction == nil
         case .generatedSwiftAdapter:
-            return binding.factoryExpression == nil
+            return binding.factoryReference == nil
                 && record.descriptor.target.backend == .swiftAdapter
                 && binding.generated != nil
                 && binding.cFunction == nil
@@ -869,14 +870,14 @@ public struct Document: Codable, Hashable, Sendable {
                     sourcePaths: sourcePaths
                 )
         case .objectiveCInvoker:
-            return binding.factoryExpression == nil
+            return binding.factoryReference == nil
                 && binding.generated == nil
                 && binding.cFunction == nil
                 && binding.importedModules.isEmpty
                 && record.descriptor.target.backend == .objectiveCMessage
                 && !record.effects.isAsync
         case .cInvoker:
-            guard binding.factoryExpression == nil,
+            guard binding.factoryReference == nil,
                   binding.generated == nil,
                   record.descriptor.target.backend == .cFunction,
                   !record.effects.isAsync,

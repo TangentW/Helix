@@ -753,6 +753,7 @@ public struct Lowerer: Sendable {
             .ExistentialInitialization.analyze(body: normalizedBody)
         let nsErrorBridges = try CanonicalSIL.NSErrorBridgePlan.analyze(
             body: normalizedBody,
+            function: function,
             directCalls: directCalls
         )
         return .init(
@@ -5614,11 +5615,15 @@ public struct Lowerer: Sendable {
                     text: "pseudogeneric Objective-C call has no concrete specialization"
                 )
             }
-            let symbol = CanonicalSIL.NativeBridgeSymbols.foreignCall(
+            let rawSymbol = CanonicalSIL.NativeBridgeSymbols.foreignCall(
                 reference: deferred.reference,
                 loweredType: deferred.loweredType,
                 dispatch: deferred.dispatch,
                 genericArguments: genericArguments
+            )
+            let symbol = directCalls.resolvedForeignSymbol(
+                rawSymbol,
+                at: currentSourceLocation
             )
             let bindings = directCalls.bindings(for: symbol)
             guard !bindings.isEmpty else {
@@ -25823,10 +25828,14 @@ public struct Lowerer: Sendable {
                     )
                     continue
                 }
-                let exactForeignSymbol = CanonicalSIL.NativeBridgeSymbols.foreignCall(
+                let rawForeignSymbol = CanonicalSIL.NativeBridgeSymbols.foreignCall(
                     reference: reference[2],
                     loweredType: reference[3],
                     dispatch: dispatch
+                )
+                let exactForeignSymbol = directCalls.resolvedForeignSymbol(
+                    rawForeignSymbol,
+                    at: currentSourceLocation
                 )
                 let resolvedSymbol = !directCalls.hasBinding(for: reference[2])
                     ? exactForeignSymbol : reference[2]

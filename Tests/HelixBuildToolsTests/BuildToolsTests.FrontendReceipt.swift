@@ -194,6 +194,11 @@ struct FrontendReceiptPipeline {
         #expect(locations.location(atUTF8Offset: next.lowerBound)?.line == 3)
         #expect(locations.location(atUTF8Offset: next.lowerBound)?.column == 1)
         #expect(locations.location(atUTF8Offset: source.count + 1) == nil)
+        #expect(locations.utf8Offset(line: 1, column: 3) == brace.lowerBound)
+        #expect(locations.utf8Offset(line: 2, column: 3) == column.lowerBound)
+        #expect(locations.utf8Offset(line: 3, column: 1) == next.lowerBound)
+        #expect(locations.utf8Offset(line: 0, column: 1) == nil)
+        #expect(locations.utf8Offset(line: 2, column: 100) == nil)
 
         let prefixed = Data("xxé{\rnext".utf8)
         let slice = prefixed[prefixed.index(prefixed.startIndex, offsetBy: 2)...]

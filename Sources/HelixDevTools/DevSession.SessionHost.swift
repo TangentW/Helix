@@ -243,6 +243,7 @@ public actor SessionHost {
                 identity: peer,
                 archive: prepared.archive,
                 manifest: prepared.manifest,
+                receipt: prepared.shellBuildReceipt,
                 reloadIndex: prepared.reloadIndex,
                 compilerURL: prepared.resolved.compilerURL,
                 nativeOutputDirectory: prepared.resolved.nativeOutputDirectoryURL,

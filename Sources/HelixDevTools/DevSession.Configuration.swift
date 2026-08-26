@@ -1,6 +1,7 @@
 import Foundation
 import HelixCompiler
 import HelixCore
+import HelixBuildTools
 import HelixDevProtocol
 import HelixInterface
 
@@ -12,6 +13,7 @@ public struct Configuration: Codable, Hashable, Sendable {
     public var manifestPath: String
     public var reloadIndexPath: String
     public var interfaceArchivePath: String
+    public var shellBuildReceiptPath: String
     public var compilerPath: String
     public var nativeOutputDirectory: String
     public var backendPreference: DevBackendSelection.Preference
@@ -25,6 +27,7 @@ public struct Configuration: Codable, Hashable, Sendable {
         manifestPath: String,
         reloadIndexPath: String,
         interfaceArchivePath: String,
+        shellBuildReceiptPath: String,
         compilerPath: String = "/usr/bin/swiftc",
         nativeOutputDirectory: String = ".helix/dev-native",
         backendPreference: DevBackendSelection.Preference = .automatic,
@@ -37,6 +40,7 @@ public struct Configuration: Codable, Hashable, Sendable {
         self.manifestPath = manifestPath
         self.reloadIndexPath = reloadIndexPath
         self.interfaceArchivePath = interfaceArchivePath
+        self.shellBuildReceiptPath = shellBuildReceiptPath
         self.compilerPath = compilerPath
         self.nativeOutputDirectory = nativeOutputDirectory
         self.backendPreference = backendPreference
@@ -52,6 +56,7 @@ public struct Configuration: Codable, Hashable, Sendable {
         }
         let paths = [
             manifestPath, reloadIndexPath, interfaceArchivePath,
+            shellBuildReceiptPath,
             compilerPath, nativeOutputDirectory,
         ]
         guard paths.allSatisfy(Self.isSafePath),
@@ -75,6 +80,7 @@ public struct Configuration: Codable, Hashable, Sendable {
             let expected: Set<String> = [
                 "schemaVersion", "manifestPath", "reloadIndexPath",
                 "interfaceArchivePath", "compilerPath", "nativeOutputDirectory",
+                "shellBuildReceiptPath",
                 "backendPreference", "deviceNativeMatrixQualified",
                 "debounceMilliseconds", "maximumSourceBytes",
                 "nativeImageSoftLimit",
@@ -108,6 +114,7 @@ public struct ResolvedConfiguration: Sendable {
     public var manifestURL: URL
     public var reloadIndexURL: URL
     public var interfaceArchiveURL: URL
+    public var shellBuildReceiptURL: URL
     public var compilerURL: URL
     public var nativeOutputDirectoryURL: URL
 
@@ -124,6 +131,10 @@ public struct ResolvedConfiguration: Sendable {
         reloadIndexURL = Self.resolve(document.reloadIndexPath, relativeTo: baseDirectory)
         interfaceArchiveURL = Self.resolve(
             document.interfaceArchivePath,
+            relativeTo: baseDirectory
+        )
+        shellBuildReceiptURL = Self.resolve(
+            document.shellBuildReceiptPath,
             relativeTo: baseDirectory
         )
         compilerURL = Self.resolve(document.compilerPath, relativeTo: baseDirectory)
@@ -146,6 +157,7 @@ public struct PreparedConfiguration: Sendable {
     public var manifest: DevBuildManifest.Document
     public var reloadIndex: ReloadIndex.Document
     public var archive: InterfaceArchive.Archive
+    public var shellBuildReceipt: ShellBuildReceipt.Document
 
     public static func load(
         configurationURL: URL,
@@ -183,7 +195,19 @@ public struct PreparedConfiguration: Sendable {
                 fileManager: fileManager
             )
         ).archive
-        try validateIdentity(manifest: manifest, index: index, archive: archive)
+        let receipt = try ShellBuildReceipt.Codec.decode(
+            Self.read(
+                resolved.shellBuildReceiptURL,
+                maximumBytes: ShellBuildReceipt.Codec.maximumDocumentBytes,
+                fileManager: fileManager
+            )
+        )
+        try validateIdentity(
+            manifest: manifest,
+            index: index,
+            archive: archive,
+            receipt: receipt
+        )
 
         var isDirectory: ObjCBool = false
         guard fileManager.isExecutableFile(atPath: resolved.compilerURL.path),
@@ -204,7 +228,8 @@ public struct PreparedConfiguration: Sendable {
             resolved: resolved,
             manifest: manifest,
             reloadIndex: index,
-            archive: archive
+            archive: archive,
+            shellBuildReceipt: receipt
         )
     }
 
@@ -216,6 +241,7 @@ public struct PreparedConfiguration: Sendable {
             platform: manifest.platform,
             architecture: manifest.architecture,
             xcodeBuild: manifest.xcodeBuild,
+            sdkBuild: manifest.sdkBuild,
             swiftCompilerFingerprint: manifest.swiftCompilerFingerprint,
             liveReloadIndexHash: manifest.liveReloadIndexHash
         )
@@ -229,6 +255,7 @@ public struct PreparedConfiguration: Sendable {
             platform: manifest.platform,
             architecture: manifest.architecture,
             xcodeBuild: manifest.xcodeBuild,
+            sdkBuild: manifest.sdkBuild,
             swiftCompilerFingerprint: manifest.swiftCompilerFingerprint,
             liveReloadIndexHash: manifest.liveReloadIndexHash
         )
@@ -245,7 +272,8 @@ public struct PreparedConfiguration: Sendable {
     private static func validateIdentity(
         manifest: DevBuildManifest.Document,
         index: ReloadIndex.Document,
-        archive: InterfaceArchive.Archive
+        archive: InterfaceArchive.Archive,
+        receipt: ShellBuildReceipt.Document
     ) throws {
         let archivedSources = Dictionary(
             uniqueKeysWithValues: archive.sources.map { ($0.logicalPath, $0.contentHash) }
@@ -253,21 +281,53 @@ public struct PreparedConfiguration: Sendable {
         let manifestSources = Dictionary(
             uniqueKeysWithValues: manifest.sourceFiles.map { ($0.logicalPath, $0.contentHash) }
         )
+        var expectedReceiptMetadata = archive.metadata
+        expectedReceiptMetadata.machOUUIDs = []
         let archivedFunctions = Set(archive.functions.map(\.key))
         let indexedFunctions = Set(index.roots.map(\.functionKey))
-        guard try index.contentHash() == manifest.liveReloadIndexHash,
-              archive.metadata.bundleID == manifest.bundleID,
-              archive.metadata.machOUUIDs.contains(manifest.executableUUID),
-              archive.metadata.targetTriple == manifest.targetTriple,
-              archive.metadata.minimumOS == manifest.minimumOS,
-              archive.metadata.xcodeBuild == manifest.xcodeBuild,
-              archive.metadata.sdkBuild == manifest.sdkBuild,
-              archive.compatibility.compilerFingerprint == manifest.swiftCompilerFingerprint,
-              archive.metadata.frontendInvocation.moduleName == manifest.moduleName,
-              archivedSources == manifestSources,
-              indexedFunctions.isSubset(of: archivedFunctions)
-        else {
-            throw DevSession.ConfigurationError.identityMismatch
+        let receiptSources = Dictionary(
+            uniqueKeysWithValues: receipt.sources.map {
+                ($0.logicalPath, $0.contentHash)
+            }
+        )
+        let checks: [(matches: Bool, fact: String)] = [
+            (try index.contentHash() == manifest.liveReloadIndexHash,
+             "Reload Index hash"),
+            (archive.metadata.bundleID == manifest.bundleID, "bundle ID"),
+            (archive.metadata.machOUUIDs.contains(manifest.executableUUID),
+             "executable UUID"),
+            (archive.metadata.targetTriple == manifest.targetTriple,
+             "target triple"),
+            (archive.metadata.minimumOS == manifest.minimumOS,
+             "minimum OS"),
+            (archive.metadata.xcodeBuild == manifest.xcodeBuild,
+             "Xcode build"),
+            (archive.metadata.sdkBuild == manifest.sdkBuild, "SDK build"),
+            (archive.compatibility.compilerFingerprint
+                == manifest.swiftCompilerFingerprint,
+             "Swift compiler fingerprint"),
+            (archive.metadata.frontendInvocation.moduleName
+                == manifest.moduleName,
+             "Swift module"),
+            (archivedSources == manifestSources, "source baseline"),
+            (indexedFunctions.isSubset(of: archivedFunctions),
+             "Reload Index function set"),
+            (receipt.metadata == expectedReceiptMetadata,
+             "Build Receipt metadata"),
+            (receipt.compatibility == archive.compatibility,
+             "Build Receipt compatibility"),
+            (receipt.capabilities == archive.capabilities,
+             "Build Receipt capabilities"),
+            (receiptSources == archivedSources, "Build Receipt sources"),
+            (Set(receipt.nativeImportCandidates) == Set(archive.nativeImports),
+             "Build Receipt NativeImport catalog"),
+            (receipt.nativeTypes == archive.nativeTypes,
+             "Build Receipt native types"),
+            (receipt.frozenValueTypes == archive.frozenValueTypes,
+             "Build Receipt frozen value types"),
+        ]
+        if let mismatch = checks.first(where: { !$0.matches }) {
+            throw DevSession.ConfigurationError.identityMismatch(mismatch.fact)
         }
     }
 
@@ -312,7 +372,7 @@ public enum ConfigurationError: Swift.Error, Equatable, Sendable, CustomStringCo
     case invalidValue
     case invalidBaseDirectory
     case invalidFilesystemEntry
-    case identityMismatch
+    case identityMismatch(String)
     case compilerIdentityMismatch
 
     public var description: String {
@@ -329,8 +389,8 @@ public enum ConfigurationError: Swift.Error, Equatable, Sendable, CustomStringCo
             "Dev Session configuration must be resolved from a local file directory"
         case .invalidFilesystemEntry:
             "a configured Dev Session input is missing, unsafe, or has the wrong file type"
-        case .identityMismatch:
-            "Dev Manifest, Reload Index, and HLXI do not share one captured build identity"
+        case let .identityMismatch(fact):
+            "Dev Manifest, Reload Index, Build Receipt, and HLXI disagree about \(fact)"
         case .compilerIdentityMismatch:
             "configured swiftc does not match the compiler recorded in the Dev Manifest"
         }

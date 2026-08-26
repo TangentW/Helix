@@ -48,5 +48,17 @@ package struct LocationMap: Sendable {
             column: offset - lineStarts[lineIndex] + 1
         )
     }
+
+    package func utf8Offset(line: Int, column: Int) -> Int? {
+        guard line > 0,
+              line <= lineStarts.count,
+              column > 0
+        else { return nil }
+        let offset = lineStarts[line - 1] + column - 1
+        guard offset <= utf8Count,
+              line == lineStarts.count || offset < lineStarts[line]
+        else { return nil }
+        return offset
+    }
 }
 }

@@ -41,6 +41,10 @@ extension ReleaseCompiler {
         public var compilerURL: URL
         public var enforceToolchainFingerprint: Bool
         public var requestedResources: Core.ResourceLimits
+        /// Session-local NativeImport slots used only by trusted Live Reload.
+        /// Records must exactly promote cataloged, non-emitted HLXI candidates;
+        /// the persisted Shell interface and its hash remain unchanged.
+        public var developmentNativeImports: [InterfaceArchive.NativeImportRecord]
         public var invocationObserver: SwiftFrontend.InvocationObserver?
 
         public init(
@@ -50,6 +54,7 @@ extension ReleaseCompiler {
             compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
             enforceToolchainFingerprint: Bool = true,
             requestedResources: Core.ResourceLimits = .init(),
+            developmentNativeImports: [InterfaceArchive.NativeImportRecord] = [],
             invocationObserver: SwiftFrontend.InvocationObserver? = nil
         ) {
             self.init(
@@ -59,6 +64,7 @@ extension ReleaseCompiler {
                 compilerURL: compilerURL,
                 enforceToolchainFingerprint: enforceToolchainFingerprint,
                 requestedResources: requestedResources,
+                developmentNativeImports: developmentNativeImports,
                 invocationObserver: invocationObserver
             )
         }
@@ -70,6 +76,7 @@ extension ReleaseCompiler {
             compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
             enforceToolchainFingerprint: Bool = true,
             requestedResources: Core.ResourceLimits = .init(),
+            developmentNativeImports: [InterfaceArchive.NativeImportRecord] = [],
             invocationObserver: SwiftFrontend.InvocationObserver? = nil
         ) {
             self.init(
@@ -79,6 +86,7 @@ extension ReleaseCompiler {
                 compilerURL: compilerURL,
                 enforceToolchainFingerprint: enforceToolchainFingerprint,
                 requestedResources: requestedResources,
+                developmentNativeImports: developmentNativeImports,
                 invocationObserver: invocationObserver
             )
         }
@@ -90,6 +98,7 @@ extension ReleaseCompiler {
             compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
             enforceToolchainFingerprint: Bool = true,
             requestedResources: Core.ResourceLimits = .init(),
+            developmentNativeImports: [InterfaceArchive.NativeImportRecord] = [],
             invocationObserver: SwiftFrontend.InvocationObserver? = nil
         ) {
             self.archive = archive
@@ -98,6 +107,10 @@ extension ReleaseCompiler {
             self.compilerURL = compilerURL
             self.enforceToolchainFingerprint = enforceToolchainFingerprint
             self.requestedResources = requestedResources
+            self.developmentNativeImports = developmentNativeImports.sorted {
+                ($0.id ?? .init(rawValue: UInt32.max))
+                    < ($1.id ?? .init(rawValue: UInt32.max))
+            }
             self.invocationObserver = invocationObserver
         }
     }
@@ -702,11 +715,66 @@ extension ReleaseCompiler {
                 ).filter { !archivedSymbols.contains($0.symbol) },
                 imageFunctions: imageFunctions
             )
-            let directCalls = try PatchCompiler.DirectCalls.make(
+            var directCalls = try PatchCompiler.DirectCalls.make(
                 archive: request.archive,
                 localFunctionIDs: localFunctionIDs,
-                additionalBindings: imageBindings
+                additionalBindings: imageBindings,
+                developmentNativeImports: request.developmentNativeImports
             )
+            // UIKit-heavy Shells commonly contain declaration-qualified
+            // bindings even when the current edit makes no Objective-C call.
+            // Avoid a redundant whole-module typed-AST frontend invocation in
+            // that common path; exact source evidence is needed only when one
+            // of the functions being lowered contains a foreign reference.
+            let lowersForeignReference = changedSIL.contains { item in
+                item.function.body.contains("foreign")
+                    || loweringSILFile.function(
+                        mangledName: item.record.mangledName
+                    )?.body.contains("foreign") == true
+            } || imageFunctions.contains { item in
+                item.optimized?.body.contains("foreign") == true
+                    || item.semantic?.body.contains("foreign") == true
+            }
+            if directCalls.requiresDeclarationReferences,
+               lowersForeignReference {
+                let logicalSources = request.archive.sources.sorted {
+                    $0.logicalPath < $1.logicalPath
+                }
+                let sourceURLsByLogicalPath = Dictionary(
+                    uniqueKeysWithValues: zip(
+                        logicalSources.map(\.logicalPath),
+                        orderedSourceFiles
+                    )
+                )
+                let primarySources = Set(changedSIL.compactMap {
+                    sourceURLsByLogicalPath[$0.record.sourceFileLogicalID]
+                })
+                guard primarySources.count == Set(
+                    changedSIL.map(\.record.sourceFileLogicalID)
+                ).count else {
+                    throw DriverError.sourceSetMismatch(
+                        "changed declarations do not map to typed-AST primary sources"
+                    )
+                }
+                let frontend = SwiftFrontend.Driver(
+                    compilerURL: request.compilerURL,
+                    invocationObserver: request.invocationObserver
+                )
+                let astOutput = try frontend.emitTypedAST(
+                    sourceFiles: orderedSourceFiles,
+                    primarySourceFiles: primarySources,
+                    invocation: request.archive.metadata.frontendInvocation
+                )
+                let documents = try SwiftFrontend.TypedAST.parseDocuments(
+                    astOutput
+                )
+                directCalls = directCalls.includingDeclarationReferences(
+                    try CanonicalSIL.DeclarationReferenceMap(
+                        documents: documents,
+                        sourceFiles: Array(primarySources)
+                    )
+                )
+            }
             var changed: [(
                 record: InterfaceArchive.FunctionRecord,
                 function: IntermediateRepresentation.Function,

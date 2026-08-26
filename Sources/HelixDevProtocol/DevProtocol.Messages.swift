@@ -46,6 +46,7 @@ public struct BuildIdentity: Codable, Hashable, Sendable {
     public var platform: DevProtocol.ApplePlatform
     public var architecture: String
     public var xcodeBuild: String
+    public var sdkBuild: String
     public var swiftCompilerFingerprint: String
     public var liveReloadIndexHash: Core.Digest
 
@@ -57,6 +58,7 @@ public struct BuildIdentity: Codable, Hashable, Sendable {
         platform: DevProtocol.ApplePlatform,
         architecture: String,
         xcodeBuild: String,
+        sdkBuild: String,
         swiftCompilerFingerprint: String,
         liveReloadIndexHash: Core.Digest
     ) {
@@ -67,6 +69,7 @@ public struct BuildIdentity: Codable, Hashable, Sendable {
         self.platform = platform
         self.architecture = architecture
         self.xcodeBuild = xcodeBuild
+        self.sdkBuild = sdkBuild
         self.swiftCompilerFingerprint = swiftCompilerFingerprint
         self.liveReloadIndexHash = liveReloadIndexHash
     }
@@ -84,6 +87,7 @@ public struct SessionIdentity: Codable, Hashable, Sendable {
     public var architecture: String
     public var operatingSystemBuild: String
     public var xcodeBuild: String
+    public var sdkBuild: String
     public var swiftCompilerFingerprint: String
     public var liveReloadIndexHash: Core.Digest
     public var supportedBackends: [LiveReload.Backend]
@@ -91,6 +95,11 @@ public struct SessionIdentity: Codable, Hashable, Sendable {
     public var highestAppliedSourceRevision: DevProtocol.SourceRevision
     public var activeGenerationID: DevProtocol.GenerationID?
     public var activeFunctionRoutes: [DevProtocol.ActiveFunctionRoute]
+    /// Session-local NativeCall capabilities published by successful HLBC
+    /// development transactions. They are reconnect inventory, not release ABI.
+    public var activeDevelopmentNativeCallKeys: [Core.NativeCall.Key]
+    public var loadedDevelopmentAdapterCount: UInt32
+    public var loadedDevelopmentAdapterBytes: UInt64
     public var loadedNativeImageCount: UInt32
     public var loadedNativeImageBytes: UInt64
     public var nativeImageSoftLimitReached: Bool
@@ -106,6 +115,7 @@ public struct SessionIdentity: Codable, Hashable, Sendable {
         architecture: String,
         operatingSystemBuild: String,
         xcodeBuild: String,
+        sdkBuild: String,
         swiftCompilerFingerprint: String,
         liveReloadIndexHash: Core.Digest,
         supportedBackends: [LiveReload.Backend],
@@ -113,6 +123,9 @@ public struct SessionIdentity: Codable, Hashable, Sendable {
         highestAppliedSourceRevision: DevProtocol.SourceRevision = .init(rawValue: 0),
         activeGenerationID: DevProtocol.GenerationID? = nil,
         activeFunctionRoutes: [DevProtocol.ActiveFunctionRoute] = [],
+        activeDevelopmentNativeCallKeys: [Core.NativeCall.Key] = [],
+        loadedDevelopmentAdapterCount: UInt32 = 0,
+        loadedDevelopmentAdapterBytes: UInt64 = 0,
         loadedNativeImageCount: UInt32 = 0,
         loadedNativeImageBytes: UInt64 = 0,
         nativeImageSoftLimitReached: Bool = false,
@@ -127,6 +140,7 @@ public struct SessionIdentity: Codable, Hashable, Sendable {
         self.architecture = architecture
         self.operatingSystemBuild = operatingSystemBuild
         self.xcodeBuild = xcodeBuild
+        self.sdkBuild = sdkBuild
         self.swiftCompilerFingerprint = swiftCompilerFingerprint
         self.liveReloadIndexHash = liveReloadIndexHash
         self.supportedBackends = supportedBackends.sorted { $0.rawValue < $1.rawValue }
@@ -136,6 +150,10 @@ public struct SessionIdentity: Codable, Hashable, Sendable {
         self.activeFunctionRoutes = activeFunctionRoutes.sorted {
             $0.functionKey.description < $1.functionKey.description
         }
+        self.activeDevelopmentNativeCallKeys = activeDevelopmentNativeCallKeys
+            .sorted()
+        self.loadedDevelopmentAdapterCount = loadedDevelopmentAdapterCount
+        self.loadedDevelopmentAdapterBytes = loadedDevelopmentAdapterBytes
         self.loadedNativeImageCount = loadedNativeImageCount
         self.loadedNativeImageBytes = loadedNativeImageBytes
         self.nativeImageSoftLimitReached = nativeImageSoftLimitReached
@@ -155,6 +173,7 @@ public struct SessionIdentity: Codable, Hashable, Sendable {
             platform: platform,
             architecture: architecture,
             xcodeBuild: xcodeBuild,
+            sdkBuild: sdkBuild,
             swiftCompilerFingerprint: swiftCompilerFingerprint,
             liveReloadIndexHash: liveReloadIndexHash
         )

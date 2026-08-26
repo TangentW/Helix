@@ -39,6 +39,25 @@ public struct ContextStore: Sendable {
         return document.contexts
     }
 
+    /// Loads reconstructible service state, quarantining an owner-only file
+    /// whose schema or contents are no longer valid. This is deliberately not
+    /// a migration: Xcode republishes exact current Build Contexts. Unsafe
+    /// permissions, non-regular files, and symbolic links still fail closed.
+    public func loadOrQuarantineInvalidDocument() throws -> [DevSession.BuildContext] {
+        do {
+            return try load()
+        } catch let original as DevSession.ContextError {
+            do {
+                _ = try SecureStorage.OwnerFile.quarantine(url)
+                return []
+            } catch SecureStorage.OwnerFile.Error.unavailable {
+                return []
+            } catch {
+                throw original
+            }
+        }
+    }
+
     private func loadDocument() throws -> Document? {
         let data: Data
         do {

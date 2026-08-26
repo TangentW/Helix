@@ -54,6 +54,13 @@ The Xcode lifecycle carries identity instead of credentials:
    TLS. The authenticated channel then carries source diagnostics, HLBC
    generations, activation results, and reconnect leases.
 
+The persistent Build Context registry is reconstructible development state, not
+a compatibility database. If its owner-only regular file cannot be decoded or
+validated by the current build, Hub moves it aside for diagnosis and starts
+with an empty registry; the next normal Xcode build republishes current
+contexts. A symbolic link, broad permissions, or another insecure filesystem
+shape still prevents startup instead of being silently replaced.
+
 The decision is fixed for the process lifetime. If the developer stops Xcode
 and later opens the same installed build from the Home Screen, the new process
 is manual: it does no Bonjour browsing and requests no local-network access
@@ -89,10 +96,11 @@ sequenceDiagram
     M->>M: "Debounce and capture a stable snapshot"
     M->>C: "Monotonic sourceRevision"
     C->>C: "Exact module type-check and body-only diff"
-    C->>C: "Lower supported SIL and build one HLBC generation"
-    C->>D: "Offer, hash, metadata, payload"
+    C->>C: "Lower SIL and resolve exact native candidates"
+    C->>C: "Build only missing Swift Adapter bodies"
+    C->>D: "Canonical DevelopmentPayload"
     D->>A: "Authenticated chunked transfer"
-    A->>A: "Verify and activate code"
+    A->>A: "Verify imports/images and atomically activate"
     A->>U: "Changed roots and reload hints"
     U-->>E: "Refreshed or manual-refresh-required status"
 ```
@@ -126,28 +134,43 @@ For an accepted save transaction, Helix:
 3. Uses declaration identities and implementation fingerprints to determine
    the changed eligible roots, then asks the captured Swift compiler for SIL.
 4. Builds a closed call table. Patch-local functions take precedence, followed
-   by eligible Shell `EntryIndex` routes and exact native capabilities that the
-   Dev Shell emitted at build time and identifies by stable `NativeCallKey`
-   values. `NativeImportID` remains only a compact Shell slot.
-5. Lowers only the supported canonical SIL into typed HLIR and HLBC, then runs
-   the independent structural and semantic verifier on the Mac.
-6. Sends one immutable, session-bound live artifact. The App rechecks session,
-   revision, target, Shell identity, hash, size, capabilities, and bytecode
-   validity before atomically activating it.
+   by eligible Shell `EntryIndex` routes, the Shell's linked native imports, and
+   exact dormant candidates from the authenticated Build Receipt. First-use
+   candidates receive deterministic session-local IDs after the linked prefix;
+   the Shell interface hash does not change. `NativeImportID` remains only a
+   compact dispatch slot, never authority.
+5. Lowers only supported canonical SIL into typed HLIR and HLBC, runs the
+   independent verifier, then inspects the produced import table. Objective-C
+   and supported C candidates use their common Runtime invokers. Only a missing
+   pure-Swift candidate causes Hub to compile its exact Adapter body, using the
+   captured compiler job and the content-addressed Adapter cache.
+6. Frames HLBC, promoted imports, Adapter image descriptors, hashes, and image
+   bytes as one canonical version-1 `DevelopmentPayload`, then sends it over the
+   authenticated session.
+7. The App rechecks session/revision, compiler and SDK identity, target, Shell
+   identity, every Descriptor/Key, Mach-O identity/signature/dependencies, size,
+   capabilities, and bytecode. It constructs one immutable native-capability
+   snapshot and only then atomically publishes the generation.
 
-No Swift compiler, linker, JIT, dylib, or source file is sent to or executed on
-the iOS process. Release and development reuse the compiler/verifier/HLVM core,
-but development artifacts are ephemeral and authenticated by a one-run Dev
-Session rather than by the production package trust chain.
+No Swift compiler, linker, JIT, or source file is sent to or executed in the
+App process. A qualified Simulator or macOS development process may receive a
+signed, exact on-demand Swift Adapter image; physical iOS rejects that image
+path and asks for a normal rebuild. Release and development reuse the
+compiler/verifier/HLVM core, but development artifacts are ephemeral and
+authenticated by a one-run Dev Session rather than the production package
+trust chain. Raw HLBC is not a development transport, even when no Adapter is
+needed.
 
 ## Native calls, instance `self`, and recursion
 
 HLBC cannot call an arbitrary Swift symbol merely because it exists in the
 process. A call is accepted only when it resolves to a function in the same
-bytecode image, an eligible Shell entry, or an exact NativeImport generated into
-that Shell. Entry routes are preferred, so ordinary calls between patchable App
-functions remain generation-aware; NativeImport is for a bounded API whose
-native implementation must run outside HLVM.
+bytecode image, an eligible Shell entry, a linked exact NativeImport, or an exact
+Build-Receipt candidate promoted by the authenticated development transaction.
+Entry routes are preferred, so ordinary calls between patchable App functions
+remain generation-aware; NativeImport is for a bounded API whose native
+implementation must run outside HLVM. Patch bytes cannot name a new selector,
+C symbol, Swift symbol, ABI, or process address.
 
 This is also the execution split for standard-library APIs. Managed collection
 algorithms use generic, verifier-visible HLBC semantic plans and callbacks; they
@@ -331,17 +354,20 @@ the Shell minimum OS and declaration isolation, excludes deprecated or
 unavailable declarations, then sends generated probes
 through the same typed AST and canonical SIL pipeline used for project source.
 Only uniquely measured, Bridge-compatible synchronous initializers, instance
-or static methods, and readable or writable properties become exact
-NativeImports.
+or static methods, and readable or writable properties become exact Catalog
+candidates. Calls already used by the baseline become linked NativeImports;
+unused candidates remain data-only records in the authenticated Build Receipt.
 When such a declaration has a compiler-proven Objective-C ABI in the supported
 matrix, its exact NativeImport is a compact descriptor bound to the shared
 Objective-C invoker; no selector-specific Swift wrapper is emitted. Exact Swift
 adapters remain for representable overlays and ABI shapes that cannot use that
-generic boundary, but they are grouped into deterministic per-module Adapter
-Packs whose source and Mach-O objects are cached independently. A proven C
-function uses the restricted common C invoker when its exact ABI fits the AOT
-matrix; the Bridge supplies the imported declaration address, with no runtime
-symbol lookup.
+generic boundary. Baseline-used adapters are grouped into deterministic
+per-module Packs; a dormant Swift candidate is compiled and cached only if a
+later HLBC generation actually imports it. A proven C function uses the
+restricted common C invoker when its exact ABI fits the AOT matrix. A linked
+baseline import uses the Bridge-bound declaration address; an authenticated
+first-use development candidate resolves only the Descriptor-fixed entry point
+from the current linked process. Neither path accepts a caller-selected symbol.
 The symbol-graph function signature is aligned with the full declaration before
 probing. Helix recovers only declaration-level `@escaping` and `@autoclosure`
 markers that the signature view is permitted to omit; any other missing
@@ -444,10 +470,12 @@ backend-specific call convention.
 Each successful transaction is one immutable development generation. On a
 qualified Simulator build the payload is a newly compiled, signed native Swift
 image; on a device or when native replacement is unavailable it is verified
-HLBC. Helix never mutates an already loaded image. The daemon sends an offer
-manifest and a bounded payload over the authenticated Dev Session, and the App
-validates the complete artifact before activation. An HLBC baseline restore may
-legitimately carry no bytecode and only remove inherited routes.
+HLBC, optionally accompanied by exact development Adapter images on qualified
+Simulator/macOS targets. Helix never mutates an already loaded image. The
+daemon sends an offer manifest and one bounded canonical payload over the
+authenticated Dev Session, and the App validates the complete transaction
+before activation. An HLBC baseline restore may legitimately carry no bytecode
+and only remove inherited routes.
 
 The default live HLBC payload limit is 16 MiB. Activation flattens inherited
 routes into one immutable snapshot, so a lookup does not depend on keeping an
@@ -463,6 +491,25 @@ lease is released, the next registry operation compacts that snapshot. A
 separate process-wide high-water mark prevents a compacted generation ID from
 being reused. Development generations are never installed in production patch
 storage, and restarting the App returns to the Dev Shell baseline.
+
+Every HLBC generation pins an immutable native-capability snapshot containing
+the linked baseline plus development candidates already published by that
+session. An escaping native callback lease retains that same snapshot, so a
+later save cannot change what its callback may call. Development Adapter images
+cannot be safely unloaded; their count and mapped bytes share the same
+process-lifetime native-image budget as Dynamic Replacement generations. A
+failed image load is never published. If loader state cannot be proven clean,
+the App marks native state uncertain and rejects further image-bearing payloads
+until restart. Reconnect identity reports both published development keys and
+mapped image inventory, allowing Hub to reuse the existing session state.
+
+Two saves may overlap while Hub is compiling the same first-use Swift Adapter.
+If the earlier transaction publishes it first, the App treats the later,
+descriptor-identical session import as an idempotent replay: it neither maps nor
+charges the redundant image again, while any changed ID, key, descriptor, ABI,
+contract, or binding still rejects the complete transaction. A payload that
+mixes already-published and genuinely new imports loads only the images required
+by the new imports before activating the new generation.
 
 The checked-in soak activates 128 real verified HLBC generations, exercises a
 failed save without changing the active generation, validates rollback and
@@ -481,12 +528,14 @@ back to verified HLBC. Physical-device builds continue to select HLBC unless a
 separate device/native matrix has been explicitly qualified; production Hot
 Patch never receives this development image-loading authority.
 
-The checked-in Simulator E2E now applies eight native generations in one App
-process and verifies five observable UIKit scenarios plus final source
-restoration. Native images cannot be unloaded safely, so count and mapped-byte
-limits remain process-lifetime resource bounds; the diagnostic asks for an App
-restart before those bounds are exhausted. The 128-generation deterministic
-soak continues to exercise the independently verified HLBC lifecycle.
+The checked-in Simulator E2E runs the same eight-update, five-scenario UIKit
+workflow twice: once through automatic native routing and once with HLBC forced.
+The forced run proves first use of a dormant pure-Swift SDK candidate, signed
+on-demand Adapter loading, generation activation, and final source restoration
+without reinstalling the Shell. Native images cannot be unloaded safely, so
+count and mapped-byte limits remain process-lifetime resource bounds; the
+diagnostic asks for an App restart before those bounds are exhausted. The
+128-generation deterministic soak separately exercises the HLBC lifecycle.
 
 ## Why code activation does not automatically redraw a page
 

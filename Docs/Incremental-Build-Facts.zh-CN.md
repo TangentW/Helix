@@ -23,6 +23,7 @@ Xcode 实际捕获的 Swift frontend 去证明完整调用面；只有所有语�
 | Hot Patch Prepare | 完整 Shell 目录和函数计数 | Prepare 精确输入，或输出中的路径、字节、权限、额外文件发生任何变化 |
 | Adapter Pack source | 按原生 module 分组的确定性 Swift Adapter | 编译器指纹、SDK/target/deployment、变换流水线、module、有序 imported module 集合与有序稳定调用 Key |
 | Adapter Pack object | 单个 module Pack 的已验证 Mach-O | Pack source identity，再加工具链、Xcode build、规范化编译参数、完整非 SDK compiler-input 快照和 module map |
+| 开发期 Adapter image | 只包含首次使用且缺失的 Swift Adapter body 的签名 Mach-O | compiler/Xcode/SDK identity、target/deployment/platform/architecture、依赖图、module、规范化语义参数与保留的链接参数、精确生成源码、有序 Descriptor/Key/type/contract 记录 |
 | Application Bridge object | 排除一次性 Hub contract 后的稳定、已验证 Mach-O | profile、工具链、Xcode/SDK build、变换流水线、规范化编译参数、稳定生成源码、compiler input 和 module map |
 | 最终 Bridge state | 已链接的 Bridge 与 C bootstrap Mach-O object | 包含 Hub contract 的全部生成源码、application/Pack 输入、Clang binary 和 bootstrap source |
 
@@ -63,8 +64,9 @@ graph 和单个声明的探测结果。也就是说，业务代码做了一次�
 - receipt 必须完整通过结构校验，并匹配当前源码、metadata 和工具链；
 - symbol graph 和实测操作走与新生成结果相同的验证；
 - Prepare state 会比较整个生成目录，包括文件权限和意外多出的条目；
-- Adapter Pack、application Bridge 与最终 Bridge state 都会重新检查 Mach-O
-  架构和平台；最终 state 还会核对已发布 object 的大小与内容 hash。
+- Adapter Pack、开发期 Adapter、application Bridge 与最终 Bridge state 都会重新检查
+  Mach-O 架构和平台。开发期 Adapter 还会检查确定性 install name、UUID、代码签名
+  command 与依赖前缀；最终 state 还会核对已发布 object 的大小与内容 hash。
 
 新生成的 module、Prepare 或 Bridge 状态发布前，还会再次确认源码和编译器接口。
 如果编辑器或另一个构建恰好在分析期间改了输入，Helix 会完成权威的无缓存流程，但
@@ -104,6 +106,16 @@ object 分别缓存。稳定 application Bridge 编译时不包含一次性 Hub 
 的内容寻址 Mach-O 缓存。Live Reload 会单独编译本次很小的 Hub contract，再把它与稳定
 application object、各 Pack object 做 relocatable link；Hot Patch 根本不生成 Hub
 contract source。
+
+受管 Debug 未使用候选只保留为 Receipt 数据，不会膨胀稳定 Bridge 或 Pack object。
+HLBC 构建完成后，Helix 会检查它真正使用的 import table。Objective-C 与受支持 C 的
+首次使用不需要生成机器码；只有新引用的 Swift Adapter Key 才会渲染成一份最小开发
+image。完全相同的请求在完整 Mach-O 校验后复用 owner-local cache。缓存仍只负责省时：
+认证 payload 会携带 image 与精确 metadata，App 在发布能力 snapshot 前仍会独立复核。
+
+Patch Compiler 只有在本次选中的 optimized 或 semantic SIL 确实包含 foreign call 时，
+才会额外请求 Typed AST 声明映射。因此，Shell Catalog 即使包含 Objective-C 候选，
+纯 Swift 修改也不会平白多跑一次 whole-module frontend。
 
 最终 Bridge state 仍更严格：它包含包括当前 invitation 在内的每一份生成源码。因此，
 新的 Live Reload reservation 会按设计让最终 state miss，但仍可命中分别验证的

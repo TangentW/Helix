@@ -48,7 +48,12 @@ public final class ApplicationSession {
         let launchMode = DevRuntime.LaunchMode.current()
         let provider = try bridgeProvider ?? Runtime.LinkedBridge.load()
         let contract = try hubContract ?? DevRuntime.LinkedHubContract.load()
-        let runtime = try provider.makeRuntime()
+        let runtime = try provider.makeRuntime(
+            registry: .init(
+                maximumGenerationCount: 512,
+                maximumEstimatedBytes: 256 * 1_024 * 1_024
+            )
+        )
         try self.init(
             hubContract: contract,
             launchMode: launchMode,

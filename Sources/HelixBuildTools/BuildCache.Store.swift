@@ -13,6 +13,7 @@ public enum Namespace: String, Codable, Hashable, Sendable {
     case managedProbe = "managed_probe"
     case adapterPack = "adapter_pack"
     case adapterObject = "adapter_object"
+    case developmentAdapter = "development_adapter"
     case applicationObject = "application_object"
 }
 
@@ -433,5 +434,32 @@ public struct Store: Sendable {
         }
         return data
     }
+}
+
+/// Resolves the owner-local shared cache used by Xcode integration and
+/// development-time Adapter compilation. An invalid override is ignored in
+/// favor of the validated user-cache location.
+public static func defaultStore(
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    fileManager: FileManager = .default
+) -> BuildCache.Store? {
+    let root: URL
+    if let configured = environment["HELIX_BUILD_CACHE_DIR"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines),
+       !configured.isEmpty,
+       configured.hasPrefix("/"),
+       !configured.contains("\n"),
+       !configured.contains("\r") {
+        root = URL(fileURLWithPath: configured, isDirectory: true)
+    } else {
+        guard let caches = fileManager.urls(
+            for: .cachesDirectory,
+            in: .userDomainMask
+        ).first else { return nil }
+        root = caches
+            .appendingPathComponent("Helix", isDirectory: true)
+            .appendingPathComponent("BuildFacts", isDirectory: true)
+    }
+    return try? .init(rootURL: root)
 }
 }

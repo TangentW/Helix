@@ -96,6 +96,7 @@ public struct UnavailableDirectCall: Hashable, Sendable {
 public struct DirectCallTable: Sendable {
     private var bindings: [String: [CanonicalSIL.DirectCallBinding]]
     private var unavailableCalls: [String: CanonicalSIL.UnavailableDirectCall]
+    private var declarationReferences: CanonicalSIL.DeclarationReferenceMap
 
     public static let empty = CanonicalSIL.DirectCallTable(
         unchecked: [:],
@@ -311,10 +312,49 @@ public struct DirectCallTable: Sendable {
     func adding(
         _ additionalBindings: [CanonicalSIL.DirectCallBinding]
     ) throws -> CanonicalSIL.DirectCallTable {
-        try CanonicalSIL.DirectCallTable(
+        var result = try CanonicalSIL.DirectCallTable(
             bindings.values.flatMap { $0 } + additionalBindings,
             unavailable: Array(unavailableCalls.values)
         )
+        result.declarationReferences = declarationReferences
+        return result
+    }
+
+    var requiresDeclarationReferences: Bool {
+        bindings.keys.contains(where:
+            CanonicalSIL.NativeBridgeSymbols
+                .isDeclarationQualifiedForeignCall
+        ) || unavailableCalls.keys.contains(where:
+            CanonicalSIL.NativeBridgeSymbols
+                .isDeclarationQualifiedForeignCall
+        )
+    }
+
+    func includingDeclarationReferences(
+        _ references: CanonicalSIL.DeclarationReferenceMap
+    ) -> CanonicalSIL.DirectCallTable {
+        var result = self
+        result.declarationReferences = references
+        return result
+    }
+
+    func resolvedForeignSymbol(
+        _ symbol: String,
+        at location: Core.SourceLocation?
+    ) -> String {
+        if let usr = declarationReferences.usr(at: location) {
+            let qualified = CanonicalSIL.NativeBridgeSymbols
+                .declarationQualifiedForeignCall(
+                    symbol: symbol,
+                    declarationUSR: usr
+                )
+            if bindings[qualified] != nil
+                || unavailableCalls[qualified] != nil
+            {
+                return qualified
+            }
+        }
+        return symbol
     }
 
     func referencesInoutCallee(in body: String) -> Bool {
@@ -413,6 +453,7 @@ public struct DirectCallTable: Sendable {
     ) {
         self.bindings = bindings
         self.unavailableCalls = unavailableCalls
+        declarationReferences = .empty
     }
 
     private static func bindingOrder(

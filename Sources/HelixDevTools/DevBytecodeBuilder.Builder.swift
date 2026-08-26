@@ -12,6 +12,11 @@ public struct Request: Sendable {
     public var sourceRevision: DevProtocol.SourceRevision
     public var generationID: DevProtocol.GenerationID
     public var compileRequest: PatchCompiler.Request
+    public var sdkBuild: String
+    public var targetTriple: String
+    public var nativeImports: [DevProtocol.DevelopmentPayload.NativeImport]
+    public var imageDescriptors: [DevProtocol.DevelopmentPayload.Image]
+    public var images: [Data]
     public var changedSources: [LiveReload.SourceFileID]
     public var changedFunctions: [Core.FunctionKey]
     public var reloadHints: [DevProtocol.ReloadHint]
@@ -21,6 +26,11 @@ public struct Request: Sendable {
         sourceRevision: DevProtocol.SourceRevision,
         generationID: DevProtocol.GenerationID,
         compileRequest: PatchCompiler.Request,
+        sdkBuild: String,
+        targetTriple: String,
+        nativeImports: [DevProtocol.DevelopmentPayload.NativeImport] = [],
+        imageDescriptors: [DevProtocol.DevelopmentPayload.Image] = [],
+        images: [Data] = [],
         changedSources: [LiveReload.SourceFileID],
         changedFunctions: [Core.FunctionKey],
         reloadHints: [DevProtocol.ReloadHint] = []
@@ -29,6 +39,11 @@ public struct Request: Sendable {
         self.sourceRevision = sourceRevision
         self.generationID = generationID
         self.compileRequest = compileRequest
+        self.sdkBuild = sdkBuild
+        self.targetTriple = targetTriple
+        self.nativeImports = nativeImports
+        self.imageDescriptors = imageDescriptors
+        self.images = images
         self.changedSources = changedSources
         self.changedFunctions = changedFunctions
         self.reloadHints = reloadHints
@@ -45,20 +60,31 @@ public struct Builder: Sendable {
 
     public func build(_ request: DevBytecodeBuilder.Request) throws -> DevBytecodeBuilder.Result {
         let compiled = try PatchCompiler.Driver().compile(request.compileRequest)
+        let payload = try DevProtocol.DevelopmentPayload.Artifact(
+            shellInterfaceHash: request.compileRequest.shellInterfaceHash,
+            compilerFingerprint:
+                request.compileRequest.compatibility.compilerFingerprint,
+            sdkBuild: request.sdkBuild,
+            targetTriple: request.targetTriple,
+            bytecode: compiled.bytecode,
+            nativeImports: request.nativeImports,
+            imageDescriptors: request.imageDescriptors,
+            images: request.images
+        ).encoded()
         let offer = DevProtocol.PatchOffer(
             sessionID: request.sessionID,
             sourceRevision: request.sourceRevision,
             generationID: request.generationID,
             backend: .hlbc,
-            payloadByteLength: UInt64(compiled.bytecode.count),
-            payloadSHA256: .sha256(compiled.bytecode),
+            payloadByteLength: UInt64(payload.count),
+            payloadSHA256: .sha256(payload),
             changedSources: request.changedSources,
             changedFunctions: request.changedFunctions,
             reloadHints: request.reloadHints
         )
         return .init(
             compiledPatch: compiled,
-            artifact: .init(offer: offer, payload: compiled.bytecode)
+            artifact: .init(offer: offer, payload: payload)
         )
     }
 }
