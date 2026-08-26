@@ -2,6 +2,12 @@ import Darwin
 import Foundation
 
 extension CLI {
+struct DirectoryPublication: Sendable {
+    var reusedFileCount: UInt64
+    var writtenFileCount: UInt64
+    var wasNoOp: Bool
+}
+
 struct FileSystem: Sendable {
     let currentDirectoryURL: URL
 
@@ -93,13 +99,14 @@ struct FileSystem: Sendable {
 
     /// Commits a complete generated-source tree with a single directory rename.
     /// Readers therefore observe either the previous build or the complete new one.
+    @discardableResult
     func writeDirectory(
         _ artifacts: [String: Data],
         to outputURL: URL,
         force: Bool,
         privatePaths: Set<String> = [],
         executablePaths: Set<String> = []
-    ) throws {
+    ) throws -> CLI.DirectoryPublication {
         let target = outputURL.standardizedFileURL
         guard !artifacts.isEmpty,
               target.path != "/",
@@ -132,13 +139,25 @@ struct FileSystem: Sendable {
                 "private and executable output modes must name disjoint artifacts"
             )
         }
+        let permissions = Dictionary(uniqueKeysWithValues: artifactPaths.map { path in
+            (path, executablePaths.contains(path) ? UInt16(0o755)
+                : privatePaths.contains(path) ? UInt16(0o600) : UInt16(0o644))
+        })
+        if Self.directoryMatches(
+            target,
+            artifacts: artifacts,
+            permissions: permissions,
+            manager: manager
+        ) {
+            return .init(
+                reusedFileCount: UInt64(artifacts.count),
+                writtenFileCount: 0,
+                wasNoOp: true
+            )
+        }
 
         let staging = parent.appendingPathComponent(
             ".helix-staging-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        let backup = parent.appendingPathComponent(
-            ".helix-backup-\(UUID().uuidString)",
             isDirectory: true
         )
         try manager.createDirectory(at: staging, withIntermediateDirectories: false)
@@ -146,36 +165,60 @@ struct FileSystem: Sendable {
         defer {
             if stagingExists { try? manager.removeItem(at: staging) }
         }
+        var reusedFileCount: UInt64 = 0
+        var writtenFileCount: UInt64 = 0
         for (path, data) in artifacts.sorted(by: { $0.key < $1.key }) {
             let destination = staging.appendingPathComponent(path)
             try manager.createDirectory(
                 at: destination.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
-            try data.write(to: destination, options: .atomic)
-            let permissions: NSNumber = executablePaths.contains(path) ? 0o755
-                : privatePaths.contains(path) ? 0o600 : 0o644
-            try manager.setAttributes(
-                [.posixPermissions: permissions],
-                ofItemAtPath: destination.path
-            )
+            let mode = permissions[path]!
+            let existing = target.appendingPathComponent(path)
+            if Self.regularFileMatches(existing, data: data, permissions: mode),
+               Darwin.link(existing.path, destination.path) == 0,
+               Self.regularFileMatches(destination, data: data, permissions: mode) {
+                reusedFileCount += 1
+            } else {
+                _ = Darwin.unlink(destination.path)
+                try data.write(to: destination, options: .atomic)
+                try manager.setAttributes(
+                    [.posixPermissions: NSNumber(value: mode)],
+                    ofItemAtPath: destination.path
+                )
+                writtenFileCount += 1
+            }
         }
 
         if manager.fileExists(atPath: target.path) {
-            try manager.moveItem(at: target, to: backup)
-            do {
-                try manager.moveItem(at: staging, to: target)
-                stagingExists = false
-            } catch {
-                try? manager.moveItem(at: backup, to: target)
-                throw error
+            let status = staging.path.withCString { stagingPath in
+                target.path.withCString { targetPath in
+                    renameatx_np(
+                        AT_FDCWD,
+                        stagingPath,
+                        AT_FDCWD,
+                        targetPath,
+                        UInt32(RENAME_SWAP)
+                    )
+                }
             }
-            // A stale backup is safer than failing a successfully committed build.
-            try? manager.removeItem(at: backup)
+            guard status == 0 else {
+                throw CLI.Error.input(
+                    "cannot atomically publish generated directory: "
+                        + String(cString: strerror(errno))
+                )
+            }
+            // The old tree now occupies the staging path and is removed by
+            // defer; the target was never absent from the filesystem.
         } else {
             try manager.moveItem(at: staging, to: target)
             stagingExists = false
         }
+        return .init(
+            reusedFileCount: reusedFileCount,
+            writtenFileCount: writtenFileCount,
+            wasNoOp: false
+        )
     }
 
     func requireExtension(_ expected: String, for url: URL) throws {
@@ -190,6 +233,69 @@ struct FileSystem: Sendable {
         let components = path.split(separator: "/", omittingEmptySubsequences: false)
         return !components.contains("") && !components.contains("..")
             && !path.unicodeScalars.contains(where: { $0.value == 0 })
+    }
+
+    private static func directoryMatches(
+        _ root: URL,
+        artifacts: [String: Data],
+        permissions: [String: UInt16],
+        manager: FileManager
+    ) -> Bool {
+        var rootInformation = Darwin.stat()
+        let rootStatus = lstat(root.path, &rootInformation)
+        guard rootStatus == 0,
+              rootInformation.st_mode & S_IFMT == S_IFDIR
+        else { return false }
+        var expected = Set(artifacts.keys)
+        for path in artifacts.keys {
+            var current = ""
+            for component in path.split(separator: "/").dropLast() {
+                current = current.isEmpty
+                    ? String(component) : "\(current)/\(component)"
+                expected.insert(current)
+            }
+        }
+        guard let subpaths = CLI.DirectoryContents.exactSubpaths(
+            of: root,
+            expected: expected
+        ) else { return false }
+        for relative in subpaths {
+            let url = root.appendingPathComponent(relative)
+            if let data = artifacts[relative], let mode = permissions[relative] {
+                guard regularFileMatches(url, data: data, permissions: mode) else {
+                    return false
+                }
+            } else {
+                var information = Darwin.stat()
+                guard lstat(url.path, &information) == 0,
+                      information.st_mode & S_IFMT == S_IFDIR
+                else { return false }
+            }
+        }
+        return true
+    }
+
+    private static func regularFileMatches(
+        _ url: URL,
+        data expected: Data,
+        permissions: UInt16
+    ) -> Bool {
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else { return false }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+        var information = Darwin.stat()
+        guard fstat(descriptor, &information) == 0,
+              information.st_mode & S_IFMT == S_IFREG,
+              information.st_mode & 0o777 == permissions,
+              information.st_size == expected.count
+        else { return false }
+        do {
+            let observed = try handle.readToEnd() ?? Data()
+            return observed == expected
+        } catch {
+            return false
+        }
     }
 }
 }

@@ -622,33 +622,44 @@ struct NativeImportDiscoveryTests {
 
     @Test("Managed SDK probing preserves NSError-backed Swift throws")
     func discoversManagedSDKNSErrorThrowingMethod() throws {
+        let cacheRoot = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-managed-probe-cache-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: cacheRoot) }
+        let cache = try BuildCache.Store(rootURL: cacheRoot)
         let frontend = SwiftFrontend.Driver(
             compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc")
         )
         let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        let importedTypes: [FrontendReceipt.Adapter.ImportedNativeType] = [
+            .init(
+                canonicalName: "FileManager",
+                swiftType: "FileManager",
+                kind: .reference,
+                aliases: ["NSFileManager", "__C.NSFileManager"],
+                representation: .reference,
+                sourceFileLogicalID: "Sources/Fixture.swift",
+                importedModules: ["Foundation"],
+                requiresMainActor: false
+            ),
+        ]
+        let invocation = InterfaceArchive.FrontendInvocation(
+            moduleName: "ManagedSDKThrowingFixture",
+            targetTriple: "arm64-apple-ios15.0-simulator",
+            sdkName: sdk.name,
+            sdkBuild: sdk.buildVersion,
+            optimization: "-Onone",
+            semanticArguments: ["-parse-as-library"]
+        )
         let expansion = try FrontendReceipt.ManagedDebugSurface.expand(
-            importedTypes: [
-                .init(
-                    canonicalName: "FileManager",
-                    swiftType: "FileManager",
-                    kind: .reference,
-                    aliases: ["NSFileManager", "__C.NSFileManager"],
-                    representation: .reference,
-                    sourceFileLogicalID: "Sources/Fixture.swift",
-                    importedModules: ["Foundation"],
-                    requiresMainActor: false
-                ),
-            ],
+            importedTypes: importedTypes,
             minimumOS: .init(15),
             frontend: frontend,
-            invocation: .init(
-                moduleName: "ManagedSDKThrowingFixture",
-                targetTriple: "arm64-apple-ios15.0-simulator",
-                sdkName: sdk.name,
-                sdkBuild: sdk.buildVersion,
-                optimization: "-Onone",
-                semanticArguments: ["-parse-as-library"]
-            )
+            invocation: invocation,
+            cache: cache,
+            compilerFingerprint: "test-compiler",
+            compilerInputHash: .sha256("test-compiler-inputs")
         )
         let fileManagerOperations = expansion.operations.filter {
             $0.ownerType.contains("FileManager")
@@ -665,6 +676,145 @@ struct NativeImportDiscoveryTests {
         #expect(removals.first?.resultSwiftType == "()")
         #expect(removals.first?.mayThrow == true)
         #expect(removals.first?.parameterProjection == .identity(parameterCount: 2))
+
+        let reused = try FrontendReceipt.ManagedDebugSurface.expand(
+            importedTypes: importedTypes,
+            minimumOS: .init(15),
+            frontend: frontend,
+            invocation: invocation,
+            cache: cache,
+            compilerFingerprint: "test-compiler",
+            compilerInputHash: .sha256("test-compiler-inputs")
+        )
+        #expect(reused.operations == expansion.operations)
+        #expect(expansion.metrics.symbolGraphCacheMissCount == 1)
+        #expect(expansion.metrics.probeCacheMissCount == expansion.metrics.candidateCount)
+        #expect(reused.metrics.symbolGraphCacheHitCount == 1)
+        #expect(reused.metrics.probeCacheHitCount == reused.metrics.candidateCount)
+        #expect(reused.metrics.probeCacheMissCount == 0)
+        #expect(reused.metrics.probeAttemptCount == 0)
+    }
+
+    @Test("Managed probe caching keeps same-label overloads bound to their candidate")
+    func cachesManagedSDKOverloadsByExactCandidate() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-managed-overload-cache-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let moduleName = "ManagedOverloadFixture"
+        let sourceURL = directory.appendingPathComponent("External.swift")
+        try Data(
+            """
+            public final class Overloaded {
+                public init() {}
+                public func transform(_ value: Int) -> Int { value }
+                public func transform(_ value: String) -> String { value }
+            }
+            """.utf8
+        ).write(to: sourceURL)
+        let frontend = SwiftFrontend.Driver(
+            compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc")
+        )
+        let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        try requireFrontendSuccess(frontend.run(arguments: [
+            sourceURL.path,
+            "-emit-module", "-parse-as-library",
+            "-module-name", moduleName,
+            "-target", "arm64-apple-ios15.0-simulator",
+            "-sdk", sdk.path,
+            "-emit-module-path", directory.appendingPathComponent(
+                "\(moduleName).swiftmodule"
+            ).path,
+        ]))
+        let invocation = InterfaceArchive.FrontendInvocation(
+            moduleName: "ManagedOverloadConsumer",
+            targetTriple: "arm64-apple-ios15.0-simulator",
+            sdkName: sdk.name,
+            sdkBuild: sdk.buildVersion,
+            optimization: "-Onone",
+            semanticArguments: ["-parse-as-library", "-I", directory.path]
+        )
+        let importedTypes: [FrontendReceipt.Adapter.ImportedNativeType] = [
+            .init(
+                canonicalName: "Overloaded",
+                swiftType: "Overloaded",
+                kind: .reference,
+                aliases: ["\(moduleName).Overloaded"],
+                representation: .reference,
+                sourceFileLogicalID: "Sources/Fixture.swift",
+                importedModules: [moduleName],
+                requiresMainActor: false
+            ),
+        ]
+        let cache = try BuildCache.Store(
+            rootURL: directory.appendingPathComponent("Cache")
+        )
+
+        let first = try FrontendReceipt.ManagedDebugSurface.expand(
+            importedTypes: importedTypes,
+            minimumOS: .init(15),
+            frontend: frontend,
+            invocation: invocation,
+            cache: cache,
+            compilerFingerprint: "overload-test-compiler",
+            compilerInputHash: .sha256("overload-test-compiler-inputs")
+        )
+        let reused = try FrontendReceipt.ManagedDebugSurface.expand(
+            importedTypes: importedTypes,
+            minimumOS: .init(15),
+            frontend: frontend,
+            invocation: invocation,
+            cache: cache,
+            compilerFingerprint: "overload-test-compiler",
+            compilerInputHash: .sha256("overload-test-compiler-inputs")
+        )
+        let overloads = first.operations.filter {
+            $0.ownerType == "Overloaded"
+                && $0.baseName == "transform"
+                && $0.argumentLabels == ["_"]
+        }
+
+        #expect(overloads.count == 2)
+        #expect(Set(overloads.map(\.parameterSwiftTypes)) == Set([
+            ["Swift.Int", "Overloaded"],
+            ["Swift.String", "Overloaded"],
+        ]))
+        #expect(reused.operations == first.operations)
+        #expect(reused.metrics.probeCacheHitCount == reused.metrics.candidateCount)
+        #expect(reused.metrics.probeAttemptCount == 0)
+    }
+
+    @Test("Managed probe caching excludes transient compiler failures")
+    func classifiesManagedProbeRejections() {
+        #expect(FrontendReceipt.ManagedDebugSurface.isDeterministicProbeRejection(
+            status: 1,
+            diagnostics: "fixture.swift:1:1: error: cannot convert value"
+        ))
+        #expect(!FrontendReceipt.ManagedDebugSurface.isDeterministicProbeRejection(
+            status: 9,
+            diagnostics: "error: compiler terminated"
+        ))
+        #expect(!FrontendReceipt.ManagedDebugSurface.isDeterministicProbeRejection(
+            status: 1,
+            diagnostics: "LLVM ERROR: out of memory\nerror: compiler crashed"
+        ))
+        #expect(!FrontendReceipt.ManagedDebugSurface.isDeterministicProbeRejection(
+            status: 1,
+            diagnostics: "warning: no deterministic rejection"
+        ))
+        #expect(!FrontendReceipt.ManagedDebugSurface.isDeterministicProbeRejection(
+            status: 1,
+            diagnostics: "fixture.swift:1:1: error: no such module 'UIKit'"
+        ))
+        #expect(!FrontendReceipt.ManagedDebugSurface.isDeterministicProbeRejection(
+            status: 1,
+            diagnostics: "error: unable to load standard library"
+        ))
     }
 
     @Test("Managed SDK probing prefreezes native members used inside callbacks")

@@ -12,7 +12,7 @@ Hub 安装的 Release 流水线会：
 
 1. 从成功的 Xcode 构建自动捕获 Shell namespace、App 身份、编译器、SDK、target、源码 membership 和语义编译参数。
 2. 使用精确 Swift frontend 自动索引 eligible 声明与原生 adapter。
-3. 生成 Derived Sources，其中包含永久声明 Bridge、需要词法执行时按 hash 精确定位的源码 body wrapper，以及已证明的原生 invoker；手写源码保持不变，Shell 编译仅对 observer 与 async 入口使用 derived copy 变换。
+3. 生成 Derived Sources，其中包含永久声明 Bridge、需要词法执行时按 hash 精确定位的源码 body wrapper，以及已证明的原生 invoker；手写源码保持不变，Shell 编译仅对 observer 与 async 入口使用 derived copy 变换。Prepare 会记录精确语义输入与输出 manifest；后续无变化构建只有在每个生成路径、字节和权限都仍然一致时，才会在 frontend 前直接返回。发生漂移时会回到已验证的内容寻址 frontend 流程，并自动修复产物。
 4. 链接生产安全的 `HelixAppIntegration` 与隐藏自动 bootstrap；业务源码无需 import 或启动 Runtime。
 5. 链接完成后用真实 Mach-O UUID finalize HLXI，并保留精确 Release 源码基线及工具链产物供以后构建补丁。
 

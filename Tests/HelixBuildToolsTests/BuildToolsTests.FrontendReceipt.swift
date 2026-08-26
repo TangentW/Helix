@@ -13,6 +13,160 @@ import Testing
 extension BuildToolsTests {
 @Suite("Real Swift frontend receipt adapter")
 struct FrontendReceiptPipeline {
+    @Test("An unchanged module reuses its receipt and ignores unrelated modules")
+    func reusesCachedModuleReceipt() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-cached-frontend-receipt-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let sourceDirectory = directory.appendingPathComponent("Sources")
+        let cacheDirectory = directory.appendingPathComponent("Cache")
+        try FileManager.default.createDirectory(
+            at: sourceDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = sourceDirectory.appendingPathComponent("Feature.swift")
+        try Data("public func increment(_ value: Int) -> Int { value + 1 }\n".utf8)
+            .write(to: sourceURL)
+        let unrelatedModule = sourceDirectory.appendingPathComponent(
+            "UnrelatedFixture.swiftmodule"
+        )
+        try Data("unrelated-interface-v1".utf8).write(to: unrelatedModule)
+        let compilerArguments = ["-I", sourceDirectory.path]
+
+        let compilerURL = URL(fileURLWithPath: "/usr/bin/swiftc")
+        let frontend = SwiftFrontend.Driver(compilerURL: compilerURL)
+        let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        let toolchain = try ReleaseCompiler.Driver().toolchainIdentity(
+            compilerURL: compilerURL
+        )
+        let moduleName = "CachedFrontendFixture"
+        let target = "arm64-apple-ios15.0-simulator"
+        let configuration = try PatchConfiguration.Document.parse(yaml: """
+        schema: 1
+        modules:
+          \(moduleName):
+            include:
+              - Sources/**
+        """)
+        let metadata = InterfaceArchive.ReleaseMetadata(
+            bundleID: "dev.helix.cached-frontend",
+            buildNumber: "1",
+            shellNamespaceID: .derive(
+                bundleID: "dev.helix.cached-frontend",
+                buildNumber: "1",
+                seed: "fixture"
+            ),
+            machOUUIDs: [],
+            targetTriple: target,
+            minimumOS: .init(15),
+            xcodeBuild: "integration-test",
+            sdkBuild: sdk.buildVersion,
+            frontendInvocation: .init(
+                moduleName: moduleName,
+                targetTriple: target,
+                sdkName: sdk.name,
+                sdkBuild: sdk.buildVersion,
+                optimization: "-Onone",
+                semanticArguments: ["-parse-as-library"]
+            ),
+            transformPipelineHash: ShellBuild.transformPipelineHash,
+            sourceBaselineHash: .sha256("computed by the indexer")
+        )
+        let request = FrontendReceipt.Request(
+            metadata: metadata,
+            configuration: configuration,
+            sources: [
+                .init(logicalPath: "Sources/Feature.swift", url: sourceURL),
+            ],
+            compilerURL: compilerURL
+        )
+        let cached = FrontendReceipt.CachedAdapter(
+            cache: try BuildCache.Store(rootURL: cacheDirectory)
+        )
+
+        let first = try cached.generate(
+            request,
+            compilerCapture: Data("capture".utf8),
+            compilerArguments: compilerArguments,
+            precomputedToolchain: toolchain
+        )
+        let second = try cached.generate(
+            request,
+            compilerCapture: Data("capture".utf8),
+            compilerArguments: compilerArguments,
+            precomputedToolchain: toolchain
+        )
+        let changedCapture = try cached.generate(
+            request,
+            compilerCapture: Data("changed-capture".utf8),
+            compilerArguments: compilerArguments,
+            precomputedToolchain: toolchain
+        )
+        try Data("unrelated-interface-v2".utf8).write(to: unrelatedModule)
+        let changedUnrelatedModule = try cached.generate(
+            request,
+            compilerCapture: Data("changed-capture".utf8),
+            compilerArguments: compilerArguments,
+            precomputedToolchain: toolchain
+        )
+
+        #expect(second.receipt == first.receipt)
+        #expect(second.diagnostics == first.diagnostics)
+        #expect(second.toolchain == first.toolchain)
+        #expect(first.performance.counters.first {
+            $0.name == "frontend_cache.module_miss_count"
+        }?.value == 1)
+        #expect(second.performance.counters.first {
+            $0.name == "frontend_cache.module_hit_count"
+        }?.value == 1)
+        #expect(second.performance.subprocesses.isEmpty)
+        #expect(changedCapture.receipt == first.receipt)
+        #expect(changedCapture.performance.counters.first {
+            $0.name == "frontend_cache.module_miss_count"
+        }?.value == 1)
+        #expect(!changedCapture.performance.subprocesses.isEmpty)
+        #expect(changedUnrelatedModule.receipt == first.receipt)
+        #expect(changedUnrelatedModule.performance.counters.first {
+            $0.name == "frontend_cache.module_hit_count"
+        }?.value == 1)
+        #expect(changedUnrelatedModule.performance.subprocesses.isEmpty)
+
+        let initialSources = [ShellBuildReceipt.Source(
+            logicalPath: "Sources/Feature.swift",
+            contentHash: .sha256(
+                "public func increment(_ value: Int) -> Int { value + 1 }\n"
+            )
+        )]
+        try Data("""
+        import Foundation
+        public func increment(_ value: Int) -> Int { value + 2 }
+
+        """.utf8).write(to: sourceURL)
+        #expect(throws: FrontendReceipt.SourceImports.ValidationError.sourceChanged) {
+            _ = try FrontendReceipt.Adapter().generate(
+                request,
+                cache: nil,
+                toolchain: toolchain,
+                compilerInputHash: nil,
+                expectedSources: initialSources
+            )
+        }
+        #expect(
+            throws: FrontendReceipt.SourceImports.ValidationError
+                .compilerImportMismatch
+        ) {
+            _ = try FrontendReceipt.Adapter().generate(
+                request,
+                cache: nil,
+                toolchain: toolchain,
+                compilerInputHash: nil,
+                expectedImports: .init(modules: [], isComplete: true)
+            )
+        }
+    }
+
     @Test("Typed AST accepts empty source documents but rejects malformed items")
     func acceptsEmptyTypedASTDocuments() throws {
         #expect(try FrontendReceipt.TypedAST.items(in: ["filename": "/tmp/Empty.swift"])

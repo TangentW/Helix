@@ -18,6 +18,11 @@ extension FrontendReceipt.ManagedDebugSurface {
     struct Metrics: Sendable {
         var moduleCount: UInt64 = 0
         var candidateCount: UInt64 = 0
+        var symbolGraphCacheHitCount: UInt64 = 0
+        var symbolGraphCacheMissCount: UInt64 = 0
+        var probeCacheHitCount: UInt64 = 0
+        var probeCacheMissCount: UInt64 = 0
+        var cachedRejectionCount: UInt64 = 0
         var probeAttemptCount: UInt64 = 0
         var failedProbeCount: UInt64 = 0
         var rejectedSingletonCount: UInt64 = 0
@@ -44,7 +49,7 @@ extension FrontendReceipt.ManagedDebugSurface {
         var surface: OwnerSurface
     }
 
-    private struct Candidate: Hashable, Sendable {
+    private struct Candidate: Codable, Hashable, Sendable {
         var preciseIdentifier: String
         var moduleName: String
         var probeOwnerType: String
@@ -59,6 +64,111 @@ extension FrontendReceipt.ManagedDebugSurface {
         var mayThrow: Bool
     }
 
+    private struct SymbolGraphCacheKey: Codable, Sendable {
+        var schemaVersion: UInt16 = 1
+        var compilerFingerprint: String
+        var compilerInputHash: Core.Digest
+        var moduleName: String
+        var invocation: InterfaceArchive.FrontendInvocation
+    }
+
+    private struct SymbolGraphCachePayload: Codable, Sendable {
+        var schemaVersion: UInt16 = 1
+        var document: SwiftFrontend.SymbolGraph.Document
+    }
+
+    private struct ProbeCandidate: Codable, Hashable, Sendable {
+        var preciseIdentifier: String
+        var moduleName: String
+        var probeOwnerType: String
+        var ownerType: String
+        var dispatch: NativeImportDiscovery.Dispatch
+        var memberName: String
+        var argumentLabels: [String]
+        var parameterTypes: [String]
+        var importedModules: [String]
+        var requiresMainActor: Bool
+        var mayThrow: Bool
+
+        init(_ candidate: Candidate) {
+            preciseIdentifier = candidate.preciseIdentifier
+            moduleName = candidate.moduleName
+            probeOwnerType = candidate.probeOwnerType
+            ownerType = candidate.ownerType
+            dispatch = candidate.dispatch
+            memberName = candidate.memberName
+            argumentLabels = candidate.argumentLabels
+            parameterTypes = candidate.parameterTypes
+            importedModules = candidate.importedModules.sorted()
+            requiresMainActor = candidate.requiresMainActor
+            mayThrow = candidate.mayThrow
+        }
+    }
+
+    private struct ProbeNativeType: Codable, Sendable {
+        var canonicalName: String
+        var swiftType: String
+        var kind: InterfaceArchive.TypeKind
+        var aliases: [String]
+        var representation: FrontendReceipt.Adapter.ImportedNativeType.Representation
+        var importedModules: [String]
+        var requiresMainActor: Bool
+
+        init(_ type: FrontendReceipt.Adapter.ImportedNativeType) {
+            canonicalName = type.canonicalName
+            swiftType = type.swiftType
+            kind = type.kind
+            aliases = type.aliases.sorted()
+            representation = type.representation
+            importedModules = type.importedModules.sorted()
+            requiresMainActor = type.requiresMainActor
+        }
+    }
+
+    private struct ProbeCacheKey: Codable, Sendable {
+        var schemaVersion: UInt16 = 1
+        var transformPipelineHash: Core.Digest
+        var compilerFingerprint: String
+        var compilerInputHash: Core.Digest
+        var invocation: InterfaceArchive.FrontendInvocation
+        var minimumOS: Core.SemanticVersion
+        var candidate: ProbeCandidate
+        var importedTypes: [ProbeNativeType]
+    }
+
+    private struct ProbeCachePayload: Codable, Sendable {
+        var schemaVersion: UInt16 = 1
+        var candidate: ProbeCandidate
+        var operations: [FrontendReceipt.Adapter.ImportedOperation]
+    }
+
+    private struct MeasuredOperation: Sendable {
+        var candidate: Candidate
+        var operation: FrontendReceipt.Adapter.ImportedOperation
+    }
+
+    private struct ProbeResult: Sendable {
+        var operations: [MeasuredOperation]
+        var cacheableCandidates: Set<Candidate>
+
+        static let empty = ProbeResult(
+            operations: [],
+            cacheableCandidates: []
+        )
+
+        static func + (lhs: ProbeResult, rhs: ProbeResult) -> ProbeResult {
+            .init(
+                operations: lhs.operations + rhs.operations,
+                cacheableCandidates: lhs.cacheableCandidates
+                    .union(rhs.cacheableCandidates)
+            )
+        }
+    }
+
+    private enum CacheLookupMiss: Swift.Error {
+        case missing
+    }
+
     /// Expands only types already frozen by the source module. Public SDK
     /// declarations nominate probes, but the captured frontend remains the
     /// authority for Swift spelling, isolation, and the exact callable ABI.
@@ -66,7 +176,10 @@ extension FrontendReceipt.ManagedDebugSurface {
         importedTypes: [FrontendReceipt.Adapter.ImportedNativeType],
         minimumOS: Core.SemanticVersion,
         frontend: SwiftFrontend.Driver,
-        invocation: InterfaceArchive.FrontendInvocation
+        invocation: InterfaceArchive.FrontendInvocation,
+        cache: BuildCache.Store? = nil,
+        compilerFingerprint: String? = nil,
+        compilerInputHash: Core.Digest? = nil
     ) throws -> Expansion {
         let moduleNames = Set(importedTypes.flatMap(\.importedModules).compactMap {
             $0.split(separator: ".").first.map(String.init)
@@ -77,11 +190,17 @@ extension FrontendReceipt.ManagedDebugSurface {
             )
         }
 
+        var metrics = Metrics(moduleCount: UInt64(moduleNames.count))
         var matchesByType: [Int: [OwnerMatch]] = [:]
         for moduleName in moduleNames where isProbeIdentifier(moduleName) {
-            let graph = try frontend.emitSymbolGraph(
+            let graph = try symbolGraph(
                 moduleName: moduleName,
-                invocation: invocation
+                frontend: frontend,
+                invocation: invocation,
+                cache: cache,
+                compilerFingerprint: compilerFingerprint,
+                compilerInputHash: compilerInputHash,
+                metrics: &metrics
             )
             let surfaces = ownerSurfaces(in: graph, minimumOS: minimumOS)
             for index in importedTypes.indices where importedTypes[index]
@@ -124,15 +243,16 @@ extension FrontendReceipt.ManagedDebugSurface {
             )
         }
 
-        var metrics = Metrics(
-            moduleCount: UInt64(moduleNames.count),
-            candidateCount: UInt64(candidates.count)
-        )
+        metrics.candidateCount = UInt64(candidates.count)
         let operations = try probe(
             candidates,
             importedTypes: enrichedTypes,
+            minimumOS: minimumOS,
             frontend: frontend,
             invocation: invocation,
+            cache: cache,
+            compilerFingerprint: compilerFingerprint,
+            compilerInputHash: compilerInputHash,
             metrics: &metrics
         )
         return Expansion(
@@ -141,6 +261,82 @@ extension FrontendReceipt.ManagedDebugSurface {
                 .mergeImportedOperations(operations),
             metrics: metrics
         )
+    }
+
+    private static func symbolGraph(
+        moduleName: String,
+        frontend: SwiftFrontend.Driver,
+        invocation: InterfaceArchive.FrontendInvocation,
+        cache: BuildCache.Store?,
+        compilerFingerprint: String?,
+        compilerInputHash: Core.Digest?,
+        metrics: inout Metrics
+    ) throws -> SwiftFrontend.SymbolGraph.Document {
+        guard let cache, let compilerFingerprint, let compilerInputHash else {
+            return try frontend.emitSymbolGraph(
+                moduleName: moduleName,
+                invocation: invocation
+            )
+        }
+        let key = try BuildCache.key(
+            domain: "HLX.BuildCache.SymbolGraph.v1",
+            value: SymbolGraphCacheKey(
+                compilerFingerprint: compilerFingerprint,
+                compilerInputHash: compilerInputHash,
+                moduleName: moduleName,
+                invocation: invocation
+            )
+        )
+        var validatedDocument: SwiftFrontend.SymbolGraph.Document?
+        let cached = try cache.value(
+            namespace: .symbolGraph,
+            key: key,
+            maximumBytes: 96 * 1_024 * 1_024,
+            validate: {
+                validatedDocument = try decodeSymbolGraphPayload(
+                    $0,
+                    expectedModuleName: moduleName
+                )
+            }
+        ) {
+            let document = try frontend.emitSymbolGraph(
+                moduleName: moduleName,
+                invocation: invocation
+            )
+            return try Core.CanonicalJSON.encode(
+                SymbolGraphCachePayload(document: document)
+            )
+        }
+        if cached.source == .hit {
+            metrics.symbolGraphCacheHitCount += 1
+        } else {
+            metrics.symbolGraphCacheMissCount += 1
+        }
+        guard let validatedDocument else {
+            throw FrontendReceipt.Error.frontendFailed(
+                "managed Debug symbol graph cache was not validated"
+            )
+        }
+        return validatedDocument
+    }
+
+    private static func decodeSymbolGraphPayload(
+        _ data: Data,
+        expectedModuleName: String
+    ) throws -> SwiftFrontend.SymbolGraph.Document {
+        let payload = try JSONDecoder().decode(
+            SymbolGraphCachePayload.self,
+            from: data
+        )
+        guard payload.schemaVersion == 1,
+              try Core.CanonicalJSON.encode(payload) == data
+        else {
+            throw FrontendReceipt.Error.frontendFailed(
+                "managed Debug symbol graph cache payload is invalid"
+            )
+        }
+        try payload.document.validate(expectedModuleName: expectedModuleName)
+        return payload.document
     }
 
     private static func ownerSurfaces(
@@ -606,22 +802,223 @@ extension FrontendReceipt.ManagedDebugSurface {
     private static func probe(
         _ candidates: [Candidate],
         importedTypes: [FrontendReceipt.Adapter.ImportedNativeType],
+        minimumOS: Core.SemanticVersion,
+        frontend: SwiftFrontend.Driver,
+        invocation: InterfaceArchive.FrontendInvocation,
+        cache: BuildCache.Store?,
+        compilerFingerprint: String?,
+        compilerInputHash: Core.Digest?,
+        metrics: inout Metrics
+    ) throws -> [FrontendReceipt.Adapter.ImportedOperation] {
+        guard let cache, let compilerFingerprint, let compilerInputHash else {
+            return try probeUncached(
+                candidates,
+                importedTypes: importedTypes,
+                frontend: frontend,
+                invocation: invocation,
+                metrics: &metrics
+            ).operations.map(\.operation)
+        }
+
+        let cacheTypes = importedTypes.map(ProbeNativeType.init).sorted {
+            ($0.canonicalName, $0.swiftType) < ($1.canonicalName, $1.swiftType)
+        }
+        var operations: [FrontendReceipt.Adapter.ImportedOperation] = []
+        var misses: [(candidate: Candidate, key: Core.Digest)] = []
+        for candidate in candidates {
+            let key = try probeCacheKey(
+                candidate: candidate,
+                importedTypes: cacheTypes,
+                minimumOS: minimumOS,
+                invocation: invocation,
+                compilerFingerprint: compilerFingerprint,
+                compilerInputHash: compilerInputHash
+            )
+            do {
+                var validatedOperations: [
+                    FrontendReceipt.Adapter.ImportedOperation
+                ]?
+                _ = try cache.value(
+                    namespace: .managedProbe,
+                    key: key,
+                    maximumBytes: 4 * 1_024 * 1_024,
+                    validate: {
+                        validatedOperations = try decodeProbePayload(
+                            $0,
+                            candidate: candidate
+                        )
+                    }
+                ) {
+                    throw CacheLookupMiss.missing
+                }
+                guard let validatedOperations else {
+                    throw FrontendReceipt.Error.frontendFailed(
+                        "managed Debug probe cache was not validated"
+                    )
+                }
+                let cached = validatedOperations.map {
+                    restoring($0, for: candidate)
+                }
+                metrics.probeCacheHitCount += 1
+                if cached.isEmpty { metrics.cachedRejectionCount += 1 }
+                operations += cached
+            } catch CacheLookupMiss.missing {
+                metrics.probeCacheMissCount += 1
+                misses.append((candidate, key))
+            }
+        }
+        guard !misses.isEmpty else { return operations }
+
+        let measured = try probeUncached(
+            misses.map(\.candidate),
+            importedTypes: importedTypes,
+            frontend: frontend,
+            invocation: invocation,
+            metrics: &metrics
+        )
+        for miss in misses {
+            guard measured.cacheableCandidates.contains(miss.candidate) else {
+                continue
+            }
+            let candidateOperations = measured.operations.filter {
+                $0.candidate == miss.candidate
+            }.map {
+                normalizingForCache($0.operation, candidate: miss.candidate)
+            }
+            let encoded = try Core.CanonicalJSON.encode(
+                ProbeCachePayload(
+                    candidate: ProbeCandidate(miss.candidate),
+                    operations: candidateOperations
+                )
+            )
+            var validatedOperations: [
+                FrontendReceipt.Adapter.ImportedOperation
+            ]?
+            _ = try cache.value(
+                namespace: .managedProbe,
+                key: miss.key,
+                maximumBytes: 4 * 1_024 * 1_024,
+                validate: {
+                    validatedOperations = try decodeProbePayload(
+                        $0,
+                        candidate: miss.candidate
+                    )
+                }
+            ) { encoded }
+            guard let validatedOperations else {
+                throw FrontendReceipt.Error.frontendFailed(
+                    "managed Debug probe cache was not validated"
+                )
+            }
+            operations += validatedOperations.map {
+                restoring($0, for: miss.candidate)
+            }
+        }
+        return operations
+    }
+
+    private static func probeUncached(
+        _ candidates: [Candidate],
+        importedTypes: [FrontendReceipt.Adapter.ImportedNativeType],
         frontend: SwiftFrontend.Driver,
         invocation: InterfaceArchive.FrontendInvocation,
         metrics: inout Metrics
-    ) throws -> [FrontendReceipt.Adapter.ImportedOperation] {
-        var operations: [FrontendReceipt.Adapter.ImportedOperation] = []
+    ) throws -> ProbeResult {
+        var result = ProbeResult.empty
         for start in stride(from: 0, to: candidates.count, by: 256) {
             let end = min(start + 256, candidates.count)
-            operations += try probeBatch(
+            result = result + (try probeBatch(
                 Array(candidates[start..<end]),
                 importedTypes: importedTypes,
                 frontend: frontend,
                 invocation: invocation,
                 metrics: &metrics
+            ))
+        }
+        return result
+    }
+
+    private static func probeCacheKey(
+        candidate: Candidate,
+        importedTypes: [ProbeNativeType],
+        minimumOS: Core.SemanticVersion,
+        invocation: InterfaceArchive.FrontendInvocation,
+        compilerFingerprint: String,
+        compilerInputHash: Core.Digest
+    ) throws -> Core.Digest {
+        try BuildCache.key(
+            domain: "HLX.BuildCache.ManagedProbe.v1",
+            value: ProbeCacheKey(
+                transformPipelineHash: ShellBuild.transformPipelineHash,
+                compilerFingerprint: compilerFingerprint,
+                compilerInputHash: compilerInputHash,
+                invocation: invocation,
+                minimumOS: minimumOS,
+                candidate: ProbeCandidate(candidate),
+                importedTypes: importedTypes
+            )
+        )
+    }
+
+    private static func decodeProbePayload(
+        _ data: Data,
+        candidate: Candidate
+    ) throws -> [FrontendReceipt.Adapter.ImportedOperation] {
+        let payload = try JSONDecoder().decode(ProbeCachePayload.self, from: data)
+        guard payload.schemaVersion == 1,
+              payload.candidate == ProbeCandidate(candidate),
+              payload.operations.count <= 4,
+              payload.operations.allSatisfy({
+                  operation($0, matches: candidate)
+                      && $0.sourceFileLogicalID.isEmpty
+                      && $0.importedModules == candidate.importedModules.sorted()
+                      && $0.witnessFunctions.isEmpty
+              }),
+              try Core.CanonicalJSON.encode(payload) == data
+        else {
+            throw FrontendReceipt.Error.frontendFailed(
+                "managed Debug probe cache payload is invalid"
             )
         }
-        return operations
+        return payload.operations
+    }
+
+    private static func normalizingForCache(
+        _ operation: FrontendReceipt.Adapter.ImportedOperation,
+        candidate: Candidate
+    ) -> FrontendReceipt.Adapter.ImportedOperation {
+        var result = operation
+        result.sourceFileLogicalID = ""
+        result.importedModules = candidate.importedModules.sorted()
+        // Probe witness names contain the temporary batch index. They have
+        // served their measurement purpose and are not a reusable API fact.
+        result.witnessFunctions = []
+        return result
+    }
+
+    private static func operation(
+        _ operation: FrontendReceipt.Adapter.ImportedOperation,
+        matches candidate: Candidate
+    ) -> Bool {
+        let expectedParameterCount = candidate.parameterTypes.count
+            + (isInstanceDispatch(candidate.dispatch) ? 1 : 0)
+        return operation.dispatch == candidate.dispatch
+            && operation.ownerType == candidate.ownerType
+            && operation.baseName == candidate.memberName
+            && operation.argumentLabels == candidate.argumentLabels
+            && operation.parameterSwiftTypes.count == expectedParameterCount
+            && operation.requiresMainActor == candidate.requiresMainActor
+            && operation.mayThrow == candidate.mayThrow
+    }
+
+    private static func restoring(
+        _ operation: FrontendReceipt.Adapter.ImportedOperation,
+        for candidate: Candidate
+    ) -> FrontendReceipt.Adapter.ImportedOperation {
+        var result = operation
+        result.sourceFileLogicalID = candidate.sourceFileLogicalID
+        result.importedModules = candidate.importedModules
+        return result
     }
 
     private static func probeBatch(
@@ -630,8 +1027,8 @@ extension FrontendReceipt.ManagedDebugSurface {
         frontend: SwiftFrontend.Driver,
         invocation: InterfaceArchive.FrontendInvocation,
         metrics: inout Metrics
-    ) throws -> [FrontendReceipt.Adapter.ImportedOperation] {
-        guard !candidates.isEmpty else { return [] }
+    ) throws -> ProbeResult {
+        guard !candidates.isEmpty else { return .empty }
         do {
             return try measure(
                 candidates,
@@ -641,11 +1038,19 @@ extension FrontendReceipt.ManagedDebugSurface {
                 metrics: &metrics
             )
         } catch let error as SwiftFrontend.Error {
-            guard case .compilationFailed = error else { throw error }
+            guard case let .compilationFailed(status, diagnostics) = error else {
+                throw error
+            }
             metrics.failedProbeCount += 1
             guard candidates.count > 1 else {
                 metrics.rejectedSingletonCount += 1
-                return []
+                return .init(
+                    operations: [],
+                    cacheableCandidates: isDeterministicProbeRejection(
+                        status: status,
+                        diagnostics: diagnostics
+                    ) ? Set(candidates) : []
+                )
             }
             let middle = candidates.count / 2
             return try probeBatch(
@@ -670,7 +1075,7 @@ extension FrontendReceipt.ManagedDebugSurface {
         frontend: SwiftFrontend.Driver,
         invocation: InterfaceArchive.FrontendInvocation,
         metrics: inout Metrics
-    ) throws -> [FrontendReceipt.Adapter.ImportedOperation] {
+    ) throws -> ProbeResult {
         metrics.probeAttemptCount += 1
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "helix-managed-debug-surface-\(UUID().uuidString)",
@@ -769,8 +1174,8 @@ extension FrontendReceipt.ManagedDebugSurface {
         let nativeTypes = placeholderNativeTypes(importedTypes)
         let swiftAliases = try FrontendReceipt.Adapter()
             .makeImportedSwiftTypeAliases(importedTypes)
-        return surface.operations.compactMap {
-            operation -> FrontendReceipt.Adapter.ImportedOperation? in
+        let operations = surface.operations.compactMap {
+            operation -> MeasuredOperation? in
             let matching = Set(operation.witnessFunctions.compactMap {
                 candidatesByWitness[$0]
             })
@@ -858,7 +1263,50 @@ extension FrontendReceipt.ManagedDebugSurface {
             // without making the call itself actor-isolated.
             measured.requiresMainActor = candidate.requiresMainActor
             measured.isolationEvidence = .importedDeclaration
-            return measured
+            return MeasuredOperation(candidate: candidate, operation: measured)
+        }
+        return .init(
+            operations: operations,
+            cacheableCandidates: Set(candidates)
+        )
+    }
+
+    static func isDeterministicProbeRejection(
+        status: Int32,
+        diagnostics: String
+    ) -> Bool {
+        guard status == 1 else { return false }
+        let stableSemanticFragments = [
+            "ambiguous use of",
+            "cannot assign to property",
+            "cannot call value of non-function type",
+            "cannot convert return expression",
+            "cannot convert value",
+            "cannot infer contextual base",
+            "cannot invoke initializer",
+            "extra argument",
+            "generic parameter ",
+            "get-only property",
+            "has no member",
+            "inaccessible due to",
+            "incorrect argument label",
+            "instance member ",
+            "is unavailable",
+            "missing argument",
+            "no exact matches in call",
+            "requires that",
+            "static member ",
+            "type of expression is ambiguous",
+        ]
+        let errors = diagnostics.split(whereSeparator: \.isNewline).compactMap {
+            line -> String? in
+            let value = line.lowercased()
+            guard let marker = value.range(of: "error:") else { return nil }
+            return String(value[marker.upperBound...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return !errors.isEmpty && errors.allSatisfy { error in
+            stableSemanticFragments.contains { error.contains($0) }
         }
     }
 

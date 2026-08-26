@@ -6,6 +6,19 @@ import Testing
 extension CompilerTests {
 @Suite("Captured SDK symbol graphs")
 struct SymbolGraph {
+    private final class InvocationLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var values: [SwiftFrontend.InvocationKind] = []
+
+        func append(_ value: SwiftFrontend.InvocationKind) {
+            lock.withLock { values.append(value) }
+        }
+
+        func count(_ value: SwiftFrontend.InvocationKind) -> Int {
+            lock.withLock { values.filter { $0 == value }.count }
+        }
+    }
+
     @Test("Partial SDK versions normalize omitted components")
     func normalizesPartialVersions() throws {
         let version = try JSONDecoder().decode(
@@ -14,6 +27,22 @@ struct SymbolGraph {
         )
 
         #expect(version == .init(major: 15, minor: 0, patch: 0))
+    }
+
+    @Test("One frontend driver resolves each SDK identity only once")
+    func cachesSDKIdentity() throws {
+        let log = InvocationLog()
+        let frontend = SwiftFrontend.Driver(
+            compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc"),
+            invocationObserver: { log.append($0.kind) }
+        )
+
+        let first = try frontend.sdkIdentity(name: "iphonesimulator")
+        let second = try frontend.sdkIdentity(name: "iphonesimulator")
+
+        #expect(first == second)
+        #expect(log.count(.sdkPath) == 1)
+        #expect(log.count(.sdkBuild) == 1)
     }
 
     @Test("UIKit and Foundation expose common Swift API shapes deterministically")

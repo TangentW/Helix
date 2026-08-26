@@ -34,6 +34,11 @@ The Xcode lifecycle carries identity instead of credentials:
    Shell and Bridge, and asks the service to reserve a one-time invitation.
    Adding, deleting, moving, or generating a Swift source requires no Helix
    file-list update.
+   The validated module receipt, SDK symbol graphs, and individual declaration
+   probes are content-addressed local build facts. An unchanged build reuses
+   them automatically. The final Prepare state is deliberately regenerated so
+   that every build receives a fresh single-use Hub invitation; no project
+   cache configuration or API allowlist is required.
 2. The hidden Bridge object embeds that invitation plus the public pin of the
    persistent Helix Host Identity. No session secret is written to the project
    or App environment.

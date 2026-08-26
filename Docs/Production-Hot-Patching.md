@@ -23,6 +23,10 @@ The Hub-installed Release pipeline:
    hashed source-body wrappers where lexical execution is required, and allowed
    native invokers. Handwritten source files are not changed; Shell compilation
    uses derived copies for observer and async source-body transformation.
+   Prepare records an exact semantic-input and output manifest. An unchanged
+   subsequent build can return before frontend work only after every generated
+   path, byte, and permission still matches. Drift falls back to the validated
+   content-addressed frontend pipeline and repairs publication automatically.
 4. Links the production-safe `HelixAppIntegration` and its hidden automatic
    bootstrap; application source imports and starts nothing.
 5. Finalizes an HLXI archive with the linked Mach-O UUID and preserves the exact

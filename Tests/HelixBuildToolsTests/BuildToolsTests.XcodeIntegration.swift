@@ -7,6 +7,73 @@ import Testing
 extension BuildToolsTests {
 @Suite("Xcode host integration contract")
 struct XcodeIntegrationContract {
+    @Test("Hot Patch Prepare state is canonical and rejects unsafe manifests")
+    func prepareStateCodec() throws {
+        let state = XcodeIntegration.PrepareState(
+            inputHash: .sha256("input"),
+            artifacts: [
+                .init(
+                    path: "Nested/Bridge.swift",
+                    contentHash: .sha256("bridge"),
+                    byteCount: 6,
+                    permissions: 0o644
+                ),
+                .init(
+                    path: "Capture.json",
+                    contentHash: .sha256("capture"),
+                    byteCount: 7,
+                    permissions: 0o600
+                ),
+            ],
+            eligibleFunctionCount: 3,
+            rejectedFunctionCount: 1
+        )
+        let data = try XcodeIntegration.PrepareStateCodec.encode(state)
+        #expect(try XcodeIntegration.PrepareStateCodec.decode(data) == state)
+
+        var noncanonical = data
+        noncanonical.append(UInt8(ascii: "\n"))
+        #expect(throws: XcodeIntegration.Error.self) {
+            _ = try XcodeIntegration.PrepareStateCodec.decode(noncanonical)
+        }
+        let unsafe = XcodeIntegration.PrepareState(
+            inputHash: .sha256("input"),
+            artifacts: [
+                .init(
+                    path: "../escape",
+                    contentHash: .sha256("value"),
+                    byteCount: 5,
+                    permissions: 0o644
+                ),
+            ],
+            eligibleFunctionCount: 0,
+            rejectedFunctionCount: 0
+        )
+        #expect(throws: XcodeIntegration.Error.self) {
+            _ = try XcodeIntegration.PrepareStateCodec.encode(unsafe)
+        }
+    }
+
+    @Test("Bridge state is canonical and bounded")
+    func bridgeStateCodec() throws {
+        let state = XcodeIntegration.BridgeState(
+            inputHash: .sha256("bridge-input"),
+            bridge: .init(contentHash: .sha256("bridge"), byteCount: 6),
+            bootstrap: .init(contentHash: .sha256("bootstrap"), byteCount: 9)
+        )
+        let data = try XcodeIntegration.BridgeStateCodec.encode(state)
+        #expect(try XcodeIntegration.BridgeStateCodec.decode(data) == state)
+
+        let empty = XcodeIntegration.BridgeState(
+            inputHash: .sha256("bridge-input"),
+            bridge: .init(contentHash: .sha256(Data()), byteCount: 0),
+            bootstrap: .init(contentHash: .sha256("bootstrap"), byteCount: 9)
+        )
+        #expect(throws: XcodeIntegration.Error.self) {
+            _ = try XcodeIntegration.BridgeStateCodec.encode(empty)
+        }
+    }
+
     @Test("Audited Release baseline receipts are canonical and identity-bound")
     func releaseBaselineReceipt() throws {
         let receipt = XcodeIntegration.ReleaseBaseline(

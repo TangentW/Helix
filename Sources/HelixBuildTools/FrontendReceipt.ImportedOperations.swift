@@ -10,8 +10,8 @@ extension FrontendReceipt.Adapter {
         var operations: [ImportedOperation]
     }
 
-    struct ImportedOperation: Hashable, Sendable {
-        enum CompilerOperation: Hashable, Sendable {
+    struct ImportedOperation: Codable, Hashable, Sendable {
+        enum CompilerOperation: String, Codable, Hashable, Sendable {
             case rawValueInitializer
             case optionSetArrayLiteralInitializer
             case selectorInitializer
@@ -19,7 +19,7 @@ extension FrontendReceipt.Adapter {
             case anyObjectBridge
         }
 
-        enum IsolationEvidence: Hashable, Sendable {
+        enum IsolationEvidence: String, Codable, Hashable, Sendable {
             /// The declaration was unavailable, so isolation is conservatively
             /// inherited from the source context that performed the call.
             case enclosingContext

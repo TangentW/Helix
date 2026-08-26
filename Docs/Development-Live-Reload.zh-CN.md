@@ -14,7 +14,7 @@ Live Reload 不再为每次 Xcode Run 创建 daemon，也不使用自定义 LLDB
 
 Xcode lifecycle 传递的是身份，不是凭据：
 
-1. 所选源码 target 的普通 Sources phase 会通过仅作用于目标 configuration 的透明 proxy 编译当前 membership。真实编译成功后，Helix 校验这次精确 invocation、生成 Shell 与 Bridge，再向 Service 预留一个绑定 profile 的一次性邀请。增加、删除、移动或生成 Swift 源文件都不需要更新 Helix 文件列表。
+1. 所选源码 target 的普通 Sources phase 会通过仅作用于目标 configuration 的透明 proxy 编译当前 membership。真实编译成功后，Helix 校验这次精确 invocation、生成 Shell 与 Bridge，再向 Service 预留一个绑定 profile 的一次性邀请。增加、删除、移动或生成 Swift 源文件都不需要更新 Helix 文件列表。已经验证的模块 receipt、SDK symbol graph 和单声明探测会自动作为内容寻址的本地构建事实复用；最终 Prepare 仍会重新生成，以便每次构建获得新的单次 Hub invitation。项目不需要配置缓存或 API allowlist。
 2. 隐藏 Bridge object 只嵌入邀请和持久 Helix Host Identity 的公开 pin。Project 与 App environment 都不会写入 session secret。
 3. App link 完成后，Scheme Run pre-action 注册精确 executable UUID 与完整 Build Context，再把预留邀请绑定到最终 Shell。
 4. Xcode 用默认 Apple debugger 启动 App。隐藏 bootstrap 自动启动 `HelixDevSupport`；进程开始时，`DevRuntime.LaunchMode.current()` 只调用一次 Darwin `sysctl` 并检查 `P_TRACED`。被跟踪的进程进入 `automaticXcode`；探测失败会保守进入 `manual`。

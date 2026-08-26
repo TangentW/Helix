@@ -32,6 +32,9 @@ It is diagnostic evidence only: it is excluded from HLBC, HLXI, signed patch
 inputs, Shell identity, Release baseline identity, and the App bundle. Nested
 stages are not additive. The measured baseline and interpretation rules are
 recorded in [Build performance observability and baseline](Build-Performance-Baseline.md).
+The cache identities, validation rules, workflow-specific fast paths, and
+content-aware publication behavior are specified in
+[Incremental build facts and publication](Incremental-Build-Facts.md).
 
 ```mermaid
 flowchart TB

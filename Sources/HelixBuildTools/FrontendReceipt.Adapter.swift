@@ -10,6 +10,24 @@ public struct Adapter: Sendable {
     public init() {}
 
     public func generate(_ request: FrontendReceipt.Request) throws -> FrontendReceipt.Output {
+        try generate(
+            request,
+            cache: nil,
+            toolchain: nil,
+            compilerInputHash: nil,
+            expectedImports: nil,
+            expectedSources: nil
+        )
+    }
+
+    func generate(
+        _ request: FrontendReceipt.Request,
+        cache: BuildCache.Store?,
+        toolchain suppliedToolchain: ReleaseCompiler.ToolchainIdentity?,
+        compilerInputHash: Core.Digest?,
+        expectedImports: FrontendReceipt.SourceImports.Result? = nil,
+        expectedSources: [ShellBuildReceipt.Source]? = nil
+    ) throws -> FrontendReceipt.Output {
         let performance = BuildPerformance.Recorder()
         try performance.measure("frontend.validate_request") {
             try validate(request)
@@ -19,16 +37,28 @@ public struct Adapter: Sendable {
         let sourceStates = try performance.measure("frontend.load_sources") {
             try loadSources(orderedSources)
         }
+        if let expectedSources {
+            let observed = sourceStates.map {
+                ShellBuildReceipt.Source(
+                    logicalPath: $0.logicalPath,
+                    contentHash: $0.contentHash
+                )
+            }
+            guard observed == expectedSources else {
+                throw FrontendReceipt.SourceImports.ValidationError.sourceChanged
+            }
+        }
         performance.setCounter(
             "frontend.source_bytes",
             value: sourceStates.reduce(0) { $0 + UInt64($1.contents.count) }
         )
-        let toolchain = try performance.measure("frontend.toolchain_identity") {
-            try ReleaseCompiler.Driver().toolchainIdentity(
-                compilerURL: request.compilerURL,
-                invocationObserver: performance.subprocessObserver
-            )
-        }
+        let toolchain = try suppliedToolchain
+            ?? performance.measure("frontend.toolchain_identity") {
+                try ReleaseCompiler.Driver().toolchainIdentity(
+                    compilerURL: request.compilerURL,
+                    invocationObserver: performance.subprocessObserver
+                )
+            }
         let frontend = SwiftFrontend.Driver(
             compilerURL: request.compilerURL,
             invocationObserver: performance.subprocessObserver
@@ -45,6 +75,19 @@ public struct Adapter: Sendable {
         )
         let documents = try performance.measure("frontend.parse_typed_ast") {
             try FrontendReceipt.TypedAST.parseDocuments(astOutput)
+        }
+        let importedModules = try performance.measure("frontend.collect_imports") {
+            Array(Set(try documents.flatMap {
+                imports(in: try FrontendReceipt.TypedAST.items(in: $0))
+            })).filter { $0 != request.metadata.frontendInvocation.moduleName }
+                .sorted()
+        }
+        if let expectedImports,
+           !expectedImports.covers(compilerModules: importedModules) {
+            // Refuse the dependency identity before any finer-grained cache
+            // can consume or publish it.
+            throw FrontendReceipt.SourceImports.ValidationError
+                .compilerImportMismatch
         }
         try validateCompilerVersion(documents, toolchain: toolchain)
         let demangled = try performance.measure("frontend.demangle_types") {
@@ -139,7 +182,10 @@ public struct Adapter: Sendable {
                     importedTypes: importedTypes,
                     minimumOS: request.metadata.minimumOS,
                     frontend: frontend,
-                    invocation: request.metadata.frontendInvocation
+                    invocation: request.metadata.frontendInvocation,
+                    cache: cache,
+                    compilerFingerprint: toolchain.fingerprint,
+                    compilerInputHash: compilerInputHash
                 )
             }
             performance.setCounter(
@@ -157,6 +203,26 @@ public struct Adapter: Sendable {
             performance.setCounter(
                 "managed_debug.candidate_count",
                 value: managedSurface.metrics.candidateCount
+            )
+            performance.setCounter(
+                "managed_debug.symbol_graph_cache_hit_count",
+                value: managedSurface.metrics.symbolGraphCacheHitCount
+            )
+            performance.setCounter(
+                "managed_debug.symbol_graph_cache_miss_count",
+                value: managedSurface.metrics.symbolGraphCacheMissCount
+            )
+            performance.setCounter(
+                "managed_debug.probe_cache_hit_count",
+                value: managedSurface.metrics.probeCacheHitCount
+            )
+            performance.setCounter(
+                "managed_debug.probe_cache_miss_count",
+                value: managedSurface.metrics.probeCacheMissCount
+            )
+            performance.setCounter(
+                "managed_debug.cached_rejection_count",
+                value: managedSurface.metrics.cachedRejectionCount
             )
             performance.setCounter(
                 "managed_debug.probe_attempt_count",
@@ -505,11 +571,12 @@ public struct Adapter: Sendable {
                     < ($1.location?.file ?? "", $1.location?.line ?? 0, $1.code, $1.message)
             },
             toolchain: toolchain,
+            importedModules: importedModules,
             performance: performance.trace()
         )
     }
 
-    private func validate(_ request: FrontendReceipt.Request) throws {
+    func validate(_ request: FrontendReceipt.Request) throws {
         do {
             try request.configuration.validate()
         } catch {

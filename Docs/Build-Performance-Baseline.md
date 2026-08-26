@@ -52,7 +52,31 @@ A representative cold Prepare trace exposed the call volume behind those totals:
 - the Shell emitted 476 NativeImports and 24 native types;
 - the Shell occupied about 3.6 MiB. Its receipt was about 1.05 MiB, the NativeImport Swift shard about 0.97 MiB, and the main Bridge Swift file about 0.83 MiB. Bridge compiled five files totaling about 1.87 MiB into an object of about 4.40 MiB.
 
-## Confirmed bottlenecks and next gates
+## Stage 1 measured result
+
+The first optimization stage kept the same Demo source and full native-import
+discovery policy while adding exact reusable facts and content-aware
+publication. These are local single-run measurements, not cross-machine or P95
+claims:
+
+| Workflow | Priming build | Immediate unchanged build | Result |
+| --- | ---: | ---: | --- |
+| Live Reload Debug | 42.38 s | 12.15 s | Prepare fell from its pre-optimization 29.144 s baseline to 1.252 s; frontend receipt fell from 28.111 s to 0.237 s |
+| Hot Patch Release | 62.51 s | 8.26 s | Prepare state hit took 0.154 s and Bridge state hit took 0.343 s |
+
+The optimized Live Reload frontend key inspected five direct non-SDK inputs
+totalling 533 bytes instead of sweeping unrelated products in Xcode search
+roots. The unchanged run performed no Typed AST, SIL, or symbol-graph work.
+Live Reload still obtains a fresh single-use Hub reservation, so its
+session-bound development-contract source changes between builds. The current
+pre-invoker Bridge therefore still compiled five files (about 1.96 MiB) in
+5.196 s; content-aware publication nevertheless reused 15 unchanged files and
+wrote only three session-bound files. In Hot Patch, where the inputs are stable,
+the repeated run performed neither frontend generation nor Swift/C Bridge
+compilation. Both fast paths revalidated their complete output manifests before
+returning.
+
+## Confirmed bottlenecks and stage conclusion
 
 The evidence says file publication is not the main cost, and reducing API coverage is not the right remedy:
 
@@ -60,6 +84,14 @@ The evidence says file publication is not the main cost, and reducing API covera
 2. An unchanged build still regenerates about 3.6 MiB of Shell output and recompiles about 1.87 MiB of Bridge source.
 3. Hot Patch and Live Reload repeatedly acquire equivalent toolchain, SDK, frontend, and archive facts. They need shared content-addressed facts rather than separate heuristic fast paths.
 
-The next stage must keep toolchain, SDK build, target, minimum OS, semantic arguments, input hashes, and generator versions in every cache key; reuse only deterministic facts and artifacts; fully fall back to the authoritative frontend on a miss; avoid rewriting byte-identical output; and prove the result with these reports, the full test suite, and a real Demo build.
+Stage 1 now keeps toolchain, SDK build, target, minimum OS, semantic arguments,
+input hashes, and generator versions in the relevant cache keys; reuses only
+validated deterministic facts and artifacts; fully falls back to the
+authoritative frontend on a miss; and avoids rewriting byte-identical output.
+The optimization does not lower the target coverage of future native calls.
 
-The next priorities are therefore SDK identity, symbol-graph and probe-result reuse, a content-fingerprinted Prepare fast return, and content-aware publication. None of these lowers the target coverage of future native calls.
+The remaining structural cost is generated-call-surface size: a Live Reload
+session can still change its Bridge input, while a large fixed Swift wrapper
+set is expensive on a true miss. Later descriptor-driven Objective-C/C
+invokers and cached Swift adapter packs address that cost without reviving a
+manual API allowlist.

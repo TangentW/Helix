@@ -83,15 +83,40 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
 }
 
 public struct Driver: Sendable {
-    public struct SDKIdentity: Hashable, Sendable {
+    public struct SDKIdentity: Codable, Hashable, Sendable {
         public var name: String
         public var path: String
         public var buildVersion: String
     }
 
+    private struct SDKCacheKey: Hashable, Sendable {
+        var name: String
+        var developerDirectory: String?
+        var toolchains: String?
+    }
+
+    private final class SDKIdentityCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var values: [SDKCacheKey: SDKIdentity] = [:]
+
+        func value(
+            for key: SDKCacheKey,
+            resolve: () throws -> SDKIdentity
+        ) throws -> SDKIdentity {
+            if let value = lock.withLock({ values[key] }) { return value }
+            let resolved = try resolve()
+            return lock.withLock {
+                if let value = values[key] { return value }
+                values[key] = resolved
+                return resolved
+            }
+        }
+    }
+
     public var compilerURL: URL
     public var environment: [String: String]
     public var invocationObserver: SwiftFrontend.InvocationObserver?
+    private let sdkIdentityCache: SDKIdentityCache
 
     public init(
         compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
@@ -101,6 +126,7 @@ public struct Driver: Sendable {
         self.compilerURL = compilerURL
         self.environment = environment
         self.invocationObserver = invocationObserver
+        sdkIdentityCache = SDKIdentityCache()
     }
 
     public func emitCanonicalSIL(
@@ -280,26 +306,44 @@ public struct Driver: Sendable {
         guard name == "iphoneos" || name == "iphonesimulator" else {
             throw SwiftFrontend.Error.sdkResolutionFailed("unsupported SDK name \(name)")
         }
-        let xcrun = SwiftFrontend.Driver(
-            compilerURL: URL(fileURLWithPath: "/usr/bin/xcrun"),
-            environment: environment,
-            invocationObserver: invocationObserver
+        let key = SDKCacheKey(
+            name: name,
+            developerDirectory: environment["DEVELOPER_DIR"],
+            toolchains: environment["TOOLCHAINS"]
         )
-        let path = try xcrun.run(arguments: ["--sdk", name, "--show-sdk-path"])
-        let build = try xcrun.run(arguments: ["--sdk", name, "--show-sdk-build-version"])
-        guard path.terminationStatus == 0, build.terminationStatus == 0 else {
-            throw SwiftFrontend.Error.sdkResolutionFailed(
-                (path.standardError + build.standardError).trimmingCharacters(in: .whitespacesAndNewlines)
+        return try sdkIdentityCache.value(for: key) {
+            let xcrun = SwiftFrontend.Driver(
+                compilerURL: URL(fileURLWithPath: "/usr/bin/xcrun"),
+                environment: environment,
+                invocationObserver: invocationObserver
             )
+            let path = try xcrun.run(arguments: [
+                "--sdk", name, "--show-sdk-path",
+            ])
+            let build = try xcrun.run(arguments: [
+                "--sdk", name, "--show-sdk-build-version",
+            ])
+            guard path.terminationStatus == 0, build.terminationStatus == 0 else {
+                throw SwiftFrontend.Error.sdkResolutionFailed(
+                    (path.standardError + build.standardError)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                )
+            }
+            let sdkPath = path.standardOutput.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            let buildVersion = build.standardOutput.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            guard !sdkPath.isEmpty, !buildVersion.isEmpty,
+                  FileManager.default.fileExists(atPath: sdkPath)
+            else {
+                throw SwiftFrontend.Error.sdkResolutionFailed(
+                    "xcrun returned an invalid SDK identity"
+                )
+            }
+            return .init(name: name, path: sdkPath, buildVersion: buildVersion)
         }
-        let sdkPath = path.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
-        let buildVersion = build.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !sdkPath.isEmpty, !buildVersion.isEmpty,
-              FileManager.default.fileExists(atPath: sdkPath)
-        else {
-            throw SwiftFrontend.Error.sdkResolutionFailed("xcrun returned an invalid SDK identity")
-        }
-        return .init(name: name, path: sdkPath, buildVersion: buildVersion)
     }
 
     public func run(arguments: [String], workingDirectory: URL? = nil) throws -> SwiftFrontend.Output {

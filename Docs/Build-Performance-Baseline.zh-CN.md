@@ -58,7 +58,25 @@ HelixGenerated/<profile>/BuildPerformance.patch.json
 - 最终生成 476 个 NativeImport、24 个 native type；
 - Shell 目录约 3.6 MiB，其中 `ShellBuildReceipt.json` 约 1.05 MiB、NativeImport Swift shard 约 0.97 MiB、主 Bridge Swift 约 0.83 MiB；Bridge 共编译 5 个源文件、约 1.87 MiB，产生约 4.40 MiB object。
 
-## 已确认的瓶颈与后续门槛
+## Stage 1 实测结果
+
+第一阶段没有缩减 Demo 源码或原生 API 发现范围，只增加精确的可复用事实和按内容发布。
+下面是同一台机器上的单次实测，不代表跨机器指标或 P95：
+
+| 工作流 | 首次构建 | 源码不变立即重构建 | 结果 |
+| --- | ---: | ---: | --- |
+| Live Reload Debug | 42.38 s | 12.15 s | Prepare 从优化前基线的 29.144 s 降到 1.252 s；frontend receipt 从 28.111 s 降到 0.237 s |
+| Hot Patch Release | 62.51 s | 8.26 s | Prepare state 命中耗时 0.154 s，Bridge state 命中耗时 0.343 s |
+
+优化后的 Live Reload frontend key 只检查源码直接使用的 5 个非 SDK 输入，共 533
+字节，不再扫描 Xcode 搜索目录中的无关产物。无变化重构建没有再执行 Typed AST、SIL
+或 symbol graph。Live Reload 仍需领取一次性的 Hub invitation，因此会话合同源码每次
+都会变化；当前尚未切换到通用 Invoker 的 Bridge 仍需编译 5 个文件（约 1.96 MiB），
+本次耗时 5.196 s。不过按内容发布已复用 15 个未变化文件，只重写 3 个会话相关文件。
+Hot Patch 输入稳定，重复构建既没有重新生成 frontend，也没有重新编译 Swift/C Bridge。
+两条快速路径返回前都重新验证了完整输出 manifest。
+
+## 已确认的瓶颈与阶段结论
 
 这组证据说明瓶颈不在文件发布，也不应通过删减 API 覆盖来解决：
 
@@ -66,12 +84,11 @@ HelixGenerated/<profile>/BuildPerformance.patch.json
 2. 源码没有变化时，仍会重新生成约 3.6 MiB Shell、重新编译约 1.87 MiB Bridge 源码。
 3. Hot Patch 与 Live Reload 都会重新获取相同的工具链、SDK、frontend 与归档事实，后续应共享内容寻址缓存，而不是各自维护一套猜测式快路径。
 
-下一阶段的优化必须同时满足：
+Stage 1 已在对应缓存 key 中纳入工具链、SDK build、target、minimum OS、语义参数、
+输入内容 hash 和生成器版本；只复用经过验证的确定性事实与产物；未命中时完整回退到
+权威 frontend；相同字节不重写。这个优化没有降低未来原生 API 的覆盖目标。
 
-- 命中缓存时仍校验工具链、SDK build、target、minimum OS、语义参数、输入内容 hash 和生成器版本；
-- 缓存只复用事实与确定性产物，不把构建机绝对路径、时钟或进程状态写进产品 identity；
-- 未命中时完整回退到当前权威 frontend 流程；
-- 相同字节不重写，Xcode 输出依赖能真正保持稳定；
-- 用本报告中的阶段、调用次数与产物大小证明收益，并运行完整单测和真实 Demo 构建。
-
-因此，下一阶段优先处理 SDK identity/symbol graph/probe 结果复用、Prepare 内容指纹快返回和产物按内容发布；它不会降低未来可调用 API 的覆盖目标。
+剩余的结构性成本来自生成调用面的体积：Live Reload 会话可能改变 Bridge 输入，真正
+miss 时编译大量固定 Swift wrapper 仍然昂贵。后续由 descriptor 驱动的 Objective-C/C
+通用调用器和可缓存 Swift Adapter Pack 会解决这部分成本，同时不会重新引入手工 API
+白名单。

@@ -6,19 +6,19 @@ public enum SymbolGraph {}
 }
 
 extension SwiftFrontend.SymbolGraph {
-public struct Document: Decodable, Sendable {
+public struct Document: Codable, Sendable {
     public var metadata: Metadata
     public var module: Module
     public var symbols: [Symbol]
     public var relationships: [Relationship]
 }
 
-public struct Metadata: Decodable, Sendable {
+public struct Metadata: Codable, Sendable {
     public var formatVersion: Version
     public var generator: String
 }
 
-public struct Version: Decodable, Hashable, Sendable {
+public struct Version: Codable, Hashable, Sendable {
     public var major: Int
     public var minor: Int
     public var patch: Int
@@ -45,11 +45,11 @@ public struct Version: Decodable, Hashable, Sendable {
     }
 }
 
-public struct Module: Decodable, Sendable {
+public struct Module: Codable, Sendable {
     public var name: String
 }
 
-public struct Symbol: Decodable, Sendable {
+public struct Symbol: Codable, Sendable {
     public var kind: Kind
     public var identifier: Identifier
     public var pathComponents: [String]
@@ -60,38 +60,38 @@ public struct Symbol: Decodable, Sendable {
     public var availability: [Availability]?
 }
 
-public struct Kind: Decodable, Hashable, Sendable {
+public struct Kind: Codable, Hashable, Sendable {
     public var identifier: String
     public var displayName: String
 }
 
-public struct Identifier: Decodable, Hashable, Sendable {
+public struct Identifier: Codable, Hashable, Sendable {
     public var precise: String
     public var interfaceLanguage: String
 }
 
-public struct Names: Decodable, Sendable {
+public struct Names: Codable, Sendable {
     public var title: String
 }
 
-public struct Fragment: Decodable, Hashable, Sendable {
+public struct Fragment: Codable, Hashable, Sendable {
     public var kind: String
     public var spelling: String
     public var preciseIdentifier: String?
 }
 
-public struct FunctionSignature: Decodable, Sendable {
+public struct FunctionSignature: Codable, Sendable {
     public var parameters: [Parameter]?
     public var returns: [Fragment]?
 }
 
-public struct Parameter: Decodable, Sendable {
+public struct Parameter: Codable, Sendable {
     public var name: String
     public var internalName: String?
     public var declarationFragments: [Fragment]
 }
 
-public struct Availability: Decodable, Sendable {
+public struct Availability: Codable, Sendable {
     public var domain: String
     public var introduced: Version?
     public var deprecated: Version?
@@ -100,11 +100,29 @@ public struct Availability: Decodable, Sendable {
     public var isUnconditionallyUnavailable: Bool?
 }
 
-public struct Relationship: Decodable, Hashable, Sendable {
+public struct Relationship: Codable, Hashable, Sendable {
     public var kind: String
     public var source: String
     public var target: String
 }
+}
+
+extension SwiftFrontend.SymbolGraph.Document {
+    public func validate(expectedModuleName: String) throws {
+        guard module.name == expectedModuleName,
+              !metadata.generator.isEmpty,
+              metadata.formatVersion.major >= 0,
+              metadata.formatVersion.minor >= 0,
+              metadata.formatVersion.patch >= 0,
+              !symbols.isEmpty,
+              symbols.count <= 1_000_000,
+              relationships.count <= 2_000_000
+        else {
+            throw SwiftFrontend.Error.invalidSymbolGraph(
+                "primary graph identity is incomplete"
+            )
+        }
+    }
 }
 
 extension SwiftFrontend.Driver {
@@ -215,16 +233,7 @@ extension SwiftFrontend.Driver {
                 SwiftFrontend.SymbolGraph.Document.self,
                 from: data
             )
-            guard document.module.name == moduleName,
-                  !document.metadata.generator.isEmpty,
-                  !document.symbols.isEmpty,
-                  document.symbols.count <= 1_000_000,
-                  document.relationships.count <= 2_000_000
-            else {
-                throw SwiftFrontend.Error.invalidSymbolGraph(
-                    "primary graph identity is incomplete"
-                )
-            }
+            try document.validate(expectedModuleName: moduleName)
             return document
         } catch let error as SwiftFrontend.Error {
             throw error

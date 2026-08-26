@@ -389,10 +389,23 @@ struct Application {
         )
         try Data(
             """
+            import ExternalFixture
+
             private func hidden(_ input: Int) -> Int { input + 1 }
             public func value(_ input: Int) -> Int { hidden(input) }
             """.utf8
         ).write(to: sourceRoot.appendingPathComponent("Sources/Feature.swift"))
+        let compilerInputRoot = directory.appendingPathComponent(
+            "CompilerInputs",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: compilerInputRoot,
+            withIntermediateDirectories: false
+        )
+        let externalModule = compilerInputRoot.appendingPathComponent(
+            "ExternalFixture.swiftmodule"
+        )
         let plan = XcodeIntegration.HostPlan(
             projectPath: "Demo.xcodeproj",
             features: [
@@ -452,13 +465,21 @@ struct Application {
             executable: "/usr/bin/xcrun",
             arguments: ["--sdk", "iphonesimulator", "--show-sdk-path"]
         )
+        try writeFixtureSwiftModule(
+            version: 1,
+            compiler: compiler,
+            sdkRoot: sdkRoot,
+            outputURL: externalModule,
+            directory: compilerInputRoot
+        )
         let sourceURL = sourceRoot.appendingPathComponent("Sources/Feature.swift")
         try writeSwiftCapture(
             profileID: "patch",
             buildDirectory: buildDirectory,
             compiler: compiler,
             sdkRoot: sdkRoot,
-            sourceURLs: [sourceURL]
+            sourceURLs: [sourceURL],
+            additionalArguments: ["-I", compilerInputRoot.path]
         )
         let environment = [
             "SRCROOT": directory.path,
@@ -483,9 +504,14 @@ struct Application {
             "OTHER_SWIFT_FLAGS": "-Xfrontend -enable-private-imports "
                 + "-Xfrontend -enable-implicit-dynamic "
                 + "-Xfrontend -enable-dynamic-replacement-chaining",
+            "SWIFT_INCLUDE_PATHS": compilerInputRoot.path,
             "HELIX_PROFILE_ID": "patch",
             "HELIX_WORKFLOW": "hotPatch",
             "HELIX_RUNTIME_PRODUCT": "HelixAppIntegration",
+            "HELIX_BUILD_CACHE_DIR": directory.appendingPathComponent(
+                "BuildCache",
+                isDirectory: true
+            ).path,
         ]
         let application = CLI.Application(
             currentDirectoryURL: directory,
@@ -580,6 +606,99 @@ struct Application {
             "Swift.debugPrint(_:separator:terminator:)",
             "Swift.print(_:separator:terminator:)",
         ])
+        let stableShellArtifact = shell.appendingPathComponent(
+            "Generated/FeatureBridge.swift"
+        )
+        let stableIdentity = try #require(
+            FileManager.default.attributesOfItem(atPath: stableShellArtifact.path)[
+                .systemFileNumber
+            ] as? NSNumber
+        )
+        let repeatedPatch = await application.runAsync([
+            "xcode", "phase",
+            "--plan", generatedPlanURL.path,
+            "--profile", "patch",
+            "--phase", "prepare",
+        ])
+        #expect(repeatedPatch.exitCode == 0, Comment(rawValue: repeatedPatch.standardError))
+        let repeatedPatchPerformance = try buildPerformanceReport(
+            at: buildDirectory.appendingPathComponent(
+                "HelixGenerated/patch/BuildPerformance.prepare.json"
+            )
+        )
+        #expect(repeatedPatchPerformance.trace.counters.contains {
+            $0.name == "prepare.state_hit_count" && $0.value == 1
+        })
+        #expect(!repeatedPatchPerformance.trace.subprocesses.contains {
+            $0.kind == .typedAST || $0.kind == .canonicalSIL
+                || $0.kind == .symbolGraph
+        })
+        #expect(try #require(
+            FileManager.default.attributesOfItem(atPath: stableShellArtifact.path)[
+                .systemFileNumber
+            ] as? NSNumber
+        ) == stableIdentity)
+
+        let stableShellBytes = try Data(contentsOf: stableShellArtifact)
+        try Data("tampered generated source\n".utf8).write(
+            to: stableShellArtifact,
+            options: .atomic
+        )
+        let repairedPatch = await application.runAsync([
+            "xcode", "phase",
+            "--plan", generatedPlanURL.path,
+            "--profile", "patch",
+            "--phase", "prepare",
+        ])
+        #expect(repairedPatch.exitCode == 0, Comment(rawValue: repairedPatch.standardError))
+        let repairedPatchPerformance = try buildPerformanceReport(
+            at: buildDirectory.appendingPathComponent(
+                "HelixGenerated/patch/BuildPerformance.prepare.json"
+            )
+        )
+        #expect(repairedPatchPerformance.trace.counters.contains {
+            $0.name == "prepare.state_miss_count" && $0.value == 1
+        })
+        #expect(repairedPatchPerformance.trace.counters.contains {
+            $0.name == "frontend_cache.module_hit_count" && $0.value == 1
+        })
+        #expect(!repairedPatchPerformance.trace.subprocesses.contains {
+            $0.kind == .typedAST || $0.kind == .canonicalSIL
+                || $0.kind == .symbolGraph
+        })
+        #expect(try Data(contentsOf: stableShellArtifact) == stableShellBytes)
+
+        try writeFixtureSwiftModule(
+            version: 2,
+            compiler: compiler,
+            sdkRoot: sdkRoot,
+            outputURL: externalModule,
+            directory: compilerInputRoot
+        )
+        let changedDependencyPatch = await application.runAsync([
+            "xcode", "phase",
+            "--plan", generatedPlanURL.path,
+            "--profile", "patch",
+            "--phase", "prepare",
+        ])
+        #expect(
+            changedDependencyPatch.exitCode == 0,
+            Comment(rawValue: changedDependencyPatch.standardError)
+        )
+        let changedDependencyPerformance = try buildPerformanceReport(
+            at: buildDirectory.appendingPathComponent(
+                "HelixGenerated/patch/BuildPerformance.prepare.json"
+            )
+        )
+        #expect(changedDependencyPerformance.trace.counters.contains {
+            $0.name == "prepare.state_miss_count" && $0.value == 1
+        })
+        #expect(changedDependencyPerformance.trace.counters.contains {
+            $0.name == "frontend_cache.module_miss_count" && $0.value == 1
+        })
+        #expect(changedDependencyPerformance.trace.subprocesses.contains {
+            $0.kind == .typedAST
+        })
 
         var liveEnvironment = environment
         liveEnvironment["CONFIGURATION"] = "Debug"
@@ -594,7 +713,8 @@ struct Application {
             buildDirectory: buildDirectory,
             compiler: compiler,
             sdkRoot: sdkRoot,
-            sourceURLs: [sourceURL]
+            sourceURLs: [sourceURL],
+            additionalArguments: ["-I", compilerInputRoot.path]
         )
         let liveResult = await CLI.Application(
             currentDirectoryURL: directory,
@@ -674,6 +794,33 @@ struct Application {
             liveReceipt.nativeImportCandidates.flatMap(\.silMangledNames)
         )
         #expect(entrySymbols.isDisjoint(with: importedSymbols))
+
+        let repeatedLive = await CLI.Application(
+            currentDirectoryURL: directory,
+            environment: liveEnvironment,
+            hubControlClient: StubHubControlClient()
+        ).runAsync([
+            "xcode", "phase",
+            "--plan", generatedPlanURL.path,
+            "--profile", "live",
+            "--phase", "prepare",
+        ])
+        #expect(repeatedLive.exitCode == 0, Comment(rawValue: repeatedLive.standardError))
+        let repeatedLivePerformance = try buildPerformanceReport(
+            at: buildDirectory.appendingPathComponent(
+                "HelixGenerated/live/BuildPerformance.prepare.json"
+            )
+        )
+        #expect(repeatedLivePerformance.trace.counters.contains {
+            $0.name == "frontend_cache.module_hit_count" && $0.value == 1
+        })
+        #expect(!repeatedLivePerformance.trace.subprocesses.contains {
+            $0.kind == .typedAST || $0.kind == .canonicalSIL
+                || $0.kind == .symbolGraph
+        })
+        #expect(repeatedLivePerformance.trace.stages.contains {
+            $0.name == "prepare.reserve_hub"
+        })
     }
 
     private func buildPerformanceReport(
@@ -715,12 +862,37 @@ struct Application {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private func writeFixtureSwiftModule(
+        version: Int,
+        compiler: String,
+        sdkRoot: String,
+        outputURL: URL,
+        directory: URL
+    ) throws {
+        let source = directory.appendingPathComponent("ExternalFixture.swift")
+        try Data(
+            "public struct ExternalValue { public static let version = \(version) }\n"
+                .utf8
+        ).write(to: source)
+        _ = try toolOutput(
+            executable: compiler,
+            arguments: [
+                "-emit-module", "-parse-as-library", source.path,
+                "-module-name", "ExternalFixture",
+                "-target", "arm64-apple-ios15.0-simulator",
+                "-sdk", sdkRoot,
+                "-emit-module-path", outputURL.path,
+            ]
+        )
+    }
+
     private func writeSwiftCapture(
         profileID: String,
         buildDirectory: URL,
         compiler: String,
         sdkRoot: String,
-        sourceURLs: [URL]
+        sourceURLs: [URL],
+        additionalArguments: [String] = []
     ) throws {
         let url = buildDirectory.appendingPathComponent(
             "Intermediates/\(profileID)/Helix/FrontendInvocation.hlxswiftc"
@@ -736,7 +908,7 @@ struct Application {
             "-target", "arm64-apple-ios15.0-simulator",
             "-sdk", sdkRoot,
             "-Onone",
-        ] + sourceURLs.map(\.path)
+        ] + additionalArguments + sourceURLs.map(\.path)
         var data = Data()
         for field in fields {
             data.append(Data(field.utf8))

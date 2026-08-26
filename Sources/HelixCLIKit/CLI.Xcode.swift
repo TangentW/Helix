@@ -712,7 +712,7 @@ private func performBuildXcodePatch(
             ),
         ]
     }
-    try performance.measure("patch.publish_artifacts") {
+    _ = try performance.measure("patch.publish_artifacts") {
         try files.writeDirectory(
             outputArtifacts,
             to: output,
@@ -1117,7 +1117,7 @@ private final class XcodePhaseLock {
     deinit { unlock() }
 }
 
-private struct XcodeFeatureCapture {
+struct XcodeFeatureCapture {
     var recordBytes: Data
     var analysisJob: BuildCapture.CapturedFrontendJob
     var frontendSources: [FrontendReceipt.Source]
@@ -1256,6 +1256,27 @@ private func performPrepareXcodeShell(
     let capture = try performance.measure("prepare.capture_frontend") {
         try capturedXcodeFeature(context, at: targetCaptureURL)
     }
+    let sourceImports = try performance.measure("prepare.scan_imports") {
+        try FrontendReceipt.SourceImports.scan(sources: capture.frontendSources)
+    }
+    var compilerInputs = performance.measure("prepare.compiler_inputs") {
+        BuildCache.CompilerInputs.capture(
+            arguments: capture.analysisJob.arguments,
+            currentModuleName: context.feature.moduleName,
+            workingDirectory: context.environment.sourceRootURL,
+            importedModules: Set(sourceImports.modules)
+        )
+    }
+    compilerInputs.isComplete = compilerInputs.isComplete
+        && sourceImports.isComplete
+    performance.setCounter(
+        "prepare.compiler_input_file_count",
+        value: compilerInputs.fileCount
+    )
+    performance.setCounter(
+        "prepare.compiler_input_bytes",
+        value: compilerInputs.byteCount
+    )
     let minimumOS: Core.SemanticVersion
     do {
         minimumOS = try Core.SemanticVersion(
@@ -1286,21 +1307,107 @@ private func performPrepareXcodeShell(
             )
         )
     }
-    let indexed = try performance.measure("prepare.frontend_receipt") {
-        try FrontendReceipt.Adapter().generate(
-            .init(
+    var prepareInputHash: Core.Digest?
+    var prepareIdentitySources: [CLI.XcodePrepareInput.Source]?
+    var precomputedToolchain: ReleaseCompiler.ToolchainIdentity?
+    if context.profile.workflow == .hotPatch {
+        let identity = try performance.measure("prepare.make_fast_path_identity") {
+            try makeHotPatchPrepareIdentity(
+                context: context,
+                capture: capture,
+                compilerInputs: compilerInputs,
                 metadata: metadata,
                 configuration: configuration,
-                sources: capture.frontendSources,
-                compilerURL: context.environment.compilerURL,
-                nativeImportCatalog: .empty,
-                callingSurfacePolicy: context.profile.workflow == .liveReload
-                    ? .managedDebugModule
-                    : .configured
+                performance: performance
             )
-        )
+        }
+        precomputedToolchain = identity.toolchain
+        prepareIdentitySources = identity.sources
+        if compilerInputs.isComplete {
+            prepareInputHash = identity.inputHash
+            if let state = loadHotPatchPrepareState(
+                context: context,
+                expectedInputHash: identity.inputHash
+            ), hotPatchPrepareSourcesMatch(identity.sources) {
+                performance.incrementCounter("prepare.state_hit_count")
+                performance.setCounter(
+                    "prepare.eligible_function_count",
+                    value: UInt64(state.eligibleFunctionCount)
+                )
+                performance.setCounter(
+                    "prepare.rejected_function_count",
+                    value: UInt64(state.rejectedFunctionCount)
+                )
+                return .init(
+                    exitCode: 0,
+                    standardOutput: "Prepared \(context.profile.id) Helix Shell at "
+                        + "\(context.environment.shellOutputURL.path)\n"
+                        + "Functions: \(state.eligibleFunctionCount) eligible, "
+                        + "\(state.rejectedFunctionCount) rejected\n"
+                )
+            }
+            performance.incrementCounter("prepare.state_miss_count")
+        } else {
+            performance.incrementCounter(
+                "prepare.compiler_inputs_incomplete_count"
+            )
+        }
+    }
+    let receiptRequest = FrontendReceipt.Request(
+        metadata: metadata,
+        configuration: configuration,
+        sources: capture.frontendSources,
+        compilerURL: context.environment.compilerURL,
+        nativeImportCatalog: .empty,
+        callingSurfacePolicy: context.profile.workflow == .liveReload
+            ? .managedDebugModule
+            : .configured
+    )
+    let indexed = try performance.measure("prepare.frontend_receipt") {
+        if let cache = xcodeBuildCacheStore() {
+            return try FrontendReceipt.CachedAdapter(cache: cache).generate(
+                receiptRequest,
+                compilerCapture: capture.recordBytes,
+                compilerArguments: capture.analysisJob.arguments,
+                workingDirectory: context.environment.sourceRootURL,
+                precomputedToolchain: precomputedToolchain,
+                precomputedCompilerInputs: compilerInputs
+            )
+        }
+        performance.incrementCounter("prepare.build_cache_unavailable_count")
+        return try FrontendReceipt.Adapter().generate(receiptRequest)
     }
     performance.merge(indexed.performance)
+    if prepareInputHash != nil {
+        var confirmedCompilerInputs = BuildCache.CompilerInputs.capture(
+            arguments: capture.analysisJob.arguments,
+            currentModuleName: context.feature.moduleName,
+            workingDirectory: context.environment.sourceRootURL,
+            importedModules: Set(sourceImports.modules)
+        )
+        confirmedCompilerInputs.isComplete = confirmedCompilerInputs.isComplete
+            && sourceImports.isComplete
+        if confirmedCompilerInputs != compilerInputs {
+            prepareInputHash = nil
+            performance.incrementCounter("prepare.input_drift_count")
+        }
+    }
+    if let prepareIdentitySources {
+        let identitySources = prepareIdentitySources.map {
+            ShellBuildReceipt.Source(
+                logicalPath: $0.logicalPath,
+                contentHash: $0.contentHash
+            )
+        }
+        if identitySources != indexed.receipt.sources {
+            prepareInputHash = nil
+            performance.incrementCounter("prepare.input_drift_count")
+        }
+    }
+    if !sourceImports.covers(compilerModules: indexed.importedModules) {
+        prepareInputHash = nil
+        performance.incrementCounter("prepare.import_scan_mismatch_count")
+    }
     let hubReservation: XcodeIntegration.HubReservationDocument?
     let hubBinding: ShellBuild.HubBinding?
     if context.profile.workflow == .liveReload {
@@ -1354,17 +1461,51 @@ private func performPrepareXcodeShell(
             "cannot create Helix profile output: \(error.localizedDescription)"
         )
     }
-    try performance.measure("prepare.publish_artifacts") {
+    let privateArtifactPaths = privatePathsForPreparedShell(
+        hubReservation: hubReservation
+    )
+    let publication = try performance.measure("prepare.publish_artifacts") {
         try files.writeDirectory(
             artifacts,
             to: context.environment.shellOutputURL,
             force: true,
-            privatePaths: Set([
-                XcodeIntegration.CompilerCapture.shellRelativeInvocationPath,
-            ] + (hubReservation == nil ? [] : [
-                XcodeIntegration.HubReservationDocument.relativePath,
-            ]))
+            privatePaths: privateArtifactPaths
         )
+    }
+    performance.setCounter(
+        "prepare.reused_artifact_count",
+        value: publication.reusedFileCount
+    )
+    performance.setCounter(
+        "prepare.written_artifact_count",
+        value: publication.writtenFileCount
+    )
+    performance.setCounter(
+        "prepare.noop_publication_count",
+        value: publication.wasNoOp ? 1 : 0
+    )
+    if let prepareInputHash {
+        let state = XcodeIntegration.PrepareState(
+            inputHash: prepareInputHash,
+            artifacts: artifacts.map { path, data in
+                .init(
+                    path: path,
+                    contentHash: .sha256(data),
+                    byteCount: UInt64(data.count),
+                    permissions: privateArtifactPaths.contains(path) ? 0o600 : 0o644
+                )
+            },
+            eligibleFunctionCount: materialized.report.eligibleFunctionCount,
+            rejectedFunctionCount: materialized.report.rejectedFunctionCount
+        )
+        try performance.measure("prepare.publish_state") {
+            try files.write(
+                try XcodeIntegration.PrepareStateCodec.encode(state),
+                to: context.environment.profileOutputURL.appendingPathComponent(
+                    XcodeIntegration.PrepareState.relativePath
+                )
+            )
+        }
     }
     for (path, data) in artifacts {
         performance.recordArtifact(
@@ -1512,6 +1653,13 @@ private func performCompileXcodeBridge(
             return resolved
         }
     }
+    let sourceImports = try performance.measure("bridge.scan_imports") {
+        try FrontendReceipt.SourceImports.scan(
+            sources: sourceURLs.enumerated().map {
+                .init(logicalPath: "Bridge/\($0.offset).swift", url: $0.element)
+            }
+        )
+    }
     performance.setCounter(
         "bridge.generated_source_count",
         value: UInt64(sourceArtifacts.count)
@@ -1525,16 +1673,16 @@ private func performCompileXcodeBridge(
     }
     let moduleMapNames = ["HelixRuntimeSupport"]
     let runtimeModuleMaps = try performance.measure("bridge.load_module_maps") {
-        try moduleMapNames.compactMap { name -> URL? in
+        try moduleMapNames.compactMap { name -> (url: URL, hash: Core.Digest)? in
             let url = context.environment.generatedModuleMapDirectoryURL
                 .appendingPathComponent("\(name).modulemap")
             guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-            _ = try readRegularFile(
+            let data = try readRegularFile(
                 url,
                 maximumBytes: 1 * 1_024 * 1_024,
                 label: "\(name) module map"
             )
-            return url
+            return (url, .sha256(data))
         }
     }
     let manager = FileManager.default
@@ -1590,7 +1738,7 @@ private func performCompileXcodeBridge(
                 expectedOptimization: context.environment.optimization,
                 additionalModuleSearchArguments:
                     context.environment.bridgeModuleSearchArguments,
-                clangModuleMapURLs: runtimeModuleMaps,
+                clangModuleMapURLs: runtimeModuleMaps.map(\.url),
                 generatedSourceURLs: sourceURLs,
                 outputURL: temporary,
                 moduleName: "HelixBridge_\(moduleSuffix)"
@@ -1598,6 +1746,106 @@ private func performCompileXcodeBridge(
         }
     } catch let error as XcodeIntegration.BridgeCompilationError {
         throw CLI.Error.input(error.description)
+    }
+    let autostartSymbol = context.profile.workflow == .liveReload
+        ? "hlx_dev_runtime_autostart_v1" : "hlx_runtime_autostart_v1"
+    let constructor = """
+    extern void \(autostartSymbol)(void);
+
+    __attribute__((constructor))
+    static void helix_runtime_autostart(void) {
+        \(autostartSymbol)();
+    }
+
+    """
+    let clangURL = context.environment.compilerURL.deletingLastPathComponent()
+        .appendingPathComponent("clang")
+    guard plan.arguments.count >= 2,
+          plan.arguments[plan.arguments.count - 2] == "-o",
+          plan.arguments.last == temporary.path
+    else {
+        throw CLI.Error.input("hidden Bridge plan has an invalid output binding")
+    }
+    var compilerInputs = performance.measure("bridge.compiler_inputs") {
+        BuildCache.CompilerInputs.capture(
+            arguments: plan.arguments,
+            currentModuleName: "HelixBridge_\(moduleSuffix)",
+            workingDirectory: context.environment.bridgeOutputURL,
+            importedModules: Set(sourceImports.modules)
+        )
+    }
+    compilerInputs.isComplete = compilerInputs.isComplete
+        && sourceImports.isComplete
+    performance.setCounter(
+        "bridge.compiler_input_file_count",
+        value: compilerInputs.fileCount
+    )
+    performance.setCounter(
+        "bridge.compiler_input_bytes",
+        value: compilerInputs.byteCount
+    )
+    let bridgeInputHash: Core.Digest? = try performance.measure(
+        "bridge.make_state_identity"
+    ) {
+        guard compilerInputs.isComplete else { return nil }
+        let toolchain = try ReleaseCompiler.Driver().toolchainIdentity(
+            compilerURL: plan.compilerURL,
+            invocationObserver: performance.subprocessObserver
+        )
+        let resolvedClang = clangURL.resolvingSymlinksInPath().standardizedFileURL
+        guard FileManager.default.isExecutableFile(atPath: resolvedClang.path) else {
+            throw CLI.Error.input("hidden bootstrap compiler is not executable")
+        }
+        let clangBytes = try readRegularFile(
+            resolvedClang,
+            maximumBytes: 512 * 1_024 * 1_024,
+            label: "hidden bootstrap compiler"
+        )
+        return try BuildCache.key(
+            domain: "HLX.Xcode.BridgeInput.v1",
+            value: CLI.XcodeBridgeInput(
+                profileID: context.profile.id,
+                transformPipelineHash: ShellBuild.transformPipelineHash,
+                toolchain: toolchain,
+                clangCompilerPath: resolvedClang.path,
+                clangCompilerHash: .sha256(clangBytes),
+                xcodeBuild: context.environment.xcodeBuild,
+                sdkBuild: context.environment.sdkBuild,
+                compilerArguments: Array(plan.arguments.dropLast(2)),
+                compilerInputs: compilerInputs,
+                generatedSources: sourceArtifacts,
+                moduleMaps: runtimeModuleMaps.map {
+                    .init(path: $0.url.standardizedFileURL.path, contentHash: $0.hash)
+                }.sorted { $0.path < $1.path },
+                bootstrapSource: constructor
+            )
+        )
+    }
+    if let bridgeInputHash, let state = loadXcodeBridgeState(
+        context: context,
+        expectedInputHash: bridgeInputHash
+    ) {
+        performance.incrementCounter("bridge.state_hit_count")
+        performance.recordArtifact(
+            relativePath: "Bridge.o",
+            byteCount: state.bridge.byteCount
+        )
+        performance.recordArtifact(
+            relativePath: "Bootstrap.o",
+            byteCount: state.bootstrap.byteCount
+        )
+        return .init(
+            exitCode: 0,
+            standardOutput: "Reused hidden Helix Bridge at "
+                + "\(context.environment.bridgeObjectURL.path)\n"
+                + "Reused automatic runtime bootstrap at "
+                + "\(context.environment.bootstrapObjectURL.path)\n"
+        )
+    }
+    if bridgeInputHash != nil {
+        performance.incrementCounter("bridge.state_miss_count")
+    } else {
+        performance.incrementCounter("bridge.compiler_inputs_incomplete_count")
     }
     let compilation = try performance.measure("bridge.compile_swift") {
         try ProcessExecution.Runner().run(
@@ -1622,22 +1870,9 @@ private func performCompileXcodeBridge(
             label: "hidden Bridge"
         )
     }
-    let autostartSymbol = context.profile.workflow == .liveReload
-        ? "hlx_dev_runtime_autostart_v1" : "hlx_runtime_autostart_v1"
-    let constructor = """
-    extern void \(autostartSymbol)(void);
-
-    __attribute__((constructor))
-    static void helix_runtime_autostart(void) {
-        \(autostartSymbol)();
-    }
-
-    """
     try performance.measure("bridge.write_bootstrap_source") {
         try Data(constructor.utf8).write(to: bootstrapSource, options: .atomic)
     }
-    let clangURL = context.environment.compilerURL.deletingLastPathComponent()
-        .appendingPathComponent("clang")
     let bootstrapCompilation = try performance.measure("bridge.compile_bootstrap") {
         try ProcessExecution.Runner().run(
             executable: clangURL,
@@ -1689,15 +1924,63 @@ private func performCompileXcodeBridge(
             )
         }
     }
-    for (name, url) in [
-        ("Bridge.o", context.environment.bridgeObjectURL),
-        ("Bootstrap.o", context.environment.bootstrapObjectURL),
-    ] {
-        if let attributes = try? manager.attributesOfItem(atPath: url.path),
-           let byteCount = (attributes[.size] as? NSNumber)?.uint64Value {
-            performance.recordArtifact(relativePath: name, byteCount: byteCount)
+    let bridgeObject = try readRegularFile(
+        context.environment.bridgeObjectURL,
+        maximumBytes: 512 * 1_024 * 1_024,
+        label: "published hidden Bridge object"
+    )
+    let publishedBootstrap = try readRegularFile(
+        context.environment.bootstrapObjectURL,
+        maximumBytes: 512 * 1_024 * 1_024,
+        label: "published hidden bootstrap object"
+    )
+    let bridgeInputsStayedStable: Bool
+    if bridgeInputHash != nil {
+        let confirmedCompilerInputs = BuildCache.CompilerInputs.capture(
+            arguments: plan.arguments,
+            currentModuleName: "HelixBridge_\(moduleSuffix)",
+            workingDirectory: context.environment.bridgeOutputURL,
+            importedModules: Set(sourceImports.modules)
+        )
+        bridgeInputsStayedStable = confirmedCompilerInputs == compilerInputs
+            && bridgeGeneratedSourcesMatch(sourceArtifacts, at: sourceURLs)
+        if !bridgeInputsStayedStable {
+            performance.incrementCounter("bridge.input_drift_count")
+        }
+    } else {
+        bridgeInputsStayedStable = false
+    }
+    let state = bridgeInputHash.flatMap { inputHash in
+        bridgeInputsStayedStable ? XcodeIntegration.BridgeState(
+            inputHash: inputHash,
+            bridge: .init(
+                contentHash: .sha256(bridgeObject),
+                byteCount: UInt64(bridgeObject.count)
+            ),
+            bootstrap: .init(
+                contentHash: .sha256(publishedBootstrap),
+                byteCount: UInt64(publishedBootstrap.count)
+            )
+        ) : nil
+    }
+    if let state {
+        try performance.measure("bridge.publish_state") {
+            try files.write(
+                try XcodeIntegration.BridgeStateCodec.encode(state),
+                to: context.environment.bridgeOutputURL.appendingPathComponent(
+                    XcodeIntegration.BridgeState.relativePath
+                )
+            )
         }
     }
+    performance.recordArtifact(
+        relativePath: "Bridge.o",
+        byteCount: UInt64(bridgeObject.count)
+    )
+    performance.recordArtifact(
+        relativePath: "Bootstrap.o",
+        byteCount: UInt64(publishedBootstrap.count)
+    )
     return .init(
         exitCode: 0,
         standardOutput: "Compiled hidden Helix Bridge at "
@@ -1708,7 +1991,7 @@ private func performCompileXcodeBridge(
     )
 }
 
-private func validateXcodeObject(
+func validateXcodeObject(
     _ url: URL,
     context: XcodeIntegration.BuildContext,
     label: String
@@ -1745,7 +2028,7 @@ private func validateXcodeObject(
     }
 }
 
-private func readRegularFile(
+func readRegularFile(
     _ url: URL,
     maximumBytes: Int,
     label: String

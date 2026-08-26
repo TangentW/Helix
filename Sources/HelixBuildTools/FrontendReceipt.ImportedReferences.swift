@@ -3,8 +3,8 @@ import HelixCore
 import HelixInterface
 
 extension FrontendReceipt.Adapter {
-    struct ImportedNativeType: Hashable, Sendable {
-        enum Representation: String, Hashable, Sendable {
+    struct ImportedNativeType: Codable, Hashable, Sendable {
+        enum Representation: String, Codable, Hashable, Sendable {
             case reference
             case rawRepresentable
             case opaqueValue

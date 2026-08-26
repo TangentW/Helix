@@ -8,7 +8,7 @@ import HelixInterface
 public enum FrontendReceipt {}
 
 extension FrontendReceipt {
-public enum CallingSurfacePolicy: Hashable, Sendable {
+public enum CallingSurfacePolicy: String, Codable, Hashable, Sendable {
     /// Uses the exact NativeImport scope resolved for this build. Xcode
     /// integration creates it automatically; headless callers may supply one.
     case configured
@@ -56,6 +56,7 @@ public struct Output: Sendable {
     public var receipt: ShellBuildReceipt.Document
     public var diagnostics: [Core.Diagnostic]
     public var toolchain: ReleaseCompiler.ToolchainIdentity
+    public var importedModules: [String]
     public var performance: BuildPerformance.Trace
 }
 
