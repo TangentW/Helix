@@ -56,6 +56,11 @@ let package = Package(
             publicHeadersPath: "include"
         ),
         .target(
+            name: "HelixCRuntimeSupport",
+            path: "Sources/HelixCRuntimeSupport",
+            publicHeadersPath: "include"
+        ),
+        .target(
             name: "HelixRuntimeTestSupport",
             path: "Tests/HelixRuntimeTestSupport",
             publicHeadersPath: "include"
@@ -65,6 +70,7 @@ let package = Package(
             dependencies: [
                 "HelixCore", "HelixBytecode", "HelixVerifier", "HelixVM",
                 "HelixRuntimeSupport", "HelixObjectiveCRuntimeSupport",
+                "HelixCRuntimeSupport",
             ]
         ),
         .target(name: "HelixCompiler", dependencies: ["HelixCore", "HelixBytecode", "HelixInterface"]),
@@ -181,6 +187,7 @@ let package = Package(
                 "HelixBuildTools", "HelixCompiler", "HelixInterface",
                 "HelixDevProtocol", "HelixLiveReloadAPI", "HelixBytecode", "HelixCore",
                 "HelixCLIKit", "HelixDevTools", "HelixVerifier",
+                "HelixCRuntimeSupport",
             ]
         ),
         .testTarget(

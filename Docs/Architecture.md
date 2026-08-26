@@ -74,6 +74,13 @@ Both workflows depend on stable, build-specific identities:
   `NSInvocation`; unsupported Swift
   overlays and ABI shapes retain the exact generated-adapter route. This is a
   reusable execution mechanism, not wildcard selector authority.
+- Compiler-proven C functions within the finite scalar/Apple-geometry ABI
+  matrix share one AOT Runtime invoker. The permanent Bridge supplies the
+  address of the exact imported declaration; Runtime performs no symbol lookup
+  and downloaded code cannot choose a pointer. Remaining Swift declarations
+  are grouped by native module into deterministic Adapter Packs with separately
+  cached source and validated Mach-O objects. This generated type-erasure
+  boundary does not expose Swift's private generic ABI.
 - Interface and transitive implementation fingerprints distinguish a body
   edit from an ABI, layout, source-membership, or dependency change.
 - Eligible existing Shell structs and enums use a captured logical-value
@@ -875,6 +882,14 @@ generated descriptor and invoker collections are emitted as deterministic,
 explicitly typed bounded chunks; this preserves ordering and the single-object
 contract while bounding Swift constraint-solver memory during hidden
 compilation.
+
+Bridge compilation also separates stable and session-specific work. The large
+application Bridge and each native-module Adapter Pack have exact
+content-addressed object identities. A fresh Live Reload invitation generates
+and compiles only a small Hub-contract source, then relocatably links that
+object with the validated stable objects. The stricter final Bridge identity
+still includes the current invitation, so object reuse cannot accidentally
+carry pairing authority from an earlier build.
 
 The Xcode integration captures the frontend, link, SDK, module, source, and
 target facts from a real Debug build. A source monitor turns editor writes and

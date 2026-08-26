@@ -10,7 +10,7 @@ public enum ShellBuild {
     /// native-call descriptor semantics change. This invalidates local build
     /// facts without changing a shipped protocol or schema version.
     public static let transformPipelineHash = Core.Digest.sha256(
-        "Helix.ShellBuild.DynamicSourceTransform.v1:declaration-groups:frozen-value-hooks:source-body-dispatch:async-original-thunks:native-call-descriptor-v1:objective-c-invoker"
+        "Helix.ShellBuild.DynamicSourceTransform.v1:declaration-groups:frozen-value-hooks:source-body-dispatch:async-original-thunks:native-call-descriptor-v1:objective-c-invoker:c-invoker-main-actor-unqualified-reference:swift-adapter-pack-v1:exact-module-imports:separate-hub-contract-object"
     )
 }
 
@@ -61,9 +61,23 @@ public struct Report: Codable, Hashable, Sendable {
     public var eligibleFunctionCount: UInt32
     public var rejectedFunctionCount: UInt32
     public var emittedNativeImportCount: UInt32
+    public var adapterPacks: [ShellBuild.AdapterPackReport]
+    public var applicationAdapterCount: UInt32
+    public var objectiveCInvokerCount: UInt32
+    public var cInvokerCount: UInt32
     public var transformedSources: [ShellBuild.Artifact]
     public var generatedSources: [ShellBuild.Artifact]
     public var diagnostics: [Core.Diagnostic]
+}
+
+public struct AdapterPackReport: Codable, Hashable, Sendable {
+    public var identity: NativeAdapterPack.Identity
+    public var moduleName: String
+    public var entryCount: UInt32
+    public var sourcePath: String
+    public var sourceHash: Core.Digest
+    public var sourceByteCount: UInt64
+    public var cacheSource: BuildCache.Source
 }
 
 public struct Output: Sendable {
@@ -130,7 +144,8 @@ public struct Materializer: Sendable {
     public func materialize(
         receipt: ShellBuildReceipt.Document,
         sourceRoot: URL,
-        hubBinding: ShellBuild.HubBinding? = nil
+        hubBinding: ShellBuild.HubBinding? = nil,
+        cache: BuildCache.Store? = nil
     ) throws -> ShellBuild.Output {
         let sourceMappings = try sourceMappings(
             for: receipt.sources,
@@ -139,14 +154,16 @@ public struct Materializer: Sendable {
         return try materialize(
             receipt: receipt,
             sourceMappings: sourceMappings,
-            hubBinding: hubBinding
+            hubBinding: hubBinding,
+            cache: cache
         )
     }
 
     public func materialize(
         receipt: ShellBuildReceipt.Document,
         sourceMappings: [String: URL],
-        hubBinding: ShellBuild.HubBinding? = nil
+        hubBinding: ShellBuild.HubBinding? = nil,
+        cache: BuildCache.Store? = nil
     ) throws -> ShellBuild.Output {
         try limits.validate()
         try receipt.validate()
@@ -340,16 +357,22 @@ public struct Materializer: Sendable {
             nativeImports: importBindings,
             nativeTypes: typeBindings
         )
-        let devContract = try ShellBuild.DevContractGenerator().generate(
-            archive: indexed.archive,
-            reloadIndexHash: reloadIndexHash,
-            hubBinding: hubBinding
+        let adapterPackCacheSources = try cacheAdapterPacks(
+            in: &bridge,
+            receipt: receipt,
+            cache: cache
         )
-        guard bridge.sourceFiles.updateValue(
-            devContract.contents,
-            forKey: devContract.path
-        ) == nil else {
-            throw ShellBuild.Error.outputCollision(devContract.path)
+        if let hubBinding {
+            let hubContract = try ShellBuild.HubContractGenerator().generate(
+                archive: indexed.archive,
+                binding: hubBinding
+            )
+            guard bridge.sourceFiles.updateValue(
+                hubContract.contents,
+                forKey: hubContract.path
+            ) == nil else {
+                throw ShellBuild.Error.outputCollision(hubContract.path)
+            }
         }
         let provider = try ShellBuild.BridgeProviderGenerator().generate(
             archive: indexed.archive,
@@ -381,6 +404,38 @@ public struct Materializer: Sendable {
         } + xcodeIntegration.artifacts.map {
             ShellBuild.Artifact(path: $0.key, data: $0.value)
         }).sorted { $0.path < $1.path }
+        let adapterPackReports = try bridge.adapterPacks.map { pack in
+            guard let source = bridge.sourceFiles[pack.sourcePath] else {
+                throw ShellBuild.Error.nativeImportBindingMismatch
+            }
+            let data = Data(source.utf8)
+            let identity = NativeAdapterPack.Identity(
+                compilerFingerprint: receipt.compatibility.compilerFingerprint,
+                sdkBuild: receipt.metadata.sdkBuild,
+                targetTriple: receipt.metadata.targetTriple,
+                minimumDeployment: receipt.metadata.minimumOS,
+                transformPipelineHash: receipt.metadata.transformPipelineHash,
+                moduleName: pack.moduleName,
+                importedModules: pack.importedModules,
+                keys: pack.keys
+            )
+            return ShellBuild.AdapterPackReport(
+                identity: identity,
+                moduleName: pack.moduleName,
+                entryCount: UInt32(pack.keys.count),
+                sourcePath: pack.sourcePath,
+                sourceHash: .sha256(data),
+                sourceByteCount: UInt64(data.count),
+                cacheSource: adapterPackCacheSources[pack.moduleName]
+                    ?? .bypassed
+            )
+        }.sorted { $0.moduleName < $1.moduleName }
+        let emittedBindingKeys = Set(indexed.archive.nativeImports.compactMap {
+            $0.isEmittedToDevice ? $0.key : nil
+        })
+        let emittedBindings = receipt.nativeImportBindings.filter {
+            emittedBindingKeys.contains($0.key)
+        }
         let report = ShellBuild.Report(
             schemaVersion: ShellBuild.Report.currentSchemaVersion,
             receiptHash: try receipt.contentHash(),
@@ -392,6 +447,17 @@ public struct Materializer: Sendable {
             eligibleFunctionCount: UInt32(indexed.eligibleCount),
             rejectedFunctionCount: UInt32(indexed.rejectedCount),
             emittedNativeImportCount: UInt32(indexed.emittedImportCount),
+            adapterPacks: adapterPackReports,
+            applicationAdapterCount: UInt32(emittedBindings.filter {
+                $0.strategy == .generatedSwiftAdapter
+                    && $0.generated?.nativeModuleName == nil
+            }.count),
+            objectiveCInvokerCount: UInt32(emittedBindings.filter {
+                $0.strategy == .objectiveCInvoker
+            }.count),
+            cInvokerCount: UInt32(emittedBindings.filter {
+                $0.strategy == .cInvoker
+            }.count),
             transformedSources: transformedArtifacts,
             generatedSources: generatedArtifacts,
             diagnostics: indexed.diagnostics
@@ -406,6 +472,65 @@ public struct Materializer: Sendable {
             xcodeIntegration: xcodeIntegration,
             report: report
         )
+    }
+
+    private func cacheAdapterPacks(
+        in bridge: inout BridgeGeneration.Output,
+        receipt: ShellBuildReceipt.Document,
+        cache: BuildCache.Store?
+    ) throws -> [String: BuildCache.Source] {
+        var sources: [String: BuildCache.Source] = [:]
+        for pack in bridge.adapterPacks {
+            guard let generated = bridge.sourceFiles[pack.sourcePath] else {
+                throw ShellBuild.Error.nativeImportBindingMismatch
+            }
+            let identity = NativeAdapterPack.Identity(
+                compilerFingerprint: receipt.compatibility.compilerFingerprint,
+                sdkBuild: receipt.metadata.sdkBuild,
+                targetTriple: receipt.metadata.targetTriple,
+                minimumDeployment: receipt.metadata.minimumOS,
+                transformPipelineHash: receipt.metadata.transformPipelineHash,
+                moduleName: pack.moduleName,
+                importedModules: pack.importedModules,
+                keys: pack.keys
+            )
+            let document = NativeAdapterPack.Document(
+                identity: identity,
+                sourcePath: pack.sourcePath,
+                source: generated
+            )
+            try document.validate(source: generated)
+            guard let cache else {
+                sources[pack.moduleName] = .bypassed
+                continue
+            }
+            let artifact = NativeAdapterPack.CachedArtifact(
+                document: document,
+                source: generated
+            )
+            var decoded: NativeAdapterPack.CachedArtifact?
+            let value = try cache.value(
+                namespace: .adapterPack,
+                key: identity.cacheKey,
+                maximumBytes: NativeAdapterPack.Codec.maximumBytes,
+                validate: { data in
+                    let candidate = try NativeAdapterPack.Codec.decode(data)
+                    decoded = try candidate.validated(
+                        against: document,
+                        source: generated
+                    )
+                },
+                produce: {
+                    try NativeAdapterPack.Codec.encode(artifact)
+                }
+            )
+            guard let decoded else {
+                throw NativeAdapterPack.Error.invalid
+            }
+            bridge.sourceFiles[pack.sourcePath] = decoded.source
+            sources[pack.moduleName] = value.source
+        }
+        return sources
     }
 
     private func renderSourceBody(
@@ -631,6 +756,7 @@ public struct Materializer: Sendable {
             case .factory: .factory
             case .generatedSwiftAdapter: .generatedSwiftAdapter
             case .objectiveCInvoker: .objectiveCInvoker
+            case .cInvoker: .cInvoker
             }
             return .init(
                 id: id,
@@ -663,7 +789,16 @@ public struct Materializer: Sendable {
                         parameterSwiftTypes: generated.parameterSwiftTypes,
                         invocationParameterSwiftTypes:
                             generated.invocationParameterSwiftTypes,
-                        resultSwiftType: generated.resultSwiftType
+                        resultSwiftType: generated.resultSwiftType,
+                        nativeModuleName: generated.nativeModuleName
+                    )
+                },
+                cFunction: binding.cFunction.map {
+                    .init(
+                        moduleName: $0.moduleName,
+                        swiftName: $0.swiftName,
+                        parameterSwiftTypes: $0.parameterSwiftTypes,
+                        resultSwiftType: $0.resultSwiftType
                     )
                 }
             )

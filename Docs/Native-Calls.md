@@ -2,10 +2,10 @@
 
 This document records the implemented version 1 baseline for describing and
 authorizing calls from HLBC into code already installed with an application.
-It is intentionally narrower than the eventual execution backends: the stable
-identity, catalog, archive, bytecode, verifier, and generic Objective-C message
-invoker described here are implemented. The restricted C invoker and reusable
-Swift Adapter Packs are introduced in later stages.
+The stable identity, catalog, archive, bytecode, verifier, generic Objective-C
+message invoker, restricted C invoker, and reusable Swift Adapter Packs
+described here are implemented. Catalog-backed on-demand development adapters
+and signed Release capability projection remain separate later stages.
 
 ## Two IDs with different jobs
 
@@ -161,8 +161,62 @@ exact descriptor emitted into the current Shell. Source-observed calls and the
 current managed-Debug SDK surface can use the generic binding now. A public API
 that was not emitted into that Shell is not yet made available merely because
 the invoker exists; full Catalog-backed development lookup and the signed
-Release capability projection are later stages. C calls and complex pure-Swift
-calls likewise continue to require their existing exact binding until the C
-invoker and Adapter Pack stages land.
+Release capability projection are later stages.
+
+## Restricted C execution
+
+Imported C functions no longer require one handwritten or generated executor
+per symbol when compiler evidence proves a supported physical ABI. Discovery
+records the declaration's Clang USR, owning module, exact C entry point,
+logical Swift signature, calling convention, layouts, effects, and
+availability. Generated Bridge code takes the address of that exact imported
+declaration as an `@convention(c)` function and registers it with one
+`Runtime.CInvoker`; the runtime never searches the process by a source string.
+
+The implementation uses a finite ahead-of-time trampoline matrix rather than
+`dlsym`, `libffi`, a descriptor-driven `unsafeBitCast`, or a user-supplied
+pointer. Generated Bridge code performs one compile-time-typed erasure from the
+exact imported `@convention(c)` function to its stored address; it does not use
+that operation to invent a calling signature. The current matrix covers bounded
+homogeneous scalar calls with up to four arguments and the explicitly validated
+Apple geometry value shapes used by the Bridge. Each slot is checked for
+calling convention, byte width, alignment, argument count, result shape,
+availability, deadline, and MainActor entry before the trusted function pointer
+is invoked. An unsupported mixed, variadic, pointer-bearing, indirect,
+throwing, callback, or otherwise unfamiliar ABI remains on the exact Swift
+adapter route or is rejected; it is never approximated.
+
+The real UIKit Demo keeps a behavior-neutral `CACurrentMediaTime()` probe. It
+therefore exercises the C descriptor, generated function address, common
+runtime invoker, MainActor policy, result decoding, and final object link in an
+ordinary Xcode build.
+
+## Reusable Swift Adapter Packs
+
+Calls that require Swift semantics—such as value overlays or an ABI outside the
+generic invoker matrices—still need compiler-generated Swift. They are now
+classified by the declaration's stable Swift USR and native module, grouped
+into one deterministic Adapter Pack per module, and sorted by `NativeCallKey`.
+The large application Bridge references stable C-ABI factories; each factory
+returns a type-erased synchronous or suspending native adapter body while the
+actual Swift call remains in the Pack's native module context.
+
+Pack source and Pack object are separate content-addressed facts. Source
+identity includes the compiler/SDK/target/deployment/transform environment,
+module, exact ordered imported modules, and exact ordered keys. Object identity
+additionally includes the toolchain binary, Xcode build, normalized compiler
+invocation, complete
+non-SDK compiler-input snapshot, module maps, and source hash. Cached objects
+are bounded Mach-O files and are revalidated for architecture and platform on
+every materialization; corrupt entries are quarantined and rebuilt. Packs are
+compiled independently and relocatably linked with the stable application
+Bridge, so adding or changing one Pack does not force all other module Packs to
+recompile.
+
+This is type erasure at a generated boundary, not generic invocation of the
+private Swift runtime. An API still needs an exact descriptor and generated
+Pack entry in the current Shell. A future development-stage on-demand adapter
+may generate a missing entry from Catalog proof, but the common runtime cannot
+invent an arbitrary Swift ABI from a name.
 
 All product, protocol, catalog, archive, and bytecode versions remain 1.

@@ -455,6 +455,12 @@ struct UIKitIntegration {
             .baselineV1, .nativeImportsV1, .nativeTypesV1,
             .mainActorIsolationV1,
         ]
+        // This fixture proves UIKit ABI execution, not scheduler timing. Give
+        // the complete two-call entry enough verified headroom to remain
+        // deterministic when the MainActor test suite runs concurrently.
+        let resourceLimits = Core.ResourceLimits(
+            maxWallTimeMainThreadMilliseconds: 1_000
+        )
         let requirements = [
             Bytecode.ImportRequirement(
                 id: setterID,
@@ -474,6 +480,7 @@ struct UIKitIntegration {
             shellInterfaceHash: shellHash,
             compatibility: compatibility,
             capabilities: capabilities,
+            requestedResources: resourceLimits,
             functions: [function],
             entries: [
                 .init(
@@ -534,6 +541,7 @@ struct UIKitIntegration {
             shell: shell,
             policy: .init(
                 acceptedCapabilities: capabilities,
+                resourceCeiling: resourceLimits,
                 allowedNativeCalls: [setterKey, getterKey],
                 allowMainActorEntries: true
             )

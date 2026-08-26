@@ -2081,6 +2081,7 @@ struct ReleasePipeline {
         for (target, objectName) in [
             ("HelixRuntimeSupport", "RuntimeAtomic.c.o"),
             ("HelixObjectiveCRuntimeSupport", "RuntimeObjectiveC.m.o"),
+            ("HelixCRuntimeSupport", "RuntimeC.c.o"),
         ] {
             let support = root.appendingPathComponent(
                 "\(target).build",
@@ -2151,6 +2152,7 @@ struct ReleasePipeline {
         for (target, objectName) in [
             ("HelixRuntimeSupport", "RuntimeAtomic.c.o"),
             ("HelixObjectiveCRuntimeSupport", "RuntimeObjectiveC.m.o"),
+            ("HelixCRuntimeSupport", "RuntimeC.c.o"),
         ] {
             let supportObject = buildDirectory
                 .appendingPathComponent("\(target).build", isDirectory: true)
@@ -2168,7 +2170,11 @@ struct ReleasePipeline {
     private func runtimeSupportCompilerArguments(modules: URL) throws -> [String] {
         let buildRoot = modules.deletingLastPathComponent()
         var arguments: [String] = []
-        for module in ["HelixRuntimeSupport", "HelixObjectiveCRuntimeSupport"] {
+        for module in [
+            "HelixRuntimeSupport",
+            "HelixObjectiveCRuntimeSupport",
+            "HelixCRuntimeSupport",
+        ] {
             let moduleMap = buildRoot
                 .appendingPathComponent("\(module).build", isDirectory: true)
                 .appendingPathComponent("module.modulemap")

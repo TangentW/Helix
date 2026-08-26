@@ -1431,9 +1431,32 @@ private func performPrepareXcodeShell(
         try ShellBuild.Materializer().materialize(
             receipt: indexed.receipt,
             sourceMappings: capture.sourceMappings,
-            hubBinding: hubBinding
+            hubBinding: hubBinding,
+            cache: xcodeBuildCacheStore()
         )
     }
+    performance.setCounter(
+        "adapter_pack.count",
+        value: UInt64(materialized.report.adapterPacks.count)
+    )
+    performance.setCounter(
+        "adapter_pack.entry_count",
+        value: materialized.report.adapterPacks.reduce(0) {
+            $0 + UInt64($1.entryCount)
+        }
+    )
+    performance.setCounter(
+        "adapter_pack.source_bytes",
+        value: materialized.report.adapterPacks.reduce(0) {
+            $0 + $1.sourceByteCount
+        }
+    )
+    performance.setCounter(
+        "adapter_pack.cache_hit_count",
+        value: UInt64(materialized.report.adapterPacks.filter {
+            $0.cacheSource == .hit
+        }.count)
+    )
     let artifacts = try performance.measure("prepare.encode_artifacts") {
         var artifacts = try materialized.artifacts()
         artifacts["ReleaseMetadata.json"] = try Core.CanonicalJSON.encode(metadata)
@@ -1622,14 +1645,66 @@ private func performCompileXcodeBridge(
         $0.path.hasPrefix("Generated/") && $0.path.hasSuffix(".swift")
     }.sorted { $0.path < $1.path }
     guard !sourceArtifacts.isEmpty,
-          Set(sourceArtifacts.map(\.path)).count == sourceArtifacts.count
+          Set(sourceArtifacts.map(\.path)).count == sourceArtifacts.count,
+          report.adapterPacks == report.adapterPacks.sorted(by: {
+              $0.moduleName < $1.moduleName
+          }),
+          Set(report.adapterPacks.map(\.moduleName)).count
+            == report.adapterPacks.count,
+          Set(report.adapterPacks.map(\.sourcePath)).count
+            == report.adapterPacks.count,
+          report.adapterPacks.allSatisfy({ pack in
+              pack.identity.moduleName == pack.moduleName
+                  && pack.identity.keys.count == Int(pack.entryCount)
+                  && pack.sourcePath == BridgeGeneration.Generator
+                    .adapterPackSourcePath(moduleName: pack.moduleName)
+          })
     else {
         throw CLI.Error.input("Shell build report contains no unique Bridge sources")
     }
+    let sourceArtifactsByPath = Dictionary(
+        uniqueKeysWithValues: sourceArtifacts.map { ($0.path, $0) }
+    )
+    let adapterPackPaths = Set(report.adapterPacks.map(\.sourcePath))
+    guard adapterPackPaths.isSubset(of: Set(sourceArtifactsByPath.keys)),
+          report.adapterPacks.allSatisfy({ pack in
+              sourceArtifactsByPath[pack.sourcePath]?.contentHash
+                    == pack.sourceHash
+                  && sourceArtifactsByPath[pack.sourcePath]?.byteCount
+                    == pack.sourceByteCount
+          })
+    else {
+        throw CLI.Error.input("Shell build report has inconsistent Adapter Packs")
+    }
+    let hubContractPath = ShellBuild.HubContractGenerator.sourcePath(
+        moduleName: context.feature.moduleName
+    )
+    let hubContractArtifact = sourceArtifactsByPath[hubContractPath]
+    switch context.profile.workflow {
+    case .liveReload:
+        guard hubContractArtifact != nil else {
+            throw CLI.Error.input(
+                "Live Reload Shell is missing its automatic Hub contract"
+            )
+        }
+    case .hotPatch:
+        guard hubContractArtifact == nil else {
+            throw CLI.Error.input(
+                "Hot Patch Shell unexpectedly contains a development Hub contract"
+            )
+        }
+    }
+    let applicationSourceArtifacts = sourceArtifacts.filter {
+        !adapterPackPaths.contains($0.path) && $0.path != hubContractPath
+    }
+    guard !applicationSourceArtifacts.isEmpty else {
+        throw CLI.Error.input("Shell build report contains no application Bridge source")
+    }
     let shellRoot = context.environment.shellOutputURL.standardizedFileURL
         .resolvingSymlinksInPath()
-    let sourceURLs = try performance.measure("bridge.validate_sources") {
-        try sourceArtifacts.map { artifact -> URL in
+    let sourceURLsByPath = try performance.measure("bridge.validate_sources") {
+        try Dictionary(uniqueKeysWithValues: sourceArtifacts.map {
+            artifact -> (String, URL) in
             let source = context.environment.shellOutputURL
                 .appendingPathComponent(artifact.path).standardizedFileURL
             let resolved = source.resolvingSymlinksInPath()
@@ -1650,15 +1725,38 @@ private func performCompileXcodeBridge(
                     "generated Bridge source drifted: \(artifact.path)"
                 )
             }
-            return resolved
+            return (artifact.path, resolved)
+        })
+    }
+    let applicationSourceURLs = try applicationSourceArtifacts.map {
+        guard let url = sourceURLsByPath[$0.path] else {
+            throw CLI.Error.input("application Bridge source is missing")
         }
+        return url
+    }
+    let hubContractURL = try hubContractArtifact.map { artifact in
+        guard let url = sourceURLsByPath[artifact.path] else {
+            throw CLI.Error.input("automatic Hub contract source is missing")
+        }
+        return url
     }
     let sourceImports = try performance.measure("bridge.scan_imports") {
         try FrontendReceipt.SourceImports.scan(
-            sources: sourceURLs.enumerated().map {
+            sources: applicationSourceURLs.enumerated().map {
                 .init(logicalPath: "Bridge/\($0.offset).swift", url: $0.element)
             }
         )
+    }
+    let hubContractImports = try performance.measure(
+        "bridge.scan_hub_contract_imports"
+    ) {
+        try hubContractURL.map { sourceURL in
+            try FrontendReceipt.SourceImports.scan(
+                sources: [
+                    .init(logicalPath: hubContractPath, url: sourceURL)
+                ]
+            )
+        }
     }
     performance.setCounter(
         "bridge.generated_source_count",
@@ -1674,6 +1772,7 @@ private func performCompileXcodeBridge(
     let moduleMapNames = [
         "HelixRuntimeSupport",
         "HelixObjectiveCRuntimeSupport",
+        "HelixCRuntimeSupport",
     ]
     let runtimeModuleMaps = try performance.measure("bridge.load_module_maps") {
         try moduleMapNames.map { name -> (url: URL, hash: Core.Digest) in
@@ -1717,6 +1816,12 @@ private func performCompileXcodeBridge(
             throw CLI.Error.input("hidden Bridge output is not a safe directory")
         }
     }
+    let mainTemporary = context.environment.bridgeOutputURL.appendingPathComponent(
+        ".HelixBridge.Main.\(UUID().uuidString).o"
+    )
+    let hubContractTemporary = context.environment.bridgeOutputURL.appendingPathComponent(
+        ".HelixBridge.HubContract.\(UUID().uuidString).o"
+    )
     let temporary = context.environment.bridgeOutputURL.appendingPathComponent(
         ".HelixBridge.\(UUID().uuidString).o"
     )
@@ -1726,10 +1831,16 @@ private func performCompileXcodeBridge(
     let bootstrapObject = context.environment.bridgeOutputURL.appendingPathComponent(
         ".HelixBootstrap.\(UUID().uuidString).o"
     )
+    var adapterObjectURLs: [URL] = []
     defer {
+        try? manager.removeItem(at: mainTemporary)
+        try? manager.removeItem(at: hubContractTemporary)
         try? manager.removeItem(at: temporary)
         try? manager.removeItem(at: bootstrapSource)
         try? manager.removeItem(at: bootstrapObject)
+        for url in adapterObjectURLs {
+            try? manager.removeItem(at: url)
+        }
     }
     let moduleSuffix = Core.Digest.sha256(context.profile.id).hex.prefix(16)
     let plan: XcodeIntegration.BridgeCompilationPlan
@@ -1746,10 +1857,34 @@ private func performCompileXcodeBridge(
                 additionalModuleSearchArguments:
                     context.environment.bridgeModuleSearchArguments,
                 clangModuleMapURLs: runtimeModuleMaps.map(\.url),
-                generatedSourceURLs: sourceURLs,
-                outputURL: temporary,
+                generatedSourceURLs: applicationSourceURLs,
+                outputURL: mainTemporary,
                 moduleName: "HelixBridge_\(moduleSuffix)"
             )
+        }
+    } catch let error as XcodeIntegration.BridgeCompilationError {
+        throw CLI.Error.input(error.description)
+    }
+    let hubContractPlan: XcodeIntegration.BridgeCompilationPlan?
+    do {
+        hubContractPlan = try hubContractURL.map { sourceURL in
+            try performance.measure("bridge.plan_hub_contract") {
+                try XcodeIntegration.BridgeCompilationPlanner().plan(
+                    compilerPath: captured.executable,
+                    capturedArguments: captured.arguments,
+                    expectedCompilerPath: context.environment.compilerURL.path,
+                    expectedCapturedModuleName: context.feature.moduleName,
+                    expectedTargetTriple: context.environment.targetTriple,
+                    expectedSDKPath: context.environment.sdkRootURL.path,
+                    expectedOptimization: context.environment.optimization,
+                    additionalModuleSearchArguments:
+                        context.environment.bridgeModuleSearchArguments,
+                    clangModuleMapURLs: runtimeModuleMaps.map(\.url),
+                    generatedSourceURLs: [sourceURL],
+                    outputURL: hubContractTemporary,
+                    moduleName: "HelixHubContract_\(moduleSuffix)"
+                )
+            }
         }
     } catch let error as XcodeIntegration.BridgeCompilationError {
         throw CLI.Error.input(error.description)
@@ -1769,7 +1904,12 @@ private func performCompileXcodeBridge(
         .appendingPathComponent("clang")
     guard plan.arguments.count >= 2,
           plan.arguments[plan.arguments.count - 2] == "-o",
-          plan.arguments.last == temporary.path
+          plan.arguments.last == mainTemporary.path,
+          hubContractPlan.map({
+              $0.arguments.count >= 2
+                  && $0.arguments[$0.arguments.count - 2] == "-o"
+                  && $0.arguments.last == hubContractTemporary.path
+          }) ?? true
     else {
         throw CLI.Error.input("hidden Bridge plan has an invalid output binding")
     }
@@ -1791,23 +1931,117 @@ private func performCompileXcodeBridge(
         "bridge.compiler_input_bytes",
         value: compilerInputs.byteCount
     )
-    let bridgeInputHash: Core.Digest? = try performance.measure(
-        "bridge.make_state_identity"
-    ) {
-        guard compilerInputs.isComplete else { return nil }
-        let toolchain = try ReleaseCompiler.Driver().toolchainIdentity(
+    let toolchain = try performance.measure("bridge.toolchain_identity") {
+        try ReleaseCompiler.Driver().toolchainIdentity(
             compilerURL: plan.compilerURL,
             invocationObserver: performance.subprocessObserver
         )
-        let resolvedClang = clangURL.resolvingSymlinksInPath().standardizedFileURL
-        guard FileManager.default.isExecutableFile(atPath: resolvedClang.path) else {
-            throw CLI.Error.input("hidden bootstrap compiler is not executable")
-        }
-        let clangBytes = try readRegularFile(
-            resolvedClang,
-            maximumBytes: 512 * 1_024 * 1_024,
-            label: "hidden bootstrap compiler"
+    }
+    let resolvedClang = clangURL.resolvingSymlinksInPath().standardizedFileURL
+    guard FileManager.default.isExecutableFile(atPath: resolvedClang.path) else {
+        throw CLI.Error.input("hidden bootstrap compiler is not executable")
+    }
+    let clangBytes = try readRegularFile(
+        resolvedClang,
+        maximumBytes: 512 * 1_024 * 1_024,
+        label: "hidden bootstrap compiler"
+    )
+    let moduleMapInputs = runtimeModuleMaps.map {
+        NativeAdapterPack.ObjectIdentity.InputFile(
+            path: $0.url.standardizedFileURL.path,
+            contentHash: $0.hash
         )
+    }.sorted { $0.path < $1.path }
+    let bridgeModuleMapInputs = runtimeModuleMaps.map {
+        CLI.XcodeBridgeInput.File(
+            path: $0.url.standardizedFileURL.path,
+            contentHash: $0.hash
+        )
+    }.sorted { $0.path < $1.path }
+    let applicationObjectCacheKey: Core.Digest? = try performance.measure(
+        "bridge.make_application_object_identity"
+    ) {
+        guard compilerInputs.isComplete else { return nil }
+        return try BuildCache.key(
+            domain: "HLX.Xcode.ApplicationObject.v1",
+            value: CLI.XcodeApplicationObjectInput(
+                profileID: context.profile.id,
+                transformPipelineHash: ShellBuild.transformPipelineHash,
+                toolchain: toolchain,
+                xcodeBuild: context.environment.xcodeBuild,
+                sdkBuild: context.environment.sdkBuild,
+                compilerArguments: Array(plan.arguments.dropLast(2)),
+                compilerInputs: compilerInputs,
+                generatedSources: applicationSourceArtifacts,
+                moduleMaps: bridgeModuleMapInputs
+            )
+        )
+    }
+    let minimumDeployment = try Core.SemanticVersion(
+        parsing: context.environment.minimumOS
+    )
+    let adapterPackPlans: [CLI.XcodeAdapterPackPlan] = try performance.measure(
+        "bridge.plan_adapter_packs"
+    ) {
+        try planXcodeAdapterPacks(
+            reports: report.adapterPacks,
+            sourceArtifactsByPath: sourceArtifactsByPath,
+            sourceURLsByPath: sourceURLsByPath,
+            captured: captured,
+            runtimeModuleMapURLs: runtimeModuleMaps.map(\.url),
+            moduleMapInputs: moduleMapInputs,
+            toolchain: toolchain,
+            minimumDeployment: minimumDeployment,
+            context: context
+        )
+    }
+    adapterObjectURLs = adapterPackPlans.map {
+        $0.compilation.compilation.outputURL
+    }
+    performance.setCounter(
+        "bridge.adapter_pack_count",
+        value: UInt64(adapterPackPlans.count)
+    )
+    performance.setCounter(
+        "bridge.adapter_pack_entry_count",
+        value: report.adapterPacks.reduce(0) { $0 + UInt64($1.entryCount) }
+    )
+    performance.setCounter(
+        "bridge.adapter_compiler_input_bytes",
+        value: adapterPackPlans.reduce(0) {
+            $0 + $1.identity.compilerInputs.byteCount
+        }
+    )
+    let adapterObjectInputs: [CLI.XcodeBridgeInput.AdapterObject]? =
+        adapterPackPlans.allSatisfy({ $0.cacheKey != nil })
+            ? adapterPackPlans.compactMap { plan in
+                plan.cacheKey.map {
+                    .init(moduleName: plan.report.moduleName, inputHash: $0)
+                }
+            }.sorted { $0.moduleName < $1.moduleName }
+            : nil
+    let hubContractObjectInput = hubContractPlan.flatMap { compilation in
+        hubContractImports.map { imports in
+            var inputs = BuildCache.CompilerInputs.capture(
+                arguments: compilation.arguments,
+                currentModuleName: "HelixHubContract_\(moduleSuffix)",
+                workingDirectory: context.environment.bridgeOutputURL,
+                importedModules: Set(imports.modules)
+            )
+            inputs.isComplete = inputs.isComplete && imports.isComplete
+            return CLI.XcodeBridgeInput.HubContractObject(
+                compilerArguments: Array(compilation.arguments.dropLast(2)),
+                compilerInputs: inputs
+            )
+        }
+    }
+    let bridgeInputHash: Core.Digest? = try performance.measure(
+        "bridge.make_state_identity"
+    ) {
+        guard compilerInputs.isComplete,
+              let adapterObjectInputs,
+              hubContractObjectInput?.compilerInputs.isComplete ?? true
+        else { return nil }
         return try BuildCache.key(
             domain: "HLX.Xcode.BridgeInput.v1",
             value: CLI.XcodeBridgeInput(
@@ -1821,9 +2055,9 @@ private func performCompileXcodeBridge(
                 compilerArguments: Array(plan.arguments.dropLast(2)),
                 compilerInputs: compilerInputs,
                 generatedSources: sourceArtifacts,
-                moduleMaps: runtimeModuleMaps.map {
-                    .init(path: $0.url.standardizedFileURL.path, contentHash: $0.hash)
-                }.sorted { $0.path < $1.path },
+                adapterObjects: adapterObjectInputs,
+                hubContractObject: hubContractObjectInput,
+                moduleMaps: bridgeModuleMapInputs,
                 bootstrapSource: constructor
             )
         )
@@ -1854,23 +2088,170 @@ private func performCompileXcodeBridge(
     } else {
         performance.incrementCounter("bridge.compiler_inputs_incomplete_count")
     }
-    let compilation = try performance.measure("bridge.compile_swift") {
-        try ProcessExecution.Runner().run(
-            executable: plan.compilerURL,
-            arguments: plan.arguments,
-            environment: environment,
-            workingDirectory: context.environment.bridgeOutputURL
+    let buildCache = xcodeBuildCacheStore()
+    var applicationDiagnostics = ""
+    let applicationObject = try performance.measure(
+        "bridge.materialize_application_object"
+    ) {
+        try materializeXcodeObject(
+            outputURL: mainTemporary,
+            namespace: .applicationObject,
+            cacheKey: applicationObjectCacheKey,
+            cache: buildCache,
+            context: context,
+            label: "application hidden Bridge"
+        ) {
+            let compilation = try performance.measure(
+                "bridge.compile_application_swift"
+            ) {
+                try ProcessExecution.Runner().run(
+                    executable: plan.compilerURL,
+                    arguments: plan.arguments,
+                    environment: environment,
+                    workingDirectory: context.environment.bridgeOutputURL
+                )
+            }
+            guard compilation.status == 0 else {
+                let diagnostics = String(
+                    compilation.standardError.prefix(512 * 1_024)
+                )
+                throw CLI.Error.input(
+                    diagnostics.isEmpty
+                        ? "hidden Bridge compiler exited with status "
+                            + "\(compilation.status)"
+                        : diagnostics
+                )
+            }
+            applicationDiagnostics = compilation.standardError
+            try validateXcodeObject(
+                mainTemporary,
+                context: context,
+                label: "application hidden Bridge"
+            )
+            return try readRegularFile(
+                mainTemporary,
+                maximumBytes: 512 * 1_024 * 1_024,
+                label: "application hidden Bridge object"
+            )
+        }
+    }
+    performance.setCounter(
+        "bridge.application_object_cache_hit_count",
+        value: applicationObject.cacheSource == .hit ? 1 : 0
+    )
+    performance.setCounter(
+        "bridge.application_object_generated_count",
+        value: [.generated, .repaired].contains(applicationObject.cacheSource) ? 1 : 0
+    )
+    performance.setCounter(
+        "bridge.application_object_bypassed_count",
+        value: applicationObject.cacheSource == .bypassed ? 1 : 0
+    )
+    performance.setCounter(
+        "bridge.application_object_bytes",
+        value: UInt64(applicationObject.data.count)
+    )
+    performance.recordArtifact(
+        relativePath: "ApplicationBridge.o",
+        byteCount: UInt64(applicationObject.data.count)
+    )
+    let adapterObjects = try performance.measure(
+        "bridge.materialize_adapter_objects"
+    ) {
+        try adapterPackPlans.map {
+            try materializeXcodeAdapterPack(
+                $0,
+                cache: buildCache,
+                context: context
+            )
+        }
+    }
+    performance.setCounter(
+        "bridge.adapter_object_cache_hit_count",
+        value: UInt64(adapterObjects.filter { $0.cacheSource == .hit }.count)
+    )
+    performance.setCounter(
+        "bridge.adapter_object_generated_count",
+        value: UInt64(adapterObjects.filter {
+            [.generated, .repaired].contains($0.cacheSource)
+        }.count)
+    )
+    performance.setCounter(
+        "bridge.adapter_object_bypassed_count",
+        value: UInt64(adapterObjects.filter {
+            $0.cacheSource == .bypassed
+        }.count)
+    )
+    performance.setCounter(
+        "bridge.adapter_object_bytes",
+        value: adapterObjects.reduce(0) { $0 + UInt64($1.data.count) }
+    )
+    for object in adapterObjects {
+        performance.recordArtifact(
+            relativePath: "AdapterPacks/"
+                + "\(object.plan.report.identity.cacheKey.hex).o",
+            byteCount: UInt64(object.data.count)
         )
     }
-    guard compilation.status == 0 else {
-        let diagnostics = String(compilation.standardError.prefix(512 * 1_024))
-        throw CLI.Error.input(
-            diagnostics.isEmpty
-                ? "hidden Bridge compiler exited with status \(compilation.status)"
-                : diagnostics
+    var hubContractDiagnostics = ""
+    if let hubContractPlan {
+        let compilation = try performance.measure("bridge.compile_hub_contract") {
+            try ProcessExecution.Runner().run(
+                executable: hubContractPlan.compilerURL,
+                arguments: hubContractPlan.arguments,
+                environment: environment,
+                workingDirectory: context.environment.bridgeOutputURL
+            )
+        }
+        guard compilation.status == 0 else {
+            let diagnostics = String(compilation.standardError.prefix(512 * 1_024))
+            throw CLI.Error.input(
+                diagnostics.isEmpty
+                    ? "Hub contract compiler exited with status \(compilation.status)"
+                    : diagnostics
+            )
+        }
+        hubContractDiagnostics = compilation.standardError
+        try performance.measure("bridge.validate_hub_contract_object") {
+            try validateXcodeObject(
+                hubContractTemporary,
+                context: context,
+                label: "automatic Hub contract"
+            )
+        }
+        let byteCount = try readRegularFile(
+            hubContractTemporary,
+            maximumBytes: 512 * 1_024 * 1_024,
+            label: "automatic Hub contract object"
+        ).count
+        performance.setCounter(
+            "bridge.hub_contract_object_bytes",
+            value: UInt64(byteCount)
+        )
+        performance.recordArtifact(
+            relativePath: "HubContract.o",
+            byteCount: UInt64(byteCount)
         )
     }
-    try performance.measure("bridge.validate_swift_object") {
+    let additionalObjectURLs = adapterObjects.sorted {
+        $0.plan.report.moduleName < $1.plan.report.moduleName
+    }.map(\.url) + (hubContractPlan == nil ? [] : [hubContractTemporary])
+    if additionalObjectURLs.isEmpty {
+        try performance.measure("bridge.publish_uncombined_object") {
+            try files.write(applicationObject.data, to: temporary)
+        }
+    } else {
+        _ = try performance.measure("bridge.link_native_objects") {
+            try linkXcodeBridgeObjects(
+                mainObjectURL: mainTemporary,
+                additionalObjectURLs: additionalObjectURLs,
+                outputURL: temporary,
+                clangURL: clangURL,
+                context: context
+            )
+        }
+    }
+    try performance.measure("bridge.validate_combined_object") {
         try validateXcodeObject(
             temporary,
             context: context,
@@ -1949,8 +2330,39 @@ private func performCompileXcodeBridge(
             workingDirectory: context.environment.bridgeOutputURL,
             importedModules: Set(sourceImports.modules)
         )
+        let confirmedAdapterInputs = adapterPackPlans.allSatisfy { pack in
+            BuildCache.CompilerInputs.capture(
+                arguments: pack.compilation.compilation.arguments,
+                currentModuleName: pack.compilation.compilerModuleName,
+                workingDirectory: context.environment.bridgeOutputURL,
+                importedModules: Set(
+                    pack.identity.compilerInputs.importedModules
+                )
+            ) == pack.identity.compilerInputs
+        }
+        let confirmedHubContractInputs = hubContractPlan.map { compilation in
+            guard let expected = hubContractObjectInput?.compilerInputs,
+                  let imports = hubContractImports
+            else { return false }
+            var inputs = BuildCache.CompilerInputs.capture(
+                arguments: compilation.arguments,
+                currentModuleName: "HelixHubContract_\(moduleSuffix)",
+                workingDirectory: context.environment.bridgeOutputURL,
+                importedModules: Set(imports.modules)
+            )
+            inputs.isComplete = inputs.isComplete && imports.isComplete
+            return inputs == expected
+        } ?? (hubContractObjectInput == nil)
+        let confirmedSourceURLs = sourceArtifacts.compactMap {
+            sourceURLsByPath[$0.path]
+        }
         bridgeInputsStayedStable = confirmedCompilerInputs == compilerInputs
-            && bridgeGeneratedSourcesMatch(sourceArtifacts, at: sourceURLs)
+            && confirmedAdapterInputs
+            && confirmedHubContractInputs
+            && bridgeGeneratedSourcesMatch(
+                sourceArtifacts,
+                at: confirmedSourceURLs
+            )
         if !bridgeInputsStayedStable {
             performance.incrementCounter("bridge.input_drift_count")
         }
@@ -1994,7 +2406,8 @@ private func performCompileXcodeBridge(
             + "\(context.environment.bridgeObjectURL.path)\n"
             + "Compiled automatic runtime bootstrap at "
             + "\(context.environment.bootstrapObjectURL.path)\n"
-            + (compilation.standardError.isEmpty ? "" : compilation.standardError)
+            + applicationDiagnostics
+            + hubContractDiagnostics
     )
 }
 
@@ -2016,6 +2429,23 @@ func validateXcodeObject(
         maximumBytes: 512 * 1_024 * 1_024,
         label: "\(label) object"
     )
+    try validateXcodeObject(
+        objectBytes,
+        context: context,
+        label: label
+    )
+}
+
+func validateXcodeObject(
+    _ objectBytes: Data,
+    context: XcodeIntegration.BuildContext,
+    label: String
+) throws {
+    guard !objectBytes.isEmpty,
+          objectBytes.count <= 512 * 1_024 * 1_024
+    else {
+        throw CLI.Error.input("\(label) compiler produced an invalid object file")
+    }
     let descriptor: MachO.Descriptor
     do {
         descriptor = try MachO.Inspector().inspect(objectBytes)

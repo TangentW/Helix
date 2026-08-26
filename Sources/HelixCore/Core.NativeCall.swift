@@ -600,6 +600,58 @@ public struct Descriptor: Codable, Hashable, Sendable {
         ).validated(contract: contract)
     }
 
+    /// Builds a catalog entry for the reusable C invoker. The physical
+    /// signature must come from compiler-observed C ABI evidence; this helper
+    /// does not infer C layouts from the source-facing Swift spelling.
+    public static func cFunction(
+        module: String,
+        member: String,
+        symbol: String,
+        signature: Core.LoweredSignature,
+        effects: Core.Effects,
+        contract: Core.NativeImportContract,
+        argumentLabels: [String] = [],
+        physicalSignature: Core.NativeCall.PhysicalSignature,
+        availability: [Core.NativeCall.Availability] = []
+    ) throws -> Self {
+        let labels: [String?] = signature.parameters.indices.map { index in
+            guard argumentLabels.indices.contains(index) else { return nil }
+            let value = argumentLabels[index]
+            return value == "_" || value.isEmpty ? nil : value
+        }
+        let logicalParameters = signature.parameters.enumerated().map {
+            index, type in
+            Core.NativeCall.LogicalParameter(
+                label: labels[index],
+                type: type,
+                ownership: ownership(from: type),
+                callbackLifetime: contract.callbacks.first(where: {
+                    Int($0.parameterIndex) == index
+                })?.lifetime,
+                isAutoclosure: type.contains("@autoclosure")
+            )
+        }
+        return try Self(
+            target: .init(
+                backend: .cFunction,
+                module: module,
+                member: member,
+                entryPoint: symbol,
+                dispatch: .global
+            ),
+            logicalSignature: .init(
+                parameters: logicalParameters,
+                result: .init(type: signature.result),
+                isThrowing: signature.isThrowing,
+                isAsync: signature.isAsync,
+                isolation: signature.isolation
+            ),
+            physicalSignature: physicalSignature,
+            effects: effects,
+            availability: availability
+        ).validated(contract: contract)
+    }
+
     public var canonicalCallee: String { target.canonicalCallee }
     public var loweredSignature: Core.LoweredSignature { logicalSignature.lowered }
 
@@ -1035,13 +1087,28 @@ public struct Descriptor: Codable, Hashable, Sendable {
         case .cFunction:
             guard objectiveC == nil,
                   target.dispatch == .global,
+                  Self.isCSymbol(target.entryPoint),
+                  !logicalSignature.isAsync,
+                  !logicalSignature.isThrowing,
+                  physicalSignature.resultConvention == .direct,
+                  physicalSignature.errorConvention == .none,
+                  physicalSignature.parameters.allSatisfy({
+                      $0.convention == .direct
+                          && $0.source.kind == .argument
+                  }),
+                  physicalSignature.parameters.enumerated().allSatisfy({
+                      $0.element.source.logicalArgumentIndex
+                          == UInt16(exactly: $0.offset)
+                  }),
+                  physicalTypes.allSatisfy(Self.cABITypeIsSupported),
                   physicalTypes.allSatisfy({ $0.kind != .bridgeValue }),
                   physicalTypes.allSatisfy({
                       $0.kind == .void || $0.encoding != nil
-                  })
+                  }),
+                  physicalTypes.allSatisfy(Self.encodedNativeTypeMatchesKind)
             else {
                 throw Core.NativeCall.DescriptorError.invalid(
-                    "C calls require a global, encoded native ABI"
+                    "C calls require a synchronous global symbol and an exact supported native ABI"
                 )
             }
         }
@@ -1077,6 +1144,31 @@ private extension Core.NativeCall.Descriptor {
             separator: ":",
             omittingEmptySubsequences: false
         ).allSatisfy(isSwiftIdentifier)
+    }
+
+    static func isCSymbol(_ value: String) -> Bool {
+        guard !value.isEmpty, value.utf8.count <= 1_024,
+              let first = value.utf8.first,
+              (first == 0x5f || first >= 0x41 && first <= 0x5a
+                  || first >= 0x61 && first <= 0x7a)
+        else { return false }
+        return value.utf8.dropFirst().allSatisfy {
+            $0 == 0x5f || $0 >= 0x41 && $0 <= 0x5a
+                || $0 >= 0x61 && $0 <= 0x7a
+                || $0 >= 0x30 && $0 <= 0x39
+        }
+    }
+
+    static func cABITypeIsSupported(
+        _ type: Core.NativeCall.ABIType
+    ) -> Bool {
+        switch type.kind {
+        case .void, .boolean, .signedInteger, .unsignedInteger,
+             .floatingPoint, .structure:
+            true
+        case .bridgeValue, .object, .classObject, .selector, .block, .pointer:
+            false
+        }
     }
 
     static func objectiveCMethodFamilyIsValid(
@@ -1138,6 +1230,12 @@ private extension Core.NativeCall.Descriptor {
     /// not change the ABI and are accepted, but the underlying encoding must
     /// agree with both the declared kind and scalar byte width.
     static func objectiveCEncodingMatchesKind(
+        _ type: Core.NativeCall.ABIType
+    ) -> Bool {
+        encodedNativeTypeMatchesKind(type)
+    }
+
+    static func encodedNativeTypeMatchesKind(
         _ type: Core.NativeCall.ABIType
     ) -> Bool {
         guard type.kind != .void else { return type.encoding == nil }

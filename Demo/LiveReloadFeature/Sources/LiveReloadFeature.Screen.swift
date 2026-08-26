@@ -1,3 +1,4 @@
+import QuartzCore
 import UIKit
 
 public enum LiveReloadFeature {}
@@ -22,6 +23,11 @@ public final class ScreenViewController: UIViewController {
     /// this callback to HLBC, calls the unchanged presentation helper through
     /// its Shell Entry, then asks UIKit to lay out this same instance.
     public override func viewDidLayoutSubviews() {
+        // Keep the real Demo exercising both non-Objective-C native paths.
+        // These values are intentionally behavior-neutral smoke probes.
+        _ = currentMediaTimeProbe()
+        _ = Date(timeIntervalSince1970: 0).addingTimeInterval(1)
+
         applyPresentation(
             badge: "HLBC · SAME VM ON DEVICE AND SIMULATOR",
             title: "Hello World", // HELIX_LIVE_BASELINE
@@ -119,6 +125,10 @@ public final class ScreenViewController: UIViewController {
             stack.centerYAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerYAnchor),
             incrementButton.heightAnchor.constraint(equalToConstant: 50),
         ])
+    }
+
+    private func currentMediaTimeProbe() -> Double {
+        CACurrentMediaTime()
     }
 
     @objc

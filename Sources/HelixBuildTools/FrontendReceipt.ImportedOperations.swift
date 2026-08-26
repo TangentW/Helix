@@ -53,7 +53,11 @@ extension FrontendReceipt.Adapter {
         /// must never share a NativeImport implementation.
         var foreignDispatch: CanonicalSIL.NativeBridgeSymbols.ForeignDispatch =
             .ordinary
+        /// Exact compiler declaration identity for imported Swift or Clang
+        /// calls. Compiler-synthesized bridges have no external declaration.
+        var declarationUSR: String? = nil
         var objectiveC: FrontendReceipt.ObjectiveCABI.Evidence? = nil
+        var c: FrontendReceipt.CABI.Evidence? = nil
         var witnessFunctions: [String] = []
         var compilerOperation: CompilerOperation? = nil
         var isolationEvidence: IsolationEvidence = .enclosingContext
@@ -70,6 +74,7 @@ extension FrontendReceipt.Adapter {
         var parameterProjection: InterfaceArchive.NativeImportParameterProjection
         var resultSwiftType: String
         var foreignDispatch: CanonicalSIL.NativeBridgeSymbols.ForeignDispatch
+        var declarationUSR: String?
 
         init(_ operation: ImportedOperation) {
             dispatch = operation.dispatch
@@ -85,6 +90,7 @@ extension FrontendReceipt.Adapter {
                 ?? .identity(parameterCount: operation.parameterSwiftTypes.count)
             resultSwiftType = operation.resultSwiftType
             foreignDispatch = operation.foreignDispatch
+            declarationUSR = operation.declarationUSR
         }
     }
 
@@ -98,6 +104,7 @@ extension FrontendReceipt.Adapter {
         var compilerOperation: ImportedOperation.CompilerOperation?
         var foreignDispatch: CanonicalSIL.NativeBridgeSymbols.ForeignDispatch
         var objectiveC: FrontendReceipt.ObjectiveCABI.Evidence?
+        var c: FrontendReceipt.CABI.Evidence?
 
         init(_ operation: ImportedOperation) {
             dispatch = operation.dispatch
@@ -113,6 +120,7 @@ extension FrontendReceipt.Adapter {
             compilerOperation = operation.compilerOperation
             foreignDispatch = operation.foreignDispatch
             objectiveC = operation.objectiveC
+            c = operation.c
         }
     }
 
@@ -211,7 +219,8 @@ extension FrontendReceipt.Adapter {
     func makeImportedOperationDeclarations(
         _ operations: [ImportedOperation],
         moduleName: String,
-        nativeTypes: [String: Core.TypeID]
+        nativeTypes: [String: Core.TypeID],
+        sourceTypeNames: Set<String> = []
     ) throws -> [NativeImportDiscovery.Declaration] {
         try canonicalizePhysicalOperations(operations).compactMap {
             operation -> NativeImportDiscovery.Declaration? in
@@ -340,7 +349,42 @@ extension FrontendReceipt.Adapter {
                 generatedInvocationParameterTypes == generatedParameterTypes
                 ? nil : generatedInvocationParameterTypes
             let generatedResultType = operation.resultSwiftType
-            let prefix = [moduleName, "HelixExternal", operation.ownerType]
+            let nativeModuleName = operation.c?.moduleName
+                ?? operation.objectiveC?.moduleName
+                ?? operation.declarationUSR.flatMap(
+                    importedSwiftDeclarationModule
+                )
+            let adapterTypeSpellings = [generatedOwnerType]
+                + generatedParameterTypes
+                + generatedInvocationParameterTypes
+                + [generatedResultType]
+            let adapterClassifier = NativeImportDiscovery
+                .SwiftAdapterClassifier()
+            let reusableNativeModuleName = adapterClassifier.classify(
+                declarationUSR: operation.declarationUSR,
+                hasCompilerOperation: operation.compilerOperation != nil,
+                adapterTypeSpellings: adapterTypeSpellings,
+                applicationTypeNames: sourceTypeNames,
+                applicationModuleName: moduleName
+            ).moduleName
+            let generatedImportedModules = reusableNativeModuleName.map {
+                adapterClassifier.requiredImports(
+                    primaryModule: $0,
+                    typeSpellings: adapterTypeSpellings,
+                    candidateModules: operation.importedModules
+                )
+            } ?? operation.importedModules
+            let generatedOwnerComponent: String? = {
+                guard operation.dispatch != .globalFunction else { return nil }
+                guard let nativeModuleName else { return generatedOwnerType }
+                let prefix = nativeModuleName + "."
+                return generatedOwnerType.hasPrefix(prefix)
+                    ? String(generatedOwnerType.dropFirst(prefix.count))
+                    : generatedOwnerType
+            }()
+            let prefix = nativeModuleName.map {
+                [$0, generatedOwnerComponent].compactMap { $0 }
+            } ?? [moduleName, "HelixExternal", generatedOwnerType]
             let callableReference = operation.baseName + "("
                 + operation.argumentLabels.map { ($0 == "_" ? "_" : $0) + ":" }
                     .joined() + ")"
@@ -368,6 +412,8 @@ extension FrontendReceipt.Adapter {
                 mangledName: primarySymbol,
                 silSymbols: silSymbols,
                 canonicalCallee: canonicalCallee,
+                declaringModuleName: nativeModuleName,
+                nativeModuleName: reusableNativeModuleName,
                 accessLevel: "internal",
                 dispatch: operation.dispatch,
                 ownerType: operation.dispatch == .globalFunction
@@ -381,7 +427,7 @@ extension FrontendReceipt.Adapter {
                 parameterProjection: operation.parameterProjection
                     ?? .identity(parameterCount: parameterTypes.count),
                 resultSwiftType: generatedResultType,
-                importedModules: operation.importedModules,
+                importedModules: generatedImportedModules,
                 parameterTypes: parameterTypes,
                 resultType: resultType,
                 signature: signature,
@@ -397,7 +443,8 @@ extension FrontendReceipt.Adapter {
                 abiAdapter: operation.dispatch == .instanceValueSetter
                     ? .mutatingValueReceiver : .direct,
                 foreignDispatch: operation.foreignDispatch,
-                objectiveC: operation.objectiveC
+                objectiveC: operation.objectiveC,
+                c: operation.c
             )
         }
     }
@@ -625,6 +672,24 @@ extension FrontendReceipt.Adapter {
             else { return operation }
             var result = operation
             result.objectiveC?.moduleName = module
+            return result
+        }
+    }
+
+    /// Applies the module that contains the exact imported C declaration.
+    /// Clang USRs are the authority because one source file can import several
+    /// umbrella modules that expose the same C family of functions.
+    func applyingCDeclarationModules(
+        to operations: [ImportedOperation],
+        modulesByUSR: [String: String]
+    ) -> [ImportedOperation] {
+        operations.map { operation in
+            guard operation.c?.moduleName == nil,
+                  let usr = operation.c?.declarationUSR,
+                  let module = modulesByUSR[usr]
+            else { return operation }
+            var result = operation
+            result.c?.moduleName = module
             return result
         }
     }
@@ -1684,6 +1749,16 @@ extension FrontendReceipt.Adapter {
             usesNSErrorBridge: usesNSErrorBridge,
             dispatchClassName: objectiveCDispatchClassName
         )
+        let c = physicalResultSpelling(in: call.loweredType).flatMap {
+            FrontendReceipt.CABI.evidence(
+                usr: usr,
+                dispatch: dispatch,
+                physicalParameterSwiftTypes: physicalParameters,
+                physicalResultSwiftType: $0,
+                projection: parameterProjection,
+                loweredType: call.loweredType
+            )
+        }
 
         // Default argument values stay in the type environment so canonical
         // SIL can validate their compiler-only storage, but they do not cross
@@ -1802,7 +1877,9 @@ extension FrontendReceipt.Adapter {
                 mayThrow: expression["throws"] != nil
                     || call.loweredType.contains("@error"),
                 foreignDispatch: call.foreignDispatch,
+                declarationUSR: usr,
                 objectiveC: objectiveC,
+                c: c,
                 witnessFunctions: [function.mangledName]
             )
         )
@@ -2873,20 +2950,12 @@ extension FrontendReceipt.Adapter {
     }
 
     private func importedGlobalFunctionOwner(usr: String) -> String {
-        guard usr.hasPrefix("s:") else { return "__C" }
-        let suffix = usr.dropFirst(2)
-        let digits = suffix.prefix(while: \.isNumber)
-        guard let length = Int(digits), length > 0 else { return "Swift" }
-        let start = suffix.index(suffix.startIndex, offsetBy: digits.count)
-        guard let end = suffix.index(
-            start,
-            offsetBy: length,
-            limitedBy: suffix.endIndex
-        ), start < end else {
-            return "Swift"
-        }
-        let module = String(suffix[start..<end])
-        return Self.isSwiftIdentifier(module) ? module : "Swift"
+        importedSwiftDeclarationModule(usr) ?? "__C"
+    }
+
+    private func importedSwiftDeclarationModule(_ usr: String) -> String? {
+        NativeImportDiscovery.SwiftAdapterClassifier
+            .declarationModule(in: usr)
     }
 
     private func implicitReceiver(
@@ -3946,6 +4015,19 @@ extension FrontendReceipt.Adapter {
                     }
                 case (.none, .some):
                     existing.objectiveC = value.objectiveC
+                case (.some, .none), (.none, .none):
+                    break
+                }
+                switch (existing.c, value.c) {
+                case let (.some(lhs), .some(rhs)):
+                    guard lhs == rhs else {
+                        throw FrontendReceipt.Error.invalidRequest(
+                            "imported operation \(value.ownerType).\(value.baseName) "
+                                + "has conflicting C ABI evidence"
+                        )
+                    }
+                case (.none, .some):
+                    existing.c = value.c
                 case (.some, .none), (.none, .none):
                     break
                 }

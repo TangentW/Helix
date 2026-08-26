@@ -28,6 +28,13 @@ extension NativeImportDiscovery {
         var mangledName: String
         var silSymbols: [String] = []
         var canonicalCallee: String
+        /// Module that owns the imported declaration. This controls call
+        /// identity and policy even when the executable adapter must remain
+        /// application-local because it references an application type.
+        var declaringModuleName: String? = nil
+        /// Reusable Pack placement. Nil identifies an application/compiler-
+        /// local adapter that cannot enter a reusable module Pack.
+        var nativeModuleName: String? = nil
         var accessLevel: String
         var dispatch: NativeImportDiscovery.Dispatch
         var ownerType: String?
@@ -52,6 +59,7 @@ extension NativeImportDiscovery {
         var foreignDispatch: CanonicalSIL.NativeBridgeSymbols.ForeignDispatch =
             .ordinary
         var objectiveC: FrontendReceipt.ObjectiveCABI.Evidence? = nil
+        var c: FrontendReceipt.CABI.Evidence? = nil
     }
 
     struct GeneratedBinding: Hashable, Sendable {
@@ -65,6 +73,18 @@ extension NativeImportDiscovery {
         var invocationParameterSwiftTypes: [String]?
         var resultSwiftType: String
         var importedModules: [String]
+        var nativeModuleName: String? = nil
+        var cFunction: CFunctionBinding? = nil
+    }
+
+    /// Structured compiler-bound function reference for the generic C
+    /// invoker. The Bridge renders this data; no project-supplied expression
+    /// crosses the receipt boundary.
+    struct CFunctionBinding: Hashable, Sendable {
+        var moduleName: String
+        var swiftName: String
+        var parameterSwiftTypes: [String]
+        var resultSwiftType: String
     }
 
     struct Candidate: Hashable, Sendable {
@@ -152,6 +172,20 @@ extension NativeImportDiscovery {
                 } else {
                     nil
                 }
+                let cPhysical: Core.NativeCall.PhysicalSignature? = if
+                    !effects.isAsync,
+                    !effects.mayThrow,
+                    let evidence = declaration.c {
+                    FrontendReceipt.CABI.physicalSignature(
+                        evidence: evidence,
+                        logicalParameterTypes: declaration.parameterTypes,
+                        logicalResultType: declaration.resultType,
+                        nativeTypeKinds: nativeTypeKinds,
+                        targetTriple: metadata.frontendInvocation.targetTriple
+                    )
+                } else {
+                    nil
+                }
                 if declaration.foreignDispatch == .superclass,
                    objectiveCPhysical == nil
                     || declaration.objectiveC?.lexicalSuperclassName == nil {
@@ -169,9 +203,13 @@ extension NativeImportDiscovery {
                     )
                     continue
                 }
-                let domain = objectiveCPhysical == nil
-                    ? Core.NativeImportDomain.application
-                    : nativeDomain(declaration.objectiveC?.moduleName)
+                let domain = nativeDomain(
+                    objectiveCPhysical != nil
+                        ? declaration.objectiveC?.moduleName
+                        : cPhysical != nil
+                            ? declaration.c?.moduleName
+                            : declaration.declaringModuleName
+                )
                 let contract = if effects.isAsync {
                     Core.NativeImportContract.suspending(
                         kind: contractKind(for: declaration.dispatch),
@@ -230,6 +268,19 @@ extension NativeImportDiscovery {
                             property: evidence.property
                         )
                     )
+                } else if let physicalSignature = cPhysical,
+                          let evidence = declaration.c,
+                          let moduleName = evidence.moduleName {
+                    callDescriptor = try .cFunction(
+                        module: moduleName,
+                        member: declaration.baseName,
+                        symbol: evidence.symbol,
+                        signature: declaration.signature,
+                        effects: effects,
+                        contract: contract,
+                        argumentLabels: declaration.argumentLabels,
+                        physicalSignature: physicalSignature
+                    )
                 } else {
                     let physicalSources = try physicalArgumentSources(
                         projection: declaration.parameterProjection,
@@ -281,7 +332,22 @@ extension NativeImportDiscovery {
                             invocationParameterSwiftTypes:
                                 declaration.invocationParameterSwiftTypes,
                             resultSwiftType: declaration.resultSwiftType,
-                            importedModules: declaration.importedModules
+                            importedModules: declaration.importedModules,
+                            nativeModuleName: declaration.nativeModuleName,
+                            cFunction: cPhysical.flatMap { physical in
+                                guard let evidence = declaration.c,
+                                      let moduleName = evidence.moduleName
+                                else { return nil }
+                                return .init(
+                                    moduleName: moduleName,
+                                    swiftName: declaration.baseName,
+                                    parameterSwiftTypes: physical.parameters
+                                        .compactMap { $0.type.canonicalName },
+                                    resultSwiftType:
+                                        physical.result.canonicalName
+                                            ?? "Swift.Void"
+                                )
+                            }
                         )
                     )
                 )

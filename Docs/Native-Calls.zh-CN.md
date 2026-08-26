@@ -1,6 +1,6 @@
 # 原生调用身份与 Catalog
 
-本文记录 Helix 已实现的版本 1 原生调用基线：HLBC 要调用 App 中已有代码时，如何描述这次调用、如何确定稳定身份，以及每一层如何验证权限。这里不会把后续能力提前写成已经完成：稳定 Descriptor、Key、Catalog、Archive、Bytecode、Verifier 与 Objective-C 通用消息调用器已经落地；受限 C 调用器和可复用 Swift Adapter Pack 会在后续阶段接入。
+本文记录 Helix 已实现的版本 1 原生调用基线：HLBC 要调用 App 中已有代码时，如何描述这次调用、如何确定稳定身份，以及每一层如何验证权限。稳定 Descriptor、Key、Catalog、Archive、Bytecode、Verifier、Objective-C 通用消息调用器、受限 C 调用器与可复用 Swift Adapter Pack 都已经落地；基于 Catalog 的开发期按需 Adapter 和签名 Release capability 投影仍属于后续阶段。
 
 ## 两种 ID，各做一件事
 
@@ -66,6 +66,22 @@ Release Archive 保存完整 Descriptor 和 Contract；设备投影保留相同�
 
 Swift 层先把已经验证的 VM value 和 callback 权限投影成 ABI slot；一个很小的 Objective-C shim 再到 Catalog 指定的声明 class（或已固定的词法 superclass）上解析精确 selector，逐项比较运行时 type encoding 和 storage kind，并验证另行记录的 class 派发目标确实继承该声明 class，然后通过 `NSInvocation` 调用实际 receiver。这样既保留普通 Objective-C override 的动态派发，也不会让只存在于意外动态子类上的 selector 扩张 Catalog 权限。receiver 继承关系直接从 Objective-C runtime 的真实 class hierarchy 读取，不依赖可被对象重写的 `isKindOfClass:`；普通动态 override 的完整 ABI 也必须与目录声明一致后才能执行。属性调用直接使用编译器已经证明的 accessor selector，不要求系统运行时一定保留可选的 Objective-C property metadata；UIKit 等系统 Framework 即使裁掉这类元数据也能正常调用。Shim 还会捕获 Objective-C exception，处理 initializer 与 retained/autoreleased method family，并在一个明确的 ownership 边界把 object result 交回 Swift。Runtime 解码前会再次检查 receiver class、平台 availability、nilability、struct encoding/size/alignment、deadline、MainActor 入口、临时存储上限和返回长度。
 
-这条路径消除了受支持 Objective-C 调用的逐方法可执行 Bridge，但它绝不是任意 selector 入口：每次调用仍必须对应当前 Shell 已发出的精确 Descriptor。源码已经出现的调用和当前 managed Debug SDK surface 现在可以使用通用 binding；仅仅因为 Runtime 有通用调用器，并不会让当前 Shell 中从未发出的公开 API 自动获得权限。完整的 Catalog 开发期查询和签名 Release capability 投影在后续阶段完成。C 调用与复杂纯 Swift 调用在 C Invoker 和 Adapter Pack 落地前，也仍需要现有的精确 binding。
+这条路径消除了受支持 Objective-C 调用的逐方法可执行 Bridge，但它绝不是任意 selector 入口：每次调用仍必须对应当前 Shell 已发出的精确 Descriptor。源码已经出现的调用和当前 managed Debug SDK surface 现在可以使用通用 binding；仅仅因为 Runtime 有通用调用器，并不会让当前 Shell 中从未发出的公开 API 自动获得权限。完整的 Catalog 开发期查询和签名 Release capability 投影在后续阶段完成。
+
+## 受限 C 通用调用路径
+
+当编译器证据能够证明物理 ABI 落在支持矩阵内时，imported C function 不再需要每个 symbol 各生成一个执行器。发现阶段会记录声明的 Clang USR、所属 module、精确 C entry point、逻辑 Swift signature、calling convention、layout、effect 与 availability。生成 Bridge 会直接取得这个已导入声明的 `@convention(c)` 函数地址，再交给同一个 `Runtime.CInvoker`；Runtime 不会拿源码字符串去进程里搜索 symbol。
+
+实现使用有限、预先编译的 trampoline 矩阵，而不是 `dlsym`、`libffi`、由 Descriptor 驱动的 `unsafeBitCast` 或调用方提供的任意 pointer。生成 Bridge 只会把已经通过 Swift 编译器精确类型检查的 imported `@convention(c)` function 做一次地址擦除；它不会借此凭空构造调用签名。当前矩阵覆盖最多四个参数的有界同类标量调用，以及 Bridge 明确验证的常见 Apple geometry value shape。真正调用前会逐项检查 calling convention、字节宽度、alignment、参数个数、结果 shape、availability、deadline 与 MainActor 入口。混合 ABI、variadic、pointer、间接结果、throwing、callback 或其他陌生形状会保留精确 Swift Adapter，或明确拒绝，绝不会猜测执行。
+
+真实 UIKit Demo 保留了一次不改变行为的 `CACurrentMediaTime()` 探针，因此普通 Xcode Build 会完整经过 C Descriptor、精确函数地址、通用 Runtime Invoker、MainActor policy、返回值解码与最终 object link。
+
+## 可复用 Swift Adapter Pack
+
+需要 Swift 语义的调用，例如 value overlay 或通用调用器矩阵以外的 ABI，仍然必须由 Swift Compiler 生成。现在 Helix 会按声明的稳定 Swift USR 与原生 module 分类，把同一 module 的条目归入一份确定性的 Adapter Pack，并按 `NativeCallKey` 排序。大型 application Bridge 只引用稳定 C ABI factory；每个 factory 返回类型擦除后的同步或挂起 native adapter body，真正的 Swift 调用仍留在对应原生 module 的编译上下文中。
+
+Pack source 与 Pack object 是两层独立的内容寻址事实。source identity 包含 compiler、SDK、target、deployment、transform 环境、module、精确有序的 imported module 集合和精确有序 Key；object identity 另外包含工具链二进制、Xcode build、规范化编译参数、完整非 SDK compiler-input 快照、module map 与 source hash。缓存 object 每次 materialize 都会重新校验 Mach-O 架构和平台；损坏条目会隔离并重建。不同 module 的 Pack 分别编译，最后与稳定 application Bridge 做 relocatable link，因此一个 Pack 变化不会迫使其他 module Pack 一起重编。
+
+这里做的是“生成边界上的类型擦除”，不是动态调用 Swift 私有泛型 ABI。当前 Shell 仍必须拥有精确 Descriptor 与对应 Pack entry。后续开发期按需 Adapter 可以根据 Catalog 证明生成缺失条目，但公共 Runtime 不能只凭函数名凭空构造任意 Swift ABI。
 
 产品、协议、Catalog、Archive 和 Bytecode 版本全部保持为 1。

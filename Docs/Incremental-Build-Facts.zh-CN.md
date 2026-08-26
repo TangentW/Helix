@@ -21,7 +21,10 @@ Xcode 实际捕获的 Swift frontend 去证明完整调用面；只有所有语�
 | Symbol graph | 已验证的 SDK 模块公开符号图 | 编译器指纹、SDK/frontend invocation、模块名 |
 | 单候选探测 | 某个候选最终测得的零个或多个操作 | 编译器指纹、变换流水线、SDK/frontend invocation、最低系统、规范化候选和边界类型 |
 | Hot Patch Prepare | 完整 Shell 目录和函数计数 | Prepare 精确输入，或输出中的路径、字节、权限、额外文件发生任何变化 |
-| Bridge | 已验证的 Swift Bridge 与 C bootstrap Mach-O object | 工具链、Xcode/SDK build、profile、变换流水线、规范化编译参数、生成源码、module map、bootstrap 源码 |
+| Adapter Pack source | 按原生 module 分组的确定性 Swift Adapter | 编译器指纹、SDK/target/deployment、变换流水线、module、有序 imported module 集合与有序稳定调用 Key |
+| Adapter Pack object | 单个 module Pack 的已验证 Mach-O | Pack source identity，再加工具链、Xcode build、规范化编译参数、完整非 SDK compiler-input 快照和 module map |
+| Application Bridge object | 排除一次性 Hub contract 后的稳定、已验证 Mach-O | profile、工具链、Xcode/SDK build、变换流水线、规范化编译参数、稳定生成源码、compiler input 和 module map |
+| 最终 Bridge state | 已链接的 Bridge 与 C bootstrap Mach-O object | 包含 Hub contract 的全部生成源码、application/Pack 输入、Clang binary 和 bootstrap source |
 
 持久缓存 key 使用 canonical JSON 和带版本的 hash domain，不依赖文件修改时间。
 源码内容、编译捕获内容、编译器可执行文件指纹、SDK build、target、最低系统、优化
@@ -60,7 +63,8 @@ graph 和单个声明的探测结果。也就是说，业务代码做了一次�
 - receipt 必须完整通过结构校验，并匹配当前源码、metadata 和工具链；
 - symbol graph 和实测操作走与新生成结果相同的验证；
 - Prepare state 会比较整个生成目录，包括文件权限和意外多出的条目；
-- Bridge state 会重新检查 Mach-O 的架构、平台、大小和内容 hash。
+- Adapter Pack、application Bridge 与最终 Bridge state 都会重新检查 Mach-O
+  架构和平台；最终 state 还会核对已发布 object 的大小与内容 hash。
 
 新生成的 module、Prepare 或 Bridge 状态发布前，还会再次确认源码和编译器接口。
 如果编辑器或另一个构建恰好在分析期间改了输入，Helix 会完成权威的无缓存流程，但
@@ -94,15 +98,18 @@ frontend 前直接返回。Live Reload 不复用最终 Prepare state，因为 Hu
 只能消费一次，每次构建必须重新预留；但耗时最大的模块、symbol graph 和 probe 事实
 照常复用，之后只重新生成很小的会话绑定合同。
 
-Bridge 有自己独立的精确状态。状态匹配时直接复用两个 object；生成源码、module map、
-工具链、编译参数、SDK、平台或 object 自身任何一处漂移，都会重新编译并验证。后续的
-固定通用调用器和 descriptor 驱动 adapter 会进一步缩小 Bridge 输入，但当前状态复用
-不提前假设那些尚未完成的架构。
+Bridge 编译现在分成多层精确事实。Objective-C 与受支持的 C 调用使用固定 Runtime
+Invoker；其余 Swift 调用按 module 归入确定性的 Adapter Pack，Pack source 和 Mach-O
+object 分别缓存。稳定 application Bridge 编译时不包含一次性 Hub contract，并拥有独立
+的内容寻址 Mach-O 缓存。Live Reload 会单独编译本次很小的 Hub contract，再把它与稳定
+application object、各 Pack object 做 relocatable link；Hot Patch 根本不生成 Hub
+contract source。
 
-当前 Live Reload 每次 reservation 都会改变很小的开发合同源码，因此业务源码不变时，
-它的精确 Bridge key 也会按设计 miss；Hot Patch 已能走 Bridge 命中路径。后续阶段会把
-其余庞大的固定 wrapper 调用面迁到通用 Invoker 与 Adapter Pack。这里不能靠放宽 key
-来“制造命中”，否则会把过期的会话合同编进 App。
+最终 Bridge state 仍更严格：它包含包括当前 invitation 在内的每一份生成源码。因此，
+新的 Live Reload reservation 会按设计让最终 state miss，但仍可命中分别验证的
+application 与 Pack object cache。源码、module map、工具链、编译参数、SDK、平台或
+object 漂移只会让它所影响的层失效。这样既保证每次 invitation 都是新的，又不需要重编
+数 MB 的稳定 Bridge。
 
 ## 怎么看是否命中
 
@@ -115,7 +122,11 @@ schema 1 构建性能报告会记录决策，但不会泄露完整路径或编�
   `cached_rejection_count`；
 - `prepare.state_hit_count`、`state_miss_count`、复用/写入产物数和
   `noop_publication_count`；
-- `bridge.state_hit_count`、`state_miss_count`。
+- `bridge.state_hit_count`、`state_miss_count`；
+- `bridge.application_object_cache_hit_count`、`_generated_count`、
+  `_bypassed_count`；
+- `bridge.adapter_object_cache_hit_count`、`_generated_count`、
+  `_bypassed_count`，以及 Pack 数量、entry 与 object 字节数。
 
 真实 Demo 的优化前后数据记录在[构建性能观测与基线](Build-Performance-Baseline.zh-CN.md)。
 缓存、状态、观测、协议、产物和产品版本都继续保持 `1`，没有新增旧方案兼容分支。

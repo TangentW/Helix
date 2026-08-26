@@ -691,5 +691,72 @@ struct NativeCall {
         #expect(try Core.NativeCall.Key.derive(descriptor: decoded)
             == Core.NativeCall.Key.derive(descriptor: descriptor))
     }
+
+    @Test("C descriptors require a direct compiler-proven physical ABI")
+    func cFunctionABI() throws {
+        let contract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .foundation,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        let int64 = Core.NativeCall.ABIType(
+            kind: .signedInteger,
+            canonicalName: "Swift.Int64",
+            size: 8,
+            alignment: 8,
+            encoding: "q"
+        )
+        let descriptor = try Core.NativeCall.Descriptor.cFunction(
+            module: "Darwin",
+            member: "labs",
+            symbol: "labs",
+            signature: .init(
+                parameters: ["Swift.Int64"],
+                result: "Swift.Int64"
+            ),
+            effects: .init(),
+            contract: contract,
+            argumentLabels: ["_"],
+            physicalSignature: .init(
+                callingConvention: .c,
+                parameters: [.init(type: int64, source: .argument(0))],
+                result: int64
+            )
+        )
+        try descriptor.validate(contract: contract)
+
+        var invalidSymbol = descriptor
+        invalidSymbol.target.entryPoint = "labs;escape"
+        #expect(throws: Core.NativeCall.DescriptorError.self) {
+            try invalidSymbol.validate(contract: contract)
+        }
+
+        var reordered = descriptor
+        reordered.physicalSignature.parameters[0].source = .argument(1)
+        #expect(throws: Core.NativeCall.DescriptorError.self) {
+            try reordered.validate(contract: contract)
+        }
+
+        var pointer = descriptor
+        pointer.physicalSignature.result = .init(
+            kind: .pointer,
+            canonicalName: "UnsafeRawPointer",
+            size: 8,
+            alignment: 8,
+            encoding: "^v"
+        )
+        #expect(throws: Core.NativeCall.DescriptorError.self) {
+            try pointer.validate(contract: contract)
+        }
+
+        var isolated = descriptor
+        isolated.logicalSignature.isolation = "MainActor"
+        isolated.effects.requiresMainActor = true
+        try isolated.validate(contract: contract)
+        #expect(try Core.NativeCall.Key.derive(descriptor: isolated)
+            != Core.NativeCall.Key.derive(descriptor: descriptor))
+    }
 }
 }

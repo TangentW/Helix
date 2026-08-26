@@ -1,5 +1,33 @@
 #import "RuntimeObjectiveCFixture.h"
 
+int64_t HelixRuntimeTestCAdd64(int64_t left, int64_t right) {
+    return left + right;
+}
+
+double HelixRuntimeTestCMultiplyDouble(double left, double right) {
+    return left * right;
+}
+
+CGRect HelixRuntimeTestCMakeRect(
+    double x,
+    double y,
+    double width,
+    double height
+) {
+    return CGRectMake(x, y, width, height);
+}
+
+BOOL HelixRuntimeTestCRectContainsPoint(CGRect rect, CGPoint point) {
+    return CGRectContainsPoint(rect, point);
+}
+
+CGPoint HelixRuntimeTestCApplyPointTransform(
+    CGPoint point,
+    CGAffineTransform transform
+) {
+    return CGPointApplyAffineTransform(point, transform);
+}
+
 #import <objc/runtime.h>
 #import <stdlib.h>
 #import <string.h>

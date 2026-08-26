@@ -353,6 +353,29 @@ static func structureType(
         encoding: structure.encoding
     )
 }
+
+static func scalarType(
+    swiftABIType raw: String,
+    targetTriple: String
+) -> Core.NativeCall.ABIType? {
+    let stripped = strippingOwnership(raw)
+    let (physical, optional) = unwrapOptional(stripped)
+    guard !optional, let scalar = scalar(
+        named: physical,
+        targetTriple: targetTriple
+    ) else { return nil }
+    return .init(
+        kind: scalar.kind,
+        canonicalName: canonicalPhysicalName(physical),
+        size: scalar.size,
+        alignment: scalar.alignment,
+        encoding: scalar.encoding
+    )
+}
+
+static func supports64BitAppleTarget(_ target: String) -> Bool {
+    isSupported64BitAppleTarget(target)
+}
 }
 
 private extension FrontendReceipt.ObjectiveCABI {

@@ -21,6 +21,26 @@ FOUNDATION_EXPORT const char *HelixRuntimeTestFloatEncoding(void);
 FOUNDATION_EXPORT const char *HelixRuntimeTestDoubleEncoding(void);
 FOUNDATION_EXPORT const char *HelixRuntimeTestPointEncoding(void);
 
+FOUNDATION_EXPORT int64_t HelixRuntimeTestCAdd64(int64_t left, int64_t right);
+FOUNDATION_EXPORT double HelixRuntimeTestCMultiplyDouble(
+    double left,
+    double right
+);
+FOUNDATION_EXPORT CGRect HelixRuntimeTestCMakeRect(
+    double x,
+    double y,
+    double width,
+    double height
+);
+FOUNDATION_EXPORT BOOL HelixRuntimeTestCRectContainsPoint(
+    CGRect rect,
+    CGPoint point
+);
+FOUNDATION_EXPORT CGPoint HelixRuntimeTestCApplyPointTransform(
+    CGPoint point,
+    CGAffineTransform transform
+);
+
 @interface HelixRuntimeTestObject : NSObject
 
 @property(nonatomic, copy) NSString *name;

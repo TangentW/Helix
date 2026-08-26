@@ -121,6 +121,47 @@ Objective-C Invoker，87 条保留精确生成的 Swift Adapter，另有 4 条 b
 0.286 s，materialize 为 1.626 s。Bridge 仍然 miss，是因为每次构建都会生成新的 Live
 Reload session contract，导致 3.1 MB 源码再次编译。现在主要体积来自主 Bridge 中较为
 冗长的 Descriptor literal，而不是逐 selector 的可执行 wrapper。因此，本阶段改善了
-执行架构并保留了覆盖能力，但不声称已经达到最终无改动延迟目标。后续 Live Reload
-阶段还需要完成紧凑 Descriptor table、复用仍然有效的 Hub reservation，以及稳定的
-Adapter Pack 输入。
+执行架构并保留了覆盖能力，但没有声称已经达到最终无改动延迟目标。下面的 Stage 4
+会把稳定 Bridge/Adapter Pack object 与一次性 Hub contract 拆开。
+
+## Stage 4 实测结果
+
+受限 C Invoker 与 Swift Adapter Pack 使用同一套真实 Simulator Demo 验证。Demo 中两类
+不改变界面行为的探针会强制走完两条非 Objective-C 路径：`CACurrentMediaTime()` 使用
+通用 C Invoker；两个 Foundation value-overlay 操作形成一份包含两个 entry 的
+Foundation Adapter Pack。最终 Shell 报告 383 条 Objective-C Invoker、1 条 C Invoker、
+84 条 application adapter 和 1 份可复用 Adapter Pack。
+
+第一次 Bridge Build 使用新的 transform identity，因此会填充两层 object cache：
+
+| 第一次 Bridge 项目 | 结果 |
+| --- | ---: |
+| Bridge 总计 | 17.044 s |
+| 稳定 application Swift 编译 | 15.360 s |
+| Application Bridge object | 6,978,432 bytes |
+| Foundation Adapter Pack object | 22,008 bytes |
+| 本次会话 Hub contract 编译 | 0.336 s |
+| 最终 relocatable link | 0.170 s |
+
+紧接着执行一次源码不变的 Xcode Build。因为它领取了新的一次性 Hub invitation，最终
+Bridge 的精确 state 按设计 miss；但稳定部分没有重新编译：
+
+| 重复 Bridge 项目 | 结果 |
+| --- | ---: |
+| Bridge 总计 | 1.353 s |
+| Application object cache | hit |
+| Adapter Pack object cache | hit |
+| `bridge.compile_application_swift` | 报告中不存在 |
+| 本次会话 Hub contract 编译 | 0.364 s |
+| 最终 relocatable link | 0.064 s |
+| 预热后的 Prepare | 2.366 s |
+
+在这台测试机上，重复 Bridge 因此省掉了 15.360 秒，同时没有复用旧邀请码，也没有缩减
+SDK API 发现范围。会话合同单独编译成一个很小的 object，再与已验证的稳定 application
+object 和各 module Pack object 一起链接。最终 state identity 仍覆盖全部生成源码、
+Pack key、compiler input、module map、toolchain、SDK、Clang binary 与 bootstrap source；
+只有能够独立证明安全的中间 object 才会复用。
+
+当前剩余 Bridge 成本主要是 import 扫描（0.348 s）、小 Hub-contract Swift 编译
+（0.364 s）以及 toolchain/Pack 规划。它们已经变成次要且有界的成本，不再构成缩减 SDK
+覆盖范围的理由。所有缓存和报告 schema 继续保持版本 1。

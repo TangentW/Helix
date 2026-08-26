@@ -337,7 +337,11 @@ When such a declaration has a compiler-proven Objective-C ABI in the supported
 matrix, its exact NativeImport is a compact descriptor bound to the shared
 Objective-C invoker; no selector-specific Swift wrapper is emitted. Exact Swift
 adapters remain for representable overlays and ABI shapes that cannot use that
-generic boundary.
+generic boundary, but they are grouped into deterministic per-module Adapter
+Packs whose source and Mach-O objects are cached independently. A proven C
+function uses the restricted common C invoker when its exact ABI fits the AOT
+matrix; the Bridge supplies the imported declaration address, with no runtime
+symbol lookup.
 The symbol-graph function signature is aligned with the full declaration before
 probing. Helix recovers only declaration-level `@escaping` and `@autoclosure`
 markers that the signature view is permitted to omit; any other missing

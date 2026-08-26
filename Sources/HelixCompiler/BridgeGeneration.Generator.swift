@@ -62,6 +62,7 @@ public struct NativeImportBinding: Hashable, Sendable {
         case factory
         case generatedSwiftAdapter
         case objectiveCInvoker
+        case cInvoker
     }
 
     public var id: Core.NativeImportID
@@ -70,6 +71,7 @@ public struct NativeImportBinding: Hashable, Sendable {
     public var factoryExpression: String?
     public var importedModules: [String]
     public var generated: BridgeGeneration.GeneratedNativeImport?
+    public var cFunction: BridgeGeneration.CFunctionBinding?
 
     public init(
         id: Core.NativeImportID,
@@ -77,7 +79,8 @@ public struct NativeImportBinding: Hashable, Sendable {
         strategy: Strategy,
         factoryExpression: String? = nil,
         importedModules: [String] = [],
-        generated: BridgeGeneration.GeneratedNativeImport? = nil
+        generated: BridgeGeneration.GeneratedNativeImport? = nil,
+        cFunction: BridgeGeneration.CFunctionBinding? = nil
     ) {
         self.id = id
         self.key = key
@@ -85,6 +88,26 @@ public struct NativeImportBinding: Hashable, Sendable {
         self.factoryExpression = factoryExpression
         self.importedModules = importedModules.sorted()
         self.generated = generated
+        self.cFunction = cFunction
+    }
+}
+
+public struct CFunctionBinding: Hashable, Sendable {
+    public var moduleName: String
+    public var swiftName: String
+    public var parameterSwiftTypes: [String]
+    public var resultSwiftType: String
+
+    public init(
+        moduleName: String,
+        swiftName: String,
+        parameterSwiftTypes: [String],
+        resultSwiftType: String
+    ) {
+        self.moduleName = moduleName
+        self.swiftName = swiftName
+        self.parameterSwiftTypes = parameterSwiftTypes
+        self.resultSwiftType = resultSwiftType
     }
 }
 
@@ -112,6 +135,7 @@ public struct GeneratedNativeImport: Hashable, Sendable {
     public var parameterSwiftTypes: [String]
     public var invocationParameterSwiftTypes: [String]?
     public var resultSwiftType: String
+    public var nativeModuleName: String?
 
     public init(
         declarationMangledName: String,
@@ -122,7 +146,8 @@ public struct GeneratedNativeImport: Hashable, Sendable {
         argumentLabels: [String],
         parameterSwiftTypes: [String],
         invocationParameterSwiftTypes: [String]? = nil,
-        resultSwiftType: String
+        resultSwiftType: String,
+        nativeModuleName: String? = nil
     ) {
         self.declarationMangledName = declarationMangledName
         self.sourceFileLogicalID = sourceFileLogicalID
@@ -133,27 +158,37 @@ public struct GeneratedNativeImport: Hashable, Sendable {
         self.parameterSwiftTypes = parameterSwiftTypes
         self.invocationParameterSwiftTypes = invocationParameterSwiftTypes
         self.resultSwiftType = resultSwiftType
+        self.nativeModuleName = nativeModuleName
     }
 
     public static func groupName(sourceFileLogicalID: String) -> String {
         "HelixNativeImports_\(Core.Digest.sha256(sourceFileLogicalID).hex)"
     }
 
+    public static func packGroupName(moduleName: String) -> String {
+        "HelixAdapterPack_\(Core.Digest.sha256("v1:\(moduleName)").hex)"
+    }
+
+    public static func groupName(
+        sourceFileLogicalID: String,
+        nativeModuleName: String?
+    ) -> String {
+        nativeModuleName.map(packGroupName(moduleName:))
+            ?? groupName(sourceFileLogicalID: sourceFileLogicalID)
+    }
+
     public static func factoryName(key: Core.NativeCall.Key) -> String {
         "make_\(key.rawValue.hex)"
     }
 
-    public static func bindingExpression(
-        sourceFileLogicalID: String,
-        id: Core.NativeImportID,
-        key: Core.NativeCall.Key
-    ) -> String {
-        let group = groupName(sourceFileLogicalID: sourceFileLogicalID)
-        let factory = factoryName(key: key)
-        return "\(group).\(factory)(id: Core.NativeImportID(rawValue: \(id.rawValue)), "
-            + "key: Core.NativeCall.Key(rawValue: try! Core.Digest(hex: "
-            + "\(String(reflecting: key.rawValue.hex)))))"
+    public static func exportSymbol(key: Core.NativeCall.Key) -> String {
+        "hlx_swift_adapter_body_v1_\(key.rawValue.hex)"
     }
+
+    public static func importFunctionName(key: Core.NativeCall.Key) -> String {
+        "helixLinkedAdapterBody_\(key.rawValue.hex)"
+    }
+
 }
 
 public struct NativeTypeBinding: Hashable, Sendable {
@@ -238,8 +273,28 @@ public struct GeneratedNativeType: Hashable, Sendable {
 public struct Output: Sendable {
     public var moduleName: String
     public var sourceFiles: [String: String]
+    public var adapterPacks: [BridgeGeneration.AdapterPack]
     public var registrationCount: UInt32
     public var interfaceHash: Core.Digest
+}
+
+public struct AdapterPack: Hashable, Sendable {
+    public var moduleName: String
+    public var importedModules: [String]
+    public var sourcePath: String
+    public var keys: [Core.NativeCall.Key]
+
+    public init(
+        moduleName: String,
+        importedModules: [String],
+        sourcePath: String,
+        keys: [Core.NativeCall.Key]
+    ) {
+        self.moduleName = moduleName
+        self.importedModules = Array(Set(importedModules)).sorted()
+        self.sourcePath = sourcePath
+        self.keys = keys.sorted()
+    }
 }
 
 public struct Generator: Sendable {
@@ -258,6 +313,13 @@ public struct Generator: Sendable {
     public static func nativeImportSourcePath(for sourceFileLogicalID: String) -> String {
         let digest = Core.Digest.sha256(sourceFileLogicalID).hex
         return "Generated/HelixBridge.NativeImport_\(digest).swift"
+    }
+
+    /// Stable source path for adapters owned entirely by one imported module.
+    /// It deliberately excludes the application and source-file identity.
+    public static func adapterPackSourcePath(moduleName: String) -> String {
+        let digest = Core.Digest.sha256("v1:\(moduleName)").hex
+        return "Generated/AdapterPacks/Pack_\(digest).swift"
     }
 
     public func generate(
@@ -451,8 +513,11 @@ public struct Generator: Sendable {
         )? in
             binding.generated.map { (binding, $0) }
         }
+        let applicationGeneratedImports = generatedImports.filter {
+            $0.1.nativeModuleName == nil
+        }
         let generatedImportGroups = Dictionary(
-            grouping: generatedImports,
+            grouping: applicationGeneratedImports,
             by: { $0.1.sourceFileLogicalID }
         )
         for (source, values) in generatedImportGroups.sorted(by: { $0.key < $1.key }) {
@@ -462,6 +527,33 @@ public struct Generator: Sendable {
                 sourceFileLogicalID: source,
                 moduleName: moduleName,
                 bindings: values.map(\.0),
+                archive: archive
+            )
+        }
+        let adapterPackValues: [(
+            moduleName: String,
+            binding: BridgeGeneration.NativeImportBinding
+        )] = generatedImports.compactMap { value in
+            value.1.nativeModuleName.map {
+                (moduleName: $0, binding: value.0)
+            }
+        }
+        let adapterPackGroups = Dictionary(
+            grouping: adapterPackValues,
+            by: \.moduleName
+        )
+        for (nativeModuleName, values) in adapterPackGroups.sorted(by: {
+            $0.key < $1.key
+        }) {
+            let path = Self.adapterPackSourcePath(
+                moduleName: nativeModuleName
+            )
+            guard files[path] == nil else {
+                throw BridgeGeneration.Error.outputCollision(path)
+            }
+            files[path] = try renderAdapterPackFile(
+                nativeModuleName: nativeModuleName,
+                bindings: values.map(\.binding),
                 archive: archive
             )
         }
@@ -485,13 +577,36 @@ public struct Generator: Sendable {
             records: archive.nativeImports,
             types: nativeTypes
         )
+        let bridgeImportModules = nativeImports.flatMap { binding -> [String] in
+            switch binding.strategy {
+            case .objectiveCInvoker:
+                return []
+            case .generatedSwiftAdapter
+            where binding.generated?.nativeModuleName != nil:
+                return []
+            case .factory, .generatedSwiftAdapter, .cInvoker:
+                return binding.importedModules
+            }
+        }
         let nativeImportStatements = Array(
-            Set(nativeImports.flatMap(\.importedModules) + nativeTypes.flatMap(\.importedModules))
+            Set(bridgeImportModules + nativeTypes.flatMap(\.importedModules))
         ).sorted().map { "import \($0)" }.joined(separator: "\n")
+        let adapterPackDeclarations = adapterPackValues.map(\.binding)
+            .sorted { $0.key < $1.key }
+            .map { binding in
+                let symbol = BridgeGeneration.GeneratedNativeImport
+                    .exportSymbol(key: binding.key)
+                let function = BridgeGeneration.GeneratedNativeImport
+                    .importFunctionName(key: binding.key)
+                return "@_silgen_name(\(quoted(symbol)))\n"
+                    + "private func \(function)() -> UnsafeMutableRawPointer?"
+            }.joined(separator: "\n\n")
         files["Generated/\(bridgeTypeName).swift"] = """
         // Generated by Helix Release Bridge Generator. Do not edit.
         \(BridgeGeneration.RuntimeImports.production)
         \(nativeImportStatements)
+
+        \(adapterPackDeclarations)
 
         public enum \(bridgeTypeName) {
             public static let interfaceHash = try! Core.Digest(hex: "\(archive.shellInterfaceHash.hex)")
@@ -517,6 +632,20 @@ public struct Generator: Sendable {
         return .init(
             moduleName: moduleName,
             sourceFiles: files,
+            adapterPacks: adapterPackGroups.map { module, values in
+                let bindings = values.map(\.binding)
+                return BridgeGeneration.AdapterPack(
+                    moduleName: module,
+                    importedModules: adapterPackImports(
+                        nativeModuleName: module,
+                        bindings: bindings
+                    ),
+                    sourcePath: Self.adapterPackSourcePath(
+                        moduleName: module
+                    ),
+                    keys: bindings.map(\.key)
+                )
+            }.sorted { $0.moduleName < $1.moduleName },
             registrationCount: UInt32(eligible.count),
             interfaceHash: archive.shellInterfaceHash
         )
@@ -2214,6 +2343,89 @@ public struct Generator: Sendable {
         return lines.joined(separator: "\n")
     }
 
+    private func renderAdapterPackFile(
+        nativeModuleName: String,
+        bindings: [BridgeGeneration.NativeImportBinding],
+        archive: InterfaceArchive.Archive
+    ) throws -> String {
+        let records = Dictionary(
+            uniqueKeysWithValues: archive.nativeImports.compactMap { record in
+                record.id.map { ($0, record) }
+            }
+        )
+        let imports = adapterPackImports(
+            nativeModuleName: nativeModuleName,
+            bindings: bindings
+        ).map { "import \($0)" }
+        var lines = [
+            "// Generated Helix Adapter Pack v1. Do not edit.",
+        ] + imports + BridgeGeneration.RuntimeImports.productionLines + [
+            "",
+            "enum \(BridgeGeneration.GeneratedNativeImport.packGroupName(moduleName: nativeModuleName)) {",
+        ]
+        let sorted = bindings.sorted { $0.key < $1.key }
+        for (offset, binding) in sorted.enumerated() {
+            guard let generated = binding.generated,
+                  generated.nativeModuleName == nativeModuleName
+            else {
+                throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
+                    binding.id,
+                    "Adapter Pack module"
+                )
+            }
+            guard let record = records[binding.id] else {
+                throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
+                    binding.id,
+                    "Adapter Pack interface lookup"
+                )
+            }
+            if offset > 0 { lines.append("") }
+            lines.append(indent(
+                try renderGeneratedNativeImportFactory(
+                    binding: binding,
+                    generated: generated,
+                    record: record
+                ),
+                spaces: 4
+            ))
+        }
+        lines.append("}")
+        for binding in sorted {
+            let symbol = BridgeGeneration.GeneratedNativeImport.exportSymbol(
+                key: binding.key
+            )
+            let function = BridgeGeneration.GeneratedNativeImport
+                .importFunctionName(key: binding.key)
+                + "_export"
+            let factory = BridgeGeneration.GeneratedNativeImport.factoryName(
+                key: binding.key
+            )
+            lines.append("")
+            lines.append("@_cdecl(\(quoted(symbol)))")
+            lines.append(
+                "public func \(function)() -> UnsafeMutableRawPointer {"
+            )
+            lines.append(
+                "    Unmanaged.passRetained("
+                    + "\(BridgeGeneration.GeneratedNativeImport.packGroupName(moduleName: nativeModuleName)).\(factory)()"
+                    + ").toOpaque()"
+            )
+            lines.append("}")
+        }
+        lines.append("")
+        return lines.joined(separator: "\n")
+    }
+
+    private func adapterPackImports(
+        nativeModuleName: String,
+        bindings: [BridgeGeneration.NativeImportBinding]
+    ) -> [String] {
+        Array(Set(
+            bindings.flatMap(\.importedModules)
+                + [nativeModuleName, "Foundation"]
+        )).sorted()
+    }
+
     private func renderGeneratedNativeImportFactory(
         binding: BridgeGeneration.NativeImportBinding,
         generated: BridgeGeneration.GeneratedNativeImport,
@@ -2332,22 +2544,12 @@ public struct Generator: Sendable {
         let body = record.effects.requiresMainActor
             ? invocation : (decoded + [invocation]).joined(separator: "\n")
         let factoryName = BridgeGeneration.GeneratedNativeImport.factoryName(key: binding.key)
-        let invokerProtocol = record.effects.isAsync
-            ? "VM.AsyncNativeInvoker" : "VM.NativeInvoker"
-        let invokerType = record.effects.isAsync
-            ? "VM.ClosureAsyncNativeInvoker" : "VM.ClosureNativeInvoker"
+        let bodyType = record.effects.isAsync
+            ? "Runtime.AsyncNativeAdapterBody"
+            : "Runtime.NativeAdapterBody"
         return """
-        static func \(factoryName)(
-            id: Core.NativeImportID,
-            key: Core.NativeCall.Key
-        ) -> any \(invokerProtocol) {
-            \(invokerType)(
-                id: id,
-                key: key,
-                parameterTypes: \(renderValueTypes(record.parameterTypes)),
-                resultType: \(render(record.resultType)),
-                effects: \(render(record.effects)),
-                contract: \(render(record.contract)),
+        static func \(factoryName)() -> \(bodyType) {
+            \(bodyType)(
                 invoke: { arguments, context in
                     guard arguments.count == \(record.parameterTypes.count) else {
                         throw VM.RuntimeTrap.nativeFailure(
@@ -3098,7 +3300,8 @@ public struct Generator: Sendable {
             switch binding.strategy {
             case .factory:
                 guard binding.factoryExpression.map(isUsableExpression) == true,
-                      binding.generated == nil
+                      binding.generated == nil,
+                      binding.cFunction == nil
                 else {
                     throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
                         binding.id,
@@ -3108,7 +3311,11 @@ public struct Generator: Sendable {
             case .generatedSwiftAdapter:
                 guard binding.factoryExpression == nil,
                       binding.generated != nil,
-                      record.descriptor.target.backend == .swiftAdapter
+                      binding.cFunction == nil,
+                      record.descriptor.target.backend == .swiftAdapter,
+                      (binding.generated?.nativeModuleName == nil
+                        || binding.generated?.nativeModuleName
+                            == record.descriptor.target.module)
                 else {
                     throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
                         binding.id,
@@ -3118,6 +3325,7 @@ public struct Generator: Sendable {
             case .objectiveCInvoker:
                 guard binding.factoryExpression == nil,
                       binding.generated == nil,
+                      binding.cFunction == nil,
                       binding.importedModules.isEmpty,
                       record.descriptor.target.backend == .objectiveCMessage,
                       !record.effects.isAsync
@@ -3125,6 +3333,35 @@ public struct Generator: Sendable {
                     throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
                         binding.id,
                         "Objective-C invoker strategy"
+                    )
+                }
+            case .cInvoker:
+                guard binding.factoryExpression == nil,
+                      binding.generated == nil,
+                      record.descriptor.target.backend == .cFunction,
+                      !record.effects.isAsync,
+                      let function = binding.cFunction,
+                      isValidModulePath(function.moduleName),
+                      Core.SwiftName.isIdentifier(function.swiftName),
+                      binding.importedModules == [function.moduleName],
+                      record.descriptor.target.module == function.moduleName,
+                      record.descriptor.target.member == function.swiftName,
+                      function.parameterSwiftTypes
+                        == record.descriptor.physicalSignature.parameters
+                            .compactMap(\.type.canonicalName),
+                      function.resultSwiftType
+                        == (record.descriptor.physicalSignature.result.canonicalName
+                            ?? "Swift.Void"),
+                      function.parameterSwiftTypes.allSatisfy(
+                          isValidGeneratedSwiftTypeSpelling
+                      ),
+                      isValidGeneratedSwiftTypeSpelling(
+                          function.resultSwiftType
+                      )
+                else {
+                    throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
+                        binding.id,
+                        "C invoker strategy"
                     )
                 }
             }
@@ -3242,6 +3479,13 @@ public struct Generator: Sendable {
         guard isSafeLogicalPath(generated.sourceFileLogicalID) else {
             throw mismatch("source file identity")
         }
+        guard generated.nativeModuleName.map({
+            isValidModulePath($0)
+                && binding.importedModules.contains($0)
+                && $0 == record.descriptor.target.module
+        }) ?? true else {
+            throw mismatch("Adapter Pack module identity")
+        }
         guard isValidSwiftIdentifier(generated.baseName)
                 || generated.dispatch == .globalFunction
                     && Core.SwiftName.isOperator(generated.baseName)
@@ -3269,8 +3513,15 @@ public struct Generator: Sendable {
         else {
             throw mismatch("Swift argument labels")
         }
+        let expectedDomain: Core.NativeImportDomain = switch
+            record.descriptor.target.module
+        {
+        case "Foundation": .foundation
+        case "UIKit": .uiKit
+        default: .application
+        }
         guard record.capability == .nativeImportsV1,
-              record.contract.domain == .application
+              record.contract.domain == expectedDomain
         else {
             throw mismatch("native call capability")
         }
@@ -3724,13 +3975,15 @@ public struct Generator: Sendable {
             synchronousImportExpressions,
             elementType: "any VM.NativeInvoker",
             factoryName: "makeSynchronousNativeInvokers",
-            directIndentation: 16
+            directIndentation: 16,
+            elementsMayThrow: true
         )
         let asynchronousInvokers = renderGeneratedArray(
             asynchronousImportExpressions,
             elementType: "any VM.AsyncNativeInvoker",
             factoryName: "makeAsynchronousNativeInvokers",
-            directIndentation: 16
+            directIndentation: 16,
+            elementsMayThrow: true
         )
         let nativeTypeOperations = renderGeneratedArray(
             typeExpressions,
@@ -3797,17 +4050,61 @@ public struct Generator: Sendable {
                     "missing generated Swift adapter"
                 )
             }
-            return BridgeGeneration.GeneratedNativeImport.bindingExpression(
+            let group = BridgeGeneration.GeneratedNativeImport.groupName(
                 sourceFileLogicalID: generated.sourceFileLogicalID,
-                id: binding.id,
+                nativeModuleName: generated.nativeModuleName
+            )
+            let factory = BridgeGeneration.GeneratedNativeImport.factoryName(
                 key: binding.key
             )
+            let body: String
+            if generated.nativeModuleName != nil {
+                let function = BridgeGeneration.GeneratedNativeImport
+                    .importFunctionName(key: binding.key)
+                let type = record.effects.isAsync
+                    ? "Runtime.AsyncNativeAdapterBody"
+                    : "Runtime.NativeAdapterBody"
+                body = "try \(type).takeRetained(\(function)())"
+            } else {
+                body = "\(group).\(factory)()"
+            }
+            return body + ".makeInvoker(id: Core.NativeImportID(rawValue: "
+                + "\(binding.id.rawValue)), key: Core.NativeCall.Key(rawValue: "
+                + "\(render(binding.key.rawValue))), parameterTypes: "
+                + "\(renderValueTypes(record.parameterTypes)), resultType: "
+                + "\(render(record.resultType)), effects: \(render(record.effects)), "
+                + "contract: \(render(record.contract)))"
         case .objectiveCInvoker:
             return """
             Runtime.ObjectiveCInvoker(
                 id: Core.NativeImportID(rawValue: \(binding.id.rawValue)),
                 key: Core.NativeCall.Key(rawValue: \(render(binding.key.rawValue))),
                 descriptor: \(render(record.descriptor)),
+                parameterTypes: \(renderValueTypes(record.parameterTypes)),
+                resultType: \(render(record.resultType)),
+                effects: \(render(record.effects)),
+                contract: \(render(record.contract))
+            )
+            """
+        case .cInvoker:
+            guard let function = binding.cFunction else {
+                throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
+                    binding.id,
+                    "missing C function binding"
+                )
+            }
+            let functionType = "@convention(c) ("
+                + function.parameterSwiftTypes.joined(separator: ", ")
+                + ") -> \(function.resultSwiftType)"
+            return """
+            Runtime.CInvoker(
+                id: Core.NativeImportID(rawValue: \(binding.id.rawValue)),
+                key: Core.NativeCall.Key(rawValue: \(render(binding.key.rawValue))),
+                descriptor: \(render(record.descriptor)),
+                function: unsafeBitCast(
+                    \(function.swiftName) as \(functionType),
+                    to: UnsafeRawPointer.self
+                ),
                 parameterTypes: \(renderValueTypes(record.parameterTypes)),
                 resultType: \(render(record.resultType)),
                 effects: \(render(record.effects)),
@@ -4118,7 +4415,8 @@ public struct Generator: Sendable {
         _ elements: [String],
         elementType: String,
         factoryName: String,
-        directIndentation: Int
+        directIndentation: Int,
+        elementsMayThrow: Bool = false
     ) -> GeneratedArrayRendering {
         let chunkSize = 32
         guard elements.count > chunkSize else {
@@ -4135,14 +4433,16 @@ public struct Generator: Sendable {
             Array(elements[start..<min(start + chunkSize, elements.count)])
         }
         var declarations: [String] = []
+        let throwsClause = elementsMayThrow ? " throws" : ""
+        let tryPrefix = elementsMayThrow ? "try " : ""
         var collector = [
-            "    private static func \(factoryName)() -> [\(elementType)] {",
+            "    private static func \(factoryName)()\(throwsClause) -> [\(elementType)] {",
             "        var result: [\(elementType)] = []",
             "        result.reserveCapacity(\(elements.count))",
         ]
         for index in chunks.indices {
             collector.append(
-                "        result.append(contentsOf: \(factoryName)_\(index)())"
+                "        result.append(contentsOf: \(tryPrefix)\(factoryName)_\(index)())"
             )
         }
         collector.append("        return result")
@@ -4150,14 +4450,14 @@ public struct Generator: Sendable {
         declarations.append(collector.joined(separator: "\n"))
         for (index, chunk) in chunks.enumerated() {
             declarations.append([
-                "    private static func \(factoryName)_\(index)() -> [\(elementType)] {",
+                "    private static func \(factoryName)_\(index)()\(throwsClause) -> [\(elementType)] {",
                 "        return " + renderArray(chunk, indentation: 12),
                 "    }",
             ].joined(separator: "\n"))
         }
         return .init(
             declarations: declarations.joined(separator: "\n\n"),
-            expression: "\(factoryName)()"
+            expression: "\(tryPrefix)\(factoryName)()"
         )
     }
 

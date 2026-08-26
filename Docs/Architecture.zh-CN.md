@@ -44,6 +44,7 @@ flowchart TB
 - `EntryIndex` 是生产 Bridge 使用的紧凑 Shell 路由。
 - `TypeID` 标识已捕获的类型操作；`NativeCallKey` 是 canonical 原生调用 Descriptor 的稳定、与项目无关的身份；`NativeImportID` 只是在单个 Shell 或 image 内使用的紧凑派发下标。Patch 会同时携带 Key 和下标，不保存进程地址，也不会把临时下标当成权限。详见[原生调用身份与 Catalog](Native-Calls.zh-CN.md)。
 - 落在支持矩阵内的 Objective-C import 共用一个由 Descriptor 驱动的 Runtime 调用器，不再为每个 selector 生成一段 Swift 函数。编译器证据会分别固定声明 class 与类方法/initializer 的实际派发 class、精确 selector/property accessor identity、物理 ABI、Block 生命周期、method family 与错误约定；Objective-C shim 在 `NSInvocation` 前再次核对 class 继承关系、真实 method encoding 和 storage kind。无法安全表示的 Swift overlay 或 ABI shape 仍走精确生成的 Adapter。这是可复用执行机制，不是 wildcard selector 权限。
+- 编译器已经证明、且落在有限标量/Apple geometry ABI 矩阵内的 C function 共用一个 AOT Runtime Invoker。永久 Bridge 提供精确 imported declaration 的函数地址；Runtime 不做 symbol lookup，下载代码也不能选择 pointer。其余 Swift 声明按原生 module 归入确定性 Adapter Pack，source 与已验证的 Mach-O object 分别缓存。这是生成边界上的类型擦除，不会暴露 Swift 私有泛型 ABI。
 - interface fingerprint 与传递 implementation fingerprint 用于区分函数体修改和 ABI、布局、源文件成员关系或依赖变化。
 - Eligible 的 Shell 已有 struct/enum 使用已记录的逻辑值合同，而不是 Swift 私有 ABI layout。Archive 会记录精确的源码限定 identity、stored field 或 enum case、label 与顺序、递归 Bridge type、copyability、受支持的 conformance 事实，以及同时纳入 device hash 的确定性 layout fingerprint。构建阶段会在声明同一源码作用域生成 private 构造 hook，使 private storage 也能按 Swift 访问控制合法重建；生成的 Bridge 则经普通、有界的 value codec 流式编解码 field 与 case。Release 和 Patch 编译会分别从源码独立推导 shape，Verifier 只有在定义完全一致时，才允许 ordinary、`borrowing`、`consuming` 或 `mutating` value receiver 成为 root。同步 Entry 可以暴露恰好一个逻辑 `inout` 区域，包括可变 `self`。生成的 Bridge 会先快照该值，只在 HLVM invocation 内建立 address，再校验唯一且类型精确的 writeback；normal 与已声明 error continuation 提交写回，VM trap 不提交任何写回，Original route 使用同一结果合同。多个或 async `inout` 会因生成边界无法证明 alias identity 而 fail closed。反射、裸内存投影、运行时 metadata、VM address 与 Swift layout 假设都不会跨边界。
 - 工具链、SDK、target triple、编译参数、module 源文件集合与二进制身份把每个产物绑定到对应 Shell。
@@ -117,6 +118,8 @@ Live Reload phase 把已处理的 App plist 声明为构建输入，在 Xcode �
 同 target 接入会加入一个 Hub-owned 空 Swift trigger，保证普通 Sources phase 调用仅作用于该 configuration 的透明 compiler proxy。真实编译成功后，proxy 校验这次精确 invocation，在 DerivedData 中 materialize 当前 Shell，把生成 Bridge 与 Runtime bootstrap 编译成经过校验的 relocatable object，并在 link 前原子发布。已有独立 module 的工程使用等价的捕获 phase；Hub 会复用 App 到源码 target 的现有依赖，缺失时自动创建可识别、可移除的依赖，避免 Xcode 并行执行源码准备与 App Bridge。App link 保留稳定 C provider 与 profile 选择的 bootstrap 符号，因此无需 Bridge framework、生成源码 target、生成 Swift import 或业务侧 session owner。
 
 业务源码 membership 始终只由 Xcode 管理。增加、删除、移动或生成 Swift 源文件后只需普通 Build，让编译器发布新 membership；不需要维护 Helix 列表或重新配置。大规模 descriptor 与 invoker 集合会按确定顺序生成显式类型的有界分块；这不改变顺序或单 object 合同，同时限制隐藏编译阶段 Swift constraint solver 的内存峰值。
+
+Bridge 编译也会把稳定工作与会话工作拆开。大型 application Bridge 和每个原生 module Adapter Pack 都有精确的内容寻址 object identity。Live Reload 获取新 invitation 时，只生成并编译一份很小的 Hub-contract source，再与已验证的稳定 object 做 relocatable link。更严格的最终 Bridge identity 仍包含当前 invitation，因此 object 复用不会把上一轮构建的配对权限带入新 App。
 
 Xcode 集成会从一次真实 Debug Build 中捕获 frontend、link、SDK、module、源码和 target 事实。源码监控器把编辑器写入与原子 rename 整理成稳定、单调递增编号的快照。开发编译器在原 module 上下文中重新检查整个 transaction：自动路由在经过资格验证的 iOS Simulator 上优先生成新的原生 Swift Dynamic Replacement image，其他情况则把与 Release 编译器相同的受支持 canonical SIL 降成不可变 HLBC generation。认证 daemon 传输选定的有界 artifact，Debug App 校验后再原子激活。
 

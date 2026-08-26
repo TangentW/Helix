@@ -22,7 +22,10 @@ override; the normal owner-local location is
 | Symbol graph | Validated SDK module symbol graph | Compiler fingerprint, SDK/frontend invocation, and module |
 | Managed probe | Zero or more uniquely measured operations for one candidate | Compiler fingerprint, transform pipeline, SDK/frontend invocation, minimum OS, normalized candidate, and imported boundary types |
 | Hot Patch Prepare | Complete generated Shell tree and function counts | Exact Prepare identity plus exact paths, bytes, modes, and absence of unexpected entries |
-| Bridge | Validated Swift Bridge and C bootstrap Mach-O objects | Toolchain, Xcode/SDK builds, profile, transform pipeline, normalized compiler arguments, generated sources, module maps, and bootstrap source |
+| Adapter Pack source | Deterministic Swift adapters grouped by native module | Compiler fingerprint, SDK/target/deployment, transform pipeline, module, ordered imported modules, and ordered stable call keys |
+| Adapter Pack object | Validated Mach-O for one module Pack | Pack source identity plus toolchain, Xcode build, normalized compiler invocation, complete non-SDK compiler-input snapshot, and module maps |
+| Application Bridge object | Stable validated Mach-O excluding the one-time Hub contract | Profile, toolchain, Xcode/SDK builds, transform pipeline, normalized compiler arguments, stable generated sources, compiler inputs, and module maps |
+| Final Bridge state | Linked Bridge and C bootstrap Mach-O objects | Every generated source including the Hub contract, application/Pack inputs, Clang binary, and bootstrap source |
 
 The persistent keys use canonical JSON and a versioned hash domain. Inputs do
 not depend on modification times. Source content, compiler-capture content,
@@ -74,8 +77,9 @@ Every cached value is decoded and semantically validated by its consumer:
   metadata and toolchain identities;
 - symbol graphs and measured operations pass the same checks as fresh output;
 - Prepare state compares the entire generated tree, including permissions;
-- Bridge state revalidates architecture/platform and hashes the published
-  objects before reuse.
+- Adapter Pack, application Bridge, and final Bridge state revalidate Mach-O
+  architecture/platform; final state also hashes the published objects before
+  reuse.
 
 Sources and compiler interfaces are confirmed again before newly produced
 module, Prepare, or Bridge state is published. If an editor or another build
@@ -120,17 +124,21 @@ new reservation is required. Live Reload still receives the expensive module,
 symbol-graph and probe cache benefits, then rematerializes the small
 session-bound contract.
 
-Bridge compilation has a separate exact state. A matching state reuses both
-published object files; any source, module-map, toolchain, compiler-argument,
-SDK, platform or object drift recompiles and revalidates them. Later fixed
-native invokers and descriptor-driven adapters can make this compilation input
-smaller, but the state identity does not assume that later architecture.
-Today a Live Reload reservation changes the small generated development
-contract, so its exact Bridge key intentionally misses even when the business
-source is unchanged. Hot Patch already exercises the Bridge hit path. Moving
-the remaining large fixed wrapper surface behind invokers and adapter packs is
-the later-stage fix; weakening this input identity would only create a stale
-session contract.
+Bridge compilation has several exact layers. Objective-C and supported C calls
+use fixed Runtime invokers. Remaining Swift calls are grouped into deterministic
+per-module Adapter Packs whose source and Mach-O objects are cached separately.
+The stable application Bridge is compiled without the one-time Hub contract
+and has its own content-addressed Mach-O cache. A Live Reload build compiles the
+small current Hub contract separately and relocatably links it with the stable
+application object and Pack objects. Hot Patch has no Hub-contract source.
+
+The final Bridge state remains stricter: it includes every generated source,
+including the current invitation. A new Live Reload reservation therefore
+intentionally misses final-state reuse, but it can still hit the independently
+validated application and Pack object caches. Any source, module-map,
+toolchain, compiler-argument, SDK, platform, or object drift invalidates the
+layer it can affect. This keeps each invitation fresh without paying to
+recompile the multi-megabyte stable Bridge.
 
 ## Observability
 
@@ -144,7 +152,11 @@ paths or compiler arguments. Relevant counters include:
   `cached_rejection_count`;
 - `prepare.state_hit_count`, `state_miss_count`, reused/written artifact counts,
   and `noop_publication_count`;
-- `bridge.state_hit_count` and `state_miss_count`.
+- `bridge.state_hit_count` and `state_miss_count`;
+- `bridge.application_object_cache_hit_count`, `_generated_count`, and
+  `_bypassed_count`;
+- `bridge.adapter_object_cache_hit_count`, `_generated_count`, and
+  `_bypassed_count`, plus Pack counts, entries, and object bytes.
 
 Measured before/after Demo evidence is maintained in
 [Build performance observability and baseline](Build-Performance-Baseline.md).

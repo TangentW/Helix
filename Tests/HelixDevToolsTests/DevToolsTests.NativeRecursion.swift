@@ -109,6 +109,7 @@ struct NativeRecursion {
         let moduleMaps = [
             "HelixRuntimeSupport",
             "HelixObjectiveCRuntimeSupport",
+            "HelixCRuntimeSupport",
         ].map {
             buildRoot.appendingPathComponent("\($0).build/module.modulemap")
         }

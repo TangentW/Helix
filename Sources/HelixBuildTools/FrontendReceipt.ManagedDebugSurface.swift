@@ -12,13 +12,13 @@ extension FrontendReceipt.ManagedDebugSurface {
     struct Expansion: Sendable {
         var importedTypes: [FrontendReceipt.Adapter.ImportedNativeType]
         var operations: [FrontendReceipt.Adapter.ImportedOperation]
-        var objectiveCModulesByDeclarationUSR: [String: String]
+        var modulesByDeclarationUSR: [String: String]
         var metrics: Metrics
     }
 
     struct ModuleResolution: Sendable {
         var importedTypes: [FrontendReceipt.Adapter.ImportedNativeType]
-        var objectiveCModulesByDeclarationUSR: [String: String]
+        var modulesByDeclarationUSR: [String: String]
         var metrics: Metrics
     }
 
@@ -59,7 +59,7 @@ extension FrontendReceipt.ManagedDebugSurface {
     private struct TypeResolution: Sendable {
         var importedTypes: [FrontendReceipt.Adapter.ImportedNativeType]
         var ownerSurfacesByIndex: [Int: OwnerSurface]
-        var objectiveCModulesByDeclarationUSR: [String: String]
+        var modulesByDeclarationUSR: [String: String]
         var metrics: Metrics
     }
 
@@ -194,6 +194,7 @@ extension FrontendReceipt.ManagedDebugSurface {
         frontend: SwiftFrontend.Driver,
         invocation: InterfaceArchive.FrontendInvocation,
         declarationUSRs: Set<String> = [],
+        candidateModules: Set<String> = [],
         cache: BuildCache.Store? = nil,
         compilerFingerprint: String? = nil,
         compilerInputHash: Core.Digest? = nil
@@ -208,6 +209,7 @@ extension FrontendReceipt.ManagedDebugSurface {
             compilerInputHash: compilerInputHash,
             requiredRuntimeNames: nil,
             requiredDeclarationUSRs: declarationUSRs,
+            additionalModuleNames: candidateModules,
             includesMembers: true
         )
         var metrics = resolution.metrics
@@ -251,19 +253,19 @@ extension FrontendReceipt.ManagedDebugSurface {
             importedTypes: enrichedTypes,
             operations: try FrontendReceipt.Adapter()
                 .mergeImportedOperations(operations),
-            objectiveCModulesByDeclarationUSR:
-                resolution.objectiveCModulesByDeclarationUSR,
+            modulesByDeclarationUSR: resolution.modulesByDeclarationUSR,
             metrics: metrics
         )
     }
 
-    /// Resolves only the declaring modules needed by source-observed
-    /// Objective-C owners. It reuses the same content-addressed Symbol Graph
-    /// cache as Managed Debug, but does not nominate or compile API probes.
-    static func resolveObjectiveCModules(
+    /// Resolves only the declaring modules needed by source-observed foreign
+    /// declarations. It reuses the same content-addressed Symbol Graph cache
+    /// as Managed Debug, but does not nominate or compile API probes.
+    static func resolveDeclarationModules(
         importedTypes: [FrontendReceipt.Adapter.ImportedNativeType],
         runtimeNames: Set<String>,
         declarationUSRs: Set<String>,
+        candidateModules: Set<String> = [],
         minimumOS: Core.SemanticVersion,
         frontend: SwiftFrontend.Driver,
         invocation: InterfaceArchive.FrontendInvocation,
@@ -281,6 +283,7 @@ extension FrontendReceipt.ManagedDebugSurface {
             compilerInputHash: compilerInputHash,
             requiredRuntimeNames: runtimeNames,
             requiredDeclarationUSRs: declarationUSRs,
+            additionalModuleNames: candidateModules,
             includesMembers: false
         )
         return .init(
@@ -289,8 +292,7 @@ extension FrontendReceipt.ManagedDebugSurface {
                     discoveredTypes: [],
                     operationTypes: resolution.importedTypes
                 ),
-            objectiveCModulesByDeclarationUSR:
-                resolution.objectiveCModulesByDeclarationUSR,
+            modulesByDeclarationUSR: resolution.modulesByDeclarationUSR,
             metrics: resolution.metrics
         )
     }
@@ -305,6 +307,7 @@ extension FrontendReceipt.ManagedDebugSurface {
         compilerInputHash: Core.Digest?,
         requiredRuntimeNames: Set<String>?,
         requiredDeclarationUSRs: Set<String>,
+        additionalModuleNames: Set<String>,
         includesMembers: Bool
     ) throws -> TypeResolution {
         let selectedIndices = importedTypes.indices.filter { index in
@@ -322,10 +325,12 @@ extension FrontendReceipt.ManagedDebugSurface {
         }
         let moduleNames = Set(importedModules.compactMap {
             $0.split(separator: ".").first.map(String.init)
+        }).union(additionalModuleNames.compactMap {
+            $0.split(separator: ".").first.map(String.init)
         }).sorted()
         guard moduleNames.count <= 32 else {
             throw FrontendReceipt.Error.frontendFailed(
-                "Objective-C module resolution exceeds the 32-module audit bound"
+                "native declaration module resolution exceeds the 32-module audit bound"
             )
         }
 
@@ -381,7 +386,7 @@ extension FrontendReceipt.ManagedDebugSurface {
         return .init(
             importedTypes: enrichedTypes,
             ownerSurfacesByIndex: ownerSurfacesByIndex,
-            objectiveCModulesByDeclarationUSR: Dictionary(
+            modulesByDeclarationUSR: Dictionary(
                 uniqueKeysWithValues: modulesByDeclarationUSR.compactMap {
                     usr, modules in
                     guard modules.count == 1, let module = modules.first else {

@@ -2593,8 +2593,10 @@ struct NativeImportDiscoveryTests {
         #expect(generated.contains("argument0.value"))
         #expect(generated.contains("argument1.value = argument0"))
         #expect(generated.contains("keyword(argument0, repeat: argument1)"))
-        #expect(generated.contains("VM.ClosureNativeInvoker("))
-        #expect(generated.contains("VM.ClosureAsyncNativeInvoker("))
+        #expect(generated.contains("Runtime.NativeAdapterBody("))
+        #expect(generated.contains("Runtime.AsyncNativeAdapterBody("))
+        #expect(!generated.contains("VM.ClosureNativeInvoker("))
+        #expect(!generated.contains("VM.ClosureAsyncNativeInvoker("))
         #expect(generated.contains("await asyncAdjust(argument0, by: argument1)"))
         #expect(generated.contains("try await mainChecked(argument0)"))
         #expect(generated.contains("catch let trap as VM.RuntimeTrap"))
@@ -2903,7 +2905,8 @@ struct NativeImportDiscoveryTests {
         let generated = shell.bridge.sourceFiles.values.joined(separator: "\n")
         #expect(generated.contains("await Values.number"))
         #expect(generated.contains("try await argument0.number"))
-        #expect(generated.contains("VM.ClosureAsyncNativeInvoker("))
+        #expect(generated.contains("Runtime.AsyncNativeAdapterBody("))
+        #expect(!generated.contains("VM.ClosureAsyncNativeInvoker("))
         try typeCheckGeneratedBridge(
             shell: shell,
             directory: directory,
@@ -3106,7 +3109,12 @@ struct NativeImportDiscoveryTests {
         let baseline = """
         import Dispatch
         import Foundation
+        import QuartzCore
         import UIKit
+
+        public func mediaTime() -> Double {
+            CACurrentMediaTime()
+        }
 
         @MainActor
         public final class Screen: UIViewController {
@@ -3427,6 +3435,26 @@ struct NativeImportDiscoveryTests {
         #expect(!output.receipt.nativeImportBindings.contains {
             $0.generated?.baseName == "constraint"
         })
+        let mediaTime = try #require(
+            output.receipt.nativeImportCandidates.first {
+                $0.descriptor.target.backend == .cFunction
+                    && $0.descriptor.target.entryPoint == "CACurrentMediaTime"
+            }
+        )
+        #expect(mediaTime.canonicalCallee == "QuartzCore.CACurrentMediaTime")
+        #expect(mediaTime.descriptor.physicalSignature.parameters.isEmpty)
+        #expect(mediaTime.descriptor.physicalSignature.result.encoding == "d")
+        let mediaTimeBinding = try #require(
+            output.receipt.nativeImportBindings.first {
+                $0.key == mediaTime.key
+            }
+        )
+        #expect(mediaTimeBinding.strategy == .cInvoker)
+        #expect(mediaTimeBinding.importedModules == ["QuartzCore"])
+        #expect(mediaTimeBinding.generated == nil)
+        #expect(mediaTimeBinding.cFunction?.swiftName == "CACurrentMediaTime")
+        #expect(mediaTimeBinding.cFunction?.parameterSwiftTypes.isEmpty == true)
+        #expect(mediaTimeBinding.cFunction?.resultSwiftType == "Double")
         #expect(generatedSymbols.contains { $0.hasPrefix("$hlx_native_option_set_literal_") })
         #expect(generatedSymbols.contains { $0.hasPrefix("$hlx_native_global_") })
         #expect(generatedSymbols.contains { $0.hasPrefix("$s") })
@@ -3559,6 +3587,36 @@ struct NativeImportDiscoveryTests {
             receipt: output.receipt,
             sourceRoot: directory
         )
+        #expect(!shell.bridge.adapterPacks.isEmpty)
+        #expect(shell.report.adapterPacks.map(\.moduleName)
+            == shell.bridge.adapterPacks.map(\.moduleName))
+        for pack in shell.report.adapterPacks {
+            #expect(pack.identity.moduleName == pack.moduleName)
+            #expect(pack.identity.keys.count == Int(pack.entryCount))
+            let source = try #require(shell.bridge.sourceFiles[pack.sourcePath])
+            #expect(source.contains("Generated Helix Adapter Pack v1"))
+            #expect(source.contains("@_cdecl(\"hlx_swift_adapter_body_v1_"))
+            #expect(source.contains("Runtime.NativeAdapterBody"))
+            #expect(!source.contains("@_private"))
+            #expect(!source.contains(moduleName))
+            #expect(pack.identity.importedModules.allSatisfy {
+                source.contains("import \($0)\n")
+            })
+            #expect(
+                source.components(separatedBy: "import Foundation").count == 2
+            )
+        }
+        let primaryBridge = try #require(
+            shell.bridge.sourceFiles["Generated/\(moduleName)Bridge.swift"]
+        )
+        #expect(primaryBridge.contains("@_silgen_name(\"hlx_swift_adapter_body_v1_"))
+        #expect(primaryBridge.contains("takeRetained("))
+        #expect(primaryBridge.contains(
+            "private static func makeSynchronousNativeInvokers_0() throws"
+        ))
+        #expect(primaryBridge.contains(
+            "try VM.NativeCatalog(try makeSynchronousNativeInvokers())"
+        ))
         let sessionTaskType = try #require(shell.archive.nativeTypes.first {
             Set([$0.canonicalName] + $0.swiftTypeAliases)
                 .contains("URLSessionDataTask")
@@ -3636,6 +3694,13 @@ struct NativeImportDiscoveryTests {
         #expect(!generatedBridge.contains("let argument0: any UIInteraction"))
         #expect(!generatedBridge.contains("as: (any UIInteraction).self"))
         #expect(generatedBridge.contains("Runtime.ObjectiveCInvoker("))
+        #expect(generatedBridge.contains("Runtime.CInvoker("))
+        #expect(generatedBridge.contains(
+            "CACurrentMediaTime as @convention(c) () -> Double"
+        ))
+        #expect(!generatedBridge.contains(
+            "QuartzCore.CACurrentMediaTime as @convention(c)"
+        ))
         #expect(!generatedBridge.contains("any Any"))
         #expect(generatedBridge.contains("makeResolvedNativeImports_0()"))
         #expect(generatedBridge.contains("makeSynchronousNativeInvokers_0()"))
@@ -3836,7 +3901,7 @@ struct NativeImportDiscoveryTests {
                 include:
                   - Sources/**
                 declarations:
-                  - \(moduleName).*
+                  - "*"
                 visibility: all
                 profile: read-write
                 maximumBoundedDurationMicroseconds: 2000
@@ -4185,7 +4250,11 @@ struct NativeImportDiscoveryTests {
     private func runtimeSupportCompilerArguments(modules: URL) throws -> [String] {
         let buildRoot = modules.deletingLastPathComponent()
         var arguments: [String] = []
-        for module in ["HelixRuntimeSupport", "HelixObjectiveCRuntimeSupport"] {
+        for module in [
+            "HelixRuntimeSupport",
+            "HelixObjectiveCRuntimeSupport",
+            "HelixCRuntimeSupport",
+        ] {
             let moduleMap = buildRoot
                 .appendingPathComponent("\(module).build", isDirectory: true)
                 .appendingPathComponent("module.modulemap")
@@ -4395,6 +4464,66 @@ struct NativeImportDiscoveryTests {
         )
         #expect(durations["ScopeFixture.compute(_:)"] == 2_000)
         #expect(durations["ScopeFixture.render(_:)"] == 16_000)
+    }
+
+    @Test("C calls retain the generic invoker inside MainActor source")
+    func routesMainActorCCallsThroughGenericInvoker() throws {
+        let configuration = try PatchConfiguration.Document.parse(yaml: """
+        schema: 1
+        modules:
+          ScopeFixture:
+            include:
+              - Native/**
+            nativeImports:
+              candidateIndex: source-and-catalog
+              emit: scoped
+              sourceScope:
+                include:
+                  - Native/**
+                declarations:
+                  - QuartzCore.*
+                visibility: public
+                profile: read-write
+                maximumBoundedDurationMicroseconds: 16000
+                allowsMainThread: true
+        """)
+        var declaration = declaration(
+            canonicalCallee: "QuartzCore.CACurrentMediaTime",
+            mangledName: "$sSo18CACurrentMediaTimeSdyFTo",
+            signature: .init(
+                parameters: [],
+                result: "Swift.Double",
+                isolation: "MainActor"
+            ),
+            effects: .init(requiresMainActor: true)
+        )
+        declaration.baseName = "CACurrentMediaTime"
+        declaration.argumentLabels = []
+        declaration.parameterSwiftTypes = []
+        declaration.parameterProjection = .identity(parameterCount: 0)
+        declaration.resultSwiftType = "Double"
+        declaration.importedModules = ["QuartzCore"]
+        declaration.parameterTypes = []
+        declaration.resultType = .float(bitWidth: 64)
+        declaration.declaringModuleName = "QuartzCore"
+        declaration.c = .init(
+            moduleName: "QuartzCore",
+            declarationUSR: "c:@F@CACurrentMediaTime",
+            symbol: "CACurrentMediaTime",
+            parameters: [],
+            resultSwiftABIType: "Double",
+            isVariadic: false
+        )
+
+        let output = try NativeImportDiscovery.Engine().discover(
+            declarations: [declaration],
+            metadata: makeMetadata(moduleName: "ScopeFixture"),
+            configuration: configuration
+        )
+        let candidate = try #require(output.candidates.first)
+        #expect(candidate.record.descriptor.target.backend == .cFunction)
+        #expect(candidate.record.effects.requiresMainActor)
+        #expect(candidate.generatedBinding.cFunction?.moduleName == "QuartzCore")
     }
 
     @Test("Automatic discovery accepts frozen Native values but rejects address and closure boundaries")
@@ -4611,7 +4740,7 @@ struct NativeImportDiscoveryTests {
                 include:
                   - Sources/**
                 declarations:
-                  - \(moduleName).*
+                  - "*"
                 visibility: all
                 profile: read-write
                 maximumBoundedDurationMicroseconds: 2000
@@ -4654,11 +4783,19 @@ struct NativeImportDiscoveryTests {
         let objectiveCRecords = output.receipt.nativeImportCandidates.filter {
             $0.descriptor.target.backend == .objectiveCMessage
         }
-        #expect(Set(objectiveCRecords.map(\.descriptor.target.entryPoint)) == [
-            "areAnimationsEnabled", "convertPoint:toView:", "isHidden",
-            "removeItemAtPath:error:", "setAnimationsEnabled:", "setHidden:",
-            "setNeedsLayout", "title", "viewDidLayoutSubviews",
-        ])
+        #expect(
+            Set(objectiveCRecords.map(\.descriptor.target.entryPoint)) == [
+                "areAnimationsEnabled", "convertPoint:toView:", "isHidden",
+                "removeItemAtPath:error:", "setAnimationsEnabled:", "setHidden:",
+                "setNeedsLayout", "title", "viewDidLayoutSubviews",
+            ],
+            Comment(rawValue: String(describing: (
+                output.receipt.nativeImportCandidates.map {
+                    ($0.canonicalCallee, $0.descriptor.target.backend)
+                },
+                output.diagnostics
+            )))
+        )
         let inheritedClassMethod = try #require(objectiveCRecords.first {
             $0.descriptor.target.entryPoint == "setAnimationsEnabled:"
         })

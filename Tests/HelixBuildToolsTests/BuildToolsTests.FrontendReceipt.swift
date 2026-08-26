@@ -1827,6 +1827,7 @@ struct FrontendReceiptPipeline {
         let supportModules = [
             "HelixRuntimeSupport",
             "HelixObjectiveCRuntimeSupport",
+            "HelixCRuntimeSupport",
         ]
         var arguments: [String] = []
         for module in supportModules {

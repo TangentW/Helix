@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import HelixBytecode
 import HelixBuildTools
+import HelixCompiler
 import HelixCore
 import HelixDevProtocol
 import HelixDevTools
@@ -585,13 +586,17 @@ struct Application {
             "ReleaseMetadata.json",
             "ReloadIndex.json",
             "Generated/FeatureBridge.swift",
-            "Generated/FeatureBridge.DevBuildContract.swift",
             "Generated/FeatureBridge.Provider.swift",
         ] {
             #expect(FileManager.default.fileExists(
                 atPath: shell.appendingPathComponent(path).path
             ))
         }
+        #expect(!FileManager.default.fileExists(
+            atPath: shell.appendingPathComponent(
+                "Generated/FeatureBridge.HubContract.swift"
+            ).path
+        ))
         #expect(!FileManager.default.fileExists(atPath: buildDirectory
             .appendingPathComponent("HelixGenerated/patch/Compiler/Feature/swiftc")
             .path))
@@ -766,7 +771,7 @@ struct Application {
         )
         let contract = try String(
             contentsOf: liveShell.appendingPathComponent(
-                "Generated/FeatureBridge.DevBuildContract.swift"
+                "Generated/FeatureBridge.HubContract.swift"
             ),
             encoding: .utf8
         )
@@ -821,6 +826,76 @@ struct Application {
         #expect(repeatedLivePerformance.trace.stages.contains {
             $0.name == "prepare.reserve_hub"
         })
+    }
+
+    @Test("Final Bridge identity covers Hub contract compiler inputs")
+    func bridgeIdentityCoversHubContractInputs() throws {
+        let applicationInputs = BuildCache.CompilerInputs.Snapshot(
+            importedModules: ["HelixRuntime"],
+            searchRoots: ["/fixture/runtime"],
+            explicitPaths: [],
+            fileCount: 1,
+            byteCount: 128,
+            contentHash: .sha256("application-inputs"),
+            isComplete: true
+        )
+        let hubInputs = BuildCache.CompilerInputs.Snapshot(
+            importedModules: ["HelixDevRuntime"],
+            searchRoots: ["/fixture/dev-runtime"],
+            explicitPaths: [],
+            fileCount: 1,
+            byteCount: 64,
+            contentHash: .sha256("hub-inputs"),
+            isComplete: true
+        )
+        let toolchain = ReleaseCompiler.ToolchainIdentity(
+            fingerprint: "swift-fixture",
+            versionOutput: "Swift fixture",
+            targetInfo: "arm64-apple-ios-simulator",
+            compilerBinaryHash: .sha256("swiftc")
+        )
+        let input = CLI.XcodeBridgeInput(
+            profileID: "live",
+            transformPipelineHash: .sha256("transform"),
+            toolchain: toolchain,
+            clangCompilerPath: "/fixture/clang",
+            clangCompilerHash: .sha256("clang"),
+            xcodeBuild: "24A1",
+            sdkBuild: "24A1",
+            compilerArguments: ["-module-name", "HelixBridge"],
+            compilerInputs: applicationInputs,
+            generatedSources: [
+                .init(
+                    path: "Generated/FeatureBridge.HubContract.swift",
+                    data: Data("contract".utf8)
+                )
+            ],
+            adapterObjects: [],
+            hubContractObject: .init(
+                compilerArguments: ["-module-name", "HelixHubContract"],
+                compilerInputs: hubInputs
+            ),
+            moduleMaps: [],
+            bootstrapSource: "bootstrap"
+        )
+        let baseline = try BuildCache.key(
+            domain: "HLX.Xcode.BridgeInput.v1",
+            value: input
+        )
+        var changed = input
+        changed.hubContractObject?.compilerInputs.contentHash = .sha256(
+            "changed-hub-inputs"
+        )
+        #expect(try BuildCache.key(
+            domain: "HLX.Xcode.BridgeInput.v1",
+            value: changed
+        ) != baseline)
+        changed = input
+        changed.hubContractObject = nil
+        #expect(try BuildCache.key(
+            domain: "HLX.Xcode.BridgeInput.v1",
+            value: changed
+        ) != baseline)
     }
 
     private func buildPerformanceReport(

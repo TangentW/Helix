@@ -184,14 +184,24 @@ public struct Adapter: Sendable {
             operationTypes: importedOperationSurface.types
         )
         if request.callingSurfacePolicy == .managedDebugModule {
-            let observedObjectiveCDeclarationUSRs: Set<String> = Set(
+            let observedDeclarationUSRs: Set<String> = Set(
                 importedOperationSurface.operations.compactMap {
                     operation in
-                    guard operation.objectiveC?.moduleName == nil else {
-                        return nil
+                    if operation.objectiveC?.moduleName == nil,
+                       let usr = operation.objectiveC?.declarationUSR {
+                        return usr
                     }
-                    return operation.objectiveC?.declarationUSR
+                    if operation.c?.moduleName == nil {
+                        return operation.c?.declarationUSR
+                    }
+                    return nil
                 }
+            )
+            let observedCModules = Set(
+                importedOperationSurface.operations.compactMap { operation in
+                    operation.c?.moduleName == nil
+                        ? operation.importedModules : nil
+                }.flatMap { $0 }
             )
             let managedSurface = try performance.measure(
                 "frontend.expand_managed_debug_surface"
@@ -201,7 +211,8 @@ public struct Adapter: Sendable {
                     minimumOS: request.metadata.minimumOS,
                     frontend: frontend,
                     invocation: request.metadata.frontendInvocation,
-                    declarationUSRs: observedObjectiveCDeclarationUSRs,
+                    declarationUSRs: observedDeclarationUSRs,
+                    candidateModules: observedCModules,
                     cache: cache,
                     compilerFingerprint: toolchain.fingerprint,
                     compilerInputHash: compilerInputHash
@@ -269,7 +280,12 @@ public struct Adapter: Sendable {
                 applyingObjectiveCDeclarationModules(
                     to: importedOperationSurface.operations,
                     modulesByUSR:
-                        managedSurface.objectiveCModulesByDeclarationUSR
+                        managedSurface.modulesByDeclarationUSR
+                )
+            importedOperationSurface.operations =
+                applyingCDeclarationModules(
+                    to: importedOperationSurface.operations,
+                    modulesByUSR: managedSurface.modulesByDeclarationUSR
                 )
             let observedCallbackSymbols = Set(
                 importedOperationSurface.operations.filter { operation in
@@ -304,24 +320,32 @@ public struct Adapter: Sendable {
                 importedOperationSurface.operations + additiveManagedOperations
             )
         } else {
-            let unresolvedEvidence = importedOperationSurface.operations
+            let unresolvedObjectiveCEvidence = importedOperationSurface.operations
                 .compactMap(\.objectiveC)
                 .filter { $0.moduleName == nil }
             let unresolvedRuntimeNames = Set(
-                unresolvedEvidence.map(\.runtimeClassName)
+                unresolvedObjectiveCEvidence.map(\.runtimeClassName)
             )
+            let unresolvedCOperations = importedOperationSurface.operations
+                .filter { $0.c != nil && $0.c?.moduleName == nil }
             let unresolvedDeclarationUSRs = Set(
-                unresolvedEvidence.map(\.declarationUSR)
+                unresolvedObjectiveCEvidence.map(\.declarationUSR)
+                    + unresolvedCOperations.compactMap { $0.c?.declarationUSR }
             )
-            if !unresolvedRuntimeNames.isEmpty {
+            let candidateModules = Set(
+                unresolvedCOperations.flatMap(\.importedModules)
+            )
+            if !unresolvedRuntimeNames.isEmpty
+                || !unresolvedDeclarationUSRs.isEmpty {
                 let resolution = try performance.measure(
-                    "frontend.resolve_objective_c_modules"
+                    "frontend.resolve_native_declaration_modules"
                 ) {
                     try FrontendReceipt.ManagedDebugSurface
-                        .resolveObjectiveCModules(
+                        .resolveDeclarationModules(
                             importedTypes: importedTypes,
                             runtimeNames: unresolvedRuntimeNames,
                             declarationUSRs: unresolvedDeclarationUSRs,
+                            candidateModules: candidateModules,
                             minimumOS: request.metadata.minimumOS,
                             frontend: frontend,
                             invocation: request.metadata.frontendInvocation,
@@ -331,15 +355,15 @@ public struct Adapter: Sendable {
                         )
                 }
                 performance.setCounter(
-                    "objective_c_module.module_count",
+                    "native_declaration_module.module_count",
                     value: resolution.metrics.moduleCount
                 )
                 performance.setCounter(
-                    "objective_c_module.symbol_graph_cache_hit_count",
+                    "native_declaration_module.symbol_graph_cache_hit_count",
                     value: resolution.metrics.symbolGraphCacheHitCount
                 )
                 performance.setCounter(
-                    "objective_c_module.symbol_graph_cache_miss_count",
+                    "native_declaration_module.symbol_graph_cache_miss_count",
                     value: resolution.metrics.symbolGraphCacheMissCount
                 )
                 importedTypes = resolution.importedTypes
@@ -352,7 +376,12 @@ public struct Adapter: Sendable {
                     applyingObjectiveCDeclarationModules(
                         to: importedOperationSurface.operations,
                         modulesByUSR:
-                            resolution.objectiveCModulesByDeclarationUSR
+                            resolution.modulesByDeclarationUSR
+                    )
+                importedOperationSurface.operations =
+                    applyingCDeclarationModules(
+                        to: importedOperationSurface.operations,
+                        modulesByUSR: resolution.modulesByDeclarationUSR
                     )
             }
         }
@@ -400,7 +429,8 @@ public struct Adapter: Sendable {
         let importedOperationDeclarations = try makeImportedOperationDeclarations(
             importedOperationSurface.operations,
             moduleName: moduleName,
-            nativeTypes: nativeTypeIDs
+            nativeTypes: nativeTypeIDs,
+            sourceTypeNames: Set(sourceNominals.map(\.canonicalName))
         )
         var drafts: [Draft] = []
         for document in documents {
@@ -1097,7 +1127,11 @@ extension FrontendReceipt.Adapter {
             allow: module.nativeImports.allow,
             sourceScope: .init(
                 include: sources.map(\.logicalPath).sorted(),
-                declarations: ["\(moduleName).*"],
+                // The source path already scopes authority to this module.
+                // Calls discovered inside it may legitimately target any
+                // imported SDK/dependency module and must retain their stable,
+                // project-independent native identity.
+                declarations: ["*"],
                 visibility: .all,
                 profile: .readWrite,
                 maximumBoundedDurationMicroseconds:
@@ -1320,6 +1354,20 @@ extension FrontendReceipt.Adapter {
                     strategy: .objectiveCInvoker
                 )
             }
+            if record.descriptor.target.backend == .cFunction,
+               let function = generated.cFunction {
+                return .init(
+                    key: record.key,
+                    strategy: .cInvoker,
+                    importedModules: [function.moduleName],
+                    cFunction: .init(
+                        moduleName: function.moduleName,
+                        swiftName: function.swiftName,
+                        parameterSwiftTypes: function.parameterSwiftTypes,
+                        resultSwiftType: function.resultSwiftType
+                    )
+                )
+            }
             return .init(
                 key: record.key,
                 strategy: .generatedSwiftAdapter,
@@ -1334,7 +1382,8 @@ extension FrontendReceipt.Adapter {
                     parameterSwiftTypes: generated.parameterSwiftTypes,
                     invocationParameterSwiftTypes:
                         generated.invocationParameterSwiftTypes,
-                    resultSwiftType: generated.resultSwiftType
+                    resultSwiftType: generated.resultSwiftType,
+                    nativeModuleName: generated.nativeModuleName
                 )
             )
         }.sorted { $0.key.rawValue < $1.key.rawValue }

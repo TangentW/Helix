@@ -32,6 +32,16 @@ struct XcodeBridgeInput: Codable, Sendable {
         var contentHash: Core.Digest
     }
 
+    struct AdapterObject: Codable, Sendable {
+        var moduleName: String
+        var inputHash: Core.Digest
+    }
+
+    struct HubContractObject: Codable, Sendable {
+        var compilerArguments: [String]
+        var compilerInputs: BuildCache.CompilerInputs.Snapshot
+    }
+
     var schemaVersion: UInt16 = 1
     var profileID: String
     var transformPipelineHash: Core.Digest
@@ -43,8 +53,26 @@ struct XcodeBridgeInput: Codable, Sendable {
     var compilerArguments: [String]
     var compilerInputs: BuildCache.CompilerInputs.Snapshot
     var generatedSources: [ShellBuild.Artifact]
+    var adapterObjects: [AdapterObject]
+    var hubContractObject: HubContractObject?
     var moduleMaps: [File]
     var bootstrapSource: String
+}
+
+/// Exact semantic identity of the stable, application-specific Bridge object.
+/// Invitation-specific development sources are deliberately absent and are
+/// compiled as a separate object before the final relocatable link.
+struct XcodeApplicationObjectInput: Codable, Sendable {
+    var schemaVersion: UInt16 = 1
+    var profileID: String
+    var transformPipelineHash: Core.Digest
+    var toolchain: ReleaseCompiler.ToolchainIdentity
+    var xcodeBuild: String
+    var sdkBuild: String
+    var compilerArguments: [String]
+    var compilerInputs: BuildCache.CompilerInputs.Snapshot
+    var generatedSources: [ShellBuild.Artifact]
+    var moduleMaps: [XcodeBridgeInput.File]
 }
 }
 

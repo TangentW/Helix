@@ -129,7 +129,54 @@ lookup took 0.286 s and materialization took 1.626 s. Bridge still missed its
 state and recompiled the source because a fresh Live Reload session contract
 changed on each build. Most source bytes now come from verbose descriptor
 literals in the main Bridge file, not selector-specific executable wrappers.
-Consequently, this stage improves execution architecture and keeps coverage,
-but does not claim the final no-change latency target. Compact descriptor
-tables, reuse of a still-valid Hub reservation, and stable Adapter Pack inputs
-remain required in the later Live Reload stage.
+Consequently, this stage improved execution architecture and kept coverage,
+but did not claim the final no-change latency target. Stage 4 below separates
+the stable Bridge and Adapter Pack objects from the single-use Hub contract.
+
+## Stage 4 measured result
+
+The restricted C invoker and Swift Adapter Pack stage was validated with the
+same real Simulator Demo. Its behavior-neutral probes force both non-
+Objective-C paths: `CACurrentMediaTime()` uses the common C invoker, while two
+Foundation value-overlay operations form one two-entry Foundation Adapter
+Pack. The resulting Shell reported 383 Objective-C invoker entries, one C
+invoker entry, 84 application adapters, and one reusable Adapter Pack.
+
+The first Bridge build used a new transform identity and therefore populated
+both object caches:
+
+| First Bridge item | Result |
+| --- | ---: |
+| Bridge total | 17.044 s |
+| Stable application Swift compilation | 15.360 s |
+| Application Bridge object | 6,978,432 bytes |
+| Foundation Adapter Pack object | 22,008 bytes |
+| Session Hub contract compilation | 0.336 s |
+| Final relocatable link | 0.170 s |
+
+An immediate unchanged Xcode build acquired a fresh one-time Hub invitation,
+so the exact final Bridge state correctly missed. The stable pieces did not
+recompile:
+
+| Repeated Bridge item | Result |
+| --- | ---: |
+| Bridge total | 1.353 s |
+| Application object cache | hit |
+| Adapter Pack object cache | hit |
+| `bridge.compile_application_swift` | absent |
+| Session Hub contract compilation | 0.364 s |
+| Final relocatable link | 0.064 s |
+| Warm Prepare | 2.366 s |
+
+This removes 15.360 seconds from the repeated Bridge on the measured machine,
+without reusing an old pairing invitation or reducing the discovered API
+surface. The session contract is compiled as a separate small object and then
+linked with the validated stable application object and module Pack objects.
+The final state identity still covers every generated source, Pack key,
+compiler input, module map, toolchain, SDK, Clang binary, and bootstrap source;
+only the independently safe intermediate objects are reused.
+
+The remaining measured Bridge costs are import scanning (0.348 s), the small
+Hub-contract Swift compile (0.364 s), and toolchain/Pack planning. These are
+now bounded secondary costs rather than a reason to enumerate fewer SDK APIs.
+All cache and report schemas remain version 1.

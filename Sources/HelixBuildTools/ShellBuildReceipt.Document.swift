@@ -141,6 +141,7 @@ public struct NativeImportBinding: Codable, Hashable, Sendable {
         case factory
         case generatedSwiftAdapter
         case objectiveCInvoker
+        case cInvoker
     }
 
     public var key: Core.NativeCall.Key
@@ -150,19 +151,44 @@ public struct NativeImportBinding: Codable, Hashable, Sendable {
     public var factoryExpression: String?
     public var importedModules: [String]
     public var generated: ShellBuildReceipt.GeneratedNativeImport?
+    public var cFunction: ShellBuildReceipt.CFunctionBinding?
 
     public init(
         key: Core.NativeCall.Key,
         strategy: Strategy,
         factoryExpression: String? = nil,
         importedModules: [String] = [],
-        generated: ShellBuildReceipt.GeneratedNativeImport? = nil
+        generated: ShellBuildReceipt.GeneratedNativeImport? = nil,
+        cFunction: ShellBuildReceipt.CFunctionBinding? = nil
     ) {
         self.key = key
         self.strategy = strategy
         self.factoryExpression = factoryExpression
         self.importedModules = importedModules.sorted()
         self.generated = generated
+        self.cFunction = cFunction
+    }
+}
+
+/// Exact compiler-bound C function reference used by the generic C invoker.
+/// Only identifier components and compiler-observed physical types are stored;
+/// arbitrary Swift expressions are never accepted from project input.
+public struct CFunctionBinding: Codable, Hashable, Sendable {
+    public var moduleName: String
+    public var swiftName: String
+    public var parameterSwiftTypes: [String]
+    public var resultSwiftType: String
+
+    public init(
+        moduleName: String,
+        swiftName: String,
+        parameterSwiftTypes: [String],
+        resultSwiftType: String
+    ) {
+        self.moduleName = moduleName
+        self.swiftName = swiftName
+        self.parameterSwiftTypes = parameterSwiftTypes
+        self.resultSwiftType = resultSwiftType
     }
 }
 
@@ -193,6 +219,9 @@ public struct GeneratedNativeImport: Codable, Hashable, Sendable {
     public var parameterSwiftTypes: [String]
     public var invocationParameterSwiftTypes: [String]?
     public var resultSwiftType: String
+    /// External module whose adapter can be emitted into a reusable Pack.
+    /// Nil keeps the adapter in its application source group.
+    public var nativeModuleName: String?
 
     public init(
         declarationMangledName: String,
@@ -203,7 +232,8 @@ public struct GeneratedNativeImport: Codable, Hashable, Sendable {
         argumentLabels: [String],
         parameterSwiftTypes: [String],
         invocationParameterSwiftTypes: [String]? = nil,
-        resultSwiftType: String
+        resultSwiftType: String,
+        nativeModuleName: String? = nil
     ) {
         self.declarationMangledName = declarationMangledName
         self.sourceFileLogicalID = sourceFileLogicalID
@@ -214,6 +244,7 @@ public struct GeneratedNativeImport: Codable, Hashable, Sendable {
         self.parameterSwiftTypes = parameterSwiftTypes
         self.invocationParameterSwiftTypes = invocationParameterSwiftTypes
         self.resultSwiftType = resultSwiftType
+        self.nativeModuleName = nativeModuleName
     }
 }
 
@@ -736,6 +767,9 @@ public struct Document: Codable, Hashable, Sendable {
         }()
         guard sourcePaths.contains(generated.sourceFileLogicalID),
               !requiresImportedType || !importedModules.isEmpty,
+              generated.nativeModuleName.map({
+                  isModulePath($0) && importedModules.contains($0)
+              }) ?? true,
               isBoundText(generated.declarationMangledName),
               isSwiftIdentifier(generated.baseName)
                 || generated.dispatch == .globalFunction
@@ -819,10 +853,15 @@ public struct Document: Codable, Hashable, Sendable {
         case .factory:
             return binding.factoryExpression.map(isBoundExpression) == true
                 && binding.generated == nil
+                && binding.cFunction == nil
         case .generatedSwiftAdapter:
             return binding.factoryExpression == nil
                 && record.descriptor.target.backend == .swiftAdapter
                 && binding.generated != nil
+                && binding.cFunction == nil
+                && (binding.generated?.nativeModuleName == nil
+                    || binding.generated?.nativeModuleName
+                        == record.descriptor.target.module)
                 && isValidGeneratedNativeImport(
                     binding.generated,
                     importedModules: binding.importedModules,
@@ -832,9 +871,34 @@ public struct Document: Codable, Hashable, Sendable {
         case .objectiveCInvoker:
             return binding.factoryExpression == nil
                 && binding.generated == nil
+                && binding.cFunction == nil
                 && binding.importedModules.isEmpty
                 && record.descriptor.target.backend == .objectiveCMessage
                 && !record.effects.isAsync
+        case .cInvoker:
+            guard binding.factoryExpression == nil,
+                  binding.generated == nil,
+                  record.descriptor.target.backend == .cFunction,
+                  !record.effects.isAsync,
+                  let function = binding.cFunction
+            else { return false }
+            return isModulePath(function.moduleName)
+                && isSwiftIdentifier(function.swiftName)
+                && binding.importedModules == [function.moduleName]
+                && record.descriptor.target.module == function.moduleName
+                && record.descriptor.target.member == function.swiftName
+                && function.parameterSwiftTypes
+                    == record.descriptor.physicalSignature.parameters
+                        .compactMap(\.type.canonicalName)
+                && function.parameterSwiftTypes.allSatisfy(
+                    FrontendReceipt.SwiftTypeSpelling.isGeneratedType
+                )
+                && function.resultSwiftType
+                    == (record.descriptor.physicalSignature.result.canonicalName
+                        ?? "Swift.Void")
+                && FrontendReceipt.SwiftTypeSpelling.isGeneratedType(
+                    function.resultSwiftType
+                )
         }
     }
 

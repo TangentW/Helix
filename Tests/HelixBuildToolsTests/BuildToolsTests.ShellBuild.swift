@@ -57,22 +57,7 @@ struct ShellBuildPipeline {
         #expect(bridge.contains("public static func makePatchBuildContract()"))
         #expect(bridge.contains("runtimeImageIdentity: .current"))
         #expect(bridge.contains("#elseif canImport(HelixAppIntegration)"))
-        let devContract = String(
-            decoding: try #require(
-                artifacts["Generated/FixtureBridge.DevBuildContract.swift"]
-            ),
-            as: UTF8.self
-        )
-        #expect(devContract.contains("public static func makeDevBuildContract()"))
-        #expect(
-            devContract.contains(
-                "bundleID: \(String(reflecting: output.archive.metadata.bundleID))"
-            )
-        )
-        #expect(devContract.contains("platform: .iOS"))
-        #expect(devContract.contains("runtimeImageIdentity: .current"))
-        #expect(devContract.contains(output.report.reloadIndexHash.hex))
-        #expect(devContract.contains("#elseif canImport(HelixDevSupport)"))
+        #expect(artifacts["Generated/FixtureBridge.HubContract.swift"] == nil)
         let provider = String(
             decoding: try #require(
                 artifacts["Generated/FixtureBridge.Provider.swift"]
@@ -191,9 +176,9 @@ struct ShellBuildPipeline {
         let source = String(
             decoding: try #require(
                 output.xcodeIntegration.artifacts[
-                    "Generated/FixtureBridge.DevBuildContract.swift"
+                    "Generated/FixtureBridge.HubContract.swift"
                 ] ?? output.bridge.sourceFiles[
-                    "Generated/FixtureBridge.DevBuildContract.swift"
+                    "Generated/FixtureBridge.HubContract.swift"
                 ].map { Data($0.utf8) }
             ),
             as: UTF8.self
@@ -485,13 +470,11 @@ struct ShellBuildPipeline {
                 atPath: outputURL.appendingPathComponent("Generated/FixtureBridge.swift").path
             )
         )
-        #expect(
-            FileManager.default.fileExists(
-                atPath: outputURL.appendingPathComponent(
-                    "Generated/FixtureBridge.DevBuildContract.swift"
-                ).path
-            )
-        )
+        #expect(!FileManager.default.fileExists(
+            atPath: outputURL.appendingPathComponent(
+                "Generated/FixtureBridge.HubContract.swift"
+            ).path
+        ))
         #expect(
             FileManager.default.fileExists(
                 atPath: outputURL.appendingPathComponent(
