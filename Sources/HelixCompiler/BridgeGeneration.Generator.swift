@@ -58,22 +58,31 @@ public struct Root: Hashable, Sendable {
 }
 
 public struct NativeImportBinding: Hashable, Sendable {
+    public enum Strategy: String, Hashable, Sendable {
+        case factory
+        case generatedSwiftAdapter
+        case objectiveCInvoker
+    }
+
     public var id: Core.NativeImportID
     public var key: Core.NativeCall.Key
-    public var invokerExpression: String
+    public var strategy: Strategy
+    public var factoryExpression: String?
     public var importedModules: [String]
     public var generated: BridgeGeneration.GeneratedNativeImport?
 
     public init(
         id: Core.NativeImportID,
         key: Core.NativeCall.Key,
-        invokerExpression: String,
+        strategy: Strategy,
+        factoryExpression: String? = nil,
         importedModules: [String] = [],
         generated: BridgeGeneration.GeneratedNativeImport? = nil
     ) {
         self.id = id
         self.key = key
-        self.invokerExpression = invokerExpression
+        self.strategy = strategy
+        self.factoryExpression = factoryExpression
         self.importedModules = importedModules.sorted()
         self.generated = generated
     }
@@ -180,20 +189,24 @@ public struct GeneratedNativeType: Hashable, Sendable {
         case reference
         case rawRepresentable
         case opaqueValue
+        case objectiveCStructure
     }
 
     public var sourceFileLogicalID: String
     public var swiftType: String
     public var representation: Representation
+    public var nativeABIEncoding: String?
 
     public init(
         sourceFileLogicalID: String,
         swiftType: String,
-        representation: Representation = .reference
+        representation: Representation = .reference,
+        nativeABIEncoding: String? = nil
     ) {
         self.sourceFileLogicalID = sourceFileLogicalID
         self.swiftType = swiftType
         self.representation = representation
+        self.nativeABIEncoding = nativeABIEncoding
     }
 
     public static func groupName(sourceFileLogicalID: String) -> String {
@@ -2115,6 +2128,23 @@ public struct Generator: Sendable {
                 clone: { (value: \(swiftType)) in value }
             )
             """
+        case .objectiveCStructure:
+            guard record.kind == .value,
+                  let encoding = generated.nativeABIEncoding,
+                  !encoding.isEmpty
+            else {
+                throw BridgeGeneration.Error.nativeTypeBindingMismatch(binding.id)
+            }
+            operations = """
+            VM.NativeTypeOperations.objectiveCStructure(
+                id: id,
+                canonicalName: canonicalName,
+                layoutFingerprint: layoutFingerprint,
+                requiresMainActor: requiresMainActor,
+                encoding: \(quoted(encoding)),
+                clone: { (value: \(swiftType)) in value }
+            )
+            """
         }
         return """
         static func \(factory)(
@@ -3051,12 +3081,6 @@ public struct Generator: Sendable {
                     "native call identity"
                 )
             }
-            guard isUsableExpression(binding.invokerExpression) else {
-                throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
-                    binding.id,
-                    "factory expression"
-                )
-            }
             guard binding.importedModules
                     == Array(Set(binding.importedModules)).sorted()
             else {
@@ -3070,6 +3094,39 @@ public struct Generator: Sendable {
                     binding.id,
                     "module name"
                 )
+            }
+            switch binding.strategy {
+            case .factory:
+                guard binding.factoryExpression.map(isUsableExpression) == true,
+                      binding.generated == nil
+                else {
+                    throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
+                        binding.id,
+                        "explicit factory strategy"
+                    )
+                }
+            case .generatedSwiftAdapter:
+                guard binding.factoryExpression == nil,
+                      binding.generated != nil,
+                      record.descriptor.target.backend == .swiftAdapter
+                else {
+                    throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
+                        binding.id,
+                        "generated Swift adapter strategy"
+                    )
+                }
+            case .objectiveCInvoker:
+                guard binding.factoryExpression == nil,
+                      binding.generated == nil,
+                      binding.importedModules.isEmpty,
+                      record.descriptor.target.backend == .objectiveCMessage,
+                      !record.effects.isAsync
+                else {
+                    throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
+                        binding.id,
+                        "Objective-C invoker strategy"
+                    )
+                }
             }
             if let generated = binding.generated {
                 try validateGeneratedNativeImport(
@@ -3134,6 +3191,7 @@ public struct Generator: Sendable {
               isValidGeneratedSwiftTypeSpelling(generated.swiftType),
               swiftTypeMatches(shape, type: .native(record.id), archive: archive),
               Self.generatedRepresentation(generated.representation, matches: record.kind),
+              Self.nativeABIEncodingIsValid(generated),
               record.isCopyable
         else {
             throw BridgeGeneration.Error.nativeTypeBindingMismatch(binding.id)
@@ -3148,6 +3206,20 @@ public struct Generator: Sendable {
         case .reference: kind == .reference
         case .rawRepresentable: kind == .value || kind == .enumeration
         case .opaqueValue: kind == .value
+        case .objectiveCStructure: kind == .value
+        }
+    }
+
+    private static func nativeABIEncodingIsValid(
+        _ generated: BridgeGeneration.GeneratedNativeType
+    ) -> Bool {
+        switch generated.representation {
+        case .objectiveCStructure:
+            generated.nativeABIEncoding.map {
+                !$0.isEmpty && $0.utf8.count <= 4_096
+            } == true
+        case .reference, .rawRepresentable, .opaqueValue:
+            generated.nativeABIEncoding == nil
         }
     }
 
@@ -3160,18 +3232,10 @@ public struct Generator: Sendable {
         func mismatch(_ reason: String) -> BridgeGeneration.Error {
             .generatedNativeImportBindingMismatch(binding.id, reason)
         }
-        let expectedExpression = BridgeGeneration.GeneratedNativeImport.bindingExpression(
-            sourceFileLogicalID: generated.sourceFileLogicalID,
-            id: binding.id,
-            key: binding.key
-        )
         let expectedDeadlineMode: Core.NativeImportDeadlineMode =
             record.effects.isAsync ? .suspending : .bounded
         let invocationParameterSwiftTypes = generated
             .invocationParameterSwiftTypes ?? generated.parameterSwiftTypes
-        guard binding.invokerExpression == expectedExpression else {
-            throw mismatch("generated factory expression")
-        }
         guard record.silMangledNames.contains(generated.declarationMangledName) else {
             throw mismatch("resolved Swift declaration identity")
         }
@@ -3644,10 +3708,14 @@ public struct Generator: Sendable {
                     "catalog lookup"
                 )
             }
+            let expression = try nativeInvokerExpression(
+                binding: binding,
+                record: record
+            )
             if record.effects.isAsync {
-                asynchronousImportExpressions.append(binding.invokerExpression)
+                asynchronousImportExpressions.append(expression)
             } else {
-                synchronousImportExpressions.append(binding.invokerExpression)
+                synchronousImportExpressions.append(expression)
             }
         }
         let typeExpressions = types.sorted(by: { $0.id.rawValue < $1.id.rawValue })
@@ -3707,6 +3775,46 @@ public struct Generator: Sendable {
                 )
             }
         """
+    }
+
+    private func nativeInvokerExpression(
+        binding: BridgeGeneration.NativeImportBinding,
+        record: InterfaceArchive.NativeImportRecord
+    ) throws -> String {
+        switch binding.strategy {
+        case .factory:
+            guard let expression = binding.factoryExpression else {
+                throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
+                    binding.id,
+                    "missing explicit factory"
+                )
+            }
+            return expression
+        case .generatedSwiftAdapter:
+            guard let generated = binding.generated else {
+                throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
+                    binding.id,
+                    "missing generated Swift adapter"
+                )
+            }
+            return BridgeGeneration.GeneratedNativeImport.bindingExpression(
+                sourceFileLogicalID: generated.sourceFileLogicalID,
+                id: binding.id,
+                key: binding.key
+            )
+        case .objectiveCInvoker:
+            return """
+            Runtime.ObjectiveCInvoker(
+                id: Core.NativeImportID(rawValue: \(binding.id.rawValue)),
+                key: Core.NativeCall.Key(rawValue: \(render(binding.key.rawValue))),
+                descriptor: \(render(record.descriptor)),
+                parameterTypes: \(renderValueTypes(record.parameterTypes)),
+                resultType: \(render(record.resultType)),
+                effects: \(render(record.effects)),
+                contract: \(render(record.contract))
+            )
+            """
+        }
     }
 
     private func renderEntry(_ record: InterfaceArchive.FunctionRecord) -> String {
@@ -3830,6 +3938,22 @@ public struct Generator: Sendable {
                 + "obsoleted: \(render(item.obsoleted)), "
                 + "isUnavailable: \(item.isUnavailable))"
         }.joined(separator: ", ")
+        let objectiveC = descriptor.objectiveC.map { metadata in
+            let dispatchClass = metadata.dispatchClassName.map(quoted) ?? "nil"
+            let superclass = metadata.lexicalSuperclassName.map(quoted) ?? "nil"
+            let failure = metadata.errorFailure.map {
+                ".\($0.rawValue)"
+            } ?? "nil"
+            let property = metadata.property.map {
+                "Core.NativeCall.ObjectiveCProperty(name: \(quoted($0.name)), "
+                    + "accessor: .\($0.accessor.rawValue))"
+            } ?? "nil"
+            return "Core.NativeCall.ObjectiveCMetadata(runtimeClassName: "
+                + "\(quoted(metadata.runtimeClassName)), dispatchClassName: "
+                + "\(dispatchClass), methodFamily: "
+                + ".\(metadata.methodFamily.rawValue), lexicalSuperclassName: "
+                + "\(superclass), errorFailure: \(failure), property: \(property))"
+        } ?? "nil"
         let isolation = descriptor.logicalSignature.isolation.map(quoted) ?? "nil"
         return """
         try! Core.NativeCall.Descriptor(
@@ -3859,6 +3983,7 @@ public struct Generator: Sendable {
                 resultConvention: .\(descriptor.physicalSignature.resultConvention.rawValue),
                 errorConvention: .\(descriptor.physicalSignature.errorConvention.rawValue)
             ),
+            objectiveC: \(objectiveC),
             effects: \(render(descriptor.effects)),
             availability: [\(availability)]
         )

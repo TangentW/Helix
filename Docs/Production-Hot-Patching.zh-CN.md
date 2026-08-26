@@ -48,7 +48,7 @@ HLBC 是版本化的强类型寄存器字节码，不是序列化 SIL。它把�
 
 Patch Compiler 会递归闭合当前 module 内可达的实现函数。因此，补丁可以在现有源码文件中新增普通顶层 helper 或 class 的 private 实例方法，并从发生变化的已归档 root 调用它；前提是完整具体签名和函数体都落在 HLBC 子集内。这类声明只存在于该不可变 bytecode image 中，不会创建新的 Shell Entry、原生符号、Swift metadata、selector，也不能被原生代码直接调用。Helix 会把 helper 的函数体计入 root 的传递实现指纹，所以即使 root 的调用点文字没有再变化，之后修改 helper 仍会产生不同 generation。
 
-Hub 会从成功构建自动发现 NativeImport，并展开成逐项 canonical descriptor、稳定 Key 与生成 invoker；设备端从不解释“全工程 wildcard”。显式列表只保留为底层 standalone compiler 输入。补丁中新增某个调用的前提是已发布 App 已经包含对应生成 capability，并且 policy 允许它的 effect。完整的版本 1 身份、Catalog 与信任边界规则见[原生调用身份与 Catalog](Native-Calls.zh-CN.md)。
+Hub 会从成功构建自动发现 NativeImport，并展开成逐项 canonical Descriptor、稳定 Key 与执行 binding；设备端从不解释“全工程 wildcard”。显式列表只保留为底层 standalone compiler 输入。落在支持矩阵内的 Objective-C capability 共用一个 Descriptor 驱动的可执行调用器，不再携带 selector 专属 Swift wrapper；但 Release Shell 仍必须包含这条调用的精确 Descriptor 与 Key，本阶段尚未把整个已链接 Framework Catalog 投影成生产能力表。复杂 Swift overlay 继续使用精确生成的 Adapter。补丁中新增某个调用的前提是已发布 App 已经包含对应 capability，并且 policy 允许它的 effect。完整的版本 1 身份、Catalog 与信任边界规则见[原生调用身份与 Catalog](Native-Calls.zh-CN.md)。
 
 这种设计不依赖不稳定的 Swift 符号查找、metadata 猜测或万能 `dlsym` API。代价也很明确：要扩大补丁能调用的原生表面，通常需要重新发版。
 

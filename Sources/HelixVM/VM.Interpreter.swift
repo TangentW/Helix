@@ -8797,7 +8797,8 @@ public struct Interpreter: Sendable {
             effects: invoker.effects,
             contract: invoker.contract,
             parameterTypes: invoker.parameterTypes,
-            callbackHost: nativeCallbackHost
+            callbackHost: nativeCallbackHost,
+            nativeTypeCatalog: nativeTypeCatalog
         )
         let result: VM.NativeInvocationResult
         do {
@@ -8828,7 +8829,8 @@ public struct Interpreter: Sendable {
             id: id,
             effects: invoker.effects,
             contract: invoker.contract,
-            parameterTypes: invoker.parameterTypes
+            parameterTypes: invoker.parameterTypes,
+            nativeTypeCatalog: nativeTypeCatalog
         )
         do {
             try budget.beginSuspension()

@@ -47,15 +47,17 @@ struct NSErrorBridgePlan: Sendable {
             guard !result.skippedLines.contains(referenceLine),
                   let reference = captures(
                       line,
-                      pattern: #"^(%[0-9]+) = (?:objc|objc_super|class)_method .*, (#[^\s:]+) : .*, \$(.+)$"#
+                      pattern: #"^(%[0-9]+) = ((?:objc|objc_super|class)_method) .*, (#[^\s:]+) : .*, \$(.+)$"#
                   ),
-                  reference[1].hasSuffix("!foreign"),
-                  reference[2].contains("AutoreleasingUnsafeMutablePointer<Optional<NSError>>"),
-                  reference[2].contains("-> ObjCBool")
+                  reference[2].hasSuffix("!foreign"),
+                  reference[3].contains("AutoreleasingUnsafeMutablePointer<Optional<NSError>>"),
+                  reference[3].contains("-> ObjCBool")
             else { continue }
             let symbol = CanonicalSIL.NativeBridgeSymbols.foreignCall(
-                reference: reference[1],
-                loweredType: reference[2]
+                reference: reference[2],
+                loweredType: reference[3],
+                dispatch: reference[1] == "objc_super_method"
+                    ? .superclass : .ordinary
             )
             guard let binding = directCalls.binding(for: symbol),
                   binding.effects.mayThrow,
@@ -74,7 +76,7 @@ struct NSErrorBridgePlan: Sendable {
             let applications = ((referenceLine + 1)..<blockEnd).compactMap {
                 index -> (Int, [String])? in
                 guard let call = captures(lines[index], pattern: applyPattern),
-                      call[2] == reference[2]
+                      call[2] == reference[3]
                 else { return nil }
                 return (index, [call[0], call[1]])
             }

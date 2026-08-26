@@ -228,6 +228,7 @@ public enum ArgumentSourceKind: String, Codable, Hashable, Sendable, CaseIterabl
     case argument
     case defaultGenerator
     case optionalNone
+    case errorOut
 }
 
 public struct ArgumentSource: Codable, Hashable, Sendable {
@@ -254,6 +255,7 @@ public struct ArgumentSource: Codable, Hashable, Sendable {
     }
 
     public static let optionalNone = Self(kind: .optionalNone)
+    public static let errorOut = Self(kind: .errorOut)
 }
 
 public struct ABIParameter: Codable, Hashable, Sendable {
@@ -280,6 +282,85 @@ public enum ErrorConvention: String, Codable, Hashable, Sendable, CaseIterable {
     case none
     case swiftThrows
     case nsErrorOut
+}
+
+/// Ownership family frozen from the imported Objective-C declaration.
+/// Runtime must not infer this from a caller-controlled selector string.
+public enum ObjectiveCMethodFamily: String, Codable, Hashable, Sendable,
+    CaseIterable
+{
+    case none
+    case initializer
+    case new
+    case copy
+    case mutableCopy
+    case alloc
+}
+
+/// Sentinel that determines whether a supported `NSError **` call failed.
+/// More conventions can be added only when the importer proves their complete
+/// Clang-to-Swift error mapping.
+public enum ObjectiveCErrorFailure: String, Codable, Hashable, Sendable,
+    CaseIterable
+{
+    case falseBoolean
+}
+
+public enum ObjectiveCPropertyAccessor: String, Codable, Hashable, Sendable,
+    CaseIterable
+{
+    case getter
+    case setter
+}
+
+/// A compiler-observed Objective-C property declaration. The exact accessor
+/// selector is stored separately in `Target`; this value preserves declaration
+/// identity without requiring optional property metadata at runtime.
+public struct ObjectiveCProperty: Codable, Hashable, Sendable {
+    public var name: String
+    public var accessor: Core.NativeCall.ObjectiveCPropertyAccessor
+
+    public init(
+        name: String,
+        accessor: Core.NativeCall.ObjectiveCPropertyAccessor
+    ) {
+        self.name = name
+        self.accessor = accessor
+    }
+}
+
+/// Objective-C facts that are not recoverable from the Swift-facing name.
+public struct ObjectiveCMetadata: Codable, Hashable, Sendable {
+    /// Cataloged declaration class accepted by `NSClassFromString`. This can
+    /// differ from both the Swift overlay owner and the class that receives a
+    /// class message or is allocated for an inherited initializer.
+    public var runtimeClassName: String
+    /// Exact Objective-C class that receives a class message or is allocated
+    /// for an initializer. Instance calls obtain their target from the verified
+    /// receiver value and keep this nil.
+    public var dispatchClassName: String?
+    public var methodFamily: Core.NativeCall.ObjectiveCMethodFamily
+    /// Runtime class at which an explicit lexical `super` lookup starts.
+    /// Ordinary calls keep this nil and retain Objective-C dynamic dispatch.
+    public var lexicalSuperclassName: String?
+    public var errorFailure: Core.NativeCall.ObjectiveCErrorFailure?
+    public var property: Core.NativeCall.ObjectiveCProperty?
+
+    public init(
+        runtimeClassName: String,
+        dispatchClassName: String? = nil,
+        methodFamily: Core.NativeCall.ObjectiveCMethodFamily = .none,
+        lexicalSuperclassName: String? = nil,
+        errorFailure: Core.NativeCall.ObjectiveCErrorFailure? = nil,
+        property: Core.NativeCall.ObjectiveCProperty? = nil
+    ) {
+        self.runtimeClassName = runtimeClassName
+        self.dispatchClassName = dispatchClassName
+        self.methodFamily = methodFamily
+        self.lexicalSuperclassName = lexicalSuperclassName
+        self.errorFailure = errorFailure
+        self.property = property
+    }
 }
 
 public struct PhysicalSignature: Codable, Hashable, Sendable {
@@ -334,6 +415,7 @@ public struct Descriptor: Codable, Hashable, Sendable {
     public var target: Core.NativeCall.Target
     public var logicalSignature: Core.NativeCall.LogicalSignature
     public var physicalSignature: Core.NativeCall.PhysicalSignature
+    public var objectiveC: Core.NativeCall.ObjectiveCMetadata?
     public var effects: Core.Effects
     public var availability: [Core.NativeCall.Availability]
 
@@ -341,12 +423,14 @@ public struct Descriptor: Codable, Hashable, Sendable {
         target: Core.NativeCall.Target,
         logicalSignature: Core.NativeCall.LogicalSignature,
         physicalSignature: Core.NativeCall.PhysicalSignature,
+        objectiveC: Core.NativeCall.ObjectiveCMetadata? = nil,
         effects: Core.Effects,
         availability: [Core.NativeCall.Availability] = []
     ) throws {
         self.target = target
         self.logicalSignature = logicalSignature
         self.physicalSignature = physicalSignature
+        self.objectiveC = objectiveC
         self.effects = effects
         self.availability = availability
         self = try canonicalized()
@@ -458,6 +542,64 @@ public struct Descriptor: Codable, Hashable, Sendable {
         ).validated(contract: contract)
     }
 
+    /// Builds a catalog entry for the reusable Objective-C message invoker.
+    /// The caller supplies compiler-proven physical ABI metadata; this helper
+    /// derives only the stable logical metadata shared with Swift adapters.
+    public static func objectiveCMessage(
+        module: String,
+        owner: String,
+        member: String,
+        selector: String,
+        dispatch: Core.NativeCall.Dispatch,
+        receiverArgumentIndex: UInt16?,
+        signature: Core.LoweredSignature,
+        effects: Core.Effects,
+        contract: Core.NativeImportContract,
+        argumentLabels: [String] = [],
+        physicalSignature: Core.NativeCall.PhysicalSignature,
+        metadata: Core.NativeCall.ObjectiveCMetadata,
+        availability: [Core.NativeCall.Availability] = []
+    ) throws -> Self {
+        let callbackByIndex = Self.callbackLifetimes(contract.callbacks)
+        let labels: [String?] = signature.parameters.indices.map { index in
+            guard argumentLabels.indices.contains(index) else { return nil }
+            let value = argumentLabels[index]
+            return value == "_" || value.isEmpty ? nil : value
+        }
+        let logicalParameters = signature.parameters.enumerated().map {
+            index, type in
+            Core.NativeCall.LogicalParameter(
+                label: labels[index],
+                type: type,
+                ownership: ownership(from: type),
+                callbackLifetime: callbackByIndex[index],
+                isAutoclosure: type.contains("@autoclosure")
+            )
+        }
+        return try Self(
+            target: .init(
+                backend: .objectiveCMessage,
+                module: module,
+                owner: owner,
+                member: member,
+                entryPoint: selector,
+                dispatch: dispatch,
+                receiverArgumentIndex: receiverArgumentIndex
+            ),
+            logicalSignature: .init(
+                parameters: logicalParameters,
+                result: .init(type: signature.result),
+                isThrowing: signature.isThrowing,
+                isAsync: signature.isAsync,
+                isolation: signature.isolation
+            ),
+            physicalSignature: physicalSignature,
+            objectiveC: metadata,
+            effects: effects,
+            availability: availability
+        ).validated(contract: contract)
+    }
+
     public var canonicalCallee: String { target.canonicalCallee }
     public var loweredSignature: Core.LoweredSignature { logicalSignature.lowered }
 
@@ -560,6 +702,34 @@ public struct Descriptor: Codable, Hashable, Sendable {
         result.physicalSignature.result = try Self.normalizeABIType(
             physicalSignature.result
         )
+        result.objectiveC = try objectiveC.map { metadata in
+            var value = metadata
+            value.runtimeClassName = try Self.normalizeIdentifierPath(
+                metadata.runtimeClassName,
+                label: "Objective-C runtime class"
+            )
+            value.dispatchClassName = try metadata.dispatchClassName.map {
+                try Self.normalizeIdentifierPath(
+                    $0,
+                    label: "Objective-C dispatch class"
+                )
+            }
+            value.lexicalSuperclassName = try metadata.lexicalSuperclassName.map {
+                try Self.normalizeIdentifierPath(
+                    $0,
+                    label: "Objective-C lexical superclass"
+                )
+            }
+            value.property = try metadata.property.map { property in
+                var property = property
+                property.name = try Self.normalizeBoundText(
+                    property.name,
+                    label: "Objective-C property"
+                )
+                return property
+            }
+            return value
+        }
         result.availability = try availability.map { item in
             var value = item
             value.platform = try Self.normalizePlatform(item.platform)
@@ -724,6 +894,16 @@ public struct Descriptor: Codable, Hashable, Sendable {
                         "native optional-none projection requires a nullable ABI type"
                     )
                 }
+            case .errorOut:
+                guard parameter.source.logicalArgumentIndex == nil,
+                      parameter.source.generatorSymbol == nil,
+                      parameter.type.kind == .pointer,
+                      parameter.type.encoding == "^@"
+                else {
+                    throw Core.NativeCall.DescriptorError.invalid(
+                        "NSError-out projection requires one encoded object pointer"
+                    )
+                }
             }
         }
         let receiver = target.receiverArgumentIndex
@@ -772,6 +952,27 @@ public struct Descriptor: Codable, Hashable, Sendable {
                 "native error convention disagrees with its backend"
             )
         }
+        let errorOutCount = physicalSignature.parameters.filter {
+            $0.source.kind == .errorOut
+        }.count
+        switch physicalSignature.errorConvention {
+        case .nsErrorOut:
+            guard errorOutCount == 1,
+                  objectiveC?.errorFailure != nil
+            else {
+                throw Core.NativeCall.DescriptorError.invalid(
+                    "Objective-C throws requires one NSError-out slot and failure sentinel"
+                )
+            }
+        case .none, .swiftThrows:
+            guard errorOutCount == 0,
+                  objectiveC?.errorFailure == nil
+            else {
+                throw Core.NativeCall.DescriptorError.invalid(
+                    "NSError-out metadata is present on a non-NSError call"
+                )
+            }
+        }
     }
 
     private func validateBackendABI() throws {
@@ -779,7 +980,8 @@ public struct Descriptor: Codable, Hashable, Sendable {
             + [physicalSignature.result]
         switch target.backend {
         case .swiftAdapter, .builtin:
-            guard physicalSignature.parameters.allSatisfy({
+            guard objectiveC == nil,
+                  physicalSignature.parameters.allSatisfy({
                       $0.type.kind == .bridgeValue
                   }),
                   physicalSignature.result.kind == (
@@ -793,23 +995,46 @@ public struct Descriptor: Codable, Hashable, Sendable {
             }
         case .objectiveCMessage:
             guard target.dispatch != .global,
-                  target.owner.map({ owner in
-                      (try? Self.normalizeIdentifierPath(
-                          owner,
-                          label: "Objective-C owner"
-                      )) == owner
-                  }) == true,
+                  let objectiveC,
                   physicalTypes.allSatisfy({ $0.kind != .bridgeValue }),
                   physicalTypes.allSatisfy({
                       $0.kind == .void || $0.encoding != nil
-                  })
+                  }),
+                  physicalTypes.allSatisfy(Self.objectiveCEncodingMatchesKind),
+                  Self.isObjectiveCSelector(target.entryPoint),
+                  target.entryPoint.filter({ $0 == ":" }).count
+                    == physicalSignature.parameters.count,
+                  objectiveC.lexicalSuperclassName == nil
+                    || target.dispatch == .instance,
+                  (target.dispatch == .instance)
+                    == (objectiveC.dispatchClassName == nil),
+                  objectiveC.property.map({ property in
+                      target.dispatch != .initializer
+                          && target.entryPoint.filter({ $0 == ":" }).count
+                              == (property.accessor == .setter ? 1 : 0)
+                          && (property.accessor == .getter
+                              || objectiveC.methodFamily == .none)
+                  }) ?? true,
+                  Self.objectiveCMethodFamilyIsValid(
+                      objectiveC.methodFamily,
+                      target: target,
+                      result: physicalSignature.result,
+                      resultConvention: physicalSignature.resultConvention
+                  )
             else {
                 throw Core.NativeCall.DescriptorError.invalid(
-                    "Objective-C calls require encoded native ABI slots"
+                    "Objective-C call \(target.canonicalCallee) ["
+                        + "\(target.entryPoint)] requires a consistent encoded native ABI "
+                        + "(dispatch: \(target.dispatch.rawValue), family: "
+                        + "\(objectiveC?.methodFamily.rawValue ?? "missing"), result: "
+                        + "\(physicalSignature.result.kind.rawValue)/"
+                        + "\(physicalSignature.resultConvention.rawValue), arguments: "
+                        + "\(physicalSignature.parameters.count))"
                 )
             }
         case .cFunction:
-            guard target.dispatch == .global,
+            guard objectiveC == nil,
+                  target.dispatch == .global,
                   physicalTypes.allSatisfy({ $0.kind != .bridgeValue }),
                   physicalTypes.allSatisfy({
                       $0.kind == .void || $0.encoding != nil
@@ -837,6 +1062,138 @@ public enum DescriptorError: Swift.Error, Equatable, Sendable,
 }
 
 private extension Core.NativeCall.Descriptor {
+    static func isObjectiveCSelector(_ value: String) -> Bool {
+        guard !value.isEmpty, value.utf8.count <= 4_096,
+              !value.unicodeScalars.contains(where: {
+                  $0.value < 0x20 || $0.value == 0x7f
+              })
+        else { return false }
+        let colonCount = value.filter { $0 == ":" }.count
+        if colonCount == 0 {
+            return isSwiftIdentifier(Substring(value))
+        }
+        guard value.last == ":" else { return false }
+        return value.dropLast().split(
+            separator: ":",
+            omittingEmptySubsequences: false
+        ).allSatisfy(isSwiftIdentifier)
+    }
+
+    static func objectiveCMethodFamilyIsValid(
+        _ family: Core.NativeCall.ObjectiveCMethodFamily,
+        target: Core.NativeCall.Target,
+        result: Core.NativeCall.ABIType,
+        resultConvention: Core.NativeCall.ABIConvention
+    ) -> Bool {
+        func belongs(to prefix: String) -> Bool {
+            let selector = target.entryPoint.drop(while: { $0 == "_" })
+            guard selector.hasPrefix(prefix) else { return false }
+            let suffix = selector.dropFirst(prefix.count)
+            guard let first = suffix.first else { return true }
+            return !first.isLowercase
+        }
+        switch family {
+        case .none:
+            guard target.dispatch != .initializer else { return false }
+            guard result.kind == .object else { return true }
+            // A wrong non-owned convention on a family selector would make
+            // Runtime add a retain to an already +1 result and leak it. Family
+            // identity follows the selector independently of the convention
+            // claimed by a catalog record.
+            return !belongs(to: "alloc")
+                && !belongs(to: "init")
+                && !belongs(to: "new")
+                && !belongs(to: "copy")
+                && !belongs(to: "mutableCopy")
+        case .alloc:
+            return target.dispatch != .initializer
+                && belongs(to: "alloc")
+                && result.kind == .object
+                && resultConvention == .directOwned
+        case .initializer:
+            return target.dispatch == .initializer
+                && belongs(to: "init")
+                && result.kind == .object
+                && resultConvention == .directOwned
+        case .new:
+            return target.dispatch != .initializer
+                && belongs(to: "new")
+                && result.kind == .object
+                && resultConvention == .directOwned
+        case .copy:
+            return target.dispatch != .initializer
+                && belongs(to: "copy")
+                && result.kind == .object
+                && resultConvention == .directOwned
+        case .mutableCopy:
+            return target.dispatch != .initializer
+                && belongs(to: "mutableCopy")
+                && result.kind == .object
+                && resultConvention == .directOwned
+        }
+    }
+
+    /// Rejects catalog metadata that would make NSInvocation read a value with
+    /// a layout different from the storage allocated by Runtime. Qualifiers do
+    /// not change the ABI and are accepted, but the underlying encoding must
+    /// agree with both the declared kind and scalar byte width.
+    static func objectiveCEncodingMatchesKind(
+        _ type: Core.NativeCall.ABIType
+    ) -> Bool {
+        guard type.kind != .void else { return type.encoding == nil }
+        guard var encoding = type.encoding, !encoding.isEmpty else {
+            return false
+        }
+        while let first = encoding.first, "rnNoORV".contains(first) {
+            encoding.removeFirst()
+        }
+        guard let marker = encoding.first else { return false }
+        switch type.kind {
+        case .void, .bridgeValue:
+            return false
+        case .object:
+            return marker == "@" && !encoding.hasPrefix("@?")
+        case .classObject:
+            return encoding == "#"
+        case .selector:
+            return encoding == ":"
+        case .block:
+            return encoding == "@?"
+        case .boolean:
+            return (encoding == "B" || encoding == "c") && type.size == 1
+        case .signedInteger:
+            return scalarEncoding(
+                encoding,
+                sizes: ["c": 1, "s": 2, "i": 4, "l": 8, "q": 8],
+                declaredSize: type.size
+            )
+        case .unsignedInteger:
+            return scalarEncoding(
+                encoding,
+                sizes: ["C": 1, "S": 2, "I": 4, "L": 8, "Q": 8],
+                declaredSize: type.size
+            )
+        case .floatingPoint:
+            return scalarEncoding(
+                encoding,
+                sizes: ["f": 4, "d": 8],
+                declaredSize: type.size
+            )
+        case .structure:
+            return marker == "{" && encoding.last == "}"
+        case .pointer:
+            return marker == "^" && encoding.count > 1
+        }
+    }
+
+    static func scalarEncoding(
+        _ encoding: String,
+        sizes: [String: UInt16],
+        declaredSize: UInt16?
+    ) -> Bool {
+        sizes[encoding] == declaredSize
+    }
+
     static func target(
         canonicalCallee: String,
         backend: Core.NativeCall.Backend,

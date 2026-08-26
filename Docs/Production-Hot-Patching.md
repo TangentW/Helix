@@ -90,11 +90,17 @@ textually unchanged.
 
 Hub discovers native imports automatically from the successful build and
 expands them into individual canonical descriptors, stable keys, and generated
-invokers; the
+bindings; the
 device never interprets a project-wide wildcard. An explicit list remains only
 as a lower-level standalone compiler input. Adding a call in a patch works only
 when the released App already contains the matching generated capability and
 its effects are allowed by policy.
+
+Supported Objective-C capabilities share one descriptor-driven executable
+invoker rather than carrying a selector-specific Swift wrapper. The released
+Shell must still contain the exact call descriptor and key; this stage does not
+yet project an entire linked framework Catalog into the production capability
+manifest. Complex Swift overlays continue to use exact generated adapters.
 
 The full version 1 identity, Catalog, and trust-boundary rules are documented
 in [Native call identity and catalog](Native-Calls.md).

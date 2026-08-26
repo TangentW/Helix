@@ -6,9 +6,11 @@ import HelixInterface
 import HelixLiveReloadAPI
 
 public enum ShellBuild {
-    /// Changes whenever the source-to-Shell transformation changes semantics.
+    /// Changes whenever source transformation, generated Shell, interface, or
+    /// native-call descriptor semantics change. This invalidates local build
+    /// facts without changing a shipped protocol or schema version.
     public static let transformPipelineHash = Core.Digest.sha256(
-        "Helix.ShellBuild.DynamicSourceTransform.v1:declaration-groups:frozen-value-hooks:source-body-dispatch:async-original-thunks"
+        "Helix.ShellBuild.DynamicSourceTransform.v1:declaration-groups:frozen-value-hooks:source-body-dispatch:async-original-thunks:native-call-descriptor-v1:objective-c-invoker"
     )
 }
 
@@ -623,10 +625,18 @@ public struct Materializer: Sendable {
             guard let id = item.id, let binding = byKey[item.key] else {
                 throw ShellBuild.Error.nativeImportBindingMismatch
             }
+            let strategy: BridgeGeneration.NativeImportBinding.Strategy = switch
+                binding.strategy
+            {
+            case .factory: .factory
+            case .generatedSwiftAdapter: .generatedSwiftAdapter
+            case .objectiveCInvoker: .objectiveCInvoker
+            }
             return .init(
                 id: id,
                 key: item.key,
-                invokerExpression: binding.invokerExpression,
+                strategy: strategy,
+                factoryExpression: binding.factoryExpression,
                 importedModules: binding.importedModules,
                 generated: binding.generated.map { generated in
                     let dispatch: BridgeGeneration.GeneratedNativeImport.Dispatch =
@@ -699,11 +709,13 @@ public struct Materializer: Sendable {
                         case .reference: .reference
                         case .rawRepresentable: .rawRepresentable
                         case .opaqueValue: .opaqueValue
+                        case .objectiveCStructure: .objectiveCStructure
                         }
                     return BridgeGeneration.GeneratedNativeType(
                         sourceFileLogicalID: $0.sourceFileLogicalID,
                         swiftType: $0.swiftType,
-                        representation: representation
+                        representation: representation,
+                        nativeABIEncoding: $0.nativeABIEncoding
                     )
                 }
             )

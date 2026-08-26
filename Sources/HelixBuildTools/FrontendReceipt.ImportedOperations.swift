@@ -48,6 +48,12 @@ extension FrontendReceipt.Adapter {
         var resultSwiftType: String
         var requiresMainActor: Bool
         var mayThrow: Bool = false
+        /// Distinguishes ordinary dynamic/class dispatch from lexical `super`
+        /// dispatch. The two can share one Clang reference and lowered type but
+        /// must never share a NativeImport implementation.
+        var foreignDispatch: CanonicalSIL.NativeBridgeSymbols.ForeignDispatch =
+            .ordinary
+        var objectiveC: FrontendReceipt.ObjectiveCABI.Evidence? = nil
         var witnessFunctions: [String] = []
         var compilerOperation: CompilerOperation? = nil
         var isolationEvidence: IsolationEvidence = .enclosingContext
@@ -63,6 +69,7 @@ extension FrontendReceipt.Adapter {
         var physicalParameterSwiftTypes: [String]
         var parameterProjection: InterfaceArchive.NativeImportParameterProjection
         var resultSwiftType: String
+        var foreignDispatch: CanonicalSIL.NativeBridgeSymbols.ForeignDispatch
 
         init(_ operation: ImportedOperation) {
             dispatch = operation.dispatch
@@ -77,6 +84,7 @@ extension FrontendReceipt.Adapter {
             parameterProjection = operation.parameterProjection
                 ?? .identity(parameterCount: operation.parameterSwiftTypes.count)
             resultSwiftType = operation.resultSwiftType
+            foreignDispatch = operation.foreignDispatch
         }
     }
 
@@ -88,6 +96,8 @@ extension FrontendReceipt.Adapter {
         var requiresMainActor: Bool
         var mayThrow: Bool
         var compilerOperation: ImportedOperation.CompilerOperation?
+        var foreignDispatch: CanonicalSIL.NativeBridgeSymbols.ForeignDispatch
+        var objectiveC: FrontendReceipt.ObjectiveCABI.Evidence?
 
         init(_ operation: ImportedOperation) {
             dispatch = operation.dispatch
@@ -101,6 +111,8 @@ extension FrontendReceipt.Adapter {
             requiresMainActor = operation.requiresMainActor
             mayThrow = operation.mayThrow
             compilerOperation = operation.compilerOperation
+            foreignDispatch = operation.foreignDispatch
+            objectiveC = operation.objectiveC
         }
     }
 
@@ -120,6 +132,20 @@ extension FrontendReceipt.Adapter {
                 ?? invocationParameterSwiftTypes
             parameterProjection = operation.parameterProjection
                 ?? .identity(parameterCount: operation.parameterSwiftTypes.count)
+        }
+    }
+
+    private struct ObjectiveCModuleEvidenceIdentity: Hashable {
+        var evidence: FrontendReceipt.ObjectiveCABI.Evidence
+
+        init?(_ operation: ImportedOperation) {
+            guard var evidence = operation.objectiveC else { return nil }
+            evidence.moduleName = nil
+            if evidence.property != nil {
+                evidence.selector = ""
+                evidence.selectorIsExact = false
+            }
+            self.evidence = evidence
         }
     }
 
@@ -369,7 +395,9 @@ extension FrontendReceipt.Adapter {
                 hasTypedThrows: false,
                 hasUnsupportedAttributes: false,
                 abiAdapter: operation.dispatch == .instanceValueSetter
-                    ? .mutatingValueReceiver : .direct
+                    ? .mutatingValueReceiver : .direct,
+                foreignDispatch: operation.foreignDispatch,
+                objectiveC: operation.objectiveC
             )
         }
     }
@@ -491,6 +519,113 @@ extension FrontendReceipt.Adapter {
             var addition = addition
             addition.silReferences.removeAll(where: ambiguousSymbols.contains)
             return addition.silReferences.isEmpty ? nil : addition
+        }
+    }
+
+    /// Applies module provenance from an exact per-module SDK probe only when
+    /// every other Objective-C declaration and physical ABI fact is identical.
+    /// Swift overlay specializations may have different logical spellings but
+    /// still name the same runtime class and selector.
+    func applyingMeasuredObjectiveCEvidence(
+        to operations: [ImportedOperation],
+        measured: [ImportedOperation]
+    ) throws -> [ImportedOperation] {
+        let evidence: [(ObjectiveCModuleEvidenceIdentity,
+                        FrontendReceipt.ObjectiveCABI.Evidence)] = measured
+            .compactMap { operation in
+                guard let identity = ObjectiveCModuleEvidenceIdentity(operation),
+                      let evidence = operation.objectiveC,
+                      evidence.moduleName != nil
+                else { return nil }
+                return (identity, evidence)
+            }
+        let grouped = Dictionary(grouping: evidence, by: \.0)
+        var resolved: [
+            ObjectiveCModuleEvidenceIdentity:
+                FrontendReceipt.ObjectiveCABI.Evidence
+        ] = [:]
+        for (identity, values) in grouped {
+            let candidates = Set(values.map(\.1))
+            guard candidates.count == 1, let evidence = candidates.first else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "Objective-C SDK probes disagree about a declaration's exact evidence"
+                )
+            }
+            resolved[identity] = evidence
+        }
+        return operations.map { operation in
+            guard let identity = ObjectiveCModuleEvidenceIdentity(operation),
+                  let measured = resolved[identity]
+            else { return operation }
+            var result = operation
+            result.objectiveC?.moduleName = measured.moduleName
+            if measured.property != nil, measured.selectorIsExact {
+                result.objectiveC?.selector = measured.selector
+                result.objectiveC?.selectorIsExact = true
+            }
+            return result
+        }
+    }
+
+    /// Resolves an initializer's allocation module from an exact concrete type
+    /// match. Ordinary methods use their declaration USR instead because a
+    /// category can live outside its Objective-C class's framework.
+    func applyingObjectiveCInitializerTypeModules(
+        to operations: [ImportedOperation],
+        importedTypes: [ImportedNativeType]
+    ) throws -> [ImportedOperation] {
+        func runtimeBaseName(_ raw: String) -> String {
+            var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if value.hasPrefix("__C.") { value.removeFirst("__C.".count) }
+            if let generic = value.firstIndex(of: "<") {
+                value = String(value[..<generic])
+            }
+            return value.split(separator: ".").last.map(String.init) ?? value
+        }
+
+        var modulesByRuntimeName: [String: Set<String>] = [:]
+        for type in importedTypes {
+            guard let module = type.objectiveCModuleName else { continue }
+            let names = Set(
+                [type.canonicalName, type.swiftType] + type.aliases
+            ).map(runtimeBaseName)
+            for name in names where !name.isEmpty {
+                modulesByRuntimeName[name, default: []].insert(module)
+            }
+        }
+        return try operations.map { operation in
+            guard operation.objectiveC?.moduleName == nil,
+                  operation.objectiveC?.methodFamily == .initializer,
+                  let runtimeName = operation.objectiveC?.dispatchClassName,
+                  let candidates = modulesByRuntimeName[runtimeName]
+            else { return operation }
+            guard candidates.count == 1, let module = candidates.first else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "Objective-C runtime class \(runtimeName) has ambiguous module provenance"
+                )
+            }
+            var result = operation
+            result.objectiveC?.moduleName = module
+            return result
+        }
+    }
+
+    /// Applies the module that contains the exact Clang declaration. This is
+    /// deliberately separate from class provenance because Objective-C
+    /// categories can declare methods on a class owned by another framework.
+    func applyingObjectiveCDeclarationModules(
+        to operations: [ImportedOperation],
+        modulesByUSR: [String: String]
+    ) -> [ImportedOperation] {
+        operations.map { operation in
+            guard operation.objectiveC?.moduleName == nil,
+                  operation.objectiveC?.methodFamily != .initializer,
+                  let usr = operation.objectiveC?.declarationUSR,
+                  let module = modulesByUSR[usr]
+            else { return operation }
+            var result = operation
+            result.objectiveC?.moduleName = module
+            return result
         }
     }
 
@@ -1089,8 +1224,9 @@ extension FrontendReceipt.Adapter {
             propertyType = isolated
         }
 
+        let staticReceiver = exactMetatypeReceiver(in: base)
         let staticOwner = importedMetatypeInstanceType(
-            base["type"],
+            staticReceiver?["type"],
             demangled: demangled
         )
         let instanceOwner = importedSwiftType(
@@ -1099,42 +1235,43 @@ extension FrontendReceipt.Adapter {
         )
         guard var receiverType = staticOwner ?? instanceOwner else { return }
         let isStatic = staticOwner != nil
+        let objectiveCDispatchClassName = isStatic
+            ? (staticReceiver?["type"] as? String).flatMap {
+                let names = Self.objectiveCClassNames(inMangledType: $0)
+                return names.count == 1 ? names[0] : nil
+            }
+            : nil
         let marker = accessor == .instanceSetter ? "setter" : "getter"
         let expectedLocation = sourceRange(in: expression).flatMap {
             sourceLocation(atUTF8Offset: $0.start, in: source)
         }
         var references: [String]
         var foreignTypeEvidence: ForeignMemberTypeEvidence?
+        var foreignDispatch: CanonicalSIL.NativeBridgeSymbols.ForeignDispatch =
+            .ordinary
         let isObjectiveCProperty = usr.hasPrefix("c:")
             && (usr.contains("(py)") || usr.contains("(cpy)"))
         if isObjectiveCProperty {
-            let physicalOwner = objectiveCPropertyOwner(usr)
-            let ownerTypes = Set(
-                [receiverType, nominalBaseName(receiverType)]
-                    + [physicalOwner].compactMap { $0 }
-            )
-            references = Array(Set(ownerTypes.flatMap { ownerType in
-                Self.foreignMemberReferences(
-                    in: function.body,
-                    ownerType: ownerType,
-                    baseName: baseName,
-                    marker: marker
-                )
-            })).sorted()
-            if references.isEmpty {
-                references = renamedForeignMemberReferences(
-                    in: function,
-                    baseName: baseName,
-                    marker: marker,
-                    sourceLocation: expectedLocation
-                )
-            }
             foreignTypeEvidence = foreignMemberTypeEvidence(
                 in: function,
                 baseName: baseName,
                 marker: marker,
                 sourceLocation: expectedLocation
             )
+            if let evidence = foreignTypeEvidence {
+                references = [evidence.symbol]
+                foreignDispatch = evidence.foreignDispatch
+            } else if let reference = renamedForeignMemberReference(
+                    in: function,
+                    baseName: baseName,
+                    marker: marker,
+                    sourceLocation: expectedLocation
+            ) {
+                references = [reference.symbol]
+                foreignDispatch = reference.dispatch
+            } else {
+                references = []
+            }
         } else if let reference = swiftPropertyReference(
             usr: usr,
             accessor: accessor,
@@ -1210,6 +1347,16 @@ extension FrontendReceipt.Adapter {
             labels = []
             resultType = propertyType
         }
+        let objectiveC = foreignTypeEvidence.flatMap {
+            objectiveCPropertyEvidence(
+                usr: usr,
+                importedBaseName: baseName,
+                dispatch: dispatch,
+                loweredType: $0.loweredType,
+                foreignDispatch: foreignDispatch,
+                dispatchClassName: objectiveCDispatchClassName
+            )
+        }
         operations.append(
             .init(
                 silReferences: references,
@@ -1222,6 +1369,8 @@ extension FrontendReceipt.Adapter {
                 parameterSwiftTypes: parameterTypes,
                 resultSwiftType: resultType,
                 requiresMainActor: requiresMainActor,
+                foreignDispatch: foreignDispatch,
+                objectiveC: objectiveC,
                 witnessFunctions: [function.mangledName]
             )
         )
@@ -1234,6 +1383,12 @@ extension FrontendReceipt.Adapter {
         /// Source-callable receiver spelling captured from `#Owner.member`.
         /// Nil for ordinary Swift function references and global functions.
         var foreignOwnerType: String? = nil
+        /// `super_method` is lexical dispatch; ordinary method references use
+        /// dynamic or class dispatch according to their declaration.
+        var foreignDispatch: CanonicalSIL.NativeBridgeSymbols.ForeignDispatch =
+            .ordinary
+
+        var isSuperDispatch: Bool { foreignDispatch == .superclass }
     }
 
     private func recordImportedSwiftCall(
@@ -1329,14 +1484,14 @@ extension FrontendReceipt.Adapter {
             ownerType = resultType
         } else if functionExpression["_kind"] as? String == "dot_syntax_call_expr",
                   let implicit = implicitReceiver(in: functionExpression) {
-            if implicit["_kind"] as? String == "type_expr" {
+            if let exactStaticReceiver = exactMetatypeReceiver(in: implicit) {
                 guard let owner = importedMetatypeInstanceType(
-                    implicit["type"],
+                    exactStaticReceiver["type"],
                     demangled: demangled
                 ) else { return }
                 dispatch = .staticMethod
                 ownerType = owner
-                staticOwner = implicit
+                staticOwner = exactStaticReceiver
             } else {
                 guard let owner = importedSwiftType(
                     implicit["type"],
@@ -1351,6 +1506,21 @@ extension FrontendReceipt.Adapter {
         } else {
             dispatch = .globalFunction
             ownerType = importedGlobalFunctionOwner(usr: usr)
+        }
+        let objectiveCDispatchClassName: String? = switch dispatch {
+        case .initializer:
+            (expression["type"] as? String).flatMap {
+                Self.objectiveCNominalIdentity(inMangledType: $0)
+            }
+        case .staticMethod:
+            (staticOwner?["type"] as? String).flatMap {
+                let names = Self.objectiveCClassNames(inMangledType: $0)
+                return names.count == 1 ? names[0] : nil
+            }
+        case .globalFunction, .instanceMethod, .nativeUpcast, .anyObjectBridge,
+             .staticGetter, .staticSetter, .instanceGetter, .instanceSetter,
+             .instanceValueSetter:
+            nil
         }
         guard Self.isSwiftIdentifier(baseName)
                 || dispatch == .globalFunction
@@ -1502,6 +1672,18 @@ extension FrontendReceipt.Adapter {
         }
         let invocationParameterSwiftTypes = invocationParameterTypes == parameterTypes
             ? nil : invocationParameterTypes
+        let objectiveC = objectiveCMethodEvidence(
+            usr: usr,
+            ownerType: ownerType,
+            importedModules: importedModules,
+            dispatch: dispatch,
+            call: call,
+            physicalParameters: physicalParameters,
+            physicalParameterIndices: physicalParameterIndices,
+            parameterProjection: parameterProjection,
+            usesNSErrorBridge: usesNSErrorBridge,
+            dispatchClassName: objectiveCDispatchClassName
+        )
 
         // Default argument values stay in the type environment so canonical
         // SIL can validate their compiler-only storage, but they do not cross
@@ -1619,6 +1801,8 @@ extension FrontendReceipt.Adapter {
                 requiresMainActor: requiresMainActor,
                 mayThrow: expression["throws"] != nil
                     || call.loweredType.contains("@error"),
+                foreignDispatch: call.foreignDispatch,
+                objectiveC: objectiveC,
                 witnessFunctions: [function.mangledName]
             )
         )
@@ -1644,6 +1828,227 @@ extension FrontendReceipt.Adapter {
              .instanceValueSetter:
             return Array(physical.prefix(logicalCount))
         }
+    }
+
+    private func objectiveCMethodEvidence(
+        usr: String,
+        ownerType: String,
+        importedModules: [String],
+        dispatch: NativeImportDiscovery.Dispatch,
+        call: ImportedSILCall,
+        physicalParameters: [String],
+        physicalParameterIndices: [Int],
+        parameterProjection: InterfaceArchive.NativeImportParameterProjection,
+        usesNSErrorBridge: Bool,
+        dispatchClassName: String?
+    ) -> FrontendReceipt.ObjectiveCABI.Evidence? {
+        guard let identity = FrontendReceipt.ObjectiveCABI.methodIdentity(usr: usr),
+              let physicalResult = physicalResultSpelling(in: call.loweredType)
+        else { return nil }
+        guard dispatch == .instanceMethod || dispatchClassName?.isEmpty == false
+        else { return nil }
+        let moduleName = dispatch == .initializer
+            ? FrontendReceipt.ObjectiveCABI.moduleName(
+                ownerType: ownerType,
+                importedModules: importedModules
+            )
+            : nil
+
+        let nativeDispatch: Core.NativeCall.Dispatch
+        switch dispatch {
+        case .initializer:
+            guard !identity.isClassMethod else { return nil }
+            nativeDispatch = .initializer
+        case .staticMethod:
+            guard identity.isClassMethod else { return nil }
+            nativeDispatch = .static
+        case .instanceMethod:
+            guard !identity.isClassMethod else { return nil }
+            nativeDispatch = .instance
+        case .globalFunction, .nativeUpcast, .anyObjectBridge, .staticGetter,
+             .staticSetter, .instanceGetter, .instanceSetter,
+             .instanceValueSetter:
+            return nil
+        }
+
+        guard physicalParameterIndices.count <= UInt16.max else { return nil }
+        let logicalByPhysical: [Int: UInt16] = Dictionary(uniqueKeysWithValues:
+            physicalParameterIndices.enumerated().compactMap { logical, physical in
+                guard let logicalIndex = UInt16(exactly: logical) else {
+                    return nil
+                }
+                return (physical, logicalIndex)
+            }
+        )
+        guard logicalByPhysical.count == physicalParameterIndices.count else {
+            return nil
+        }
+        let defaultsByPhysical = Dictionary(uniqueKeysWithValues:
+            parameterProjection.defaultArguments.map {
+                (Int($0.physicalParameterIndex), $0)
+            }
+        )
+        let receiverPhysicalIndex = dispatch == .instanceMethod
+            ? physicalParameterIndices.last : nil
+        var sawErrorOut = false
+        var parameters: [FrontendReceipt.ObjectiveCABI.Parameter] = []
+        for physicalIndex in physicalParameters.indices
+        where physicalIndex != receiverPhysicalIndex {
+            let source: Core.NativeCall.ArgumentSource
+            if let logical = logicalByPhysical[physicalIndex] {
+                source = .argument(logical)
+            } else if usesNSErrorBridge,
+                      !sawErrorOut,
+                      physicalParameters[physicalIndex].contains(
+                          "AutoreleasingUnsafeMutablePointer<Optional<NSError>>"
+                      ) {
+                source = .errorOut
+                sawErrorOut = true
+            } else if let value = defaultsByPhysical[physicalIndex] {
+                switch value.origin {
+                case .optionalNone:
+                    source = .optionalNone
+                case .externalGenerator:
+                    guard let symbol = value.generatorSymbol else { return nil }
+                    source = .defaultGenerator(symbol)
+                }
+            } else {
+                return nil
+            }
+            parameters.append(.init(
+                swiftABIType: physicalParameters[physicalIndex],
+                source: source
+            ))
+        }
+        guard sawErrorOut == usesNSErrorBridge,
+              identity.selector.filter({ $0 == ":" }).count == parameters.count
+        else { return nil }
+        let family = FrontendReceipt.ObjectiveCABI.methodFamily(
+            selector: identity.selector,
+            dispatch: nativeDispatch,
+            resultSwiftABIType: physicalResult
+        )
+        let lexicalSuperclassName: String?
+        if call.isSuperDispatch {
+            // `super.init` initializes an already allocated subclass instance;
+            // the generic initializer path instead allocates its cataloged
+            // class. Preserve the exact Swift adapter for that distinct ABI.
+            guard nativeDispatch == .instance else { return nil }
+            guard let owner = call.foreignOwnerType else { return nil }
+            let components = owner.split(separator: ".").map(String.init)
+            guard let runtimeName = components.last,
+                  components.count == 1
+                    || importedModules.contains(components[0])
+            else { return nil }
+            lexicalSuperclassName = runtimeName
+        } else {
+            lexicalSuperclassName = nil
+        }
+        return .init(
+            moduleName: moduleName,
+            declarationUSR: usr,
+            // An inherited initializer's Clang USR names its declaration
+            // owner (often NSObject), while Swift's constructor expression
+            // names the concrete class that must be allocated.
+            runtimeClassName: identity.runtimeClassName,
+            dispatchClassName: dispatchClassName,
+            selector: identity.selector,
+            lexicalSuperclassName: lexicalSuperclassName,
+            methodFamily: family,
+            property: nil,
+            parameters: parameters,
+            resultSwiftABIType: physicalResult,
+            resultConvention: FrontendReceipt.ObjectiveCABI.resultConvention(
+                swiftABIType: physicalResult,
+                methodFamily: family
+            ),
+            errorConvention: usesNSErrorBridge ? .nsErrorOut : .none,
+            errorFailure: usesNSErrorBridge ? .falseBoolean : nil
+        )
+    }
+
+    private func objectiveCPropertyEvidence(
+        usr: String,
+        importedBaseName: String,
+        dispatch: NativeImportDiscovery.Dispatch,
+        loweredType: String,
+        foreignDispatch: CanonicalSIL.NativeBridgeSymbols.ForeignDispatch,
+        dispatchClassName: String?
+    ) -> FrontendReceipt.ObjectiveCABI.Evidence? {
+        guard let identity = FrontendReceipt.ObjectiveCABI.propertyIdentity(usr: usr),
+              let physicalResult = physicalResultSpelling(in: loweredType)
+        else { return nil }
+        let accessor: Core.NativeCall.ObjectiveCPropertyAccessor
+        let isInstance: Bool
+        switch dispatch {
+        case .instanceGetter:
+            accessor = .getter
+            isInstance = true
+        case .instanceSetter:
+            accessor = .setter
+            isInstance = true
+        case .staticGetter:
+            accessor = .getter
+            isInstance = false
+        case .staticSetter:
+            accessor = .setter
+            isInstance = false
+        case .globalFunction, .initializer, .staticMethod, .nativeUpcast,
+             .anyObjectBridge, .instanceMethod, .instanceValueSetter:
+            return nil
+        }
+        guard identity.isClassProperty == !isInstance,
+              isInstance || dispatchClassName?.isEmpty == false,
+              foreignDispatch == .ordinary || isInstance,
+              let selector = FrontendReceipt.ObjectiveCABI.propertySelectorProbeSeed(
+                  name: identity.name,
+                  accessor: accessor,
+                  importedBaseName: importedBaseName
+              )
+        else { return nil }
+        var physicalParameters = physicalParameterSpellings(in: loweredType)
+            .filter { !isPhysicalMetatypeParameter($0) }
+        if isInstance {
+            guard !physicalParameters.isEmpty else { return nil }
+            physicalParameters.removeLast()
+        }
+        let expectedCount = accessor == .setter ? 1 : 0
+        guard physicalParameters.count == expectedCount,
+              selector.filter({ $0 == ":" }).count == expectedCount
+        else { return nil }
+        let parameters = physicalParameters.enumerated().compactMap {
+            index, swiftType -> FrontendReceipt.ObjectiveCABI.Parameter? in
+            guard let logical = UInt16(exactly: index) else { return nil }
+            return .init(swiftABIType: swiftType, source: .argument(logical))
+        }
+        guard parameters.count == physicalParameters.count else { return nil }
+        let methodFamily = accessor == .getter
+            ? FrontendReceipt.ObjectiveCABI.methodFamily(
+                selector: selector,
+                dispatch: isInstance ? .instance : .static,
+                resultSwiftABIType: physicalResult
+            )
+            : .none
+        return .init(
+            moduleName: nil,
+            declarationUSR: usr,
+            runtimeClassName: identity.runtimeClassName,
+            dispatchClassName: dispatchClassName,
+            selector: selector,
+            selectorIsExact: false,
+            lexicalSuperclassName: foreignDispatch == .superclass
+                ? identity.runtimeClassName : nil,
+            methodFamily: methodFamily,
+            property: .init(name: identity.name, accessor: accessor),
+            parameters: parameters,
+            resultSwiftABIType: physicalResult,
+            resultConvention: FrontendReceipt.ObjectiveCABI.resultConvention(
+                swiftABIType: physicalResult,
+                methodFamily: methodFamily
+            ),
+            errorConvention: .none,
+            errorFailure: nil
+        )
     }
 
     private func callbackGlobalActor(
@@ -2338,6 +2743,8 @@ extension FrontendReceipt.Adapter {
                     let symbol = CanonicalSIL.NativeBridgeSymbols.foreignCall(
                         reference: reference,
                         loweredType: loweredType,
+                        dispatch: line.contains("super_method ")
+                            ? .superclass : .ordinary,
                         genericArguments: genericArguments
                     )
                     methodCandidates.append(
@@ -2349,7 +2756,9 @@ extension FrontendReceipt.Adapter {
                                 foreignOwnerType: Self.foreignOwnerType(
                                     in: reference,
                                     baseName: baseName
-                                )
+                                ),
+                                foreignDispatch: line.contains("super_method ")
+                                    ? .superclass : .ordinary
                             ),
                             location: location
                         )
@@ -2488,6 +2897,27 @@ extension FrontendReceipt.Adapter {
               values.count == 1
         else { return nil }
         return values[0]["expr"] as? [String: Any]
+    }
+
+    /// Clang importer inserts a metatype conversion when a class member is
+    /// inherited, for example `UIButton.setAnimationsEnabled` converts the
+    /// source `UIButton.Type` receiver to the declaring `UIView.Type`. Retain
+    /// the innermost source type as the actual class-message target while the
+    /// declaration USR independently supplies the authorized ABI owner.
+    private func exactMetatypeReceiver(
+        in expression: [String: Any]
+    ) -> [String: Any]? {
+        switch expression["_kind"] as? String {
+        case "type_expr":
+            return expression
+        case "metatype_conversion_expr":
+            guard let child = expression["sub_expr"] as? [String: Any] else {
+                return nil
+            }
+            return exactMetatypeReceiver(in: child)
+        default:
+            return nil
+        }
     }
 
     private func recordImportedEnumCase(
@@ -3115,20 +3545,6 @@ extension FrontendReceipt.Adapter {
         return body.contains("function_ref @\(symbol) ") ? symbol : nil
     }
 
-    private func objectiveCPropertyOwner(_ usr: String) -> String? {
-        guard usr.hasPrefix("c:objc"),
-              let propertyMarker = ["(cpy)", "(py)"].compactMap({
-                  usr.range(of: $0)
-              }).min(by: { $0.lowerBound < $1.lowerBound }),
-              let ownerMarker = ["(cs)", "(pl)"].compactMap({
-                  usr.range(of: $0)
-              }).filter({ $0.upperBound <= propertyMarker.lowerBound })
-                .min(by: { $0.lowerBound < $1.lowerBound })
-        else { return nil }
-        let ownerType = String(usr[ownerMarker.upperBound..<propertyMarker.lowerBound])
-        return Self.isSwiftIdentifier(ownerType) ? ownerType : nil
-    }
-
     private func importedMetatypeInstanceType(
         _ rawType: Any?,
         demangled: [String: String]
@@ -3311,8 +3727,10 @@ extension FrontendReceipt.Adapter {
     }
 
     private struct ForeignMemberTypeEvidence: Hashable {
+        var symbol: String
         var ownerType: String
         var loweredType: String
+        var foreignDispatch: CanonicalSIL.NativeBridgeSymbols.ForeignDispatch
     }
 
     private func foreignMemberTypeEvidence(
@@ -3344,55 +3762,29 @@ extension FrontendReceipt.Adapter {
                           baseName: baseName
                       )
                 else { return nil }
+                let loweredType = debugMetadataStrippedSuffix(
+                    String(line[loweredMarker.upperBound...])
+                )
+                let dispatch: CanonicalSIL.NativeBridgeSymbols.ForeignDispatch =
+                    line.contains("super_method ") ? .superclass : .ordinary
                 return .init(
                     evidence: .init(
+                        symbol: CanonicalSIL.NativeBridgeSymbols.foreignCall(
+                            reference: reference,
+                            loweredType: loweredType,
+                            dispatch: dispatch
+                        ),
                         ownerType: owner,
-                        loweredType: debugMetadataStrippedSuffix(
-                            String(line[loweredMarker.upperBound...])
-                        )
+                        loweredType: loweredType,
+                        foreignDispatch: dispatch
                     ),
                     location: function.sourceLocation(atBodyLine: offset + 1)
                 )
             })
-        if let sourceLocation {
-            let exact = Set(candidates.compactMap { candidate in
-                candidate.location == sourceLocation ? candidate.evidence : nil
-            })
-            if exact.count == 1 { return exact.first }
-            let lineMatches = Set(candidates.compactMap { candidate in
-                candidate.location?.line == sourceLocation.line
-                    ? candidate.evidence : nil
-            })
-            if lineMatches.count == 1 { return lineMatches.first }
-        }
-        let evidence = Set(candidates.map(\.evidence))
-        return evidence.count == 1 ? evidence.first : nil
-    }
-
-    static func foreignMemberReferences(
-        in body: String,
-        ownerType: String,
-        baseName: String,
-        marker: String
-    ) -> [String] {
-        return Array(Set(body.split(separator: "\n").compactMap { rawLine -> String? in
-            let line = String(rawLine)
-            guard line.contains("_method "),
-                  let hash = line.firstIndex(of: "#"),
-                  let separator = line[hash...].range(of: " : "),
-                  let loweredMarker = line.range(of: ", $", options: .backwards)
-            else { return nil }
-            let reference = String(line[hash..<separator.lowerBound])
-            guard reference.hasPrefix("#\(ownerType)."),
-                  foreignReference(reference, hasBaseName: baseName),
-                  reference.contains("!\(marker)"),
-                  reference.hasSuffix(".foreign")
-            else { return nil }
-            return CanonicalSIL.NativeBridgeSymbols.foreignCall(
-                reference: reference,
-                loweredType: String(line[loweredMarker.upperBound...])
-            )
-        })).sorted()
+        return uniquelySourceMatched(
+            candidates.map { ($0.evidence, $0.location) },
+            sourceLocation: sourceLocation
+        )
     }
 
     private static func foreignReference(
@@ -3420,14 +3812,19 @@ extension FrontendReceipt.Adapter {
         return nil
     }
 
-    private func renamedForeignMemberReferences(
+    private struct ForeignMemberReference: Hashable {
+        var symbol: String
+        var dispatch: CanonicalSIL.NativeBridgeSymbols.ForeignDispatch
+    }
+
+    private func renamedForeignMemberReference(
         in function: CanonicalSIL.Function,
         baseName: String,
         marker: String,
         sourceLocation: Core.SourceLocation?
-    ) -> [String] {
+    ) -> ForeignMemberReference? {
         struct Candidate: Hashable {
-            var symbol: String
+            var reference: ForeignMemberReference
             var location: Core.SourceLocation?
         }
 
@@ -3445,30 +3842,73 @@ extension FrontendReceipt.Adapter {
                   reference.contains("!\(marker)"),
                   reference.hasSuffix(".foreign")
             else { return nil }
+            let dispatch: CanonicalSIL.NativeBridgeSymbols.ForeignDispatch =
+                line.contains("super_method ") ? .superclass : .ordinary
+            let loweredType = debugMetadataStrippedSuffix(
+                String(line[loweredMarker.upperBound...])
+            )
             return Candidate(
-                symbol: CanonicalSIL.NativeBridgeSymbols.foreignCall(
-                    reference: reference,
-                    loweredType: String(line[loweredMarker.upperBound...])
+                reference: .init(
+                    symbol: CanonicalSIL.NativeBridgeSymbols.foreignCall(
+                        reference: reference,
+                        loweredType: loweredType,
+                        dispatch: dispatch
+                    ),
+                    dispatch: dispatch
                 ),
                 location: function.sourceLocation(atBodyLine: offset + 1)
             )
         }))
+        return uniquelySourceMatched(
+            candidates.map { ($0.reference, $0.location) },
+            sourceLocation: sourceLocation
+        )
+    }
+
+    /// Typed AST ranges and SIL instruction locations can point at different
+    /// tokens within the same member expression (for example, the receiver
+    /// versus the property name). Exact locations remain authoritative; when
+    /// a source line contains multiple otherwise identical foreign members,
+    /// a unique nearest column preserves their lexical ordering without
+    /// guessing across lines or accepting ties.
+    private func uniquelySourceMatched<Value: Hashable>(
+        _ candidates: [(value: Value, location: Core.SourceLocation?)],
+        sourceLocation: Core.SourceLocation?
+    ) -> Value? {
         if let sourceLocation {
-            let exact = Set(candidates.compactMap { candidate -> String? in
-                guard candidate.location?.line == sourceLocation.line,
-                      candidate.location?.column == sourceLocation.column
-                else { return nil }
-                return candidate.symbol
+            let exact = Set(candidates.compactMap { candidate in
+                candidate.location == sourceLocation ? candidate.value : nil
             })
-            if exact.count == 1 { return exact.sorted() }
-            let lineMatches = Set(candidates.compactMap { candidate -> String? in
-                candidate.location?.line == sourceLocation.line
-                    ? candidate.symbol : nil
-            })
-            if lineMatches.count == 1 { return lineMatches.sorted() }
+            if exact.count == 1 { return exact.first }
+
+            let lineCandidates = candidates.filter { candidate in
+                candidate.location?.file == sourceLocation.file
+                    && candidate.location?.line == sourceLocation.line
+            }
+            let lineValues = Set(lineCandidates.map(\.value))
+            if lineValues.count == 1 { return lineValues.first }
+            if !lineCandidates.isEmpty {
+                let distances = lineCandidates.compactMap { candidate in
+                    candidate.location.map {
+                        abs($0.column - sourceLocation.column)
+                    }
+                }
+                if let minimum = distances.min() {
+                    let nearest = Set<Value>(
+                        lineCandidates.compactMap { candidate in
+                            guard let location = candidate.location,
+                                  abs(location.column - sourceLocation.column)
+                                    == minimum
+                            else { return nil }
+                            return candidate.value
+                        }
+                    )
+                    if nearest.count == 1 { return nearest.first }
+                }
+            }
         }
-        let symbols = Set(candidates.map(\.symbol))
-        return symbols.count == 1 ? symbols.sorted() : []
+        let values = Set(candidates.map(\.value))
+        return values.count == 1 ? values.first : nil
     }
 
     private func mergeOperationTypes(
@@ -3492,6 +3932,22 @@ extension FrontendReceipt.Adapter {
                         "imported operation \(value.ownerType).\(value.baseName) "
                             + "has conflicting typed call sites"
                     )
+                }
+                switch (existing.objectiveC, value.objectiveC) {
+                case let (.some(lhs), .some(rhs)):
+                    guard lhs == rhs else {
+                        let fields = objectiveCABIConflictFields(lhs, rhs)
+                            .joined(separator: ", ")
+                        throw FrontendReceipt.Error.invalidRequest(
+                            "imported operation \(value.ownerType).\(value.baseName) "
+                                + "has conflicting Objective-C ABI evidence "
+                                + "(differing fields: \(fields))"
+                        )
+                    }
+                case (.none, .some):
+                    existing.objectiveC = value.objectiveC
+                case (.some, .none), (.none, .none):
+                    break
                 }
                 switch (existing.isolationEvidence, value.isolationEvidence) {
                 case (.importedDeclaration, .importedDeclaration):
@@ -3557,6 +4013,41 @@ extension FrontendReceipt.Adapter {
                        $1.sourceFileLogicalID)
             return lhs < rhs
         }
+    }
+
+    private func objectiveCABIConflictFields(
+        _ lhs: FrontendReceipt.ObjectiveCABI.Evidence,
+        _ rhs: FrontendReceipt.ObjectiveCABI.Evidence
+    ) -> [String] {
+        var fields: [String] = []
+        if lhs.moduleName != rhs.moduleName { fields.append("moduleName") }
+        if lhs.declarationUSR != rhs.declarationUSR {
+            fields.append("declarationUSR")
+        }
+        if lhs.runtimeClassName != rhs.runtimeClassName {
+            fields.append("runtimeClassName")
+        }
+        if lhs.dispatchClassName != rhs.dispatchClassName {
+            fields.append("dispatchClassName")
+        }
+        if lhs.selector != rhs.selector { fields.append("selector") }
+        if lhs.lexicalSuperclassName != rhs.lexicalSuperclassName {
+            fields.append("lexicalSuperclassName")
+        }
+        if lhs.methodFamily != rhs.methodFamily { fields.append("methodFamily") }
+        if lhs.property != rhs.property { fields.append("property") }
+        if lhs.parameters != rhs.parameters { fields.append("parameters") }
+        if lhs.resultSwiftABIType != rhs.resultSwiftABIType {
+            fields.append("resultSwiftABIType")
+        }
+        if lhs.resultConvention != rhs.resultConvention {
+            fields.append("resultConvention")
+        }
+        if lhs.errorConvention != rhs.errorConvention {
+            fields.append("errorConvention")
+        }
+        if lhs.errorFailure != rhs.errorFailure { fields.append("errorFailure") }
+        return fields.isEmpty ? ["unknown"] : fields
     }
 
     func applyingSwiftTypeAliases(

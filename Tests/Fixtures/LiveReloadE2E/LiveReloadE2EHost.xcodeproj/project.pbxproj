@@ -17,6 +17,7 @@
 		40000000000000000000000C /* HelixAppIntegration in Frameworks */ = {isa = PBXBuildFile; productRef = 710000000000000000000002 /* HelixAppIntegration */; };
 		40000000000000000000000D /* DevRuntimeIOSTests.UIKit.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10000000000000000000000B /* DevRuntimeIOSTests.UIKit.swift */; };
 		40000000000000000000000E /* HelixAppIntegration in Frameworks */ = {isa = PBXBuildFile; productRef = 710000000000000000000001 /* HelixAppIntegration */; };
+		40000000000000000000000F /* HelixDevRuntime in Frameworks */ = {isa = PBXBuildFile; productRef = 710000000000000000000003 /* HelixDevRuntime */; };
 		3E2AA715D510D586A999DD7A = { fileRef = EC32AB1AF8C0463FB895017F; isa = PBXBuildFile; };
 /* End PBXBuildFile section */
 
@@ -81,7 +82,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				40000000000000000000000E /* HelixAppIntegration in Frameworks */,
+				40000000000000000000000F /* HelixDevRuntime in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -150,7 +151,7 @@
 		200000000000000000000001 = { buildConfigurationList = 600000000000000000000002; buildPhases = (300000000000000000000001, 5748D160830FE75172F55B9E, 300000000000000000000002, ); buildRules = (); dependencies = (); isa = PBXNativeTarget; name = LiveReloadE2E; packageProductDependencies = (); productName = LiveReloadE2E; productReference = 100000000000000000000006; productType = com.apple.product-type.framework; };
 		200000000000000000000003 = { buildConfigurationList = 600000000000000000000004; buildPhases = (2F6BCED05D520342733663AB, 300000000000000000000005, 300000000000000000000006, 300000000000000000000007, FC17224651506E983082E046, B4DB999E861D51E9CBC69CDB, ); buildRules = (); dependencies = (); isa = PBXNativeTarget; name = LiveReloadE2EHost; packageProductDependencies = (710000000000000000000001, 1B80FC2F8C2C376290B7C42D, ); productName = LiveReloadE2EHost; productReference = 100000000000000000000008; productType = com.apple.product-type.application; };
 		200000000000000000000004 = { buildConfigurationList = 600000000000000000000005; buildPhases = (300000000000000000000009, 300000000000000000000008, ); buildRules = (); dependencies = (); isa = PBXNativeTarget; name = ReleaseRuntimeHost; packageProductDependencies = (710000000000000000000002, ); productName = ReleaseRuntimeHost; productReference = 10000000000000000000000A; productType = com.apple.product-type.application; };
-		200000000000000000000005 = { buildConfigurationList = 600000000000000000000006; buildPhases = (30000000000000000000000B, 30000000000000000000000A, ); buildRules = (); dependencies = (); isa = PBXNativeTarget; name = LiveReloadUIKitTests; packageProductDependencies = (710000000000000000000001, ); productName = LiveReloadUIKitTests; productReference = 10000000000000000000000C; productType = com.apple.product-type.bundle.unit-test; };
+		200000000000000000000005 = { buildConfigurationList = 600000000000000000000006; buildPhases = (30000000000000000000000B, 30000000000000000000000A, ); buildRules = (); dependencies = (); isa = PBXNativeTarget; name = LiveReloadUIKitTests; packageProductDependencies = (710000000000000000000003, ); productName = LiveReloadUIKitTests; productReference = 10000000000000000000000C; productType = com.apple.product-type.bundle.unit-test; };
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -448,6 +449,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 700000000000000000000001 /* XCLocalSwiftPackageReference "../../.." */;
 			productName = HelixAppIntegration;
+		};
+		710000000000000000000003 /* HelixDevRuntime */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 700000000000000000000001 /* XCLocalSwiftPackageReference "../../.." */;
+			productName = HelixDevRuntime;
 		};
 		1B80FC2F8C2C376290B7C42D = { isa = XCSwiftPackageProductDependency; package = 700000000000000000000001; productName = HelixDevSupport; };
 /* End XCSwiftPackageProductDependency section */

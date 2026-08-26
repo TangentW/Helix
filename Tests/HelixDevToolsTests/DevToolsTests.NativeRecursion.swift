@@ -105,16 +105,21 @@ struct NativeRecursion {
         try sourceData.write(to: sourceURL, options: .atomic)
 
         let modules = try swiftPMModulesDirectory()
-        let moduleMap = modules.deletingLastPathComponent()
-            .appendingPathComponent("HelixRuntimeSupport.build/module.modulemap")
+        let buildRoot = modules.deletingLastPathComponent()
+        let moduleMaps = [
+            "HelixRuntimeSupport",
+            "HelixObjectiveCRuntimeSupport",
+        ].map {
+            buildRoot.appendingPathComponent("\($0).build/module.modulemap")
+        }
         let moduleCache = directory.appendingPathComponent("ModuleCache", isDirectory: true)
         let compiler = SwiftFrontend.Driver(compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc"))
         let platformArguments = try macOSPlatformArguments()
-        let importArguments = [
-            "-I", modules.path,
-            "-Xcc", "-fmodule-map-file=\(moduleMap.path)",
-            "-module-cache-path", moduleCache.path,
-        ]
+        let importArguments = ["-I", modules.path]
+            + moduleMaps.flatMap {
+                ["-Xcc", "-fmodule-map-file=\($0.path)"]
+            }
+            + ["-module-cache-path", moduleCache.path]
         let ast = try compiler.run(
             arguments: [
                 "-frontend", "-dump-ast", "-dump-ast-format", "json",

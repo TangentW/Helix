@@ -250,16 +250,14 @@ struct Identities {
             try dishonestGetter.validate(effects: .init(hasExternalSideEffects: true))
         }
 
-        let offActorUIKit = Core.NativeImportContract.bounded(
+        let nonisolatedUIKit = Core.NativeImportContract.bounded(
             kind: .instanceMethod,
             domain: .uiKit,
             access: .read,
             maximumDurationMicroseconds: 500,
             allowsMainThread: true
         )
-        #expect(throws: Core.NativeImportContractError.self) {
-            try offActorUIKit.validate(effects: .init())
-        }
+        try nonisolatedUIKit.validate(effects: .init())
 
         let oversizedMainThreadWork = Core.NativeImportContract.cooperative(
             kind: .serviceMethod,

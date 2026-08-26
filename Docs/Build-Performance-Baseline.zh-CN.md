@@ -87,8 +87,40 @@ Hot Patch 输入稳定，重复构建既没有重新生成 frontend，也没有�
 Stage 1 已在对应缓存 key 中纳入工具链、SDK build、target、minimum OS、语义参数、
 输入内容 hash 和生成器版本；只复用经过验证的确定性事实与产物；未命中时完整回退到
 权威 frontend；相同字节不重写。这个优化没有降低未来原生 API 的覆盖目标。
+转换指纹也覆盖生成 Interface 与 NativeCall Descriptor 的语义；工具更新后会自动让
+旧的本地事实失效，不要求开发者手工清理 DerivedData，也不需要修改协议版本。
 
 剩余的结构性成本来自生成调用面的体积：Live Reload 会话可能改变 Bridge 输入，真正
 miss 时编译大量固定 Swift wrapper 仍然昂贵。后续由 descriptor 驱动的 Objective-C/C
 通用调用器和可缓存 Swift Adapter Pack 会解决这部分成本，同时不会重新引入手工 API
 白名单。
+
+## Stage 3 实测结果
+
+Objective-C 通用执行阶段使用真实 Demo 做了 8 代连续 Live Reload。测试在同一个模拟器
+进程中覆盖了 view hierarchy 修改、按钮配置、动画 completion、页面 present、dismiss
+以及恢复基线。最终 Shell 一共有 479 条 NativeImport，其中 388 条复用同一个
+Objective-C Invoker，87 条保留精确生成的 Swift Adapter，另有 4 条 builtin factory。
+
+这个结果证明，落在支持矩阵内的 Objective-C selector 已经不会再各自生成一段 Swift
+调用函数。同时，实测也明确暴露了下一处结构性成本，没有把它包装成已经解决：
+
+| 实测项 | 结果 |
+| --- | ---: |
+| Descriptor 缓存失效后的冷 Prepare | 27.320 s |
+| 冷 Prepare 中的 Managed Debug 展开 | 21.020 s |
+| 当次 Bridge 总耗时 | 13.844 s |
+| Bridge 中的 Swift 编译 | 13.017 s |
+| 同一 Hub 会话内缓存预热后的无改动 Prepare | 2.085 s |
+| 立即无改动 Bridge | 13.779 s |
+| 生成的 Swift 源码总量 | 3,164,111 bytes |
+| 主 Bridge 文件 | 2,825,004 bytes |
+| NativeImport shards | 约 202 KiB |
+
+预热后的 Prepare 没有再执行 Typed AST、SIL 或 symbol graph；frontend lookup 为
+0.286 s，materialize 为 1.626 s。Bridge 仍然 miss，是因为每次构建都会生成新的 Live
+Reload session contract，导致 3.1 MB 源码再次编译。现在主要体积来自主 Bridge 中较为
+冗长的 Descriptor literal，而不是逐 selector 的可执行 wrapper。因此，本阶段改善了
+执行架构并保留了覆盖能力，但不声称已经达到最终无改动延迟目标。后续 Live Reload
+阶段还需要完成紧凑 Descriptor table、复用仍然有效的 Hub reservation，以及稳定的
+Adapter Pack 输入。

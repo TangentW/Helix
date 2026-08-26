@@ -480,12 +480,13 @@ public final class InvocationBudget: @unchecked Sendable {
         }
     }
 
-    func beginNativeInvocation(
+    package func beginNativeInvocation(
         id: Core.NativeImportID,
         effects: Core.Effects,
         contract: Core.NativeImportContract,
         parameterTypes: [Bytecode.ValueType] = [],
         callbackHost: VM.NativeCallbackHost? = nil,
+        nativeTypeCatalog: VM.NativeTypeCatalog = .init(),
         isMainThread: Bool = Thread.isMainThread
     ) throws -> VM.NativeInvocationContext {
         try contract.validate(effects: effects)
@@ -524,7 +525,8 @@ public final class InvocationBudget: @unchecked Sendable {
                     && effects.requiresMainActor,
                 callbacks: contract.callbacks,
                 parameterTypes: parameterTypes,
-                callbackHost: callbackHost
+                callbackHost: callbackHost,
+                nativeTypeCatalog: nativeTypeCatalog
             )
         }
     }

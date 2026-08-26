@@ -1,6 +1,6 @@
 # 原生调用身份与 Catalog
 
-本文记录 Helix 已实现的版本 1 原生调用基线：HLBC 要调用 App 中已有代码时，如何描述这次调用、如何确定稳定身份，以及每一层如何验证权限。这里不会把后续能力提前写成已经完成：稳定 Descriptor、Key、Catalog、Archive、Bytecode、Verifier 与 Runtime 合同已经落地；Objective-C/C 通用调用器和可复用 Swift Adapter Pack 会在后续阶段接入。
+本文记录 Helix 已实现的版本 1 原生调用基线：HLBC 要调用 App 中已有代码时，如何描述这次调用、如何确定稳定身份，以及每一层如何验证权限。这里不会把后续能力提前写成已经完成：稳定 Descriptor、Key、Catalog、Archive、Bytecode、Verifier 与 Objective-C 通用消息调用器已经落地；受限 C 调用器和可复用 Swift Adapter Pack 会在后续阶段接入。
 
 ## 两种 ID，各做一件事
 
@@ -15,6 +15,7 @@
 - backend、module、owner、member、entry point、派发方式，以及明确的 instance receiver 参数；
 - Swift 逻辑参数和返回值、参数 label、ownership、闭包生命周期、autoclosure、throws、async 和 isolation；
 - 物理调用约定、ABI value 类型、原生 encoding 和 layout、Swift direct/guaranteed/indirect convention、默认参数来源和错误约定；
+- Objective-C backend 使用的 runtime class、method family、词法 superclass、property accessor 身份，以及受支持的 `NSError **` 失败约定；
 - effect 与各平台 availability。
 
 Helix BridgeSlot 的 ownership 与底层原生调用 convention 是两回事。例如，一个值可以由 Helix 以 owned 方式持有，但底层 Swift 方法使用 `@in_guaranteed` 接收。现在编译器 ownership 标记不会再混在类型字符串里，而是单独保存在 ABI convention 字段中，避免两种不同的机器调用方式被误认为同一个 Key。
@@ -50,8 +51,21 @@ Release Archive 保存完整 Descriptor 和 Contract；设备投影保留相同�
 
 重复下标和重复稳定 Key 都会被拒绝。诊断会携带稳定 Key；Source Map 可用时还会指出原始 Swift 文件、行和列。运行日志不再只能依赖某次构建临时分配的整数来定位 API。
 
-## 当前执行边界
+## Objective-C 通用执行路径
 
-本阶段仍由现有的精确签名 Swift NativeImport factory 执行已经捕获的 Framework 和 App 调用。新的 Descriptor 与 Key 已经替换原先依赖项目 namespace 的身份，并贯穿 Archive、Bytecode、Verifier、Bridge 生成、Runtime 和 Patch BuildContract。Catalog 已经成为共用解析模型，但仅有一条 Catalog 记录还不能让从未安装过的 Objective-C、C 或纯 Swift 调用自动执行；后续通用调用器与 Adapter Pack 阶段仍需为它安装匹配 binding。
+如果编译器已经证明一条 Objective-C 声明的逻辑类型和物理类型落在支持矩阵内，它会直接绑定到同一个 `Runtime.ObjectiveCInvoker`。Bridge Generator 只输出结构化 Descriptor，不再为每个 selector 生成一段 Swift wrapper。当前通用矩阵包括 Objective-C object/Optional object、精确位宽的整数和浮点数、`Bool`、常见 CoreGraphics/UIKit struct、属性、实例/类方法、initializer、受支持的 `NSError **` 导入，以及一组可复用的同步 Objective-C Block 形状。无法证明表示等价的 Swift value overlay 仍然走精确生成的 Swift Adapter。
+
+模块归属不会根据 `UI`/`NS` 前缀或 class 所在模块猜测。普通方法和属性会用精确 Clang USR 查询已导入模块索引，因此 category 可以属于另一个 Framework；继承 initializer 则以 Swift 构造表达式的具体 class 模块为准，实际分配该具体类型，而不是错误地分配 `init` 声明所在的 superclass。归属不唯一时继续走 Swift Adapter。
+
+自定义 Objective-C 属性 accessor 还必须通过编译器 `#selector` 探针恢复精确 getter 或 setter，不能从 Swift 源码名称猜 selector。Descriptor 会把“API 声明 class”和“类消息/初始化实际派发 class”分开记录。例如，继承来的 `UIButton.setAnimationsEnabled` 以 `UIView` 声明做权限和 ABI 校验，但类消息仍发给 `UIButton`；继承来的 `UIViewController()` 在 `NSObject` 上解析 `init`，实际分配的仍是 `UIViewController`。两种身份都会进入稳定 Key。只有 Typed AST mangling 能精确证明源码 metatype 或构造结果时，Compiler 才使用这条通用路径；否则保留 Swift Adapter。
+
+普通 Objective-C 动态派发与词法 `super` 派发也使用不同的稳定调用身份，方法和属性都
+一样。编译器会把 Typed AST 表达式对应到唯一的 SIL 指令，只为 `super` 记录词法父类。
+证据缺失或存在歧义时，Helix 会拒绝该通用路径或保留精确 Swift Adapter，绝不会悄悄
+把 `super` 调用降级成动态派发。
+
+Swift 层先把已经验证的 VM value 和 callback 权限投影成 ABI slot；一个很小的 Objective-C shim 再到 Catalog 指定的声明 class（或已固定的词法 superclass）上解析精确 selector，逐项比较运行时 type encoding 和 storage kind，并验证另行记录的 class 派发目标确实继承该声明 class，然后通过 `NSInvocation` 调用实际 receiver。这样既保留普通 Objective-C override 的动态派发，也不会让只存在于意外动态子类上的 selector 扩张 Catalog 权限。receiver 继承关系直接从 Objective-C runtime 的真实 class hierarchy 读取，不依赖可被对象重写的 `isKindOfClass:`；普通动态 override 的完整 ABI 也必须与目录声明一致后才能执行。属性调用直接使用编译器已经证明的 accessor selector，不要求系统运行时一定保留可选的 Objective-C property metadata；UIKit 等系统 Framework 即使裁掉这类元数据也能正常调用。Shim 还会捕获 Objective-C exception，处理 initializer 与 retained/autoreleased method family，并在一个明确的 ownership 边界把 object result 交回 Swift。Runtime 解码前会再次检查 receiver class、平台 availability、nilability、struct encoding/size/alignment、deadline、MainActor 入口、临时存储上限和返回长度。
+
+这条路径消除了受支持 Objective-C 调用的逐方法可执行 Bridge，但它绝不是任意 selector 入口：每次调用仍必须对应当前 Shell 已发出的精确 Descriptor。源码已经出现的调用和当前 managed Debug SDK surface 现在可以使用通用 binding；仅仅因为 Runtime 有通用调用器，并不会让当前 Shell 中从未发出的公开 API 自动获得权限。完整的 Catalog 开发期查询和签名 Release capability 投影在后续阶段完成。C 调用与复杂纯 Swift 调用在 C Invoker 和 Adapter Pack 落地前，也仍需要现有的精确 binding。
 
 产品、协议、Catalog、Archive 和 Bytecode 版本全部保持为 1。

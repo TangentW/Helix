@@ -1671,12 +1671,19 @@ private func performCompileXcodeBridge(
     let captured = try performance.measure("bridge.load_capture") {
         try capturedXcodeFeature(context).analysisJob
     }
-    let moduleMapNames = ["HelixRuntimeSupport"]
+    let moduleMapNames = [
+        "HelixRuntimeSupport",
+        "HelixObjectiveCRuntimeSupport",
+    ]
     let runtimeModuleMaps = try performance.measure("bridge.load_module_maps") {
-        try moduleMapNames.compactMap { name -> (url: URL, hash: Core.Digest)? in
+        try moduleMapNames.map { name -> (url: URL, hash: Core.Digest) in
             let url = context.environment.generatedModuleMapDirectoryURL
                 .appendingPathComponent("\(name).modulemap")
-            guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                throw CLI.Error.input(
+                    "required runtime module map is missing: \(name)"
+                )
+            }
             let data = try readRegularFile(
                 url,
                 maximumBytes: 1 * 1_024 * 1_024,

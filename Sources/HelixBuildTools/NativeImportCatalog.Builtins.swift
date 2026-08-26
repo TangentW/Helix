@@ -107,7 +107,8 @@ enum Builtins {
             }
             return ShellBuildReceipt.NativeImportBinding(
                 key: record.key,
-                invokerExpression: definition.invokerFactory + "("
+                strategy: .factory,
+                factoryExpression: definition.invokerFactory + "("
                     + "id: Core.NativeImportID(rawValue: \(id.rawValue)), "
                     + "key: Core.NativeCall.Key(rawValue: try! Core.Digest(hex: "
                     + "\(String(reflecting: record.key.rawValue.hex)))))",

@@ -486,6 +486,181 @@ struct NativeCall {
         }
     }
 
+    @Test("Objective-C encodings agree with ABI kinds and scalar storage")
+    func validatesObjectiveCEncodings() throws {
+        let contract = Core.NativeImportContract.bounded(
+            kind: .instanceMethod,
+            domain: .application,
+            access: .read,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: false
+        )
+        let descriptor = try Core.NativeCall.Descriptor.objectiveCMessage(
+            module: "Foundation",
+            owner: "NSObject",
+            member: "compare(_:)",
+            selector: "compare:",
+            dispatch: .instance,
+            receiverArgumentIndex: 0,
+            signature: .init(
+                parameters: ["Foundation.NSObject", "Swift.Int64"],
+                result: "Swift.Bool"
+            ),
+            effects: .init(),
+            contract: contract,
+            physicalSignature: .init(
+                callingConvention: .objectiveC,
+                parameters: [
+                    .init(
+                        type: .init(
+                            kind: .signedInteger,
+                            canonicalName: "Swift.Int64",
+                            size: 8,
+                            alignment: 8,
+                            encoding: "q"
+                        ),
+                        source: .argument(1)
+                    ),
+                ],
+                result: .init(
+                    kind: .boolean,
+                    canonicalName: "Swift.Bool",
+                    size: 1,
+                    alignment: 1,
+                    encoding: "B"
+                )
+            ),
+            metadata: .init(runtimeClassName: "NSObject")
+        )
+        try descriptor.validate(contract: contract)
+
+        var wrongKind = descriptor
+        wrongKind.physicalSignature.parameters[0].type.encoding = "d"
+        #expect(throws: Core.NativeCall.DescriptorError.self) {
+            try wrongKind.validate(contract: contract)
+        }
+
+        var wrongWidth = descriptor
+        wrongWidth.physicalSignature.parameters[0].type.size = 4
+        wrongWidth.physicalSignature.parameters[0].type.alignment = 4
+        #expect(throws: Core.NativeCall.DescriptorError.self) {
+            try wrongWidth.validate(contract: contract)
+        }
+
+        var blockAsObject = descriptor
+        blockAsObject.physicalSignature.parameters[0].type = .init(
+            kind: .object,
+            canonicalName: "ObjectiveC.Block",
+            encoding: "@?"
+        )
+        #expect(throws: Core.NativeCall.DescriptorError.self) {
+            try blockAsObject.validate(contract: contract)
+        }
+
+        var malformedStructure = descriptor
+        malformedStructure.physicalSignature.parameters[0].type = .init(
+            kind: .structure,
+            canonicalName: "CoreGraphics.CGPoint",
+            size: 16,
+            alignment: 8,
+            encoding: "{CGPoint=dd"
+        )
+        #expect(throws: Core.NativeCall.DescriptorError.self) {
+            try malformedStructure.validate(contract: contract)
+        }
+    }
+
+    @Test("Objective-C ownership families cannot be hidden by a false convention")
+    func validatesObjectiveCMethodFamilies() throws {
+        let contract = Core.NativeImportContract.bounded(
+            kind: .staticMethod,
+            domain: .foundation,
+            access: .read,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: false
+        )
+        #expect(throws: Core.NativeCall.DescriptorError.self) {
+            try Core.NativeCall.Descriptor.objectiveCMessage(
+                module: "Foundation",
+                owner: "NSObject",
+                member: "new()",
+                selector: "new",
+                dispatch: .static,
+                receiverArgumentIndex: nil,
+                signature: .init(
+                    parameters: [],
+                    result: "Foundation.NSObject"
+                ),
+                effects: .init(mayAllocate: true),
+                contract: contract,
+                physicalSignature: .init(
+                    callingConvention: .objectiveC,
+                    parameters: [],
+                    result: .init(
+                        kind: .object,
+                        canonicalName: "NSObject",
+                        encoding: "@"
+                    ),
+                    resultConvention: .autoreleased
+                ),
+                metadata: .init(
+                    runtimeClassName: "NSObject",
+                    dispatchClassName: "NSObject"
+                )
+            )
+        }
+
+        let ownedObject: Core.NativeCall.ABIType = .init(
+            kind: .object,
+            canonicalName: "NSObject",
+            encoding: "@"
+        )
+        let new = try Core.NativeCall.Descriptor.objectiveCMessage(
+            module: "Foundation",
+            owner: "NSObject",
+            member: "_newObject()",
+            selector: "_newObject",
+            dispatch: .static,
+            receiverArgumentIndex: nil,
+            signature: .init(
+                parameters: [],
+                result: "Foundation.NSObject"
+            ),
+            effects: .init(mayAllocate: true),
+            contract: contract,
+            physicalSignature: .init(
+                callingConvention: .objectiveC,
+                parameters: [],
+                result: ownedObject,
+                resultConvention: .directOwned
+            ),
+            metadata: .init(
+                runtimeClassName: "NSObject",
+                dispatchClassName: "NSObject",
+                methodFamily: .new
+            )
+        )
+        try new.validate(contract: contract)
+
+        var missingDispatchClass = new
+        missingDispatchClass.objectiveC?.dispatchClassName = nil
+        #expect(throws: Core.NativeCall.DescriptorError.self) {
+            try missingDispatchClass.validate(contract: contract)
+        }
+
+        var alloc = new
+        alloc.target.entryPoint = "__allocObject"
+        alloc.objectiveC?.methodFamily = .alloc
+        try alloc.validate(contract: contract)
+
+        var hiddenFamily = new
+        hiddenFamily.objectiveC?.methodFamily = .none
+        hiddenFamily.physicalSignature.resultConvention = .autoreleased
+        #expect(throws: Core.NativeCall.DescriptorError.self) {
+            try hiddenFamily.validate(contract: contract)
+        }
+    }
+
     @Test("Canonical descriptors round-trip without changing their key")
     func canonicalRoundTrip() throws {
         let contract = Core.NativeImportContract.bounded(

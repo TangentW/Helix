@@ -17,6 +17,9 @@ extension FrontendReceipt.Adapter {
         var representation: Representation
         var sourceFileLogicalID: String
         var importedModules: [String]
+        /// Exact declaring module recovered from that module's Symbol Graph.
+        /// Nil means source-only discovery could not prove provenance.
+        var objectiveCModuleName: String? = nil
         var requiresMainActor: Bool
     }
     func discoverImportedNativeTypes(
@@ -387,6 +390,15 @@ extension FrontendReceipt.Adapter {
                 existing.importedModules = Array(Set(
                     existing.importedModules + use.importedModules
                 )).sorted()
+                if let existingModule = existing.objectiveCModuleName,
+                   let incomingModule = use.objectiveCModuleName,
+                   existingModule != incomingModule {
+                    throw FrontendReceipt.Error.invalidRequest(
+                        "imported native type \(use.canonicalName) has conflicting declaring modules"
+                    )
+                }
+                existing.objectiveCModuleName = existing.objectiveCModuleName
+                    ?? use.objectiveCModuleName
                 existing.aliases = Array(Set(
                     existing.aliases + use.aliases
                 )).sorted()

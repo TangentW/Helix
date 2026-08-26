@@ -88,6 +88,9 @@ Stage 1 now keeps toolchain, SDK build, target, minimum OS, semantic arguments,
 input hashes, and generator versions in the relevant cache keys; reuses only
 validated deterministic facts and artifacts; fully falls back to the
 authoritative frontend on a miss; and avoids rewriting byte-identical output.
+The transformation fingerprint also covers generated interface and native-call
+descriptor semantics, so a tool update invalidates obsolete local facts without
+requiring the developer to clear DerivedData or change a protocol version.
 The optimization does not lower the target coverage of future native calls.
 
 The remaining structural cost is generated-call-surface size: a Live Reload
@@ -95,3 +98,38 @@ session can still change its Bridge input, while a large fixed Swift wrapper
 set is expensive on a true miss. Later descriptor-driven Objective-C/C
 invokers and cached Swift adapter packs address that cost without reviving a
 manual API allowlist.
+
+## Stage 3 measured result
+
+The generic Objective-C execution stage was measured with the real eight-
+generation Live Reload Demo flow. It exercised view hierarchy changes, button
+configuration, animation completion, presentation, dismissal, and baseline
+restoration in one simulator process. The generated Shell contained 479 native
+imports: 388 used the shared Objective-C invoker, 87 retained exact generated
+Swift adapters, and four used built-in factories.
+
+The result proves that supported Objective-C selectors no longer add one Swift
+invocation body each. It also exposes the next structural cost rather than
+hiding it:
+
+| Measured item | Result |
+| --- | ---: |
+| Cold Prepare after descriptor-cache invalidation | 27.320 s |
+| Managed Debug expansion within cold Prepare | 21.020 s |
+| Bridge total on that build | 13.844 s |
+| Swift compilation within Bridge | 13.017 s |
+| Immediate unchanged Prepare in the same Hub session | 2.085 s |
+| Immediate unchanged Bridge | 13.779 s |
+| Generated Swift source | 3,164,111 bytes |
+| Main Bridge file | 2,825,004 bytes |
+| NativeImport shards | about 202 KiB |
+
+The warm Prepare performed no Typed AST, SIL, or symbol-graph work; frontend
+lookup took 0.286 s and materialization took 1.626 s. Bridge still missed its
+state and recompiled the source because a fresh Live Reload session contract
+changed on each build. Most source bytes now come from verbose descriptor
+literals in the main Bridge file, not selector-specific executable wrappers.
+Consequently, this stage improves execution architecture and keeps coverage,
+but does not claim the final no-change latency target. Compact descriptor
+tables, reuse of a still-valid Hub reservation, and stable Adapter Pack inputs
+remain required in the later Live Reload stage.

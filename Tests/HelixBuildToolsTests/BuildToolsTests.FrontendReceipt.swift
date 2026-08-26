@@ -1823,15 +1823,26 @@ struct FrontendReceiptPipeline {
     }
 
     private func runtimeSupportCompilerArguments(modules: URL) throws -> [String] {
-        let supportDirectory = modules.deletingLastPathComponent()
-            .appendingPathComponent("HelixRuntimeSupport.build", isDirectory: true)
-        let moduleMap = supportDirectory.appendingPathComponent("module.modulemap")
-        guard FileManager.default.fileExists(atPath: moduleMap.path) else {
-            throw FrontendReceipt.Error.invalidRequest(
-                "missing HelixRuntimeSupport module map"
-            )
+        let buildRoot = modules.deletingLastPathComponent()
+        let supportModules = [
+            "HelixRuntimeSupport",
+            "HelixObjectiveCRuntimeSupport",
+        ]
+        var arguments: [String] = []
+        for module in supportModules {
+            let moduleMap = buildRoot
+                .appendingPathComponent("\(module).build", isDirectory: true)
+                .appendingPathComponent("module.modulemap")
+            guard FileManager.default.fileExists(atPath: moduleMap.path) else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "missing \(module) module map"
+                )
+            }
+            arguments.append(contentsOf: [
+                "-Xcc", "-fmodule-map-file=\(moduleMap.path)",
+            ])
         }
-        return ["-Xcc", "-fmodule-map-file=\(moduleMap.path)"]
+        return arguments
     }
 
     func typeCheckNativeReplacements(

@@ -49,6 +49,9 @@ extension NativeImportDiscovery {
         var hasTypedThrows: Bool
         var hasUnsupportedAttributes: Bool
         var abiAdapter: InterfaceArchive.NativeImportABIAdapter = .direct
+        var foreignDispatch: CanonicalSIL.NativeBridgeSymbols.ForeignDispatch =
+            .ordinary
+        var objectiveC: FrontendReceipt.ObjectiveCABI.Evidence? = nil
     }
 
     struct GeneratedBinding: Hashable, Sendable {
@@ -78,7 +81,8 @@ extension NativeImportDiscovery {
         func discover(
             declarations: [NativeImportDiscovery.Declaration],
             metadata: InterfaceArchive.ReleaseMetadata,
-            configuration: PatchConfiguration.Document
+            configuration: PatchConfiguration.Document,
+            nativeTypeKinds: [Core.TypeID: InterfaceArchive.TypeKind] = [:]
         ) throws -> NativeImportDiscovery.Result {
             try configuration.validate()
             guard let module = configuration.modules[metadata.frontendInvocation.moduleName],
@@ -135,10 +139,43 @@ extension NativeImportDiscovery {
                     requiresMainActor: declaration.inferredEffects.requiresMainActor,
                     isAsync: declaration.inferredEffects.isAsync
                 )
+                let objectiveCPhysical: Core.NativeCall.PhysicalSignature? = if
+                    !effects.isAsync,
+                    let evidence = declaration.objectiveC {
+                    FrontendReceipt.ObjectiveCABI.physicalSignature(
+                        evidence: evidence,
+                        logicalParameterTypes: declaration.parameterTypes,
+                        logicalResultType: declaration.resultType,
+                        nativeTypeKinds: nativeTypeKinds,
+                        targetTriple: metadata.frontendInvocation.targetTriple
+                    )
+                } else {
+                    nil
+                }
+                if declaration.foreignDispatch == .superclass,
+                   objectiveCPhysical == nil
+                    || declaration.objectiveC?.lexicalSuperclassName == nil {
+                    diagnostics.append(
+                        .init(
+                            code: "HLXNID009",
+                            severity: .note,
+                            message: "\(declaration.canonicalCallee): lexical super dispatch requires an exact Objective-C ABI and superclass",
+                            location: .init(
+                                file: declaration.sourceFileLogicalID,
+                                line: 1,
+                                column: 1
+                            )
+                        )
+                    )
+                    continue
+                }
+                let domain = objectiveCPhysical == nil
+                    ? Core.NativeImportDomain.application
+                    : nativeDomain(declaration.objectiveC?.moduleName)
                 let contract = if effects.isAsync {
                     Core.NativeImportContract.suspending(
                         kind: contractKind(for: declaration.dispatch),
-                        domain: .application,
+                        domain: domain,
                         access: operationAccess,
                         maximumDurationMicroseconds:
                             scope.maximumSuspendingDurationMicroseconds,
@@ -147,7 +184,7 @@ extension NativeImportDiscovery {
                 } else {
                     Core.NativeImportContract.bounded(
                         kind: contractKind(for: declaration.dispatch),
-                        domain: .application,
+                        domain: domain,
                         access: operationAccess,
                         maximumDurationMicroseconds:
                             boundedDuration(
@@ -159,27 +196,60 @@ extension NativeImportDiscovery {
                     )
                 }
                 try contract.validate(effects: effects)
-                let physicalSources = try physicalArgumentSources(
-                    projection: declaration.parameterProjection,
-                    logicalParameterCount: declaration.signature.parameters.count
-                )
-                let callDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
-                    canonicalCallee: declaration.canonicalCallee,
-                    signature: declaration.signature,
-                    effects: effects,
-                    contract: contract,
-                    argumentLabels: declaration.argumentLabels,
-                    physicalParameterTypes:
-                        declaration.physicalParameterSwiftTypes
-                            ?? declaration.invocationParameterSwiftTypes
-                            ?? declaration.parameterSwiftTypes,
-                    physicalArgumentSources: physicalSources,
-                    receiverArgumentIndex: isInstanceDispatch(
-                        declaration.dispatch
-                    ) ? declaration.signature.parameters.indices.last.flatMap {
+                let receiverIndex = isInstanceDispatch(declaration.dispatch)
+                    ? declaration.signature.parameters.indices.last.flatMap {
                         UInt16(exactly: $0)
                     } : nil
-                )
+                let callDescriptor: Core.NativeCall.Descriptor
+                if let physicalSignature = objectiveCPhysical,
+                   let evidence = declaration.objectiveC,
+                   let moduleName = evidence.moduleName,
+                   let owner = objectiveCOwner(
+                       declaration.ownerType,
+                       moduleName: moduleName
+                   ) {
+                    callDescriptor = try .objectiveCMessage(
+                        module: moduleName,
+                        owner: owner,
+                        member: objectiveCMember(for: declaration),
+                        selector: evidence.selector,
+                        dispatch: nativeDispatch(for: declaration.dispatch),
+                        receiverArgumentIndex: receiverIndex,
+                        signature: declaration.signature,
+                        effects: effects,
+                        contract: contract,
+                        argumentLabels: declaration.argumentLabels,
+                        physicalSignature: physicalSignature,
+                        metadata: .init(
+                            runtimeClassName: evidence.runtimeClassName,
+                            dispatchClassName: evidence.dispatchClassName,
+                            methodFamily: evidence.methodFamily,
+                            lexicalSuperclassName:
+                                evidence.lexicalSuperclassName,
+                            errorFailure: evidence.errorFailure,
+                            property: evidence.property
+                        )
+                    )
+                } else {
+                    let physicalSources = try physicalArgumentSources(
+                        projection: declaration.parameterProjection,
+                        logicalParameterCount:
+                            declaration.signature.parameters.count
+                    )
+                    callDescriptor = try .swiftAdapter(
+                        canonicalCallee: declaration.canonicalCallee,
+                        signature: declaration.signature,
+                        effects: effects,
+                        contract: contract,
+                        argumentLabels: declaration.argumentLabels,
+                        physicalParameterTypes:
+                            declaration.physicalParameterSwiftTypes
+                                ?? declaration.invocationParameterSwiftTypes
+                                ?? declaration.parameterSwiftTypes,
+                        physicalArgumentSources: physicalSources,
+                        receiverArgumentIndex: receiverIndex
+                    )
+                }
                 let key = try Core.NativeCall.Key.derive(
                     descriptor: callDescriptor
                 )
@@ -282,6 +352,63 @@ extension NativeImportDiscovery {
                 : Core.NativeImportExecutionPolicy
                     .maximumBoundedDurationMicroseconds
             return min(scope.maximumBoundedDurationMicroseconds, ceiling)
+        }
+
+        private func nativeDomain(_ moduleName: String?) -> Core.NativeImportDomain {
+            switch moduleName {
+            case "Foundation": .foundation
+            case "UIKit": .uiKit
+            default: .application
+            }
+        }
+
+        private func objectiveCOwner(
+            _ raw: String?,
+            moduleName: String
+        ) -> String? {
+            guard var owner = raw, !owner.isEmpty else { return nil }
+            let prefix = moduleName + "."
+            if owner.hasPrefix(prefix) {
+                owner.removeFirst(prefix.count)
+            }
+            return owner.isEmpty ? nil : owner
+        }
+
+        private func objectiveCMember(
+            for declaration: NativeImportDiscovery.Declaration
+        ) -> String {
+            switch declaration.dispatch {
+            case .instanceGetter, .staticGetter:
+                return declaration.baseName + ".get"
+            case .instanceSetter, .staticSetter:
+                return declaration.baseName + ".set"
+            case .instanceValueSetter:
+                return declaration.baseName + ".mutate"
+            case .initializer, .globalFunction, .staticMethod, .instanceMethod:
+                return declaration.baseName + "("
+                    + declaration.argumentLabels.map {
+                        ($0 == "_" ? "_" : $0) + ":"
+                    }.joined() + ")"
+            case .nativeUpcast:
+                return "upcast"
+            case .anyObjectBridge:
+                return "bridge"
+            }
+        }
+
+        private func nativeDispatch(
+            for dispatch: NativeImportDiscovery.Dispatch
+        ) -> Core.NativeCall.Dispatch {
+            switch dispatch {
+            case .initializer: .initializer
+            case .staticMethod, .nativeUpcast, .anyObjectBridge,
+                 .staticGetter, .staticSetter:
+                .static
+            case .instanceMethod, .instanceGetter, .instanceSetter,
+                 .instanceValueSetter:
+                .instance
+            case .globalFunction: .global
+            }
         }
 
         private func rejection(

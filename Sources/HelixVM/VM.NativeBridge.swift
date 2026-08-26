@@ -57,6 +57,7 @@ public struct NativeInvocationContext: Sendable {
         let parameterTypes: [Bytecode.ValueType]
         let callbackHost: VM.NativeCallbackHost?
         let callbackEpoch: VM.NativeCallbackEpoch?
+        let nativeTypeCatalog: VM.NativeTypeCatalog
         let lock = NSLock()
         var checkpointCount: UInt32 = 0
         var enteredRequiredMainActor = false
@@ -71,7 +72,8 @@ public struct NativeInvocationContext: Sendable {
             requiresAsyncMainActorEntry: Bool,
             callbacks: [Core.NativeImportCallback],
             parameterTypes: [Bytecode.ValueType],
-            callbackHost: VM.NativeCallbackHost?
+            callbackHost: VM.NativeCallbackHost?,
+            nativeTypeCatalog: VM.NativeTypeCatalog
         ) {
             self.id = id
             self.budget = budget
@@ -86,6 +88,7 @@ public struct NativeInvocationContext: Sendable {
             )
             self.parameterTypes = callbacks.isEmpty ? [] : parameterTypes
             self.callbackHost = callbacks.isEmpty ? nil : callbackHost
+            self.nativeTypeCatalog = nativeTypeCatalog
             callbackEpoch = callbacks.isEmpty
                 ? nil
                 : VM.NativeCallbackEpoch(budget: budget)
@@ -103,7 +106,8 @@ public struct NativeInvocationContext: Sendable {
         requiresAsyncMainActorEntry: Bool,
         callbacks: [Core.NativeImportCallback],
         parameterTypes: [Bytecode.ValueType],
-        callbackHost: VM.NativeCallbackHost?
+        callbackHost: VM.NativeCallbackHost?,
+        nativeTypeCatalog: VM.NativeTypeCatalog
     ) {
         state = State(
             id: id,
@@ -114,7 +118,8 @@ public struct NativeInvocationContext: Sendable {
             requiresAsyncMainActorEntry: requiresAsyncMainActorEntry,
             callbacks: callbacks,
             parameterTypes: parameterTypes,
-            callbackHost: callbackHost
+            callbackHost: callbackHost,
+            nativeTypeCatalog: nativeTypeCatalog
         )
     }
 
@@ -201,6 +206,10 @@ public struct NativeInvocationContext: Sendable {
         state.budget.resourceLimits
     }
 
+    package var nativeTypeCatalog: VM.NativeTypeCatalog {
+        state.nativeTypeCatalog
+    }
+
     /// Polls both the root and exact NativeImport deadlines without satisfying
     /// a cooperative-import checkpoint. Result encoding occurs after the
     /// native operation, so it must not mask a factory that failed to cooperate
@@ -272,7 +281,7 @@ public struct NativeInvocationContext: Sendable {
         return try await operation()
     }
 
-    func finish(requireCooperation: Bool) throws {
+    package func finish(requireCooperation: Bool) throws {
         let snapshot = try state.lock.withLock {
             () -> (checkpointCount: UInt32, enteredRequiredMainActor: Bool) in
             guard !state.isFinished else {

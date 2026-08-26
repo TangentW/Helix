@@ -255,13 +255,9 @@ public struct NativeImportContract: Codable, Hashable, Sendable {
                 "MainActor native imports must allow main-thread execution"
             )
         }
-        if domain == .uiKit {
-            guard effects.requiresMainActor, execution.allowsMainThread else {
-                throw Core.NativeImportContractError.invalid(
-                    "UIKit native imports must be MainActor-bound"
-                )
-            }
-        }
+        // The module policy domain does not imply actor isolation. Modern SDKs
+        // contain explicitly nonisolated UIKit APIs; the compiler-observed
+        // effect remains the authority for scheduling and thread checks.
         switch kind {
         case .instanceGetter, .staticGetter, .instanceSubscriptGetter:
             guard access == .pure || access == .read else {

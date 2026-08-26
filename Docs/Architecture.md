@@ -65,6 +65,15 @@ Both workflows depend on stable, build-specific identities:
   `NativeImportID` is only the compact per-Shell/per-image dispatch slot. A
   patch carries both rather than embedding a process pointer or treating the
   compact slot as authority. See [Native call identity and catalog](Native-Calls.md).
+- Supported Objective-C imports share one descriptor-driven Runtime invoker
+  instead of one generated Swift function per selector. Compiler evidence fixes
+  the declaration class, a separate class/initializer dispatch class where
+  applicable, exact selector/property accessor identity, physical ABI, Block
+  lifetime, method family, and error convention. The Objective-C shim rechecks
+  class ancestry, the actual method encoding, and storage kinds before
+  `NSInvocation`; unsupported Swift
+  overlays and ABI shapes retain the exact generated-adapter route. This is a
+  reusable execution mechanism, not wildcard selector authority.
 - Interface and transitive implementation fingerprints distinguish a body
   edit from an ABI, layout, source-membership, or dependency change.
 - Eligible existing Shell structs and enums use a captured logical-value

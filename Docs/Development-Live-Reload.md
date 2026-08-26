@@ -333,6 +333,11 @@ through the same typed AST and canonical SIL pipeline used for project source.
 Only uniquely measured, Bridge-compatible synchronous initializers, instance
 or static methods, and readable or writable properties become exact
 NativeImports.
+When such a declaration has a compiler-proven Objective-C ABI in the supported
+matrix, its exact NativeImport is a compact descriptor bound to the shared
+Objective-C invoker; no selector-specific Swift wrapper is emitted. Exact Swift
+adapters remain for representable overlays and ABI shapes that cannot use that
+generic boundary.
 The symbol-graph function signature is aligned with the full declaration before
 probing. Helix recovers only declaration-level `@escaping` and `@autoclosure`
 markers that the signature view is permitted to omit; any other missing
@@ -374,13 +379,14 @@ source boundary still ignores inherited implicit constructors that the frontend
 synthesizes for a project subclass; beyond the separately proven zero-argument
 SDK-type construction above, inherited `Bundle`/`Coder` parameters do not enter
 the generated interface merely because a superclass declares them. A compiler-proven
-Objective-C protocol parameter keeps the v1 `AnyObject` boundary identity but
-records its exact Swift existential spelling for the generated invoker. The
-invoker performs that conformance-checked decode inside `MainActor` when the
-operation is actor-isolated. Plain `Any` and `AnyObject` are not inferred to be
-protocols. This bounded convenience surface is not added to production Shells,
-does not introduce a new boundary type by itself, and never performs runtime
-selector or symbol lookup.
+Objective-C protocol parameter keeps the v1 `AnyObject` logical boundary
+identity while its physical descriptor retains the exact protocol existential.
+The generic invoker checks runtime conformance before dispatch, inside
+`MainActor` when the operation is actor-isolated. Plain `Any` and `AnyObject`
+are not inferred to be protocols. This bounded convenience surface is not
+added to production Shells and does not introduce a new boundary type by
+itself. Runtime lookup is restricted to the descriptor's exact class and
+selector; patch code cannot provide or compose either string.
 
 For a supported source `class` instance method, the hidden Bridge carries
 `self` as the build-captured reference `TypeID`. Generated `NativeTypeOperations` retain,

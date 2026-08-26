@@ -129,6 +129,7 @@ public struct NativeTypeOperations: Sendable {
     public let requiresMainActor: Bool
     public let estimatedSize: UInt64
     public let referenceClass: VM.NativeReferenceClass?
+    public let nativeABI: VM.NativeABI.Codec?
 
     private let boxStorage: @Sendable (Any) throws -> VM.NativeValue
     private let copyStorage: @Sendable (VM.NativeValue) throws -> VM.NativeValue
@@ -157,6 +158,7 @@ public struct NativeTypeOperations: Sendable {
         self.requiresMainActor = requiresMainActor
         self.estimatedSize = estimatedSize
         referenceClass = nil
+        nativeABI = nil
 
         @Sendable func makeBox(_ value: Value) -> VM.NativeValue {
             VM.NativeValue(
@@ -289,6 +291,36 @@ public struct NativeTypeOperations: Sendable {
         ).acceptingOpaqueValues(as: Value.self)
     }
 
+    /// Creates TypeOps for an imported C structure whose exact bitwise layout
+    /// and Objective-C encoding were proven by the captured compiler/SDK.
+    public static func objectiveCStructure<Value: BitwiseCopyable>(
+        id: Core.TypeID,
+        canonicalName: String,
+        layoutFingerprint: Core.Digest,
+        requiresMainActor: Bool = false,
+        encoding: String,
+        clone: @escaping @Sendable (Value) -> Value = { $0 },
+        describe: @escaping @Sendable (Value) -> String = {
+            String(describing: $0)
+        }
+    ) -> Self {
+        let operations = Self.opaqueValue(
+            id: id,
+            canonicalName: canonicalName,
+            layoutFingerprint: layoutFingerprint,
+            requiresMainActor: requiresMainActor,
+            estimatedSize: UInt64(MemoryLayout<Value>.stride),
+            clone: clone,
+            describe: describe
+        )
+        let codec = VM.NativeABI.Codec(
+            encoding: encoding,
+            valueType: Value.self,
+            box: { try operations.box($0) }
+        )
+        return operations.attachingNativeABI(codec)
+    }
+
     private func acceptingOpaqueValues<Value>(as type: Value.Type) -> Self {
         let operations = self
         return Self(
@@ -300,6 +332,7 @@ public struct NativeTypeOperations: Sendable {
             requiresMainActor: requiresMainActor,
             estimatedSize: estimatedSize,
             referenceClass: referenceClass,
+            nativeABI: nativeABI,
             boxStorage: { storage in
                 guard let value = storage as? Value else {
                     throw VM.RuntimeTrap.nativeTypeMismatch(expected: operations.id)
@@ -319,6 +352,7 @@ public struct NativeTypeOperations: Sendable {
         requiresMainActor: Bool,
         estimatedSize: UInt64,
         referenceClass: VM.NativeReferenceClass?,
+        nativeABI: VM.NativeABI.Codec?,
         boxStorage: @escaping @Sendable (Any) throws -> VM.NativeValue,
         copyStorage: @escaping @Sendable (VM.NativeValue) throws -> VM.NativeValue
     ) {
@@ -330,6 +364,7 @@ public struct NativeTypeOperations: Sendable {
         self.requiresMainActor = requiresMainActor
         self.estimatedSize = estimatedSize
         self.referenceClass = referenceClass
+        self.nativeABI = nativeABI
         self.boxStorage = boxStorage
         self.copyStorage = copyStorage
     }
@@ -357,8 +392,25 @@ public struct NativeTypeOperations: Sendable {
             requiresMainActor: requiresMainActor,
             estimatedSize: estimatedSize,
             referenceClass: .init(metatype),
+            nativeABI: nativeABI,
             boxStorage: { try attachReference(boxStorage($0)) },
             copyStorage: { try attachReference(copyStorage($0)) }
+        )
+    }
+
+    private func attachingNativeABI(_ codec: VM.NativeABI.Codec) -> Self {
+        Self(
+            id: id,
+            canonicalName: canonicalName,
+            kind: kind,
+            layoutFingerprint: layoutFingerprint,
+            isCopyable: isCopyable,
+            requiresMainActor: requiresMainActor,
+            estimatedSize: estimatedSize,
+            referenceClass: referenceClass,
+            nativeABI: codec,
+            boxStorage: boxStorage,
+            copyStorage: copyStorage
         )
     }
 
@@ -432,7 +484,7 @@ public struct NativeTypeCatalog: Sendable {
         return try operations.copy(value)
     }
 
-    func referencedObject(in value: VM.NativeValue) throws -> AnyObject {
+    package func referencedObject(in value: VM.NativeValue) throws -> AnyObject {
         guard let operations = operations[value.typeID],
               operations.kind == .reference,
               let object = value.referencedObject
@@ -440,6 +492,39 @@ public struct NativeTypeCatalog: Sendable {
             throw VM.RuntimeTrap.nativeTypeMismatch(expected: value.typeID)
         }
         return object
+    }
+
+    package func encodeNativeABI(
+        _ value: VM.NativeValue,
+        expectedEncoding: String,
+        expectedSize: UInt16,
+        expectedAlignment: UInt16
+    ) throws -> Data {
+        guard let codec = operations[value.typeID]?.nativeABI,
+              codec.encoding == expectedEncoding,
+              codec.size == expectedSize,
+              codec.alignment == expectedAlignment
+        else {
+            throw VM.RuntimeTrap.nativeTypeMismatch(expected: value.typeID)
+        }
+        return try codec.encode(value)
+    }
+
+    package func decodeNativeABI(
+        _ bytes: Data,
+        as id: Core.TypeID,
+        expectedEncoding: String,
+        expectedSize: UInt16,
+        expectedAlignment: UInt16
+    ) throws -> VM.NativeValue {
+        guard let codec = operations[id]?.nativeABI,
+              codec.encoding == expectedEncoding,
+              codec.size == expectedSize,
+              codec.alignment == expectedAlignment
+        else {
+            throw VM.RuntimeTrap.unknownNativeType(id)
+        }
+        return try codec.decode(bytes)
     }
 }
 }

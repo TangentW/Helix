@@ -393,6 +393,7 @@ struct StaticKeyPath {
                     isNullable: true
                 )
             ),
+            objectiveC: .init(runtimeClassName: "NSObject"),
             effects: .init()
         )
         let requirement = Bytecode.ImportRequirement(

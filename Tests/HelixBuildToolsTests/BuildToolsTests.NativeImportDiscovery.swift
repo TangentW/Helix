@@ -2549,11 +2549,9 @@ struct NativeImportDiscoveryTests {
         #expect(overridden.diagnostics.contains { $0.code == "HLXNID008" })
 
         var tampered = output.receipt
-        let tamperedID = try #require(tampered.nativeImportCandidates.first?.id)
-        tampered.nativeImportBindings[0].invokerExpression += ".tampered"
-        #expect(throws: BridgeGeneration.Error.generatedNativeImportBindingMismatch(
-            tamperedID,
-            "generated factory expression"
+        tampered.nativeImportBindings[0].strategy = .factory
+        #expect(throws: ShellBuildReceipt.Error.invalid(
+            "native import candidates or bindings are duplicated, unordered, or empty"
         )) {
             try ShellBuild.Materializer().materialize(
                 receipt: tampered,
@@ -3092,7 +3090,7 @@ struct NativeImportDiscoveryTests {
         )
     }
 
-    @Test("Managed Debug freezes UIKit and Foundation call surfaces end to end")
+    @Test("Managed Debug captures UIKit and Foundation call surfaces end to end")
     func lowersImportedFrameworkOperations() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "helix-managed-uikit-reference-\(UUID().uuidString)",
@@ -3407,31 +3405,28 @@ struct NativeImportDiscoveryTests {
             $0.canonicalCallee.contains("NSLayoutAnchor")
                 && $0.canonicalCallee.contains("constraint")
         }
-        let constraintShapes = Set(
-            output.receipt.nativeImportBindings.compactMap(\.generated)
-                .filter { $0.baseName == "constraint" }
-                .compactMap { operation in
-                    operation.ownerType.map {
-                        "\($0).\(operation.argumentLabels.joined(separator: ","))"
-                    }
-                }
-        )
-        #expect(constraintShapes == Set([
-            "NSLayoutAnchor<NSLayoutXAxisAnchor>.equalTo",
-            "NSLayoutAnchor<NSLayoutXAxisAnchor>.equalTo,constant",
-            "NSLayoutAnchor<NSLayoutYAxisAnchor>.equalTo",
-            "NSLayoutAnchor<NSLayoutYAxisAnchor>.equalTo,constant",
-            "NSLayoutXAxisAnchor.equalToSystemSpacingAfter,multiplier",
-            "NSLayoutYAxisAnchor.equalToSystemSpacingBelow,multiplier",
-        ]))
-        let genericConstraintShapeCount = constraintShapes.filter {
-            $0.hasPrefix("NSLayoutAnchor<")
-        }.count
-        #expect(constraintImports.count == genericConstraintShapeCount)
-        #expect(
-            Set(constraintImports.flatMap(\.silMangledNames)).count
-                == genericConstraintShapeCount
-        )
+        let objectiveCConstraintImports = constraintImports.filter {
+            $0.descriptor.target.backend == .objectiveCMessage
+        }
+        #expect(objectiveCConstraintImports.count == 2)
+        #expect(Set(objectiveCConstraintImports.map {
+            $0.descriptor.target.entryPoint
+        }) == ["constraintEqualToAnchor:"])
+        #expect(Set(objectiveCConstraintImports.map {
+            $0.descriptor.target.module
+        }) == ["UIKit"])
+        #expect(Set(objectiveCConstraintImports.compactMap {
+            $0.descriptor.objectiveC?.runtimeClassName
+        }) == ["NSLayoutAnchor"])
+        let objectiveCConstraintKeys = Set(objectiveCConstraintImports.map(\.key))
+        #expect(output.receipt.nativeImportBindings.filter {
+            objectiveCConstraintKeys.contains($0.key)
+        }.allSatisfy {
+            $0.strategy == .objectiveCInvoker && $0.generated == nil
+        })
+        #expect(!output.receipt.nativeImportBindings.contains {
+            $0.generated?.baseName == "constraint"
+        })
         #expect(generatedSymbols.contains { $0.hasPrefix("$hlx_native_option_set_literal_") })
         #expect(generatedSymbols.contains { $0.hasPrefix("$hlx_native_global_") })
         #expect(generatedSymbols.contains { $0.hasPrefix("$s") })
@@ -3454,26 +3449,43 @@ struct NativeImportDiscoveryTests {
         #expect(importedNativeNames.contains("FileManager"))
         let generatedOperations = output.receipt.nativeImportBindings
             .compactMap(\.generated)
-        let controllerInitializer = try #require(generatedOperations.first {
-            $0.ownerType == "UIViewController"
-                && $0.baseName == "init"
-                && $0.dispatch == .initializer
-                && $0.argumentLabels.isEmpty
-        })
-        #expect(controllerInitializer.parameterSwiftTypes.isEmpty)
-        #expect(controllerInitializer.resultSwiftType == "UIViewController")
-        let presentBinding = try #require(
-            output.receipt.nativeImportBindings.first {
-                $0.generated?.ownerType == "UIViewController"
-                    && $0.generated?.baseName == "present"
-                    && $0.generated?.dispatch == .instanceMethod
+        let controllerInitializer = try #require(
+            output.receipt.nativeImportCandidates.first {
+                $0.canonicalCallee == "UIKit.UIViewController.init()"
             }
         )
+        #expect(controllerInitializer.descriptor.target.backend == .objectiveCMessage)
+        #expect(controllerInitializer.descriptor.target.entryPoint == "init")
+        #expect(
+            controllerInitializer.descriptor.objectiveC?.runtimeClassName
+                == "NSObject"
+        )
+        #expect(
+            controllerInitializer.descriptor.objectiveC?.dispatchClassName
+                == "UIViewController"
+        )
+        let controllerInitializerBinding = try #require(
+            output.receipt.nativeImportBindings.first {
+                $0.key == controllerInitializer.key
+            }
+        )
+        #expect(controllerInitializerBinding.strategy == .objectiveCInvoker)
+        #expect(controllerInitializerBinding.generated == nil)
         let presentImport = try #require(
             output.receipt.nativeImportCandidates.first {
-                $0.key == presentBinding.key
+                $0.descriptor.objectiveC?.runtimeClassName == "UIViewController"
+                    && $0.descriptor.target.entryPoint
+                        == "presentViewController:animated:completion:"
             }
         )
+        #expect(presentImport.descriptor.target.backend == .objectiveCMessage)
+        let presentBinding = try #require(
+            output.receipt.nativeImportBindings.first {
+                $0.key == presentImport.key
+            }
+        )
+        #expect(presentBinding.strategy == .objectiveCInvoker)
+        #expect(presentBinding.generated == nil)
         #expect(presentImport.effects.requiresMainActor)
         #expect(
             presentImport.contract.execution.maximumDurationMicroseconds
@@ -3486,15 +3498,30 @@ struct NativeImportDiscoveryTests {
                 "groupTableViewBackgroundColor",
             ].contains($0.baseName)
         })
-        let interaction = try #require(generatedOperations.first {
-            $0.ownerType == "UIView" && $0.baseName == "addInteraction"
-        })
-        #expect(interaction.parameterSwiftTypes == [
+        let interaction = try #require(
+            output.receipt.nativeImportCandidates.first {
+                $0.descriptor.target.entryPoint == "addInteraction:"
+                    && $0.descriptor.objectiveC?.runtimeClassName == "UIView"
+            }
+        )
+        #expect(interaction.descriptor.target.backend == .objectiveCMessage)
+        let interactionBinding = try #require(
+            output.receipt.nativeImportBindings.first {
+                $0.key == interaction.key
+            }
+        )
+        #expect(interactionBinding.strategy == .objectiveCInvoker)
+        #expect(interactionBinding.generated == nil)
+        #expect(interaction.descriptor.logicalSignature.parameters.map(\.type) == [
             "Swift.AnyObject", "UIView",
         ])
-        #expect(interaction.invocationParameterSwiftTypes == [
-            "any UIInteraction", "UIView",
+        #expect(interaction.descriptor.physicalSignature.parameters.map(\.type.kind) == [
+            .object,
         ])
+        #expect(
+            interaction.descriptor.physicalSignature.parameters.first?
+                .type.canonicalName == "any UIInteraction"
+        )
 
         let typeBindings = output.receipt.nativeTypeBindings.compactMap(\.generated)
         #expect(typeBindings.contains {
@@ -3551,35 +3578,46 @@ struct NativeImportDiscoveryTests {
         })
         let generatedBridge = shell.bridge.sourceFiles.values.joined(separator: "\n")
         #expect(generatedBridge.contains("import Foundation"))
-        #expect(generatedBridge.contains(".textAlignment ="))
-        #expect(generatedBridge.contains(".accessibilityTraits ="))
-        #expect(generatedBridge.contains("UIColor.black"))
-        #expect(generatedBridge.contains(".backgroundColor ="))
-        #expect(generatedBridge.contains("UIFont.systemFont("))
-        #expect(generatedBridge.contains(".addingTimeInterval("))
-        #expect(generatedBridge.contains(".configuration ="))
-        #expect(generatedBridge.contains(".title ="))
-        #expect(generatedBridge.contains("NSMaxRange(argument0)"))
-        #expect(generatedBridge.contains(".subviews"))
-        #expect(generatedBridge.contains("scheduledTimer"))
-        #expect(generatedBridge.contains("asyncAfter"))
-        #expect(generatedBridge.contains("dataTask"))
-        #expect(generatedBridge.contains("addObserver"))
-        #expect(generatedBridge.contains("addOperation"))
-        #expect(generatedBridge.contains("addCompletion"))
-        #expect(generatedBridge.contains("animateKeyframes"))
-        #expect(generatedBridge.contains(".configurationUpdateHandler ="))
-        #expect(generatedBridge.contains(".completionBlock ="))
-        #expect(generatedBridge.contains("UIAction("))
-        #expect(generatedBridge.contains("UIAlertAction("))
-        #expect(generatedBridge.contains("UIContextualAction("))
-        #expect(generatedBridge.contains("UIViewController()"))
-        #expect(generatedBridge.contains(".present("))
-        #expect(generatedBridge.contains("encodeNativeClosure("))
-        #expect(generatedBridge.contains("callbackEncoder.encodeError("))
-        #expect(generatedBridge.contains("NSPredicate"))
-        #expect(generatedBridge.contains("enumerator"))
-        #expect(!generatedBridge.contains("NSTimer"))
+        let expectedSwiftAdapterSnippets = [
+            ".textAlignment =", ".accessibilityTraits =",
+            "UIFont.systemFont(", ".addingTimeInterval(", ".configuration =",
+            ".title =", "NSMaxRange(argument0)", "scheduledTimer", "asyncAfter",
+            "dataTask", "addObserver", "addOperation", "addCompletion", ".subviews",
+            "animateKeyframes", ".configurationUpdateHandler =",
+            "UIAction(", "UIAlertAction(", "UIContextualAction(",
+            "encodeNativeClosure(", "callbackEncoder.encodeError(", "NSPredicate",
+            "enumerator",
+        ]
+        let missingSwiftAdapterSnippets = expectedSwiftAdapterSnippets.filter {
+            !generatedBridge.contains($0)
+        }
+        #expect(missingSwiftAdapterSnippets.isEmpty)
+        let blackColor = try #require(
+            output.receipt.nativeImportCandidates.first {
+                $0.canonicalCallee == "UIKit.UIColor.black.get"
+            }
+        )
+        #expect(blackColor.descriptor.target.backend == .objectiveCMessage)
+        let genericObjectiveCSelectors = Set(
+            output.receipt.nativeImportCandidates.compactMap { candidate in
+                candidate.descriptor.target.backend == .objectiveCMessage
+                    ? candidate.descriptor.target.entryPoint
+                    : nil
+            }
+        )
+        #expect(genericObjectiveCSelectors.isSuperset(of: [
+            "addInteraction:", "init",
+            "presentViewController:animated:completion:",
+            "setBackgroundColor:", "setCompletionBlock:",
+        ]))
+        let scheduledTimerImport = try #require(
+            output.receipt.nativeImportCandidates.first {
+                $0.descriptor.target.entryPoint
+                    == "scheduledTimerWithTimeInterval:repeats:block:"
+            }
+        )
+        #expect(scheduledTimerImport.descriptor.objectiveC?.runtimeClassName == "NSTimer")
+        #expect(scheduledTimerImport.descriptor.logicalSignature.result.type == "Timer")
         let descriptorTypeSpellings = shell.archive.nativeImports.flatMap {
             record in
             record.descriptor.logicalSignature.parameters.map(\.type)
@@ -3595,12 +3633,9 @@ struct NativeImportDiscoveryTests {
         })
         #expect(generatedBridge.contains(".invokeResult("))
         #expect(generatedBridge.contains("failureResult: {"))
-        #expect(generatedBridge.contains("let argument0: any UIInteraction"))
-        #expect(generatedBridge.contains("as: (any UIInteraction).self"))
-        #expect(generatedBridge.contains(
-            "try context.withMainActor {\n"
-                + "                            let argument0: any UIInteraction"
-        ))
+        #expect(!generatedBridge.contains("let argument0: any UIInteraction"))
+        #expect(!generatedBridge.contains("as: (any UIInteraction).self"))
+        #expect(generatedBridge.contains("Runtime.ObjectiveCInvoker("))
         #expect(!generatedBridge.contains("any Any"))
         #expect(generatedBridge.contains("makeResolvedNativeImports_0()"))
         #expect(generatedBridge.contains("makeSynchronousNativeInvokers_0()"))
@@ -3676,8 +3711,8 @@ struct NativeImportDiscoveryTests {
         )
     }
 
-    @Test("Managed Debug prefreezes measured SDK members generically")
-    func prefreezesManagedSDKMembers() throws {
+    @Test("Managed Debug captures measured SDK members generically")
+    func capturesManagedSDKMembers() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "helix-managed-sdk-properties-\(UUID().uuidString)",
             isDirectory: true
@@ -3844,26 +3879,26 @@ struct NativeImportDiscoveryTests {
             configured.receipt.nativeImportCandidates.map(\.canonicalCallee)
         )
         #expect(configuredNames.contains(
-            "\(moduleName).HelixExternal.UIColor.systemBlue.get"
+            "UIKit.UIColor.systemBlue.get"
         ))
         #expect(!configuredNames.contains(
-            "\(moduleName).HelixExternal.UIColor.black.get"
+            "UIKit.UIColor.black.get"
         ))
         #expect(!configuredNames.contains(
-            "\(moduleName).HelixExternal.UIScreen.main.get"
+            "UIKit.UIScreen.main.get"
         ))
         #expect(!configuredNames.contains(
-            "\(moduleName).HelixExternal.Bundle.main.get"
+            "Foundation.Bundle.main.get"
         ))
         for name in [
-            "\(moduleName).HelixExternal.UIView.isHidden.get",
-            "\(moduleName).HelixExternal.UIView.alpha.set",
-            "\(moduleName).HelixExternal.UIView.setNeedsLayout().call",
-            "\(moduleName).HelixExternal.UIView.setAnimationsEnabled(_:).call",
-            "\(moduleName).HelixExternal.UIColor.init(white:alpha:)",
-            "\(moduleName).HelixExternal.Bundle.path(forResource:ofType:).call",
-            "\(moduleName).HelixExternal.URLCache.shared.set",
-            "\(moduleName).HelixExternal.FileManager.removeItem(atPath:).call",
+            "UIKit.UIView.isHidden.get",
+            "UIKit.UIView.alpha.set",
+            "UIKit.UIView.setNeedsLayout()",
+            "UIKit.UIView.setAnimationsEnabled(_:)",
+            "UIKit.UIColor.init(white:alpha:)",
+            "Foundation.Bundle.path(forResource:ofType:)",
+            "Foundation.URLCache.shared.set",
+            "Foundation.FileManager.removeItem(atPath:)",
         ] {
             #expect(!configuredNames.contains(name))
         }
@@ -3875,37 +3910,37 @@ struct NativeImportDiscoveryTests {
             managed.receipt.nativeImportCandidates.map(\.canonicalCallee)
         )
         let deprecatedScreenMain =
-            "\(moduleName).HelixExternal.UIScreen.main.get"
+            "UIKit.UIScreen.main.get"
         #expect(!managedNames.contains(deprecatedScreenMain))
         let firstUseNames = [
-            "\(moduleName).HelixExternal.UIColor.black.get",
-            "\(moduleName).HelixExternal.UIDevice.current.get",
-            "\(moduleName).HelixExternal.UIApplication.shared.get",
-            "\(moduleName).HelixExternal.UIView.areAnimationsEnabled.get",
-            "\(moduleName).HelixExternal.Bundle.main.get",
-            "\(moduleName).HelixExternal.ProcessInfo.processInfo.get",
+            "UIKit.UIColor.black.get",
+            "UIKit.UIDevice.current.get",
+            "UIKit.UIApplication.shared.get",
+            "UIKit.UIView.areAnimationsEnabled.get",
+            "Foundation.Bundle.main.get",
+            "Foundation.ProcessInfo.processInfo.get",
         ]
         for name in firstUseNames {
             #expect(managedNames.contains(name))
         }
         let callableNames = [
-            "\(moduleName).HelixExternal.UIView.isHidden.get",
-            "\(moduleName).HelixExternal.UIView.alpha.set",
-            "\(moduleName).HelixExternal.UIView.setNeedsLayout().call",
-            "\(moduleName).HelixExternal.UIView.setAnimationsEnabled(_:).call",
-            "\(moduleName).HelixExternal.UIColor.init(white:alpha:)",
-            "\(moduleName).HelixExternal.Bundle.path(forResource:ofType:).call",
-            "\(moduleName).HelixExternal.URLCache.shared.set",
-            "\(moduleName).HelixExternal.FileManager.removeItem(atPath:).call",
+            "UIKit.UIView.isHidden.get",
+            "UIKit.UIView.alpha.set",
+            "UIKit.UIView.setNeedsLayout()",
+            "UIKit.UIView.setAnimationsEnabled(_:)",
+            "UIKit.UIColor.init(white:alpha:)",
+            "Foundation.Bundle.path(forResource:ofType:)",
+            "Foundation.URLCache.shared.set",
+            "Foundation.FileManager.removeItem(atPath:)",
         ]
         for name in callableNames {
             #expect(managedNames.contains(name))
         }
         #expect(managedNames.contains(
-            "\(moduleName).HelixExternal.UIColor.systemMint.get"
+            "UIKit.UIColor.systemMint.get"
         ))
         #expect(!managedNames.contains(
-            "\(moduleName).HelixExternal.UIApplication."
+            "UIKit.UIApplication."
                 + "openDefaultApplicationsSettingsURLString.get"
         ))
         let blackName = firstUseNames[0]
@@ -3919,7 +3954,7 @@ struct NativeImportDiscoveryTests {
         )
         let systemBlue = try #require(managed.receipt.nativeImportCandidates.first {
             $0.canonicalCallee
-                == "\(moduleName).HelixExternal.UIColor.systemBlue.get"
+                == "UIKit.UIColor.systemBlue.get"
         })
         #expect(!systemBlue.effects.requiresMainActor)
         let application = try #require(managed.receipt.nativeImportCandidates.first {
@@ -3976,24 +4011,41 @@ struct NativeImportDiscoveryTests {
             sourceRoot: directory
         )
         let generated = shell.bridge.sourceFiles.values.joined(separator: "\n")
-        #expect(!generated.contains("NSBundle"))
-        #expect(!generated.contains("NSProcessInfo"))
-        #expect(generated.contains("UIColor.black"))
-        #expect(generated.contains("UIColor.systemMint"))
+        #expect(generated.contains("runtimeClassName: \"NSBundle\""))
+        #expect(generated.contains("runtimeClassName: \"NSProcessInfo\""))
+        #expect(!generated.contains("UIColor.black"))
+        #expect(!generated.contains("UIColor.systemMint"))
         #expect(!generated.contains("UIScreen.main"))
-        #expect(generated.contains("UIDevice.current"))
-        #expect(generated.contains("UIApplication.shared"))
-        #expect(generated.contains("UIView.areAnimationsEnabled"))
-        #expect(generated.contains("Bundle.main"))
-        #expect(generated.contains("ProcessInfo.processInfo"))
-        #expect(generated.contains("argument0.isHidden"))
-        #expect(generated.contains("argument1.alpha = argument0"))
-        #expect(generated.contains("argument0.setNeedsLayout()"))
-        #expect(generated.contains("UIView.setAnimationsEnabled(argument0)"))
-        #expect(generated.contains("UIColor(white: argument0, alpha: argument1)"))
-        #expect(generated.contains("argument2.path(forResource: argument0, ofType: argument1)"))
-        #expect(generated.contains("URLCache.shared = argument0"))
-        #expect(generated.contains("try argument1.removeItem(atPath: argument0)"))
+        #expect(!generated.contains("UIDevice.current"))
+        #expect(!generated.contains("UIApplication.shared"))
+        #expect(!generated.contains("Bundle.main"))
+        #expect(generated.contains("Runtime.ObjectiveCInvoker("))
+        #expect(!generated.contains("UIView.areAnimationsEnabled"))
+        #expect(!generated.contains("ProcessInfo.processInfo"))
+        #expect(!generated.contains("argument0.isHidden"))
+        #expect(!generated.contains("argument1.alpha = argument0"))
+        #expect(!generated.contains("argument0.setNeedsLayout()"))
+        #expect(!generated.contains("UIView.setAnimationsEnabled(argument0)"))
+        #expect(!generated.contains("UIColor(white: argument0, alpha: argument1)"))
+        #expect(!generated.contains("argument2.path(forResource: argument0, ofType: argument1)"))
+        #expect(!generated.contains("URLCache.shared = argument0"))
+        #expect(!generated.contains("try argument1.removeItem(atPath: argument0)"))
+        let objectiveCKeys = Set((firstUseNames + callableNames).compactMap { name in
+            managed.receipt.nativeImportCandidates.first {
+                $0.canonicalCallee == name
+                    && $0.descriptor.target.backend == .objectiveCMessage
+            }?.key
+        })
+        #expect(
+            objectiveCKeys.count == firstUseNames.count + callableNames.count
+        )
+        #expect(managed.receipt.nativeImportBindings.filter {
+            objectiveCKeys.contains($0.key)
+        }.allSatisfy {
+            $0.strategy == .objectiveCInvoker
+                && $0.generated == nil
+                && $0.importedModules.isEmpty
+        })
 
         let changed = baseline
             .replacingOccurrences(of: ".systemBlue", with: ".black")
@@ -4131,13 +4183,22 @@ struct NativeImportDiscoveryTests {
     }
 
     private func runtimeSupportCompilerArguments(modules: URL) throws -> [String] {
-        let supportDirectory = modules.deletingLastPathComponent()
-            .appendingPathComponent("HelixRuntimeSupport.build", isDirectory: true)
-        let moduleMap = supportDirectory.appendingPathComponent("module.modulemap")
-        guard FileManager.default.fileExists(atPath: moduleMap.path) else {
-            throw FrontendReceipt.Error.invalidRequest("missing HelixRuntimeSupport module map")
+        let buildRoot = modules.deletingLastPathComponent()
+        var arguments: [String] = []
+        for module in ["HelixRuntimeSupport", "HelixObjectiveCRuntimeSupport"] {
+            let moduleMap = buildRoot
+                .appendingPathComponent("\(module).build", isDirectory: true)
+                .appendingPathComponent("module.modulemap")
+            guard FileManager.default.fileExists(atPath: moduleMap.path) else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "missing \(module) module map"
+                )
+            }
+            arguments.append(contentsOf: [
+                "-Xcc", "-fmodule-map-file=\(moduleMap.path)",
+            ])
         }
-        return ["-Xcc", "-fmodule-map-file=\(moduleMap.path)"]
+        return arguments
     }
 
     private func requireFrontendSuccess(_ output: SwiftFrontend.Output) throws {
@@ -4403,6 +4464,289 @@ struct NativeImportDiscoveryTests {
             "ScopeFixture.consume(_:)",
         ])
         #expect(output.diagnostics.map(\.code) == ["HLXNID005", "HLXNID005"])
+    }
+
+    @Test("Lexical super dispatch never degrades to a dynamic Swift adapter")
+    func rejectsUnprovenLexicalSuperDispatch() throws {
+        let configuration = try PatchConfiguration.Document.parse(yaml: """
+        schema: 1
+        modules:
+          ScopeFixture:
+            include:
+              - Sources/**
+            nativeImports:
+              candidateIndex: source-and-catalog
+              emit: scoped
+              sourceScope:
+                include:
+                  - Sources/**
+                profile: read-write
+                allowsMainThread: true
+        """)
+        let metadata = makeMetadata(moduleName: "ScopeFixture")
+        let controllerID = Core.TypeID.derive(
+            namespace: metadata.shellNamespaceID,
+            canonicalType: "UIViewController"
+        )
+        var declaration = declaration(
+            canonicalCallee:
+                "ScopeFixture.HelixExternal.UIViewController.viewDidLayoutSubviews().call",
+            mangledName: "$hlx_native_foreign_super",
+            dispatch: .instanceMethod,
+            ownerType: "UIViewController",
+            signature: .init(
+                parameters: ["UIViewController"],
+                result: "Swift.Void",
+                isolation: "MainActor"
+            ),
+            effects: .init(requiresMainActor: true)
+        )
+        declaration.baseName = "viewDidLayoutSubviews"
+        declaration.sourceFileLogicalID = "Sources/Screen.swift"
+        declaration.argumentLabels = []
+        declaration.parameterSwiftTypes = ["UIViewController"]
+        declaration.parameterProjection = .identity(parameterCount: 1)
+        declaration.resultSwiftType = "Swift.Void"
+        declaration.parameterTypes = [.native(controllerID)]
+        declaration.resultType = .void
+        declaration.foreignDispatch = .superclass
+
+        let output = try NativeImportDiscovery.Engine().discover(
+            declarations: [declaration],
+            metadata: metadata,
+            configuration: configuration,
+            nativeTypeKinds: [controllerID: .reference]
+        )
+        #expect(output.candidates.isEmpty)
+        #expect(output.diagnostics.map(\.code) == ["HLXNID009"])
+    }
+
+    @Test("Source-observed Objective-C APIs use one structured invoker")
+    func routesObjectiveCCallsWithoutPerMethodSwiftAdapters() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-objective-c-invoker-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let sourceDirectory = directory.appendingPathComponent(
+            "Sources",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: sourceDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = sourceDirectory.appendingPathComponent("Screen.swift")
+        try Data("""
+        import Foundation
+        import UIKit
+
+        @MainActor
+        public func update(_ view: UIView, hidden: Bool) -> Bool {
+            view.isHidden = hidden
+            view.setNeedsLayout()
+            return view.isHidden
+        }
+
+        @MainActor
+        public func convert(_ view: UIView, point: CGPoint) -> CGPoint {
+            view.convert(point, to: nil)
+        }
+
+        public func remove(_ manager: FileManager, path: String) throws {
+            try manager.removeItem(atPath: path)
+        }
+
+        public func remove(_ manager: FileManager, url: URL) throws {
+            try manager.removeItem(at: url)
+        }
+
+        @MainActor
+        public func disableButtonAnimations() {
+            UIButton.setAnimationsEnabled(false)
+        }
+
+        @MainActor
+        public func buttonAnimationsEnabled() -> Bool {
+            UIButton.areAnimationsEnabled
+        }
+
+        @MainActor
+        public final class Screen: UIViewController {
+            public override func viewDidLayoutSubviews() {
+                applyLayout()
+            }
+
+            private func applyLayout() {
+                super.viewDidLayoutSubviews()
+                _ = inheritedTitle(from: self)
+            }
+
+            private func inheritedTitle(
+                from controller: UIViewController
+            ) -> String? {
+                super.title ?? controller.title
+            }
+        }
+
+        """.utf8).write(to: sourceURL)
+
+        let moduleName = "ObjectiveCInvokerFixture"
+        let frontend = SwiftFrontend.Driver(
+            compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc")
+        )
+        let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        let target = "arm64-apple-ios15.0-simulator"
+        let configuration = try PatchConfiguration.Document.parse(yaml: """
+        schema: 1
+        modules:
+          \(moduleName):
+            include:
+              - Sources/**
+            entrypoints: all
+            nativeImports:
+              candidateIndex: source-and-catalog
+              emit: scoped
+              sourceScope:
+                include:
+                  - Sources/**
+                declarations:
+                  - \(moduleName).*
+                visibility: all
+                profile: read-write
+                maximumBoundedDurationMicroseconds: 2000
+                allowsMainThread: true
+        """)
+        let invocation = InterfaceArchive.FrontendInvocation(
+            moduleName: moduleName,
+            targetTriple: target,
+            sdkName: sdk.name,
+            sdkBuild: sdk.buildVersion,
+            optimization: "-Onone",
+            semanticArguments: ["-parse-as-library"]
+        )
+        let metadata = InterfaceArchive.ReleaseMetadata(
+            bundleID: "dev.helix.objective-c-invoker",
+            buildNumber: "1",
+            shellNamespaceID: .derive(
+                bundleID: "dev.helix.objective-c-invoker",
+                buildNumber: "1",
+                seed: "fixture"
+            ),
+            machOUUIDs: [],
+            targetTriple: target,
+            minimumOS: .init(15),
+            xcodeBuild: "integration-test",
+            sdkBuild: sdk.buildVersion,
+            frontendInvocation: invocation,
+            transformPipelineHash: ShellBuild.transformPipelineHash,
+            sourceBaselineHash: .sha256("computed by indexer")
+        )
+        let output = try FrontendReceipt.Adapter().generate(.init(
+            metadata: metadata,
+            configuration: configuration,
+            sources: [.init(
+                logicalPath: "Sources/Screen.swift",
+                url: sourceURL
+            )],
+            compilerURL: frontend.compilerURL
+        ))
+        let objectiveCRecords = output.receipt.nativeImportCandidates.filter {
+            $0.descriptor.target.backend == .objectiveCMessage
+        }
+        #expect(Set(objectiveCRecords.map(\.descriptor.target.entryPoint)) == [
+            "areAnimationsEnabled", "convertPoint:toView:", "isHidden",
+            "removeItemAtPath:error:", "setAnimationsEnabled:", "setHidden:",
+            "setNeedsLayout", "title", "viewDidLayoutSubviews",
+        ])
+        let inheritedClassMethod = try #require(objectiveCRecords.first {
+            $0.descriptor.target.entryPoint == "setAnimationsEnabled:"
+        })
+        #expect(inheritedClassMethod.descriptor.objectiveC?.runtimeClassName == "UIView")
+        #expect(inheritedClassMethod.descriptor.objectiveC?.dispatchClassName == "UIButton")
+        #expect(inheritedClassMethod.descriptor.target.dispatch == .static)
+        let inheritedClassProperty = try #require(objectiveCRecords.first {
+            $0.descriptor.target.entryPoint == "areAnimationsEnabled"
+        })
+        #expect(inheritedClassProperty.descriptor.objectiveC?.runtimeClassName == "UIView")
+        #expect(inheritedClassProperty.descriptor.objectiveC?.dispatchClassName == "UIButton")
+        #expect(inheritedClassProperty.descriptor.target.dispatch == .static)
+        let lexicalSuper = try #require(objectiveCRecords.first {
+            $0.descriptor.target.entryPoint == "viewDidLayoutSubviews"
+                && $0.descriptor.objectiveC?.lexicalSuperclassName
+                    == "UIViewController"
+        })
+        #expect(lexicalSuper.descriptor.target.module == "UIKit")
+        let titleGetters = objectiveCRecords.filter {
+            $0.descriptor.target.entryPoint == "title"
+        }
+        #expect(titleGetters.contains {
+            $0.descriptor.objectiveC?.lexicalSuperclassName == nil
+        })
+        #expect(titleGetters.contains {
+            $0.descriptor.objectiveC?.lexicalSuperclassName == "UIViewController"
+        })
+        let viewRecords = objectiveCRecords.filter {
+            $0.descriptor.objectiveC?.runtimeClassName == "UIView"
+        }
+        #expect(viewRecords.count == 6)
+        #expect(viewRecords.allSatisfy {
+            $0.descriptor.target.module == "UIKit"
+                && $0.contract.domain == .uiKit
+        })
+        let removal = try #require(objectiveCRecords.first {
+            $0.descriptor.target.entryPoint == "removeItemAtPath:error:"
+        })
+        #expect(removal.descriptor.target.module == "Foundation")
+        #expect(removal.descriptor.objectiveC?.runtimeClassName == "NSFileManager")
+        #expect(removal.descriptor.objectiveC?.errorFailure == .falseBoolean)
+        #expect(removal.descriptor.physicalSignature.errorConvention == .nsErrorOut)
+        #expect(removal.descriptor.physicalSignature.parameters.map(\.source.kind) == [
+            .argument, .errorOut,
+        ])
+        let overlay = try #require(output.receipt.nativeImportCandidates.first {
+            $0.canonicalCallee.contains("FileManager.removeItem(at:)")
+        })
+        #expect(overlay.descriptor.target.backend == .swiftAdapter)
+        let overlayBinding = try #require(output.receipt.nativeImportBindings.first {
+            $0.key == overlay.key
+        })
+        #expect(overlayBinding.strategy == .generatedSwiftAdapter)
+        #expect(overlayBinding.generated != nil)
+        let keys = Set(objectiveCRecords.map(\.key))
+        let bindings = output.receipt.nativeImportBindings.filter {
+            keys.contains($0.key)
+        }
+        #expect(bindings.count == objectiveCRecords.count)
+        #expect(bindings.allSatisfy {
+            $0.strategy == .objectiveCInvoker
+                && $0.factoryExpression == nil
+                && $0.generated == nil
+                && $0.importedModules.isEmpty
+        })
+        let pointType = try #require(output.receipt.nativeTypes.first {
+            $0.canonicalName.split(separator: ".").last == "CGPoint"
+        })
+        #expect(pointType.estimatedSize == 16)
+        let pointBinding = try #require(
+            output.receipt.nativeTypeBindings.first {
+                $0.canonicalName == pointType.canonicalName
+            }
+        )
+        #expect(pointBinding.generated?.representation == .objectiveCStructure)
+        #expect(pointBinding.generated?.nativeABIEncoding == "{CGPoint=dd}")
+
+        let shell = try ShellBuild.Materializer().materialize(
+            receipt: output.receipt,
+            sourceRoot: directory
+        )
+        let generated = shell.bridge.sourceFiles.values.joined(separator: "\n")
+        #expect(generated.contains("Runtime.ObjectiveCInvoker("))
+        #expect(generated.contains("ObjectiveCMetadata(runtimeClassName: \"UIView\""))
+        #expect(generated.contains("VM.NativeTypeOperations.objectiveCStructure("))
+        #expect(generated.contains("encoding: \"{CGPoint=dd}\""))
+        #expect(!generated.contains("argument0.setNeedsLayout()"))
+        #expect(!generated.contains("argument1.isHidden"))
     }
 
     private func declaration(

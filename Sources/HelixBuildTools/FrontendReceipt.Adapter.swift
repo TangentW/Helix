@@ -170,11 +170,29 @@ public struct Adapter: Sendable {
             demangled: demangled,
             silFile: operationSILFile
         )
+        importedOperationSurface.operations = try performance.measure(
+            "frontend.resolve_objective_c_selectors"
+        ) {
+            try FrontendReceipt.ObjectiveCSelectorResolver.resolve(
+                operations: importedOperationSurface.operations,
+                frontend: frontend,
+                invocation: request.metadata.frontendInvocation
+            )
+        }
         var importedTypes = try mergeImportedNativeTypes(
             discoveredTypes: discoveredImportedTypes,
             operationTypes: importedOperationSurface.types
         )
         if request.callingSurfacePolicy == .managedDebugModule {
+            let observedObjectiveCDeclarationUSRs: Set<String> = Set(
+                importedOperationSurface.operations.compactMap {
+                    operation in
+                    guard operation.objectiveC?.moduleName == nil else {
+                        return nil
+                    }
+                    return operation.objectiveC?.declarationUSR
+                }
+            )
             let managedSurface = try performance.measure(
                 "frontend.expand_managed_debug_surface"
             ) {
@@ -183,6 +201,7 @@ public struct Adapter: Sendable {
                     minimumOS: request.metadata.minimumOS,
                     frontend: frontend,
                     invocation: request.metadata.frontendInvocation,
+                    declarationUSRs: observedObjectiveCDeclarationUSRs,
                     cache: cache,
                     compilerFingerprint: toolchain.fingerprint,
                     compilerInputHash: compilerInputHash
@@ -241,6 +260,17 @@ public struct Adapter: Sendable {
                 value: managedSurface.metrics.generatedProbeSourceBytes
             )
             importedTypes = managedSurface.importedTypes
+            importedOperationSurface.operations = try
+                applyingObjectiveCInitializerTypeModules(
+                    to: importedOperationSurface.operations,
+                    importedTypes: importedTypes
+                )
+            importedOperationSurface.operations =
+                applyingObjectiveCDeclarationModules(
+                    to: importedOperationSurface.operations,
+                    modulesByUSR:
+                        managedSurface.objectiveCModulesByDeclarationUSR
+                )
             let observedCallbackSymbols = Set(
                 importedOperationSurface.operations.filter { operation in
                     operation.parameterSwiftTypes.contains {
@@ -257,6 +287,11 @@ public struct Adapter: Sendable {
                 )
                 return operation.silReferences.isEmpty ? nil : operation
             }
+            importedOperationSurface.operations = try
+                applyingMeasuredObjectiveCEvidence(
+                    to: importedOperationSurface.operations,
+                    measured: measuredManagedOperations
+                )
             let additiveManagedOperations = unambiguousAdditiveImportedOperations(
                 measuredManagedOperations,
                 authoritative: importedOperationSurface.operations
@@ -268,13 +303,70 @@ public struct Adapter: Sendable {
             importedOperationSurface.operations = try mergeImportedOperations(
                 importedOperationSurface.operations + additiveManagedOperations
             )
+        } else {
+            let unresolvedEvidence = importedOperationSurface.operations
+                .compactMap(\.objectiveC)
+                .filter { $0.moduleName == nil }
+            let unresolvedRuntimeNames = Set(
+                unresolvedEvidence.map(\.runtimeClassName)
+            )
+            let unresolvedDeclarationUSRs = Set(
+                unresolvedEvidence.map(\.declarationUSR)
+            )
+            if !unresolvedRuntimeNames.isEmpty {
+                let resolution = try performance.measure(
+                    "frontend.resolve_objective_c_modules"
+                ) {
+                    try FrontendReceipt.ManagedDebugSurface
+                        .resolveObjectiveCModules(
+                            importedTypes: importedTypes,
+                            runtimeNames: unresolvedRuntimeNames,
+                            declarationUSRs: unresolvedDeclarationUSRs,
+                            minimumOS: request.metadata.minimumOS,
+                            frontend: frontend,
+                            invocation: request.metadata.frontendInvocation,
+                            cache: cache,
+                            compilerFingerprint: toolchain.fingerprint,
+                            compilerInputHash: compilerInputHash
+                        )
+                }
+                performance.setCounter(
+                    "objective_c_module.module_count",
+                    value: resolution.metrics.moduleCount
+                )
+                performance.setCounter(
+                    "objective_c_module.symbol_graph_cache_hit_count",
+                    value: resolution.metrics.symbolGraphCacheHitCount
+                )
+                performance.setCounter(
+                    "objective_c_module.symbol_graph_cache_miss_count",
+                    value: resolution.metrics.symbolGraphCacheMissCount
+                )
+                importedTypes = resolution.importedTypes
+                importedOperationSurface.operations = try
+                    applyingObjectiveCInitializerTypeModules(
+                        to: importedOperationSurface.operations,
+                        importedTypes: importedTypes
+                    )
+                importedOperationSurface.operations =
+                    applyingObjectiveCDeclarationModules(
+                        to: importedOperationSurface.operations,
+                        modulesByUSR:
+                            resolution.objectiveCModulesByDeclarationUSR
+                    )
+            }
         }
+        let objectiveCStructures = try objectiveCStructureTypes(
+            in: importedOperationSurface.operations,
+            targetTriple: request.metadata.frontendInvocation.targetTriple
+        )
         let provisionalNativeTypes = try makeNativeTypes(
             request.nativeImportCatalog,
             sourceNominals: sourceNominals,
             importedTypes: importedTypes,
             mainActorReferenceTypes: [],
-            metadata: request.metadata
+            metadata: request.metadata,
+            objectiveCStructures: objectiveCStructures
         )
         let nativeTypeIDs = try makeNativeTypeLookup(
             records: provisionalNativeTypes,
@@ -371,7 +463,8 @@ public struct Adapter: Sendable {
             sourceNominals: sourceNominals,
             importedTypes: importedTypes,
             mainActorReferenceTypes: mainActorReferenceTypes,
-            metadata: request.metadata
+            metadata: request.metadata,
+            objectiveCStructures: objectiveCStructures
         )
         guard nativeTypeRecords.map(\.id) == provisionalNativeTypes.map(\.id) else {
             throw FrontendReceipt.Error.invalidRequest(
@@ -436,7 +529,10 @@ public struct Adapter: Sendable {
                     ? nil : draft.nativeImportDeclaration
             } + importedOperationDeclarations,
             metadata: request.metadata,
-            configuration: effectiveConfiguration
+            configuration: effectiveConfiguration,
+            nativeTypeKinds: Dictionary(uniqueKeysWithValues:
+                nativeTypeRecords.map { ($0.id, $0.kind) }
+            )
         )
         // Selection is anchored to SIL symbols so an explicit Catalog entry may
         // safely rename a source-discovered operation while overriding its factory.
@@ -1201,15 +1297,10 @@ extension FrontendReceipt.Adapter {
             return (item.key, item)
         })
         return candidates.compactMap { candidate in
-            guard let record = emitted[candidate.record.key], let id = record.id else {
+            guard let record = emitted[candidate.record.key], record.id != nil else {
                 return nil
             }
             let generated = candidate.generatedBinding
-            let expression = BridgeGeneration.GeneratedNativeImport.bindingExpression(
-                sourceFileLogicalID: generated.sourceFileLogicalID,
-                id: id,
-                key: record.key
-            )
             let dispatch: ShellBuildReceipt.GeneratedNativeImport.Dispatch = switch generated.dispatch {
             case .globalFunction: .globalFunction
             case .initializer: .initializer
@@ -1223,9 +1314,15 @@ extension FrontendReceipt.Adapter {
             case .instanceSetter: .instanceSetter
             case .instanceValueSetter: .instanceValueSetter
             }
+            if record.descriptor.target.backend == .objectiveCMessage {
+                return .init(
+                    key: record.key,
+                    strategy: .objectiveCInvoker
+                )
+            }
             return .init(
                 key: record.key,
-                invokerExpression: expression,
+                strategy: .generatedSwiftAdapter,
                 importedModules: generated.importedModules,
                 generated: .init(
                     declarationMangledName: generated.declarationMangledName,
@@ -1248,7 +1345,8 @@ extension FrontendReceipt.Adapter {
         sourceNominals: [SourceNominal],
         importedTypes: [ImportedNativeType],
         mainActorReferenceTypes: Set<String>,
-        metadata: InterfaceArchive.ReleaseMetadata
+        metadata: InterfaceArchive.ReleaseMetadata,
+        objectiveCStructures: [String: Core.NativeCall.ABIType] = [:]
     ) throws -> [InterfaceArchive.TypeRecord] {
         let catalogByName = Dictionary(uniqueKeysWithValues: catalog.nativeTypes.map {
             ($0.canonicalName, $0)
@@ -1348,6 +1446,33 @@ extension FrontendReceipt.Adapter {
                 )).sorted()
                 continue
             }
+            let objectiveCStructure = try objectiveCStructure(
+                for: imported,
+                catalog: objectiveCStructures
+            )
+            guard objectiveCStructure == nil || imported.kind == .value else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "Objective-C structure \(imported.canonicalName) is not an imported value"
+                )
+            }
+            let layoutFingerprint: Core.Digest
+            if let structure = objectiveCStructure {
+                let physicalName = structure.canonicalName
+                    ?? imported.canonicalName
+                let encoding = structure.encoding ?? ""
+                let size = structure.size ?? 0
+                let alignment = structure.alignment ?? 0
+                layoutFingerprint = .sha256(
+                    "HLX.ObjectiveCStructure.v1:\(physicalName):"
+                        + "\(encoding):\(size):\(alignment)"
+                )
+            } else {
+                layoutFingerprint = .sha256(
+                    "HLX.ImportedNativeType.v1:"
+                        + "\(metadata.frontendInvocation.targetTriple):"
+                        + "\(imported.kind.rawValue):\(imported.canonicalName)"
+                )
+            }
             records.append(
                 .init(
                     id: .derive(
@@ -1360,14 +1485,11 @@ extension FrontendReceipt.Adapter {
                         excluding: imported.canonicalName
                     ),
                     kind: imported.kind,
-                    layoutFingerprint: .sha256(
-                        "HLX.ImportedNativeType.v1:\(metadata.frontendInvocation.targetTriple):"
-                            + "\(imported.kind.rawValue):\(imported.canonicalName)"
-                    ),
+                    layoutFingerprint: layoutFingerprint,
                     isCopyable: true,
                     requiresMainActor: imported.requiresMainActor,
                     isEmittedToDevice: true,
-                    estimatedSize: 8
+                    estimatedSize: UInt64(objectiveCStructure?.size ?? 8)
                 )
             )
         }
@@ -1377,6 +1499,53 @@ extension FrontendReceipt.Adapter {
             )
         }
         return records.sorted { $0.id.rawValue < $1.id.rawValue }
+    }
+
+    private func objectiveCStructureTypes(
+        in operations: [ImportedOperation],
+        targetTriple: String
+    ) throws -> [String: Core.NativeCall.ABIType] {
+        var result: [String: Core.NativeCall.ABIType] = [:]
+        for evidence in operations.compactMap(\.objectiveC) {
+            for raw in evidence.parameters.map(\.swiftABIType)
+                + [evidence.resultSwiftABIType] {
+                guard let type = FrontendReceipt.ObjectiveCABI.structureType(
+                    swiftABIType: raw,
+                    targetTriple: targetTriple
+                ), let name = type.canonicalName
+                else { continue }
+                let aliases = Set([name, name.split(separator: ".").last.map(
+                    String.init
+                ) ?? name])
+                for alias in aliases {
+                    if let existing = result[alias], existing != type {
+                        throw FrontendReceipt.Error.invalidRequest(
+                            "Objective-C structure \(alias) has conflicting target ABI evidence"
+                        )
+                    }
+                    result[alias] = type
+                }
+            }
+        }
+        return result
+    }
+
+    private func objectiveCStructure(
+        for imported: ImportedNativeType,
+        catalog: [String: Core.NativeCall.ABIType]
+    ) throws -> Core.NativeCall.ABIType? {
+        let names = Set(
+            [imported.canonicalName, imported.swiftType] + imported.aliases
+        ).flatMap { name in
+            [name, name.split(separator: ".").last.map(String.init) ?? name]
+        }
+        let matches = Set(names.compactMap { catalog[$0] })
+        guard matches.count <= 1 else {
+            throw FrontendReceipt.Error.invalidRequest(
+                "imported native type \(imported.canonicalName) has ambiguous Objective-C structure ABI evidence"
+            )
+        }
+        return matches.count == 1 ? matches.first : nil
     }
 
     /// The typed AST and mangled ABI jointly prove these spellings denote the
@@ -1489,7 +1658,8 @@ extension FrontendReceipt.Adapter {
                 + "\(String(reflecting: item.key.rawValue.hex)))))"
             return .init(
                 key: item.key,
-                invokerExpression: expression,
+                strategy: .factory,
+                factoryExpression: expression,
                 importedModules: candidate.importedModules
             )
         }.sorted { $0.key.rawValue < $1.key.rawValue }
@@ -1510,6 +1680,7 @@ extension FrontendReceipt.Adapter {
         let importedByName = Dictionary(uniqueKeysWithValues: importedTypes.map {
             ($0.canonicalName, $0)
         })
+        let objectiveCStructures = try objectiveCStructureABIs(in: archive)
         return try archive.nativeTypes.compactMap { item in
             guard item.isEmittedToDevice else { return nil }
             if let candidate = byName[item.canonicalName] {
@@ -1534,16 +1705,35 @@ extension FrontendReceipt.Adapter {
                 )
             }
             if let imported = importedByName[item.canonicalName] {
+                let structure = objectiveCStructures[item.id]
                 let representation: ShellBuildReceipt.GeneratedNativeType.Representation =
-                    switch imported.representation {
-                    case .reference: .reference
-                    case .rawRepresentable: .rawRepresentable
-                    case .opaqueValue: .opaqueValue
+                    if structure != nil {
+                        .objectiveCStructure
+                    } else {
+                        switch imported.representation {
+                        case .reference: .reference
+                        case .rawRepresentable: .rawRepresentable
+                        case .opaqueValue: .opaqueValue
+                        }
                     }
+                if let structure {
+                    guard imported.kind == .value,
+                          structure.kind == .structure,
+                          let size = structure.size,
+                          UInt64(size) == item.estimatedSize,
+                          structure.alignment != nil,
+                          structure.encoding != nil
+                    else {
+                        throw FrontendReceipt.Error.invalidRequest(
+                            "Objective-C structure \(item.canonicalName) disagrees with its TypeRecord"
+                        )
+                    }
+                }
                 let generated = ShellBuildReceipt.GeneratedNativeType(
                     sourceFileLogicalID: imported.sourceFileLogicalID,
                     swiftType: imported.swiftType,
-                    representation: representation
+                    representation: representation,
+                    nativeABIEncoding: structure?.encoding
                 )
                 let expression = BridgeGeneration.GeneratedNativeType.bindingExpression(
                     sourceFileLogicalID: generated.sourceFileLogicalID,
@@ -1596,6 +1786,44 @@ extension FrontendReceipt.Adapter {
             ($0.canonicalName, $0.layoutFingerprint.hex)
                 < ($1.canonicalName, $1.layoutFingerprint.hex)
         }
+    }
+
+    private func objectiveCStructureABIs(
+        in archive: InterfaceArchive.Archive
+    ) throws -> [Core.TypeID: Core.NativeCall.ABIType] {
+        var result: [Core.TypeID: Core.NativeCall.ABIType] = [:]
+        func record(
+            _ type: Core.NativeCall.ABIType,
+            logical: Bytecode.ValueType
+        ) throws {
+            guard type.kind == .structure,
+                  case let .native(id) = logical
+            else { return }
+            if let existing = result[id], existing != type {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "native type \(id) has conflicting Objective-C structure ABIs"
+                )
+            }
+            result[id] = type
+        }
+        for call in archive.nativeImports
+        where call.descriptor.target.backend == .objectiveCMessage {
+            for parameter in call.descriptor.physicalSignature.parameters {
+                guard parameter.source.kind == .argument,
+                      let index = parameter.source.logicalArgumentIndex,
+                      call.parameterTypes.indices.contains(Int(index))
+                else { continue }
+                try record(
+                    parameter.type,
+                    logical: call.parameterTypes[Int(index)]
+                )
+            }
+            try record(
+                call.descriptor.physicalSignature.result,
+                logical: call.resultType
+            )
+        }
+        return result
     }
 
     func loadSources(_ sources: [FrontendReceipt.Source]) throws -> [SourceState] {

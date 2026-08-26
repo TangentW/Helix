@@ -12,6 +12,13 @@ extension FrontendReceipt.ManagedDebugSurface {
     struct Expansion: Sendable {
         var importedTypes: [FrontendReceipt.Adapter.ImportedNativeType]
         var operations: [FrontendReceipt.Adapter.ImportedOperation]
+        var objectiveCModulesByDeclarationUSR: [String: String]
+        var metrics: Metrics
+    }
+
+    struct ModuleResolution: Sendable {
+        var importedTypes: [FrontendReceipt.Adapter.ImportedNativeType]
+        var objectiveCModulesByDeclarationUSR: [String: String]
         var metrics: Metrics
     }
 
@@ -47,6 +54,13 @@ extension FrontendReceipt.ManagedDebugSurface {
     private struct OwnerMatch: Sendable {
         var score: Int
         var surface: OwnerSurface
+    }
+
+    private struct TypeResolution: Sendable {
+        var importedTypes: [FrontendReceipt.Adapter.ImportedNativeType]
+        var ownerSurfacesByIndex: [Int: OwnerSurface]
+        var objectiveCModulesByDeclarationUSR: [String: String]
+        var metrics: Metrics
     }
 
     private struct Candidate: Codable, Hashable, Sendable {
@@ -112,6 +126,7 @@ extension FrontendReceipt.ManagedDebugSurface {
         var aliases: [String]
         var representation: FrontendReceipt.Adapter.ImportedNativeType.Representation
         var importedModules: [String]
+        var objectiveCModuleName: String?
         var requiresMainActor: Bool
 
         init(_ type: FrontendReceipt.Adapter.ImportedNativeType) {
@@ -121,6 +136,7 @@ extension FrontendReceipt.ManagedDebugSurface {
             aliases = type.aliases.sorted()
             representation = type.representation
             importedModules = type.importedModules.sorted()
+            objectiveCModuleName = type.objectiveCModuleName
             requiresMainActor = type.requiresMainActor
         }
     }
@@ -177,58 +193,34 @@ extension FrontendReceipt.ManagedDebugSurface {
         minimumOS: Core.SemanticVersion,
         frontend: SwiftFrontend.Driver,
         invocation: InterfaceArchive.FrontendInvocation,
+        declarationUSRs: Set<String> = [],
         cache: BuildCache.Store? = nil,
         compilerFingerprint: String? = nil,
         compilerInputHash: Core.Digest? = nil
     ) throws -> Expansion {
-        let moduleNames = Set(importedTypes.flatMap(\.importedModules).compactMap {
-            $0.split(separator: ".").first.map(String.init)
-        }).sorted()
-        guard moduleNames.count <= 32 else {
-            throw FrontendReceipt.Error.frontendFailed(
-                "managed Debug surface exceeds the 32-module audit bound"
-            )
-        }
-
-        var metrics = Metrics(moduleCount: UInt64(moduleNames.count))
-        var matchesByType: [Int: [OwnerMatch]] = [:]
-        for moduleName in moduleNames where isProbeIdentifier(moduleName) {
-            let graph = try symbolGraph(
-                moduleName: moduleName,
-                frontend: frontend,
-                invocation: invocation,
-                cache: cache,
-                compilerFingerprint: compilerFingerprint,
-                compilerInputHash: compilerInputHash,
-                metrics: &metrics
-            )
-            let surfaces = ownerSurfaces(in: graph, minimumOS: minimumOS)
-            for index in importedTypes.indices where importedTypes[index]
-                .importedModules.contains(where: {
-                    $0.split(separator: ".").first == Substring(moduleName)
-                }) {
-                guard let match = bestOwnerMatch(
-                    for: importedTypes[index],
-                    in: surfaces
-                ) else { continue }
-                matchesByType[index, default: []].append(match)
-            }
-        }
-
-        var enrichedTypes = importedTypes
+        let resolution = try resolveImportedTypeSurfaces(
+            importedTypes: importedTypes,
+            minimumOS: minimumOS,
+            frontend: frontend,
+            invocation: invocation,
+            cache: cache,
+            compilerFingerprint: compilerFingerprint,
+            compilerInputHash: compilerInputHash,
+            requiredRuntimeNames: nil,
+            requiredDeclarationUSRs: declarationUSRs,
+            includesMembers: true
+        )
+        var metrics = resolution.metrics
+        var enrichedTypes = resolution.importedTypes
         var candidates: [Candidate] = []
         for index in importedTypes.indices.sorted(by: {
             importedTypes[$0].canonicalName < importedTypes[$1].canonicalName
         }) {
-            guard let matches = matchesByType[index],
-                  let selected = uniqueBestMatch(matches)
-            else { continue }
-            enrichedTypes[index] = enrich(
-                importedTypes[index],
-                with: selected.surface
-            )
+            guard let surface = resolution.ownerSurfacesByIndex[index] else {
+                continue
+            }
             candidates += makeCandidates(
-                surface: selected.surface,
+                surface: surface,
                 importedType: enrichedTypes[index]
             )
         }
@@ -259,6 +251,145 @@ extension FrontendReceipt.ManagedDebugSurface {
             importedTypes: enrichedTypes,
             operations: try FrontendReceipt.Adapter()
                 .mergeImportedOperations(operations),
+            objectiveCModulesByDeclarationUSR:
+                resolution.objectiveCModulesByDeclarationUSR,
+            metrics: metrics
+        )
+    }
+
+    /// Resolves only the declaring modules needed by source-observed
+    /// Objective-C owners. It reuses the same content-addressed Symbol Graph
+    /// cache as Managed Debug, but does not nominate or compile API probes.
+    static func resolveObjectiveCModules(
+        importedTypes: [FrontendReceipt.Adapter.ImportedNativeType],
+        runtimeNames: Set<String>,
+        declarationUSRs: Set<String>,
+        minimumOS: Core.SemanticVersion,
+        frontend: SwiftFrontend.Driver,
+        invocation: InterfaceArchive.FrontendInvocation,
+        cache: BuildCache.Store? = nil,
+        compilerFingerprint: String? = nil,
+        compilerInputHash: Core.Digest? = nil
+    ) throws -> ModuleResolution {
+        let resolution = try resolveImportedTypeSurfaces(
+            importedTypes: importedTypes,
+            minimumOS: minimumOS,
+            frontend: frontend,
+            invocation: invocation,
+            cache: cache,
+            compilerFingerprint: compilerFingerprint,
+            compilerInputHash: compilerInputHash,
+            requiredRuntimeNames: runtimeNames,
+            requiredDeclarationUSRs: declarationUSRs,
+            includesMembers: false
+        )
+        return .init(
+            importedTypes: try FrontendReceipt.Adapter()
+                .mergeImportedNativeTypes(
+                    discoveredTypes: [],
+                    operationTypes: resolution.importedTypes
+                ),
+            objectiveCModulesByDeclarationUSR:
+                resolution.objectiveCModulesByDeclarationUSR,
+            metrics: resolution.metrics
+        )
+    }
+
+    private static func resolveImportedTypeSurfaces(
+        importedTypes: [FrontendReceipt.Adapter.ImportedNativeType],
+        minimumOS: Core.SemanticVersion,
+        frontend: SwiftFrontend.Driver,
+        invocation: InterfaceArchive.FrontendInvocation,
+        cache: BuildCache.Store?,
+        compilerFingerprint: String?,
+        compilerInputHash: Core.Digest?,
+        requiredRuntimeNames: Set<String>?,
+        requiredDeclarationUSRs: Set<String>,
+        includesMembers: Bool
+    ) throws -> TypeResolution {
+        let selectedIndices = importedTypes.indices.filter { index in
+            guard let requiredRuntimeNames else { return true }
+            let type = importedTypes[index]
+            return !requiredRuntimeNames.isDisjoint(with: Set(
+                [type.canonicalName, type.swiftType] + type.aliases
+            ).map {
+                normalizedTypeName($0, moduleName: nil)
+                    .split(separator: ".").last.map(String.init) ?? $0
+            })
+        }
+        let importedModules = selectedIndices.reduce(into: [String]()) {
+            $0.append(contentsOf: importedTypes[$1].importedModules)
+        }
+        let moduleNames = Set(importedModules.compactMap {
+            $0.split(separator: ".").first.map(String.init)
+        }).sorted()
+        guard moduleNames.count <= 32 else {
+            throw FrontendReceipt.Error.frontendFailed(
+                "Objective-C module resolution exceeds the 32-module audit bound"
+            )
+        }
+
+        var metrics = Metrics(moduleCount: UInt64(moduleNames.count))
+        var matchesByType: [Int: [OwnerMatch]] = [:]
+        var modulesByDeclarationUSR: [String: Set<String>] = [:]
+        for moduleName in moduleNames where isProbeIdentifier(moduleName) {
+            let graph = try symbolGraph(
+                moduleName: moduleName,
+                frontend: frontend,
+                invocation: invocation,
+                cache: cache,
+                compilerFingerprint: compilerFingerprint,
+                compilerInputHash: compilerInputHash,
+                metrics: &metrics
+            )
+            let surfaces = ownerSurfaces(
+                in: graph,
+                minimumOS: minimumOS,
+                includesMembers: includesMembers
+            )
+            for symbol in graph.symbols
+            where requiredDeclarationUSRs.contains(symbol.identifier.precise) {
+                modulesByDeclarationUSR[
+                    symbol.identifier.precise,
+                    default: []
+                ].insert(moduleName)
+            }
+            for index in selectedIndices where importedTypes[index]
+                .importedModules.contains(where: {
+                    $0.split(separator: ".").first == Substring(moduleName)
+                }) {
+                guard let match = bestOwnerMatch(
+                    for: importedTypes[index],
+                    in: surfaces
+                ) else { continue }
+                matchesByType[index, default: []].append(match)
+            }
+        }
+
+        var enrichedTypes = importedTypes
+        var ownerSurfacesByIndex: [Int: OwnerSurface] = [:]
+        for index in selectedIndices {
+            guard let matches = matchesByType[index],
+                  let selected = uniqueBestMatch(matches)
+            else { continue }
+            enrichedTypes[index] = enrich(
+                importedTypes[index],
+                with: selected.surface
+            )
+            ownerSurfacesByIndex[index] = selected.surface
+        }
+        return .init(
+            importedTypes: enrichedTypes,
+            ownerSurfacesByIndex: ownerSurfacesByIndex,
+            objectiveCModulesByDeclarationUSR: Dictionary(
+                uniqueKeysWithValues: modulesByDeclarationUSR.compactMap {
+                    usr, modules in
+                    guard modules.count == 1, let module = modules.first else {
+                        return nil
+                    }
+                    return (usr, module)
+                }
+            ),
             metrics: metrics
         )
     }
@@ -341,7 +472,8 @@ extension FrontendReceipt.ManagedDebugSurface {
 
     private static func ownerSurfaces(
         in graph: SwiftFrontend.SymbolGraph.Document,
-        minimumOS: Core.SemanticVersion
+        minimumOS: Core.SemanticVersion,
+        includesMembers: Bool
     ) -> [OwnerSurface] {
         let typeKinds: Set<String> = [
             "swift.class", "swift.enum", "swift.struct", "swift.typealias",
@@ -367,7 +499,8 @@ extension FrontendReceipt.ManagedDebugSurface {
         for precise in ambiguousOwners { owners.removeValue(forKey: precise) }
         var memberOwner: [String: String] = [:]
         var ambiguousMembers = Set<String>()
-        for relationship in graph.relationships where relationship.kind == "memberOf" {
+        for relationship in graph.relationships
+        where includesMembers && relationship.kind == "memberOf" {
             if let existing = memberOwner[relationship.source],
                existing != relationship.target {
                 ambiguousMembers.insert(relationship.source)
@@ -377,7 +510,8 @@ extension FrontendReceipt.ManagedDebugSurface {
         }
         for precise in ambiguousMembers { memberOwner.removeValue(forKey: precise) }
         var membersByOwner: [String: [SwiftFrontend.SymbolGraph.Symbol]] = [:]
-        for symbol in graph.symbols where memberKinds.contains(symbol.kind.identifier) {
+        for symbol in graph.symbols
+        where includesMembers && memberKinds.contains(symbol.kind.identifier) {
             guard symbol.accessLevel == "public" || symbol.accessLevel == "open",
                   let owner = memberOwner[symbol.identifier.precise],
                   owners[owner] != nil,
@@ -475,6 +609,9 @@ extension FrontendReceipt.ManagedDebugSurface {
     ) -> FrontendReceipt.Adapter.ImportedNativeType {
         var result = type
         result.requiresMainActor = surface.requiresMainActor
+        if surface.runtimeName != nil {
+            result.objectiveCModuleName = surface.moduleName
+        }
         // An unspecialized generic SDK spelling is not an alias of any one
         // concrete frozen specialization. Adding it to every specialization
         // would make later type resolution ambiguous.
@@ -1119,6 +1256,9 @@ extension FrontendReceipt.ManagedDebugSurface {
         )
         let resolver = FrontendReceipt.SILFunctionResolver(file: silFile)
         var candidatesByWitness: [String: Candidate] = [:]
+        var propertySelectorsByCandidate: [
+            Candidate: Set<FrontendReceipt.ObjectiveCABI.PropertySelector>
+        ] = [:]
         var ambiguousWitnesses = Set<String>()
         let measuredDocuments = try documents.compactMap { document ->
             FrontendReceipt.TypedAST.Object? in
@@ -1133,16 +1273,31 @@ extension FrontendReceipt.ManagedDebugSurface {
                     measuredItems.append(value)
                     continue
                 }
+                let name = FrontendReceipt.Adapter().baseName(in: item)
+                if let name,
+                   name.hasPrefix("helixManagedDebugSelector"),
+                   let index = Int(name.dropFirst(
+                       "helixManagedDebugSelector".count
+                   )),
+                   candidates.indices.contains(index) {
+                    propertySelectorsByCandidate[candidates[index], default: []]
+                        .formUnion(
+                            FrontendReceipt.ObjectiveCABI.propertySelectors(
+                                in: item
+                            )
+                        )
+                    continue
+                }
                 guard let function = try resolver.function(
                     for: item,
                     source: state,
-                    baseName: FrontendReceipt.Adapter().baseName(in: item)
+                    baseName: name
                 ) else {
                     // The compiler may eliminate an unreferenced private probe.
                     continue
                 }
                 measuredItems.append(value)
-                guard let name = FrontendReceipt.Adapter().baseName(in: item),
+                guard let name,
                       name.hasPrefix("helixManagedDebugProbe"),
                       let index = Int(name.dropFirst("helixManagedDebugProbe".count)),
                       candidates.indices.contains(index)
@@ -1187,6 +1342,19 @@ extension FrontendReceipt.ManagedDebugSurface {
                   operation.mayThrow == candidate.mayThrow
             else { return nil }
             var measured = operation
+            if var evidence = measured.objectiveC,
+               let property = evidence.property {
+                let selectors = propertySelectorsByCandidate[candidate]?
+                    .filter {
+                        $0.declarationUSR == evidence.declarationUSR
+                            && $0.accessor == property.accessor
+                    } ?? []
+                if selectors.count == 1, let selector = selectors.first {
+                    evidence.selector = selector.selector
+                    evidence.selectorIsExact = true
+                    measured.objectiveC = evidence
+                }
+            }
             measured.ownerType = candidate.ownerType
             measured.parameterSwiftTypes = operation.parameterSwiftTypes.map {
                 FrontendReceipt.SwiftTypeSpelling.replacingNominalAliases(
@@ -1258,6 +1426,10 @@ extension FrontendReceipt.ManagedDebugSurface {
             else { return nil }
             measured.sourceFileLogicalID = candidate.sourceFileLogicalID
             measured.importedModules = candidate.importedModules
+            // The Symbol Graph was extracted from this exact module. Prefer
+            // that provenance over class-name prefix heuristics used while
+            // reading a source call that may import several frameworks.
+            measured.objectiveC?.moduleName = candidate.moduleName
             // Isolation belongs to the imported declaration. A nonisolated
             // member may accept or return an actor-isolated nominal value
             // without making the call itself actor-isolated.
@@ -1312,8 +1484,9 @@ extension FrontendReceipt.ManagedDebugSurface {
 
     private static func renderSource(_ candidates: [Candidate]) -> String {
         let imports = Set(candidates.map(\.moduleName)).sorted().map { "import \($0)" }
-        let declarations = candidates.enumerated().map { index, candidate in
-            renderProbe(index: index, candidate: candidate)
+        let declarations = candidates.enumerated().flatMap { index, candidate in
+            [renderProbe(index: index, candidate: candidate)]
+                + propertySelectorProbe(index: index, candidate: candidate)
         }
         return (imports + [""] + declarations + [""]).joined(separator: "\n")
     }
@@ -1362,6 +1535,32 @@ extension FrontendReceipt.ManagedDebugSurface {
         return "\(isolation)private func helixManagedDebugProbe\(index)("
             + "\(parameters.joined(separator: ", ")))\(throwing) {"
             + "\(mutableReceiver)\n    _ = \(tryPrefix)\(call)\n}"
+    }
+
+    private static func propertySelectorProbe(
+        index: Int,
+        candidate: Candidate
+    ) -> [String] {
+        guard candidate.preciseIdentifier.hasPrefix("c:objc(cs)"),
+              candidate.preciseIdentifier.contains("(py)")
+                || candidate.preciseIdentifier.contains("(cpy)")
+        else { return [] }
+        let accessor: String
+        switch candidate.dispatch {
+        case .instanceGetter, .staticGetter:
+            accessor = "getter"
+        case .instanceSetter, .staticSetter:
+            accessor = "setter"
+        case .globalFunction, .initializer, .staticMethod, .nativeUpcast,
+             .anyObjectBridge, .instanceMethod, .instanceValueSetter:
+            return []
+        }
+        let owner = escapedNominalType(candidate.probeOwnerType)
+        let member = escapedIdentifier(candidate.memberName)
+        return [
+            "private func helixManagedDebugSelector\(index)() {\n"
+                + "    _ = #selector(\(accessor): \(owner).\(member))\n}"
+        ]
     }
 
     private static func isInstanceDispatch(

@@ -5,6 +5,11 @@ extension CanonicalSIL {
 /// They are frozen into the Shell just like real SIL symbols and never resolved
 /// dynamically on the device.
 public enum NativeBridgeSymbols {
+    public enum ForeignDispatch: String, Codable, Hashable, Sendable {
+        case ordinary
+        case superclass
+    }
+
     public static func rawValueInitializer(for type: Core.TypeID) -> String {
         "$hlx_native_raw_init_\(type.rawValue.hex)"
     }
@@ -23,11 +28,13 @@ public enum NativeBridgeSymbols {
     public static func foreignCall(
         reference: String,
         loweredType: String,
+        dispatch: ForeignDispatch = .ordinary,
         genericArguments: [String] = []
     ) -> String {
         var hasher = Core.StableHasher(domain: "HLX.NativeForeignCall.v1")
         hasher.append(reference)
         hasher.append(loweredType)
+        hasher.append(dispatch.rawValue)
         if !genericArguments.isEmpty {
             hasher.append("generic-specialization")
             for argument in genericArguments {

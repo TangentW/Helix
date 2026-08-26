@@ -625,6 +625,7 @@ struct ImportedFrameworks {
         let viewControllerType = Core.TypeID(rawValue: .sha256("UIKit.UIViewController"))
         let upcastRequirement = try importRequirement(id: 5)
         let superRequirement = try importRequirement(id: 6)
+        let dynamicRequirement = try importRequirement(id: 7)
         let loweredSuperType = "@convention(objc_method) (UIViewController) -> ()"
         let calls = try CanonicalSIL.DirectCallTable([
             .init(
@@ -639,11 +640,21 @@ struct ImportedFrameworks {
             .init(
                 mangledName: CanonicalSIL.NativeBridgeSymbols.foreignCall(
                     reference: "#UIViewController.viewDidLayoutSubviews!foreign",
-                    loweredType: loweredSuperType
+                    loweredType: loweredSuperType,
+                    dispatch: .superclass
                 ),
                 parameterTypes: [.native(viewControllerType)],
                 resultType: .void,
                 target: .nativeImport(superRequirement)
+            ),
+            .init(
+                mangledName: CanonicalSIL.NativeBridgeSymbols.foreignCall(
+                    reference: "#UIViewController.viewDidLayoutSubviews!foreign",
+                    loweredType: loweredSuperType
+                ),
+                parameterTypes: [.native(viewControllerType)],
+                resultType: .void,
+                target: .nativeImport(dynamicRequirement)
             ),
         ])
         let environment = try CanonicalSIL.TypeEnvironment.empty.includingNativeTypes(
@@ -665,8 +676,10 @@ struct ImportedFrameworks {
               %2 = unchecked_ref_cast %0 to $Fixture.Controller
               %3 = objc_super_method %2, #UIViewController.viewDidLayoutSubviews!foreign : (UIViewController) -> () -> (), $\(loweredSuperType)
               %4 = apply %3(%1) : $\(loweredSuperType)
-              %5 = tuple ()
-              return %5
+              %5 = objc_method %1, #UIViewController.viewDidLayoutSubviews!foreign : (UIViewController) -> () -> (), $\(loweredSuperType)
+              %6 = apply %5(%1) : $\(loweredSuperType)
+              %7 = tuple ()
+              return %7
             """
         )
 
@@ -680,7 +693,11 @@ struct ImportedFrameworks {
             guard case let .nativeApply(_, id, _) = instruction else { return nil }
             return id
         }
-        #expect(imports == [upcastRequirement.id, superRequirement.id])
+        #expect(imports == [
+            upcastRequirement.id,
+            superRequirement.id,
+            dynamicRequirement.id,
+        ])
     }
 
     @Test("Reference casts between distinct frozen types remain rejected")
@@ -2428,6 +2445,11 @@ struct ImportedFrameworks {
             reference: reference,
             loweredType: "@convention(objc_method) (NSString, UILabel) -> ()"
         )
+        let superclass = CanonicalSIL.NativeBridgeSymbols.foreignCall(
+            reference: reference,
+            loweredType: "@convention(objc_method) (Optional<NSString>, UILabel) -> ()",
+            dispatch: .superclass
+        )
 
         let specialized = CanonicalSIL.NativeBridgeSymbols.foreignCall(
             reference: reference,
@@ -2444,6 +2466,7 @@ struct ImportedFrameworks {
 
         #expect(first == repeated)
         #expect(first != overload)
+        #expect(first != superclass)
         #expect(specialized != otherSpecialization)
         #expect(first.hasPrefix("$hlx_native_foreign_"))
     }

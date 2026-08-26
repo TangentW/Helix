@@ -274,6 +274,7 @@ struct NativeAPICatalogTests {
                 ],
                 result: .void
             ),
+            objectiveC: .init(runtimeClassName: "UIViewController"),
             effects: .init(
                 mayAllocate: true,
                 hasExternalSideEffects: true,

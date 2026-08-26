@@ -3,9 +3,9 @@
 This document records the implemented version 1 baseline for describing and
 authorizing calls from HLBC into code already installed with an application.
 It is intentionally narrower than the eventual execution backends: the stable
-identity, catalog, archive, bytecode, verifier, and runtime contracts described
-here are implemented; generic Objective-C/C invokers and reusable Swift Adapter
-Packs are introduced in later stages.
+identity, catalog, archive, bytecode, verifier, and generic Objective-C message
+invoker described here are implemented. The restricted C invoker and reusable
+Swift Adapter Packs are introduced in later stages.
 
 ## Two IDs with different jobs
 
@@ -32,6 +32,9 @@ A canonical descriptor records:
 - physical calling convention, ABI value kinds, native encodings and layouts,
   Swift direct/guaranteed/indirect conventions, default-argument sources, and
   error convention;
+- the Objective-C runtime class, method family, lexical superclass, property
+  accessor identity, and supported `NSError **` failure convention when the
+  backend is Objective-C;
 - effects and per-platform availability.
 
 The stable adapter boundary's ownership is separate from the compiler-proven
@@ -96,15 +99,70 @@ carry the stable key and, when the bytecode source map has one, the original
 Swift file, line, and column. Runtime logs no longer need a build-local integer
 to identify which API failed.
 
-## Current execution boundary
+## Generic Objective-C execution
 
-At this stage, existing generated exact-signature Swift NativeImport factories
-remain the executable backend for imported framework and application calls.
-The new descriptor and key replace their former project-derived identity and
-are already used by archive, bytecode, verifier, Bridge generation, runtime,
-and patch build contracts. The Catalog is the shared resolution model, but it
-does not yet make an unseen Objective-C, C, or pure-Swift call executable by
-itself. The later invoker and Adapter Pack stages must install a matching
-binding before such a call can run.
+A compiler-proven Objective-C declaration whose logical and physical types fit
+the supported ABI matrix is bound directly to one `Runtime.ObjectiveCInvoker`.
+Bridge generation emits structured descriptor data rather than a Swift wrapper
+for each selector. The common matrix currently includes Objective-C objects and
+nullable objects, exact-width integers and floating-point values, `Bool`, common
+CoreGraphics/UIKit structures, properties, instance/class methods,
+initializers, supported `NSError **` imports, and a reusable set of synchronous
+Objective-C Block shapes. Swift overlays whose value representation cannot be
+proved equivalent still use an exact generated Swift adapter.
+
+Module provenance is not inferred from `UI`/`NS` prefixes or from the owning
+class alone. Ordinary methods and properties resolve their exact Clang USR in
+the imported module indexes, so a category can belong to a framework different
+from its class. An inherited initializer instead uses the exact concrete class
+module and allocates that Swift constructor result, not the superclass named by
+the inherited `init` declaration. Ambiguous provenance keeps the Swift adapter.
+For a custom Objective-C property accessor, a compiler `#selector` probe must
+also recover the exact getter or setter; the source spelling is never guessed.
+
+The descriptor keeps the declaration class separate from the class-message or
+initializer dispatch class. For example, an inherited
+`UIButton.setAnimationsEnabled` call is authorized and ABI-checked against its
+`UIView` declaration but sends the class message to `UIButton`; an inherited
+`UIViewController()` initializer resolves `init` on `NSObject` but allocates a
+`UIViewController`. Both identities participate in the stable key. The
+compiler admits this route only when the Typed AST mangling proves the concrete
+source metatype or constructor result; otherwise it retains the Swift adapter.
+
+Ordinary Objective-C dispatch and lexical `super` dispatch also have distinct
+stable identities, for both methods and properties. The compiler associates
+the Typed AST expression with one exact SIL instruction and records the
+lexical superclass only for `super`. If that evidence is missing or ambiguous,
+Helix fails closed or keeps the exact Swift adapter; it never silently turns a
+`super` call into dynamic dispatch.
+
+The Swift layer projects verified VM values and callback authority into ABI
+slots. A small Objective-C shim then resolves the exact selector against the
+cataloged declaration class (or the pinned lexical superclass), compares every
+runtime type encoding and storage kind, verifies that the separately recorded
+class dispatch target inherits from that declaration class, and invokes the
+concrete receiver through `NSInvocation`. Ordinary Objective-C override dispatch is therefore
+preserved, while a selector that exists only on an unexpected runtime subclass
+cannot expand the cataloged authority. Receiver ancestry is read directly from
+the Objective-C runtime rather than through overridable `isKindOfClass:`
+messaging, and an ordinary dynamic override must retain the declaration's
+complete ABI before it can be invoked. Property calls use the compiler-proven
+accessor selector and deliberately do not require optional Objective-C property
+metadata, which system frameworks may omit at runtime. The shim captures
+Objective-C exceptions, handles initializer and retained/autoreleased method
+families, and returns object results at one explicit ownership boundary. The
+runtime also rechecks receiver class, platform availability, nilability,
+structure encoding/size/alignment, deadline, MainActor entry, temporary
+storage, and result length before decoding the result.
+
+This removes per-method executable Bridge code for supported Objective-C calls;
+it does not permit arbitrary selectors. Every executable call must still be an
+exact descriptor emitted into the current Shell. Source-observed calls and the
+current managed-Debug SDK surface can use the generic binding now. A public API
+that was not emitted into that Shell is not yet made available merely because
+the invoker exists; full Catalog-backed development lookup and the signed
+Release capability projection are later stages. C calls and complex pure-Swift
+calls likewise continue to require their existing exact binding until the C
+invoker and Adapter Pack stages land.
 
 All product, protocol, catalog, archive, and bytecode versions remain 1.

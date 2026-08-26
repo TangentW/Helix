@@ -751,7 +751,8 @@ struct ReleasePipeline {
         let importBinding = BridgeGeneration.NativeImportBinding(
             id: nativeImportID,
             key: nativeImportKey,
-            invokerExpression: "FixtureIncrementFactory.make("
+            strategy: .factory,
+            factoryExpression: "FixtureIncrementFactory.make("
                 + "id: Core.NativeImportID(rawValue: \(nativeImportID.rawValue)), "
                 + "key: Core.NativeCall.Key(rawValue: try! Core.Digest(hex: "
                 + "\(String(reflecting: nativeImportKey.rawValue.hex)))))"
@@ -788,7 +789,8 @@ struct ReleasePipeline {
                     .init(
                         id: nativeImportID,
                         key: .init(rawValue: .sha256("wrong native import")),
-                        invokerExpression: "FixtureIncrementInvoker()"
+                        strategy: .factory,
+                        factoryExpression: "FixtureIncrementInvoker()"
                     ),
                 ],
                 nativeTypes: [typeBinding]
@@ -2076,12 +2078,22 @@ struct ReleasePipeline {
             let encoded = try JSONEncoder().encode(outputMap)
             try encoded.write(to: targetDirectory.appendingPathComponent("output-file-map.json"))
         }
-        let support = root
-            .appendingPathComponent("HelixRuntimeSupport.build", isDirectory: true)
-        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
-        let supportObject = support.appendingPathComponent("RuntimeAtomic.c.o")
-        try Data().write(to: supportObject)
-        expected.append(supportObject)
+        for (target, objectName) in [
+            ("HelixRuntimeSupport", "RuntimeAtomic.c.o"),
+            ("HelixObjectiveCRuntimeSupport", "RuntimeObjectiveC.m.o"),
+        ] {
+            let support = root.appendingPathComponent(
+                "\(target).build",
+                isDirectory: true
+            )
+            try FileManager.default.createDirectory(
+                at: support,
+                withIntermediateDirectories: true
+            )
+            let supportObject = support.appendingPathComponent(objectName)
+            try Data().write(to: supportObject)
+            expected.append(supportObject)
+        }
 
         #expect(try runtimeObjectFiles(modules: modules) == expected)
     }
@@ -2136,25 +2148,40 @@ struct ReleasePipeline {
             }
             result.append(contentsOf: objectPaths.sorted().map(URL.init(fileURLWithPath:)))
         }
-        let supportObject = buildDirectory
-            .appendingPathComponent("HelixRuntimeSupport.build", isDirectory: true)
-            .appendingPathComponent("RuntimeAtomic.c.o")
-        guard FileManager.default.fileExists(atPath: supportObject.path) else {
-            throw SwiftFrontend.Error.launchFailed("missing HelixRuntimeSupport object file")
+        for (target, objectName) in [
+            ("HelixRuntimeSupport", "RuntimeAtomic.c.o"),
+            ("HelixObjectiveCRuntimeSupport", "RuntimeObjectiveC.m.o"),
+        ] {
+            let supportObject = buildDirectory
+                .appendingPathComponent("\(target).build", isDirectory: true)
+                .appendingPathComponent(objectName)
+            guard FileManager.default.fileExists(atPath: supportObject.path) else {
+                throw SwiftFrontend.Error.launchFailed(
+                    "missing \(target) object file"
+                )
+            }
+            result.append(supportObject)
         }
-        result.append(supportObject)
         return result
     }
 
     private func runtimeSupportCompilerArguments(modules: URL) throws -> [String] {
-        let supportDirectory = modules
-            .deletingLastPathComponent()
-            .appendingPathComponent("HelixRuntimeSupport.build", isDirectory: true)
-        let moduleMap = supportDirectory.appendingPathComponent("module.modulemap")
-        guard FileManager.default.fileExists(atPath: moduleMap.path) else {
-            throw SwiftFrontend.Error.launchFailed("missing HelixRuntimeSupport module map")
+        let buildRoot = modules.deletingLastPathComponent()
+        var arguments: [String] = []
+        for module in ["HelixRuntimeSupport", "HelixObjectiveCRuntimeSupport"] {
+            let moduleMap = buildRoot
+                .appendingPathComponent("\(module).build", isDirectory: true)
+                .appendingPathComponent("module.modulemap")
+            guard FileManager.default.fileExists(atPath: moduleMap.path) else {
+                throw SwiftFrontend.Error.launchFailed(
+                    "missing \(module) module map"
+                )
+            }
+            arguments.append(contentsOf: [
+                "-Xcc", "-fmodule-map-file=\(moduleMap.path)",
+            ])
         }
-        return ["-Xcc", "-fmodule-map-file=\(moduleMap.path)"]
+        return arguments
     }
 
     private func swiftPMModulesDirectory() throws -> URL {

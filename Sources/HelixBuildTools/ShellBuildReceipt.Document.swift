@@ -137,19 +137,30 @@ public struct Root: Codable, Hashable, Sendable {
 }
 
 public struct NativeImportBinding: Codable, Hashable, Sendable {
+    public enum Strategy: String, Codable, Hashable, Sendable {
+        case factory
+        case generatedSwiftAdapter
+        case objectiveCInvoker
+    }
+
     public var key: Core.NativeCall.Key
-    public var invokerExpression: String
+    public var strategy: Strategy
+    /// Trusted factory expression from the explicit Catalog. Generated and
+    /// generic invokers are rendered solely from structured archive metadata.
+    public var factoryExpression: String?
     public var importedModules: [String]
     public var generated: ShellBuildReceipt.GeneratedNativeImport?
 
     public init(
         key: Core.NativeCall.Key,
-        invokerExpression: String,
+        strategy: Strategy,
+        factoryExpression: String? = nil,
         importedModules: [String] = [],
         generated: ShellBuildReceipt.GeneratedNativeImport? = nil
     ) {
         self.key = key
-        self.invokerExpression = invokerExpression
+        self.strategy = strategy
+        self.factoryExpression = factoryExpression
         self.importedModules = importedModules.sorted()
         self.generated = generated
     }
@@ -238,20 +249,24 @@ public struct GeneratedNativeType: Codable, Hashable, Sendable {
         case reference
         case rawRepresentable
         case opaqueValue
+        case objectiveCStructure
     }
 
     public var sourceFileLogicalID: String
     public var swiftType: String
     public var representation: Representation
+    public var nativeABIEncoding: String?
 
     public init(
         sourceFileLogicalID: String,
         swiftType: String,
-        representation: Representation = .reference
+        representation: Representation = .reference,
+        nativeABIEncoding: String? = nil
     ) {
         self.sourceFileLogicalID = sourceFileLogicalID
         self.swiftType = swiftType
         self.representation = representation
+        self.nativeABIEncoding = nativeABIEncoding
     }
 }
 
@@ -482,16 +497,20 @@ public struct Document: Codable, Hashable, Sendable {
             nativeImportBindings == nativeImportBindings.sorted(by: {
                 $0.key.rawValue < $1.key.rawValue
             }), Set(nativeImportBindings.map(\.key)).count == nativeImportBindings.count,
-            nativeImportBindings.allSatisfy({
-                Self.isBoundExpression($0.invokerExpression)
-                    && $0.importedModules == Array(Set($0.importedModules)).sorted()
-                    && $0.importedModules.allSatisfy(Self.isModulePath)
-                    && Self.isValidGeneratedNativeImport(
-                        $0.generated,
-                        importedModules: $0.importedModules,
-                        declarations: declarations,
-                        sourcePaths: sourcePaths
-                    )
+            nativeImportBindings.allSatisfy({ binding in
+                binding.importedModules
+                    == Array(Set(binding.importedModules)).sorted()
+                    && binding.importedModules.allSatisfy(Self.isModulePath)
+                    && nativeImportCandidates.first(where: {
+                        $0.key == binding.key
+                    }).map { record in
+                        Self.isValidNativeImportBinding(
+                            binding,
+                            record: record,
+                            declarations: declarations,
+                            sourcePaths: sourcePaths
+                        )
+                    } == true
             }), Set(nativeImportBindings.map(\.key))
                 == Set(nativeImportCandidates.filter(\.isEmittedToDevice).map(\.key))
         else {
@@ -790,6 +809,35 @@ public struct Document: Codable, Hashable, Sendable {
         }
     }
 
+    private static func isValidNativeImportBinding(
+        _ binding: ShellBuildReceipt.NativeImportBinding,
+        record: InterfaceArchive.NativeImportRecord,
+        declarations: [ReleaseCompiler.DeclarationCandidate],
+        sourcePaths: Set<String>
+    ) -> Bool {
+        switch binding.strategy {
+        case .factory:
+            return binding.factoryExpression.map(isBoundExpression) == true
+                && binding.generated == nil
+        case .generatedSwiftAdapter:
+            return binding.factoryExpression == nil
+                && record.descriptor.target.backend == .swiftAdapter
+                && binding.generated != nil
+                && isValidGeneratedNativeImport(
+                    binding.generated,
+                    importedModules: binding.importedModules,
+                    declarations: declarations,
+                    sourcePaths: sourcePaths
+                )
+        case .objectiveCInvoker:
+            return binding.factoryExpression == nil
+                && binding.generated == nil
+                && binding.importedModules.isEmpty
+                && record.descriptor.target.backend == .objectiveCMessage
+                && !record.effects.isAsync
+        }
+    }
+
     private static func isValidGeneratedNativeType(
         _ generated: ShellBuildReceipt.GeneratedNativeType?,
         canonicalName: String,
@@ -803,7 +851,16 @@ public struct Document: Codable, Hashable, Sendable {
         let expectedSwiftType = isSourceType
             ? String(canonicalName.dropFirst(modulePrefix.count))
             : canonicalName
-        return sourcePaths.contains(generated.sourceFileLogicalID)
+        let encodingIsValid: Bool = switch generated.representation {
+        case .objectiveCStructure:
+            generated.nativeABIEncoding.map {
+                !$0.isEmpty && $0.utf8.count <= 4_096
+            } == true
+        case .reference, .rawRepresentable, .opaqueValue:
+            generated.nativeABIEncoding == nil
+        }
+        return encodingIsValid
+            && sourcePaths.contains(generated.sourceFileLogicalID)
             && (isSourceType ? importedModules.isEmpty : !importedModules.isEmpty)
             && generated.swiftType == expectedSwiftType
             && FrontendReceipt.SwiftTypeSpelling.isGeneratedType(generated.swiftType)

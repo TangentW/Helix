@@ -980,7 +980,13 @@ public struct Lowerer: Sendable {
         var objectiveCBridgeDynamicTypes: [Bytecode.Register: Bytecode.DynamicType] = [:]
         var hostedAllocatorReferences: [String: Core.TypeID] = [:]
         var hostedSuperReferences: [String: HostedSuperReference] = [:]
-        var deferredForeignReferences: [String: (reference: String, loweredType: String)] = [:]
+        var deferredForeignReferences: [
+            String: (
+                reference: String,
+                loweredType: String,
+                dispatch: CanonicalSIL.NativeBridgeSymbols.ForeignDispatch
+            )
+        ] = [:]
         var deferredGenericFunctionReferences: [
             String: DeferredGenericFunctionReference
         ] = [:]
@@ -5593,7 +5599,11 @@ public struct Lowerer: Sendable {
         }
 
         func resolveDeferredForeignReference(
-            _ deferred: (reference: String, loweredType: String),
+            _ deferred: (
+                reference: String,
+                loweredType: String,
+                dispatch: CanonicalSIL.NativeBridgeSymbols.ForeignDispatch
+            ),
             genericArguments rawArguments: String,
             line: Int
         ) throws -> ResolvedFunctionReferenceSet {
@@ -5607,6 +5617,7 @@ public struct Lowerer: Sendable {
             let symbol = CanonicalSIL.NativeBridgeSymbols.foreignCall(
                 reference: deferred.reference,
                 loweredType: deferred.loweredType,
+                dispatch: deferred.dispatch,
                 genericArguments: genericArguments
             )
             let bindings = directCalls.bindings(for: symbol)
@@ -25796,28 +25807,33 @@ public struct Lowerer: Sendable {
 
             if let reference = match(
                 line,
-                pattern: #"^(%[0-9]+) = (?:objc|objc_super|class)_method .*, (#[^\s:]+) : .*, \$(.+)$"#
+                pattern: #"^(%[0-9]+) = ((?:objc|objc_super|class)_method) .*, (#[^\s:]+) : .*, \$(.+)$"#
             ) {
-                let usesObjectiveCBridge = reference[1].hasSuffix("foreign")
+                let dispatch: CanonicalSIL.NativeBridgeSymbols.ForeignDispatch =
+                    reference[1] == "objc_super_method"
+                        ? .superclass : .ordinary
+                let usesObjectiveCBridge = reference[2].hasSuffix("foreign")
                 if usesObjectiveCBridge,
-                   reference[2].contains("@pseudogeneric")
-                    || reference[2].contains("τ_") {
+                   reference[3].contains("@pseudogeneric")
+                    || reference[3].contains("τ_") {
                     deferredForeignReferences[reference[0]] = (
-                        reference: reference[1],
-                        loweredType: reference[2]
+                        reference: reference[2],
+                        loweredType: reference[3],
+                        dispatch: dispatch
                     )
                     continue
                 }
                 let exactForeignSymbol = CanonicalSIL.NativeBridgeSymbols.foreignCall(
-                    reference: reference[1],
-                    loweredType: reference[2]
+                    reference: reference[2],
+                    loweredType: reference[3],
+                    dispatch: dispatch
                 )
-                let resolvedSymbol = !directCalls.hasBinding(for: reference[1])
-                    ? exactForeignSymbol : reference[1]
+                let resolvedSymbol = !directCalls.hasBinding(for: reference[2])
+                    ? exactForeignSymbol : reference[2]
                 let bindings = directCalls.bindings(for: resolvedSymbol)
                 guard !bindings.isEmpty else {
                     if let unavailable = directCalls.unavailableCall(for: resolvedSymbol)
-                        ?? directCalls.unavailableCall(for: reference[1]) {
+                        ?? directCalls.unavailableCall(for: reference[2]) {
                         throw CanonicalSIL.LoweringError.unavailableNativeImport(
                             line: sourceLine,
                             mangledName: resolvedSymbol,
@@ -25832,7 +25848,7 @@ public struct Lowerer: Sendable {
                 }
                 functionReferences[reference[0]] = try resolveFunctionReferenceSet(
                     bindings: bindings,
-                    loweredType: reference[2],
+                    loweredType: reference[3],
                     bridgesPhysicalTypes: usesObjectiveCBridge,
                     usesObjectiveCBridge: usesObjectiveCBridge,
                     symbol: resolvedSymbol,

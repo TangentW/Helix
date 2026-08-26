@@ -287,6 +287,304 @@ struct UIKitIntegration {
         #expect(invoker.effects.requiresMainActor)
     }
 
+    @Test("The generic Objective-C invoker executes UIKit property access")
+    func genericObjectiveCInvokerExecutesUIKit() throws {
+        let viewType = Core.TypeID(rawValue: .sha256("UIKit.UIView.iOS-fixture"))
+        let layout = Core.Digest.sha256("UIKit.UIView.iOS-layout")
+        let boolABI = Core.NativeCall.ABIType(
+            kind: .boolean,
+            canonicalName: "ObjectiveC.BOOL",
+            size: UInt16(MemoryLayout<Bool>.size),
+            alignment: UInt16(MemoryLayout<Bool>.alignment),
+            encoding: "B"
+        )
+        let setterEffects = Core.Effects(
+            hasExternalSideEffects: true,
+            requiresMainActor: true
+        )
+        let getterEffects = Core.Effects(requiresMainActor: true)
+        let setterContract = Core.NativeImportContract.bounded(
+            kind: .instanceSetter,
+            domain: .uiKit,
+            access: .write,
+            maximumDurationMicroseconds: Core.NativeImportExecutionPolicy
+                .maximumMainThreadDurationMicroseconds,
+            allowsMainThread: true
+        )
+        let getterContract = Core.NativeImportContract.bounded(
+            kind: .instanceGetter,
+            domain: .uiKit,
+            access: .read,
+            maximumDurationMicroseconds: Core.NativeImportExecutionPolicy
+                .maximumMainThreadDurationMicroseconds,
+            allowsMainThread: true
+        )
+        let receiver = Core.NativeCall.LogicalParameter(
+            type: "UIKit.UIView"
+        )
+        let setter = try Core.NativeCall.Descriptor(
+            target: .init(
+                backend: .objectiveCMessage,
+                module: "UIKit",
+                owner: "UIView",
+                member: "isHidden.setter",
+                entryPoint: "setHidden:",
+                dispatch: .instance,
+                receiverArgumentIndex: 0
+            ),
+            logicalSignature: .init(
+                parameters: [receiver, .init(type: "Swift.Bool")],
+                result: .init(type: "Swift.Void"),
+                isolation: "MainActor"
+            ),
+            physicalSignature: .init(
+                callingConvention: .objectiveC,
+                parameters: [
+                    .init(type: boolABI, source: .argument(1)),
+                ],
+                result: .void
+            ),
+            objectiveC: .init(
+                runtimeClassName: "UIView",
+                property: .init(name: "hidden", accessor: .setter)
+            ),
+            effects: setterEffects
+        ).validated(contract: setterContract)
+        let getter = try Core.NativeCall.Descriptor(
+            target: .init(
+                backend: .objectiveCMessage,
+                module: "UIKit",
+                owner: "UIView",
+                member: "isHidden.getter",
+                entryPoint: "isHidden",
+                dispatch: .instance,
+                receiverArgumentIndex: 0
+            ),
+            logicalSignature: .init(
+                parameters: [receiver],
+                result: .init(type: "Swift.Bool"),
+                isolation: "MainActor"
+            ),
+            physicalSignature: .init(
+                callingConvention: .objectiveC,
+                parameters: [],
+                result: boolABI
+            ),
+            objectiveC: .init(
+                runtimeClassName: "UIView",
+                property: .init(name: "hidden", accessor: .getter)
+            ),
+            effects: getterEffects
+        ).validated(contract: getterContract)
+        let setterKey = try Core.NativeCall.Key.derive(descriptor: setter)
+        let getterKey = try Core.NativeCall.Key.derive(descriptor: getter)
+        let setterID = Core.NativeImportID(rawValue: 0)
+        let getterID = Core.NativeImportID(rawValue: 1)
+        let entry = Core.EntryIndex(rawValue: 0)
+        let functionID = Bytecode.FunctionID(rawValue: 0)
+        let functionEffects = Core.Effects(
+            hasExternalSideEffects: true,
+            requiresMainActor: true
+        )
+        let function = Bytecode.Function(
+            id: functionID,
+            name: "exerciseUIKitProperty",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .bool,
+            registerTypes: [
+                .native(viewType), .native(viewType), .native(viewType),
+                .bool, .bool,
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .copyValue(
+                            result: .init(rawValue: 1),
+                            source: .init(rawValue: 0)
+                        ),
+                        .copyValue(
+                            result: .init(rawValue: 2),
+                            source: .init(rawValue: 0)
+                        ),
+                        .constantBool(result: .init(rawValue: 3), value: true),
+                        .nativeApply(
+                            result: nil,
+                            importID: setterID,
+                            arguments: [.init(rawValue: 1), .init(rawValue: 3)]
+                        ),
+                        .nativeApply(
+                            result: .init(rawValue: 4),
+                            importID: getterID,
+                            arguments: [.init(rawValue: 2)]
+                        ),
+                        .destroyValue(.init(rawValue: 0)),
+                        .returnValue(.init(rawValue: 4)),
+                    ]
+                ),
+            ],
+            effects: functionEffects
+        )
+        let namespace = Core.ShellNamespaceID.derive(
+            bundleID: "dev.helix.ios-objective-c-invoker",
+            buildNumber: "1",
+            seed: "fixture"
+        )
+        let functionKey = try Core.FunctionKey.derive(
+            namespace: namespace,
+            module: "UIKitObjectiveCInvokerFixture",
+            sourceFileLogicalID: "Fixture.swift",
+            canonicalDeclaration: "func exerciseUIKitProperty(_ view: UIView) -> Bool",
+            loweredSignature: .init(
+                parameters: ["UIKit.UIView"],
+                result: "Swift.Bool",
+                isolation: "MainActor"
+            ),
+            role: .function
+        )
+        let compatibility = Core.Compatibility(
+            runtime: Core.Versions.runtime,
+            bytecode: Core.Versions.bytecode,
+            interfaceArchive: Core.Versions.interfaceArchive,
+            compilerFingerprint: "ios-objective-c-invoker-fixture"
+        )
+        let shellHash = Core.Digest.sha256("ios-objective-c-invoker-shell")
+        let capabilities: Set<Core.Capability> = [
+            .baselineV1, .nativeImportsV1, .nativeTypesV1,
+            .mainActorIsolationV1,
+        ]
+        let requirements = [
+            Bytecode.ImportRequirement(
+                id: setterID,
+                key: setterKey,
+                descriptor: setter,
+                contract: setterContract
+            ),
+            Bytecode.ImportRequirement(
+                id: getterID,
+                key: getterKey,
+                descriptor: getter,
+                contract: getterContract
+            ),
+        ]
+        let module = Bytecode.Module(
+            name: "UIKitObjectiveCInvokerFixture",
+            shellInterfaceHash: shellHash,
+            compatibility: compatibility,
+            capabilities: capabilities,
+            functions: [function],
+            entries: [
+                .init(
+                    entryIndex: entry,
+                    functionKey: functionKey,
+                    functionID: functionID
+                ),
+            ],
+            imports: requirements
+        )
+        let shellImports = [
+            Verification.ResolvedNativeImport(
+                id: setterID,
+                key: setterKey,
+                descriptor: setter,
+                parameterTypes: [.native(viewType), .bool],
+                resultType: .void,
+                contract: setterContract
+            ),
+            Verification.ResolvedNativeImport(
+                id: getterID,
+                key: getterKey,
+                descriptor: getter,
+                parameterTypes: [.native(viewType)],
+                resultType: .bool,
+                contract: getterContract
+            ),
+        ]
+        let shell = try Verification.ShellInterface(
+            interfaceHash: shellHash,
+            compatibility: compatibility,
+            capabilities: capabilities,
+            entries: [
+                .init(
+                    index: entry,
+                    key: functionKey,
+                    parameterTypes: [.native(viewType)],
+                    parameterConventions: function.parameterConventions,
+                    resultType: .bool,
+                    effects: functionEffects
+                ),
+            ],
+            imports: shellImports,
+            types: [
+                .init(
+                    id: viewType,
+                    canonicalName: "UIKit.UIView",
+                    kind: .reference,
+                    layoutFingerprint: layout,
+                    isCopyable: true,
+                    requiresMainActor: true,
+                    estimatedSize: UInt64(MemoryLayout<UIView>.stride)
+                ),
+            ]
+        )
+        let image = try Verification.Engine().verify(
+            bytes: Bytecode.Encoder.encode(module),
+            shell: shell,
+            policy: .init(
+                acceptedCapabilities: capabilities,
+                allowedNativeCalls: [setterKey, getterKey],
+                allowMainActorEntries: true
+            )
+        )
+        let typeCatalog = try VM.NativeTypeCatalog([
+            .reference(
+                id: viewType,
+                canonicalName: "UIKit.UIView",
+                layoutFingerprint: layout,
+                requiresMainActor: true,
+                estimatedByteCount: { (_: UIView) in
+                    UInt64(MemoryLayout<UIView>.stride)
+                }
+            ),
+        ])
+        let nativeCatalog = try VM.NativeCatalog([
+            Runtime.ObjectiveCInvoker(
+                id: setterID,
+                key: setterKey,
+                descriptor: setter,
+                parameterTypes: [.native(viewType), .bool],
+                resultType: .void,
+                effects: setterEffects,
+                contract: setterContract
+            ),
+            Runtime.ObjectiveCInvoker(
+                id: getterID,
+                key: getterKey,
+                descriptor: getter,
+                parameterTypes: [.native(viewType)],
+                resultType: .bool,
+                effects: getterEffects,
+                contract: getterContract
+            ),
+        ])
+        let view = UIView()
+        let boxed = try typeCatalog.boxReference(view, as: viewType)
+
+        #expect(
+            VM.Interpreter(
+                nativeCatalog: nativeCatalog,
+                nativeTypeCatalog: typeCatalog
+            ).invoke(
+                entry: entry,
+                image: image,
+                arguments: [.native(boxed)]
+            ) == .returned(.bool(true))
+        )
+        #expect(view.isHidden)
+    }
+
     @Test("A hosted UIViewController executes its pinned HLBC lifecycle callback")
     func hostedUIViewControllerExecutesLifecycle() throws {
         let namespace = Core.ShellNamespaceID.derive(
@@ -413,6 +711,7 @@ struct UIKitIntegration {
                     index: entry,
                     key: functionKey,
                     parameterTypes: [],
+                    parameterConventions: [],
                     resultType: .native(typeID),
                     effects: .init(mayAllocate: true, requiresMainActor: true)
                 ),
@@ -451,7 +750,13 @@ struct UIKitIntegration {
         let observer = HostedObserver()
         let engine = Runtime.Engine(
             originals: try .init([
-                .init(index: entry, parameterTypes: [], resultType: .native(typeID)) { _ in
+                .init(
+                    index: entry,
+                    parameterTypes: [],
+                    parameterConventions: [],
+                    resultType: .native(typeID),
+                    effects: .init(mayAllocate: true, requiresMainActor: true)
+                ) { _ in
                     .returned(.native(fallback))
                 },
             ]),

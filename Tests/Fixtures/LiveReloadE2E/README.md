@@ -82,5 +82,8 @@ Tests/Fixtures/LiveReloadE2E/run-ios-runtime-tests.sh \
   AF763A53-66CF-405B-AE92-F5A9CDECE0CE
 ```
 
-The dedicated Xcode logic-test target compiles only the App runtime graph. It
-does not pull macOS compiler/CLI products into an iOS test build.
+The dedicated Xcode logic-test target links the development runtime product and
+compiles only the App runtime graph. It does not pull macOS compiler/CLI
+products into an iOS test build. Its UIKit matrix includes an actual verified
+HLBC call through the descriptor-driven Objective-C invoker, so a passing
+macOS-only shim test cannot hide an iOS runtime metadata difference.
