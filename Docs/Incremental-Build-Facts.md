@@ -23,6 +23,7 @@ override; the normal owner-local location is
 | Module frontend | Validated receipt, diagnostics, and toolchain identity | Compiler-capture bytes, compiler fingerprint, non-SDK module/header interface snapshot, metadata, policy, catalog, configuration, and every logical/physical source identity and content hash |
 | Symbol graph | Validated SDK module symbol graph | Compiler fingerprint, SDK/frontend invocation, and module |
 | Managed probe | The uniquely measured operations and native signature types for one candidate | Compiler fingerprint, transform pipeline, SDK/frontend invocation, minimum OS, normalized candidate, and imported boundary types |
+| Native API Catalog | Canonical module document plus the opaque compiler projection that deterministically reconstructs it | Xcode/SDK/compiler, target/deployment/language mode, module-content/search/dependency digests, normalized module-loading semantics, and transform pipeline |
 | Hot Patch Prepare | Complete generated Shell tree and function counts | Exact Prepare identity plus exact paths, bytes, modes, and absence of unexpected entries |
 | Release capability projection | Canonical schema-1 Native Capability Manifest and digest | Release/Shell identity, capabilities, and the complete ordered set of device-emitted Descriptor, Key, Contract, and capability records |
 | Adapter Pack source | Deterministic Swift adapters grouped by native module | Compiler fingerprint, SDK/target/deployment, transform pipeline, module, ordered imported modules, and ordered stable call keys |
@@ -74,6 +75,33 @@ validation path has established it. Each entry also retains only the native
 types actually named by that candidate's receiver, parameters, callbacks, or
 result. This lets a previously unseen signature type survive a cache hit while
 keeping the entry independent of whichever probe batch first produced it.
+
+The module-level Catalog is a wider, separately keyed layer above those two
+fine-grained caches. Its producer scans one module's concrete public surface
+and reuses the same exact probe pipeline, then stores the canonical Catalog and
+the compiler facts needed to reconstruct it. The whole-Catalog key contains no
+consumer module name and normalizes physical Swift/Clang search roots, module
+maps, PCM locations, resource roots, and module-cache directories. Their
+ordered semantic roles remain in the key; module bytes, search-space meaning,
+and dependencies are represented by the separately computed identity digests.
+Non-path Clang options such as macros remain exact. This permits safe
+cross-project reuse without treating a path spelling as API identity.
+
+On a Catalog hit, no Symbol Graph or candidate probe process is launched. The
+cached compiler projection is nevertheless normalized and reclassified, and
+its reconstructed entries must exactly match the cached document. The current
+Prepare path has not yet switched to Catalog-first resolution at this stage;
+that integration will replace recurring source-rooted framework expansion,
+not add another full scan to each build.
+
+Cold whole-module probing deliberately bypasses the per-candidate filesystem
+cache: the enclosing Catalog key already names the exact module, while one
+lock/manifest lookup per public API would add linear I/O without useful reuse.
+Its independent 256-entry top-level batches use at most four workers. Results
+and failures are joined in batch order, so concurrency changes elapsed time but
+not bytes, diagnostics, metrics, or cache identity. Source-rooted expansion
+continues to use the fine-grained probe cache because ordinary source edits can
+reuse those candidates even when the broader module receipt changes.
 
 ## Validation and failure behavior
 

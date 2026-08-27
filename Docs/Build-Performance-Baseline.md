@@ -184,3 +184,36 @@ The remaining measured Bridge costs are import scanning (0.348 s), the small
 Hub-contract Swift compile (0.364 s), and toolchain/Pack planning. These are
 now bounded secondary costs rather than a reason to enumerate fewer SDK APIs.
 All cache and report schemas remain version 1.
+
+## Module Catalog cold-generation evidence
+
+The module-level Catalog producer was exercised against the installed UIKit
+from the iPhone Simulator SDK, not only a synthetic fixture. Its opt-in
+integration test starts with an empty private cache and requires the resulting
+Catalog to contain the exact Objective-C entries for
+`UIView.backgroundColor`, `UIViewController.present`, and `UIView.animate`.
+The successful run on August 27, 2026 took 195.123 seconds. This is evidence of
+correct whole-SDK coverage and of a substantial cold indexing cost; it is not
+an acceptable per-Prepare latency and is not represented as one.
+
+An earlier sequential run was stopped after roughly five minutes. Bounded
+four-worker scheduling raised observed test-process CPU utilization from about
+14% to about 95% while its sampled memory share remained around 2%. Process
+snapshots during the successful run showed no more than four frontend children.
+A default
+260-API regression crosses the 256-candidate batch boundary, builds the same
+module into two independent cold caches, and requires byte-identical Catalog
+documents; it completed in 2.503 seconds in the recorded run.
+
+The UIKit test also exposed two correctness boundaries that small fixtures had
+missed: distinct overlay types can share one generic Swift SIL implementation,
+and a module graph can surface protocol defaults owned by another module. The
+Catalog now keeps the former distinct using owner/USR/signature evidence and
+omits the latter from the wrong module. These fixes preserve fail-closed source
+discovery and do not broaden Objective-C/C module authority.
+
+The product conclusion is therefore explicit: full SDK Catalog generation is
+one-time background work keyed by SDK/module identity. Catalog-first Prepare
+must consume a validated hit or perform a small source-demanded query; it must
+never put this 195-second scan back onto every local build. Schema, protocol,
+artifact, and product versions remain 1.

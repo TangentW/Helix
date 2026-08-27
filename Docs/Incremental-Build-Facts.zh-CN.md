@@ -21,6 +21,7 @@ Xcode 实际捕获的 Swift frontend 去证明以本次构建已证明 imported 
 | 模块 frontend | 已验证的 receipt、诊断和工具链 identity | 编译捕获内容、编译器指纹、非 SDK 模块/头文件接口快照、metadata、策略、catalog、配置，以及每个源码的逻辑路径、物理路径和内容 hash |
 | Symbol graph | 已验证的 SDK 模块公开符号图 | 编译器指纹、SDK/frontend invocation、模块名 |
 | 单候选探测 | 某个候选最终测得的操作及其原生签名类型 | 编译器指纹、变换流水线、SDK/frontend invocation、最低系统、规范化候选和边界类型 |
+| Native API Catalog | canonical 模块 Document，以及能确定性重建它的不透明 compiler projection | Xcode/SDK/compiler、target/deployment/language mode、模块内容/搜索/依赖 digest、规范化模块加载语义与变换流水线 |
 | Hot Patch Prepare | 完整 Shell 目录和函数计数 | Prepare 精确输入，或输出中的路径、字节、权限、额外文件发生任何变化 |
 | Release 能力投影 | canonical schema 1 Native Capability Manifest 与 digest | Release/Shell identity、capability，以及所有 device-emitted Descriptor、Key、Contract 与 capability 的完整有序集合 |
 | Adapter Pack source | 按原生 module 分组的确定性 Swift Adapter | 编译器指纹、SDK/target/deployment、变换流水线、module、有序 imported module 集合与有序稳定调用 Key |
@@ -59,6 +60,24 @@ graph 和单个声明的探测结果。也就是说，业务代码做了一次�
 结果。每条缓存还只保存该候选的 receiver、参数、回调或返回值实际引用的原生类型。
 因此，签名里首次出现的新类型在缓存命中时不会丢失，结果也不会依赖它第一次恰好
 与哪些候选被分到同一探测批次。
+
+模块级 Catalog 是位于上述两种细粒度缓存之上的、更宽的一层独立缓存。Producer 会扫描
+一个模块的具体公开调用面，复用同一套精确探针，再把 canonical Catalog 与可重建它的
+compiler facts 一起保存。整份 Catalog 的 key 不包含消费方项目 module name，并会归一化
+Swift/Clang 的物理搜索目录、module map、PCM、resource root 和 module cache 路径；参数
+顺序与语义角色仍会保留，真正的模块字节、搜索空间含义和依赖则由单独计算的 identity
+digest 表示。宏等非路径 Clang 参数保持精确，因此跨项目复用不会把不同语义误合并。
+
+Catalog 命中时不会启动 Symbol Graph 或候选探针进程，但缓存中的 compiler projection
+仍要重新规范化、重新分类，而且重建出的 entry 必须和缓存 Document 完全一致。当前阶段
+的 Prepare 尚未切换到 Catalog-first；后续接入会用它替换每次构建里的源码根 Framework
+扩展，而不是再叠加一次全模块扫描。
+
+冷的全模块探测不会再对每个候选逐条查询文件缓存：外层 Catalog key 已经精确表示该
+模块，而每个公开 API 再开一次 lock、读一次 manifest 只会增加线性 I/O，不能带来有效
+复用。顶层每 256 条为一批，最多 4 个 worker；结果和错误按批次顺序 join，因此并发只
+改变耗时，不改变输出字节、诊断、指标或缓存身份。源码根扩展仍使用细粒度探针缓存，
+因为普通源码修改造成 module receipt miss 时，这些候选仍有实际复用价值。
 
 ## 命中前仍然要验证
 

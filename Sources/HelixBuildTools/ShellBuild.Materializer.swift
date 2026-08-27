@@ -10,7 +10,7 @@ public enum ShellBuild {
     /// native-call descriptor semantics change. This invalidates local build
     /// facts without changing a shipped protocol or schema version.
     public static let transformPipelineHash = Core.Digest.sha256(
-        "Helix.ShellBuild.DynamicSourceTransform.v1:declaration-groups:frozen-value-hooks:source-body-dispatch:async-original-thunks:native-call-descriptor-v1:objective-c-invoker:objective-c-lightweight-generic-erasure:c-invoker-main-actor-unqualified-reference:swift-adapter-pack-v1:development-native-candidate-emission:production-native-capability-manifest:indexed-source-baseline-metadata:objective-c-declaration-qualified-sil:property-declaration-identity:exact-module-imports:separate-hub-contract-object"
+        "Helix.ShellBuild.DynamicSourceTransform.v1:declaration-groups:frozen-value-hooks:source-body-dispatch:async-original-thunks:native-call-descriptor-v1:objective-c-invoker:objective-c-lightweight-generic-erasure:c-invoker-main-actor-unqualified-reference:swift-adapter-pack-v1:development-native-candidate-emission:production-native-capability-manifest:indexed-source-baseline-metadata:objective-c-declaration-qualified-sil:property-declaration-identity:exact-module-imports:separate-hub-contract-object:module-native-api-catalog:bounded-parallel-native-probes"
     )
 }
 

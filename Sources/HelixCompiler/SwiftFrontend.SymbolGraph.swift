@@ -267,7 +267,7 @@ extension SwiftFrontend.Driver {
     /// later probes replay every captured source semantic, so dropping
     /// source-only flags is a safe under-approximation while forwarding them
     /// would make the independent extractor reject otherwise valid builds.
-    func symbolGraphImportArguments(
+    public func symbolGraphImportArguments(
         _ arguments: [String]
     ) throws -> [String] {
         let values = try directFrontendArguments(arguments)

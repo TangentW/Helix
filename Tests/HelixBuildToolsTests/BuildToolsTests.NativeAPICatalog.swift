@@ -1,7 +1,9 @@
 import Foundation
-import HelixBuildTools
+import HelixCompiler
 import HelixCore
+import HelixInterface
 import Testing
+@testable import HelixBuildTools
 
 extension BuildToolsTests {
 @Suite("Native API Catalog")
@@ -176,6 +178,616 @@ struct NativeAPICatalogTests {
         #expect(base.cacheKey != changedContent.cacheKey)
         #expect(base.cacheKey != changedTarget.cacheKey)
         #expect(base.cacheKey != changedSearchPath.cacheKey)
+    }
+
+    @Test("Catalog cache identity ignores physical module locations only")
+    func normalizesModuleLoadingPaths() {
+        let first = NativeAPICatalog.Builder.cacheIdentityArguments([
+            "-I", "/First/SwiftModules",
+            "-F/First/Frameworks",
+            "-Xcc", "-I", "-Xcc", "/First/ClangHeaders",
+            "-Xcc", "-isystem/First/SystemHeaders",
+            "-Xcc", "-fmodule-map-file=/First/Modules/module.modulemap",
+            "-Xcc", "-fmodule-file=Dependency=/First/Modules/Dependency.pcm",
+            "-module-cache-path", "/First/ModuleCache",
+            "-Xcc", "-fmodules-cache-path=/First/ClangModuleCache",
+            "-Xcc", "-fmodules-cache-path", "-Xcc",
+            "/First/OtherClangModuleCache",
+            "-Xcc", "-DHELIX_FEATURE=1",
+        ])
+        let second = NativeAPICatalog.Builder.cacheIdentityArguments([
+            "-I", "/Second/SwiftModules",
+            "-F/Second/Frameworks",
+            "-Xcc", "-I", "-Xcc", "/Second/ClangHeaders",
+            "-Xcc", "-isystem/Second/SystemHeaders",
+            "-Xcc", "-fmodule-map-file=/Second/Modules/module.modulemap",
+            "-Xcc", "-fmodule-file=Dependency=/Second/Modules/Dependency.pcm",
+            "-module-cache-path", "/Second/ModuleCache",
+            "-Xcc", "-fmodules-cache-path=/Second/ClangModuleCache",
+            "-Xcc", "-fmodules-cache-path", "-Xcc",
+            "/Second/OtherClangModuleCache",
+            "-Xcc", "-DHELIX_FEATURE=1",
+        ])
+        let differentMacro = NativeAPICatalog.Builder.cacheIdentityArguments([
+            "-I", "/Second/SwiftModules",
+            "-F/Second/Frameworks",
+            "-Xcc", "-I", "-Xcc", "/Second/ClangHeaders",
+            "-Xcc", "-isystem/Second/SystemHeaders",
+            "-Xcc", "-fmodule-map-file=/Second/Modules/module.modulemap",
+            "-Xcc", "-fmodule-file=Dependency=/Second/Modules/Dependency.pcm",
+            "-module-cache-path", "/Second/ModuleCache",
+            "-Xcc", "-fmodules-cache-path=/Second/ClangModuleCache",
+            "-Xcc", "-fmodules-cache-path", "-Xcc",
+            "/Second/OtherClangModuleCache",
+            "-Xcc", "-DHELIX_FEATURE=2",
+        ])
+
+        #expect(first == second)
+        #expect(first != differentMacro)
+        #expect(first.contains("-DHELIX_FEATURE=1"))
+        #expect(!first.contains { $0.contains("/First/") })
+        #expect(
+            NativeAPICatalog.Builder.cacheIdentityArguments([
+                "-module-cache-path",
+            ]) != NativeAPICatalog.Builder.cacheIdentityArguments([])
+        )
+    }
+
+    @Test("Catalog keeps distinct logical APIs that share one Swift implementation")
+    func projectsSharedSwiftImplementation() throws {
+        let moduleName = "Fixture"
+        let sourceID = NativeAPICatalog.Projector.sourceFileLogicalID(
+            moduleName: moduleName
+        )
+        let typeNames = ["Fixture.First", "Fixture.Second"]
+        let types = try FrontendReceipt.Adapter().mergeImportedNativeTypes(
+            discoveredTypes: [],
+            operationTypes: typeNames.map { name in
+                .init(
+                    canonicalName: name,
+                    swiftType: name,
+                    kind: .value,
+                    aliases: [String(name.split(separator: ".").last!)],
+                    representation: .opaqueValue,
+                    sourceFileLogicalID: sourceID,
+                    importedModules: [moduleName],
+                    requiresMainActor: false
+                )
+            }
+        )
+        let sharedSymbol = "$ss20_SwiftNewtypeWrapperPsSHRzSH8RawValueSYRpzrlE04hashE0Sivg"
+        let operations = try FrontendReceipt.Adapter().mergeImportedOperations(
+            typeNames.enumerated().map { index, name in
+                .init(
+                    silReferences: [sharedSymbol],
+                    sourceFileLogicalID: sourceID,
+                    importedModules: [moduleName],
+                    dispatch: .instanceGetter,
+                    ownerType: name,
+                    baseName: "hashValue",
+                    argumentLabels: [],
+                    parameterSwiftTypes: [name],
+                    resultSwiftType: "Swift.Int",
+                    requiresMainActor: false,
+                    declarationUSR: "s:7Fixture6Value\(index)V9hashValueSivp",
+                    isolationEvidence: .importedDeclaration,
+                    isEmittedToDevice: false
+                )
+            }
+        )
+        let projection = NativeAPICatalog.CompilerProjection(
+            sourceFileLogicalID: sourceID,
+            importedTypes: types,
+            operations: operations,
+            modulesByDeclarationUSR: Dictionary(uniqueKeysWithValues:
+                operations.compactMap { operation in
+                    operation.declarationUSR.map { ($0, moduleName) }
+                }
+            )
+        )
+        let catalogIdentity = identity(module: moduleName)
+        let entries = try NativeAPICatalog.Projector.entries(
+            projection: projection,
+            identity: catalogIdentity,
+            invocation: .init(
+                moduleName: "CatalogConsumer",
+                targetTriple: catalogIdentity.targetTriple,
+                sdkName: "iphonesimulator",
+                sdkBuild: catalogIdentity.sdkProductBuild,
+                optimization: "-Onone",
+                semanticArguments: ["-parse-as-library"]
+            )
+        )
+
+        #expect(entries.count == 2)
+        #expect(Set(entries.map(\.descriptor.canonicalCallee)) == [
+            "Fixture.First.hashValue.get",
+            "Fixture.Second.hashValue.get",
+        ])
+        #expect(entries.allSatisfy {
+            $0.compilerSymbols.contains(sharedSymbol)
+                && $0.binding?.strategy == .swiftAdapter
+        })
+    }
+
+    @Test("Catalog omits protocol defaults declared by another Swift module")
+    func omitsForeignProtocolDefaults() throws {
+        let moduleName = "Fixture"
+        let sourceID = NativeAPICatalog.Projector.sourceFileLogicalID(
+            moduleName: moduleName
+        )
+        let type = FrontendReceipt.Adapter.ImportedNativeType(
+            canonicalName: "Fixture.Wrapped",
+            swiftType: "Fixture.Wrapped",
+            kind: .value,
+            aliases: ["Wrapped"],
+            representation: .opaqueValue,
+            sourceFileLogicalID: sourceID,
+            importedModules: [moduleName],
+            requiresMainActor: false
+        )
+        let usr = "s:5Swift8HashableP9hashValueSivg"
+        let operation = FrontendReceipt.Adapter.ImportedOperation(
+            silReferences: [
+                "$ss8HashableP9hashValueSivg",
+            ],
+            sourceFileLogicalID: sourceID,
+            importedModules: [moduleName],
+            dispatch: .instanceGetter,
+            ownerType: type.swiftType,
+            baseName: "hashValue",
+            argumentLabels: [],
+            parameterSwiftTypes: [type.swiftType],
+            resultSwiftType: "Swift.Int",
+            requiresMainActor: false,
+            declarationUSR: usr,
+            isolationEvidence: .importedDeclaration,
+            isEmittedToDevice: false
+        )
+        let projection = NativeAPICatalog.CompilerProjection(
+            sourceFileLogicalID: sourceID,
+            importedTypes: [type],
+            operations: [operation],
+            modulesByDeclarationUSR: [usr: moduleName]
+        )
+        let catalogIdentity = identity(module: moduleName)
+
+        #expect(try NativeAPICatalog.Projector.entries(
+            projection: projection,
+            identity: catalogIdentity,
+            invocation: .init(
+                moduleName: "CatalogConsumer",
+                targetTriple: catalogIdentity.targetTriple,
+                sdkName: "iphonesimulator",
+                sdkBuild: catalogIdentity.sdkProductBuild,
+                optimization: "-Onone",
+                semanticArguments: ["-parse-as-library"]
+            )
+        ).isEmpty)
+    }
+
+    @Test("Module Catalog is compiler-proven and reused across projects")
+    func buildsAndReusesModuleCatalog() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-native-api-catalog-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let firstSearchPath = directory.appendingPathComponent(
+            "FirstSearchPath",
+            isDirectory: true
+        )
+        let secondSearchPath = directory.appendingPathComponent(
+            "SecondSearchPath",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: firstSearchPath,
+            withIntermediateDirectories: false
+        )
+        try FileManager.default.createDirectory(
+            at: secondSearchPath,
+            withIntermediateDirectories: false
+        )
+        let moduleName = "CatalogFixture"
+        let source = Data(
+            """
+            public final class Payload {
+                public init() {}
+            }
+            public final class Transformer {
+                public init() {}
+                public func transform(_ value: Payload) -> Payload { value }
+            }
+            public func increment(_ value: Int) -> Int { value + 1 }
+            """.utf8
+        )
+        let sourceURL = firstSearchPath.appendingPathComponent("Fixture.swift")
+        try source.write(to: sourceURL)
+        let compilerURL = URL(fileURLWithPath: "/usr/bin/swiftc")
+        let frontend = SwiftFrontend.Driver(compilerURL: compilerURL)
+        let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        let target = "arm64-apple-ios15.0-simulator"
+        let compilation = try frontend.run(arguments: [
+            sourceURL.path,
+            "-emit-module", "-parse-as-library",
+            "-module-name", moduleName,
+            "-target", target,
+            "-sdk", sdk.path,
+            "-emit-module-path", firstSearchPath.appendingPathComponent(
+                "\(moduleName).swiftmodule"
+            ).path,
+        ])
+        guard compilation.terminationStatus == 0 else {
+            throw FrontendReceipt.Error.frontendFailed(
+                compilation.standardError
+            )
+        }
+        try FileManager.default.copyItem(
+            at: firstSearchPath.appendingPathComponent(
+                "\(moduleName).swiftmodule"
+            ),
+            to: secondSearchPath.appendingPathComponent(
+                "\(moduleName).swiftmodule"
+            )
+        )
+        let toolchain = try ReleaseCompiler.Driver().toolchainIdentity(
+            compilerURL: compilerURL
+        )
+        let identity = NativeAPICatalog.Identity(
+            provenance: .thirdPartyModule,
+            xcodeProductBuild: "integration-test",
+            sdkProductBuild: sdk.buildVersion,
+            compilerFingerprint: toolchain.fingerprint,
+            targetTriple: target,
+            minimumDeployment: .init(15),
+            swiftLanguageMode: "5",
+            moduleName: moduleName,
+            moduleContentHash: .sha256(source),
+            moduleSearchPathHash: .sha256("one equivalent module search slot"),
+            dependencyGraphHash: .sha256("none")
+        )
+        func invocation(
+            consumer: String,
+            condition: String,
+            searchPath: URL
+        ) -> InterfaceArchive.FrontendInvocation {
+            .init(
+                moduleName: consumer,
+                targetTriple: target,
+                sdkName: sdk.name,
+                sdkBuild: sdk.buildVersion,
+                optimization: "-Onone",
+                semanticArguments: [
+                    "-parse-as-library", "-I", searchPath.path,
+                    "-D", condition,
+                ]
+            )
+        }
+        let builder = NativeAPICatalog.Builder(cache: try .init(
+            rootURL: directory.appendingPathComponent("Cache")
+        ))
+        let first = try builder.build(.init(
+            identity: identity,
+            frontendInvocation: invocation(
+                consumer: "FirstApplication",
+                condition: "FIRST_PROJECT",
+                searchPath: firstSearchPath
+            ),
+            compilerURL: compilerURL,
+            precomputedToolchain: toolchain
+        ))
+        let second = try builder.build(.init(
+            identity: identity,
+            frontendInvocation: invocation(
+                consumer: "SecondApplication",
+                condition: "SECOND_PROJECT",
+                searchPath: secondSearchPath
+            ),
+            compilerURL: compilerURL,
+            precomputedToolchain: toolchain
+        ))
+
+        #expect(first.metrics.cacheSource == .generated)
+        #expect(second.metrics.cacheSource == .hit)
+        #expect(first.metrics.probeAttemptCount > 0)
+        #expect(second.metrics.symbolGraphCacheHitCount == 0)
+        #expect(second.metrics.symbolGraphCacheMissCount == 0)
+        #expect(second.metrics.probeCacheHitCount == 0)
+        #expect(second.metrics.probeCacheMissCount == 0)
+        #expect(second.metrics.probeAttemptCount == 0)
+        #expect(second.snapshot.document == first.snapshot.document)
+        #expect(second.snapshot.compilerProjection
+            == first.snapshot.compilerProjection)
+        #expect(first.snapshot.document.entries.contains {
+            $0.descriptor.canonicalCallee
+                == "CatalogFixture.Transformer.transform(_:).call"
+                && $0.binding?.strategy == .swiftAdapter
+        })
+        #expect(first.snapshot.document.entries.contains {
+            $0.descriptor.canonicalCallee
+                == "CatalogFixture.increment(_:).call"
+                && $0.binding?.strategy == .swiftAdapter
+        })
+        #expect(first.metrics.entryCount > 0)
+        #expect(first.metrics.candidateCount >= first.metrics.entryCount)
+        #expect(first.snapshot.compilerProjection.importedTypes.contains {
+            $0.canonicalName == "CatalogFixture.Payload"
+        })
+        try first.snapshot.document.validate()
+
+        var mismatchedIdentity = identity
+        mismatchedIdentity.targetTriple = "x86_64-apple-ios15.0-simulator"
+        #expect(throws: NativeAPICatalog.Error.self) {
+            _ = try builder.build(.init(
+                identity: mismatchedIdentity,
+                frontendInvocation: invocation(
+                    consumer: "MismatchedApplication",
+                    condition: "MISMATCHED_PROJECT",
+                    searchPath: firstSearchPath
+                ),
+                compilerURL: compilerURL,
+                precomputedToolchain: toolchain
+            ))
+        }
+    }
+
+    @Test("Module Catalog classifies Objective-C messages and C functions")
+    func buildsClangModuleCatalog() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-native-clang-catalog-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let moduleName = "CatalogForeign"
+        let header = Data(
+            """
+            #import <Foundation/Foundation.h>
+
+            NS_ASSUME_NONNULL_BEGIN
+            @interface CatalogObject : NSObject
+            - (NSInteger)increment:(NSInteger)value;
+            - (void)performWithCompletion:(void (^)(BOOL finished))completion;
+            @end
+
+            FOUNDATION_EXPORT NSInteger CatalogAdd(NSInteger lhs, NSInteger rhs);
+            NS_ASSUME_NONNULL_END
+            """.utf8
+        )
+        let moduleMap = Data(
+            """
+            module CatalogForeign {
+              header "CatalogForeign.h"
+              export *
+            }
+            """.utf8
+        )
+        let headerURL = directory.appendingPathComponent("CatalogForeign.h")
+        let moduleMapURL = directory.appendingPathComponent("module.modulemap")
+        try header.write(to: headerURL)
+        try moduleMap.write(to: moduleMapURL)
+        let compilerURL = URL(fileURLWithPath: "/usr/bin/swiftc")
+        let frontend = SwiftFrontend.Driver(compilerURL: compilerURL)
+        let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        let toolchain = try ReleaseCompiler.Driver().toolchainIdentity(
+            compilerURL: compilerURL
+        )
+        let target = "arm64-apple-ios15.0-simulator"
+        var content = Data()
+        content.append(header)
+        content.append(moduleMap)
+        let identity = NativeAPICatalog.Identity(
+            provenance: .thirdPartyModule,
+            xcodeProductBuild: "integration-test",
+            sdkProductBuild: sdk.buildVersion,
+            compilerFingerprint: toolchain.fingerprint,
+            targetTriple: target,
+            minimumDeployment: .init(15),
+            swiftLanguageMode: "5",
+            moduleName: moduleName,
+            moduleContentHash: .sha256(content),
+            moduleSearchPathHash: .sha256(directory.path),
+            dependencyGraphHash: .sha256("Foundation")
+        )
+        let output = try NativeAPICatalog.Builder(cache: .init(
+            rootURL: directory.appendingPathComponent("Cache")
+        )).build(.init(
+            identity: identity,
+            frontendInvocation: .init(
+                moduleName: "ForeignConsumer",
+                targetTriple: target,
+                sdkName: sdk.name,
+                sdkBuild: sdk.buildVersion,
+                optimization: "-Onone",
+                semanticArguments: [
+                    "-parse-as-library", "-I", directory.path,
+                    "-Xcc", "-fmodule-map-file=\(moduleMapURL.path)",
+                ]
+            ),
+            compilerURL: compilerURL,
+            precomputedToolchain: toolchain
+        ))
+
+        let objectiveC = try #require(output.snapshot.document.entries.first {
+            $0.descriptor.target.backend == .objectiveCMessage
+                && $0.descriptor.target.entryPoint == "increment:"
+        })
+        #expect(objectiveC.binding?.strategy == .objectiveCInvoker)
+        #expect(objectiveC.binding?.adapterID == nil)
+        let cFunction = try #require(output.snapshot.document.entries.first {
+            $0.descriptor.target.backend == .cFunction
+                && $0.descriptor.target.entryPoint == "CatalogAdd"
+        })
+        #expect(cFunction.binding?.strategy == .cInvoker)
+        #expect(cFunction.binding?.adapterID == nil)
+        #expect(output.snapshot.document.entries.contains {
+            $0.descriptor.target.backend == .objectiveCMessage
+                && $0.descriptor.target.entryPoint
+                    == "performWithCompletion:"
+                && $0.descriptor.logicalSignature.parameters.contains {
+                    $0.callbackLifetime == .escaping
+                }
+        })
+        try output.snapshot.document.validate()
+    }
+
+    @Test("Parallel Catalog probes produce deterministic documents")
+    func parallelCatalogProbesAreDeterministic() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-parallel-catalog-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let moduleName = "ParallelCatalogFixture"
+        let source = Data((0..<260).map { index in
+            "public func value\(index)(_ input: Int) -> Int { input + \(index) }"
+        }.joined(separator: "\n").utf8)
+        let sourceURL = directory.appendingPathComponent("Fixture.swift")
+        try source.write(to: sourceURL)
+        let compilerURL = URL(fileURLWithPath: "/usr/bin/swiftc")
+        let frontend = SwiftFrontend.Driver(compilerURL: compilerURL)
+        let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        let target = "arm64-apple-ios15.0-simulator"
+        let compilation = try frontend.run(arguments: [
+            sourceURL.path,
+            "-emit-module", "-parse-as-library",
+            "-module-name", moduleName,
+            "-target", target,
+            "-sdk", sdk.path,
+            "-emit-module-path", directory.appendingPathComponent(
+                "\(moduleName).swiftmodule"
+            ).path,
+        ])
+        guard compilation.terminationStatus == 0 else {
+            throw FrontendReceipt.Error.frontendFailed(
+                compilation.standardError
+            )
+        }
+        let toolchain = try ReleaseCompiler.Driver().toolchainIdentity(
+            compilerURL: compilerURL
+        )
+        let identity = NativeAPICatalog.Identity(
+            provenance: .thirdPartyModule,
+            xcodeProductBuild: "integration-test",
+            sdkProductBuild: sdk.buildVersion,
+            compilerFingerprint: toolchain.fingerprint,
+            targetTriple: target,
+            minimumDeployment: .init(15),
+            swiftLanguageMode: "5",
+            moduleName: moduleName,
+            moduleContentHash: .sha256(source),
+            moduleSearchPathHash: .sha256("parallel-fixture-search"),
+            dependencyGraphHash: .sha256("none")
+        )
+        let invocation = InterfaceArchive.FrontendInvocation(
+            moduleName: "ParallelCatalogConsumer",
+            targetTriple: target,
+            sdkName: sdk.name,
+            sdkBuild: sdk.buildVersion,
+            optimization: "-Onone",
+            semanticArguments: ["-parse-as-library", "-I", directory.path]
+        )
+        func build(cacheName: String) throws -> NativeAPICatalog.BuildOutput {
+            try NativeAPICatalog.Builder(cache: .init(
+                rootURL: directory.appendingPathComponent(cacheName)
+            )).build(.init(
+                identity: identity,
+                frontendInvocation: invocation,
+                compilerURL: compilerURL,
+                precomputedToolchain: toolchain
+            ))
+        }
+        let first = try build(cacheName: "FirstCache")
+        let second = try build(cacheName: "SecondCache")
+
+        #expect(first.metrics.cacheSource == .generated)
+        #expect(second.metrics.cacheSource == .generated)
+        #expect(first.metrics.probeAttemptCount == 2)
+        #expect(second.metrics.probeAttemptCount == 2)
+        #expect(first.snapshot.document.entries.count == 260)
+        #expect(second.snapshot.document == first.snapshot.document)
+    }
+
+    @Test("System SDK Catalog covers representative UIKit first uses")
+    func buildsUIKitCatalogWhenRequested() throws {
+        guard ProcessInfo.processInfo.environment[
+            "HELIX_RUN_SDK_CATALOG_INTEGRATION"
+        ] == "1" else { return }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-uikit-catalog-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let compilerURL = URL(fileURLWithPath: "/usr/bin/swiftc")
+        let frontend = SwiftFrontend.Driver(compilerURL: compilerURL)
+        let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        let toolchain = try ReleaseCompiler.Driver().toolchainIdentity(
+            compilerURL: compilerURL
+        )
+        let target = "arm64-apple-ios15.0-simulator"
+        let identity = NativeAPICatalog.Identity(
+            provenance: .systemSDK,
+            xcodeProductBuild: "integration-test",
+            sdkProductBuild: sdk.buildVersion,
+            compilerFingerprint: toolchain.fingerprint,
+            targetTriple: target,
+            minimumDeployment: .init(15),
+            swiftLanguageMode: "5",
+            moduleName: "UIKit",
+            moduleContentHash: .sha256("UIKit:\(sdk.buildVersion)"),
+            moduleSearchPathHash: .sha256("system-sdk"),
+            dependencyGraphHash: .sha256("UIKit-system-dependencies")
+        )
+        let output = try NativeAPICatalog.Builder(cache: .init(
+            rootURL: directory.appendingPathComponent("Cache")
+        )).build(.init(
+            identity: identity,
+            frontendInvocation: .init(
+                moduleName: "UIKitCatalogConsumer",
+                targetTriple: target,
+                sdkName: sdk.name,
+                sdkBuild: sdk.buildVersion,
+                optimization: "-Onone",
+                semanticArguments: ["-parse-as-library"]
+            ),
+            compilerURL: compilerURL,
+            precomputedToolchain: toolchain
+        ))
+
+        #expect(output.metrics.candidateCount > 1_000)
+        #expect(output.snapshot.document.entries.contains {
+            $0.descriptor.target.backend == .objectiveCMessage
+                && $0.descriptor.target.owner == "UIViewController"
+                && $0.descriptor.target.entryPoint
+                    == "presentViewController:animated:completion:"
+        })
+        #expect(output.snapshot.document.entries.contains {
+            $0.descriptor.target.backend == .objectiveCMessage
+                && $0.descriptor.target.owner == "UIView"
+                && $0.descriptor.target.entryPoint == "setBackgroundColor:"
+        })
+        #expect(output.snapshot.document.entries.contains {
+            $0.descriptor.target.backend == .objectiveCMessage
+                && $0.descriptor.target.owner == "UIView"
+                && $0.descriptor.canonicalCallee.contains("animate")
+        })
+        try output.snapshot.document.validate()
     }
 
     private func swiftEntry() throws -> NativeAPICatalog.Entry {

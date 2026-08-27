@@ -9,6 +9,7 @@ public enum BuildCache {}
 extension BuildCache {
 public enum Namespace: String, Codable, Hashable, Sendable {
     case moduleFrontend = "module_frontend"
+    case nativeAPICatalog = "native_api_catalog"
     case symbolGraph = "symbol_graph"
     case managedProbe = "managed_probe"
     case adapterPack = "adapter_pack"

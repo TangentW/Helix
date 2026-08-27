@@ -169,3 +169,27 @@ Pack key、compiler input、module map、toolchain、SDK、Clang binary 与 boot
 当前剩余 Bridge 成本主要是 import 扫描（0.348 s）、小 Hub-contract Swift 编译
 （0.364 s）以及 toolchain/Pack 规划。它们已经变成次要且有界的成本，不再构成缩减 SDK
 覆盖范围的理由。所有缓存和报告 schema 继续保持版本 1。
+
+## 模块 Catalog 冷生成证据
+
+模块级 Catalog Producer 已经对当前安装的 iPhone Simulator SDK 中真实 UIKit 做过验证，
+不是只跑小型人造 fixture。显式开启的集成测试从空的私有缓存开始，并要求最终 Catalog
+确实包含 `UIView.backgroundColor`、`UIViewController.present` 与 `UIView.animate` 三条
+精确 Objective-C 记录。2026-08-27 的成功运行耗时 195.123 秒。这证明全 SDK 覆盖链路
+能成立，也证明冷索引本身代价很大；它绝不是可接受的每次 Prepare 耗时，文档也不会把
+它写成普通构建性能。
+
+顺序执行的早期版本运行约 5 分钟后被主动停止。改成最多 4 个 worker 的有界调度后，
+采样到的测试进程 CPU 利用率从约 14% 提高到约 95%，内存占比仍约 2%；成功运行期间的
+进程快照没有出现超过 4 个 frontend 子进程。常规测试还用 260 条 API 强制跨过 256 条批次
+边界，在两个独立冷缓存中分别生成，并要求 Catalog 字节语义完全一致；记录的一次运行
+耗时 2.503 秒。
+
+UIKit 还暴露了小 fixture 没发现的两条正确性边界：不同 overlay 类型可能共享一个泛型
+Swift SIL 实现，模块图也可能展示由其他模块声明的 protocol 默认实现。Catalog 现在用
+owner、USR 与完整签名区分前者，并从错误模块中剔除后者；普通源码分析仍保持失败关闭，
+Objective-C/C 模块权限也没有被放宽。
+
+因此产品结论很明确：完整 SDK Catalog 只能按 SDK/模块身份做一次后台生成。Catalog-first
+Prepare 必须读取经过验证的命中，或只对源码当前需要的 API 做小范围查询，绝不能把这次
+195 秒扫描重新塞回每次本地构建。schema、协议、产物与产品版本全部继续保持 1。

@@ -79,6 +79,47 @@ disagree about an existing key. Identical snapshots load idempotently. Lookup
 is available by stable key, Swift spelling, compiler symbol, and native entry
 point; every result resolves back to the same descriptor.
 
+`NativeAPICatalog.Builder` now produces that snapshot from a real imported
+module rather than from project Type IDs. It extracts the module's public
+Symbol Graph, nominates concrete public class/struct/enum members and public
+global functions, and asks the captured Swift frontend to compile every
+candidate. The exact Typed AST and SIL evidence is projected through the same
+native-import classifier used by application builds. Objective-C and C entries
+therefore bind to their generic invokers, while concrete Swift entries receive
+a deterministic Adapter ID derived from the stable call key. Signature-only
+native types are retained in an opaque compiler projection so later project
+binding does not lose a type that was absent from the owner list.
+
+Independent 256-candidate probe batches run with at most four workers and are
+merged in original batch order. Recursive failure isolation remains local to
+one batch, metrics are combined after all workers join, and the earliest batch
+error is reported deterministically. A shared generic SIL implementation does
+not collapse distinct logical APIs: Catalog projection treats the exact owner,
+USR, and signature as the identity evidence. Conversely, a Swift protocol
+default or synthesized operation owned by another module is not published in
+the current module's Catalog. Objective-C or C module disagreement remains a
+hard evidence error.
+
+The complete validated document and compiler projection are cached together
+under the module identity. Absolute project and DerivedData locations in Swift
+and Clang module-loading flags are replaced by ordered placeholders; the
+identity's module-content, semantic search-space, and dependency-graph digests
+remain authoritative. Consequently two projects using byte-identical module
+inputs can reuse one Catalog even when their physical search roots differ.
+Every read still validates canonical encoding and bounds, reconstructs all
+entries from the compiler projection, and requires exact equality with the
+stored document. Project-local Type IDs never enter a descriptor or stable
+key.
+
+This whole-module producer deliberately does not invent an ABI for open
+generics, protocol existentials, type aliases whose representation is unknown,
+async declarations, or declarations rejected by the exact probe. Concrete
+generic specializations observed by an application remain available through
+the existing source-rooted compiler path. Catalog-first Prepare consumption
+and automatic identity discovery are separate integration stages; until those
+are connected, Release capability publication continues to use the
+build-proven imported-type boundary described below.
+
 ## Trust-boundary flow
 
 The release archive stores the complete descriptor and contract. Its device

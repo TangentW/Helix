@@ -37,6 +37,34 @@ Descriptor 规范化会限制文本和数组大小、统一 Swift 类型写法�
 
 Codec 会拒绝超大或非 canonical JSON。不可变 Registry 会拒绝“同一个缓存身份对应两份不同内容”，也会拒绝两个 Catalog 对同一个 Key 给出不同记录；重复加载同一快照是幂等的。Registry 可以按稳定 Key、Swift 名称、编译器符号和原生 entry point 查询，而且所有索引最终都回到同一份 Descriptor。
 
+`NativeAPICatalog.Builder` 现在可以直接从一个真实的已导入模块生成这份快照，不再依赖
+任何项目临时 Type ID。它先读取该模块的公开 Symbol Graph，提名具体的公开
+class/struct/enum 成员与公开全局函数，再让本次捕获的 Swift frontend 逐项编译验证。
+Typed AST 与 SIL 证据会进入和业务模块相同的原生调用分类器：Objective-C、C 记录分别
+绑定通用 Invoker，具体 Swift 调用则根据稳定 Call Key 获得确定性的 Adapter ID。
+只出现在参数或返回值里的原生类型也会保留在一份不对外暴露的 compiler projection
+中，避免后续绑定项目时因为它不在 owner 列表里而丢失。
+
+互相独立的候选每 256 条组成一批，最多由 4 个 worker 并行探测，结果仍按原始批次顺序
+合并。失败递归拆分只发生在本批次，所有 worker join 后再合并指标，并确定性地返回最早
+批次的错误。多个逻辑 API 即使复用同一个泛型 SIL 实现，Catalog 仍会依据精确 owner、
+USR 与签名分别保存；反过来，由其他 Swift 模块声明的 protocol 默认实现或合成操作不会
+混进当前模块 Catalog。Objective-C/C 如果出现模块证据错配，仍然直接失败。
+
+完整 Catalog 与 compiler projection 会一起按模块身份进入全局内容缓存。Swift 和
+Clang 模块加载参数中的项目目录、DerivedData 等物理路径会替换成有顺序的占位符；真正
+决定复用权限的是 identity 中的模块内容、语义搜索空间与依赖图 hash。因此，两个项目
+即使模块搜索目录不同，只要实际模块输入完全相同，也可以复用同一份 Catalog。每次读取
+仍会检查 canonical 编码、数量与大小上限，并根据 compiler projection 重新生成全部
+entry，要求它和缓存 Document 逐字义一致。项目局部 Type ID 不会进入 Descriptor 或
+稳定 Key。
+
+这条全模块生成路径不会猜测开放泛型、protocol existential、表示未知的 typealias、
+async 声明，或精确探针已经拒绝的 ABI。App frontend 已经证明的具体泛型 specialization
+仍可由现有的源码根调用面路径处理。Catalog-first Prepare 消费与模块 identity 自动发现
+属于后续接入阶段；在完成接入之前，Release 能力发布仍使用下文所述的 build-proven
+imported-type 边界。
+
 ## 从 Patch 到 Runtime 的验证链
 
 Release Archive 保存完整 Descriptor 和 Contract；设备投影保留相同调用权限，但不携带只在构建期使用的编译器符号。HLBC import requirement 再次写入 Key、Descriptor、Contract 和 Capability。Shell interface 与 Runtime registry 同时保留紧凑下标和稳定 Key。
