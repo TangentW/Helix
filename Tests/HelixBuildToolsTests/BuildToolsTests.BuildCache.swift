@@ -75,6 +75,64 @@ struct BuildCacheStore {
         #expect(try permissions(of: entry.appendingPathComponent("Payload.bin")) == 0o600)
     }
 
+    @Test("Read-only lookup never creates work or waits for a producer")
+    func readsPublishedValuesWithoutBlocking() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let key = Core.Digest.sha256("background-catalog")
+
+        #expect(try fixture.store.cachedValue(
+            namespace: .nativeAPICatalog,
+            key: key,
+            maximumBytes: 1_024
+        ) == nil)
+        #expect(!FileManager.default.fileExists(atPath: fixture.root.path))
+
+        let producerStarted = DispatchSemaphore(value: 0)
+        let allowProducer = DispatchSemaphore(value: 0)
+        let producerFinished = DispatchSemaphore(value: 0)
+        let producer = Thread {
+            defer { producerFinished.signal() }
+            _ = try! fixture.store.value(
+                namespace: .nativeAPICatalog,
+                key: key,
+                maximumBytes: 1_024
+            ) {
+                producerStarted.signal()
+                allowProducer.wait()
+                return Data("catalog".utf8)
+            }
+        }
+        producer.qualityOfService = .userInitiated
+        producer.start()
+        let started = producerStarted.wait(timeout: .now() + 30)
+        #expect(started == .success)
+        guard started == .success else {
+            allowProducer.signal()
+            _ = producerFinished.wait(timeout: .now() + 30)
+            return
+        }
+        #expect(try fixture.store.cachedValue(
+            namespace: .nativeAPICatalog,
+            key: key,
+            maximumBytes: 1_024
+        ) == nil)
+        allowProducer.signal()
+        #expect(producerFinished.wait(timeout: .now() + 30) == .success)
+
+        #expect(try fixture.store.cachedValue(
+            namespace: .nativeAPICatalog,
+            key: key,
+            maximumBytes: 1_024
+        ) == .init(data: Data("catalog".utf8), source: .hit))
+        #expect(try fixture.store.cachedValue(
+            namespace: .nativeAPICatalog,
+            key: key,
+            maximumBytes: 1_024,
+            validate: { _ in throw ValidationError.invalid }
+        ) == nil)
+    }
+
     @Test("Corrupt entries are repaired instead of trusted")
     func repairsCorruptEntry() throws {
         let fixture = try makeFixture()
@@ -377,6 +435,51 @@ struct BuildCacheStore {
         #expect(selectedChanged.contentHash != first.contentHash)
     }
 
+    @Test("Module content identity is portable but preserves search precedence")
+    func fingerprintsPortableOrderedModuleContent() throws {
+        let manager = FileManager.default
+        let root = manager.temporaryDirectory.appendingPathComponent(
+            "helix-portable-compiler-inputs-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let firstRoot = root.appendingPathComponent("First", isDirectory: true)
+        let secondRoot = root.appendingPathComponent("Second", isDirectory: true)
+        let copiedRoot = root.appendingPathComponent("Copied", isDirectory: true)
+        for directory in [firstRoot, secondRoot, copiedRoot] {
+            try manager.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true
+            )
+        }
+        defer { try? manager.removeItem(at: root) }
+        try Data("selected-v1".utf8).write(
+            to: firstRoot.appendingPathComponent("Selected.swiftmodule")
+        )
+        try Data("selected-v2".utf8).write(
+            to: secondRoot.appendingPathComponent("Selected.swiftmodule")
+        )
+        try Data("selected-v1".utf8).write(
+            to: copiedRoot.appendingPathComponent("Selected.swiftmodule")
+        )
+        func snapshot(_ roots: [URL]) -> BuildCache.CompilerInputs.Snapshot {
+            BuildCache.CompilerInputs.capture(
+                arguments: roots.flatMap { ["-I", $0.path] },
+                currentModuleName: "Current",
+                workingDirectory: root,
+                importedModules: ["Selected"]
+            )
+        }
+
+        let original = snapshot([firstRoot])
+        let copied = snapshot([copiedRoot])
+        let forward = snapshot([firstRoot, secondRoot])
+        let reversed = snapshot([secondRoot, firstRoot])
+
+        #expect(original.contentHash == copied.contentHash)
+        #expect(original.searchRoots != copied.searchRoots)
+        #expect(forward.contentHash != reversed.contentHash)
+    }
+
     @Test("A selected Clang module fingerprints its local module-map surface")
     func fingerprintsSelectedClangModule() throws {
         let manager = FileManager.default
@@ -545,6 +648,101 @@ struct BuildCacheStore {
         #expect(first.explicitPaths.contains(mapped.path))
         #expect(siblingChanged.contentHash != first.contentHash)
         #expect(changed.contentHash != first.contentHash)
+    }
+
+    @Test("Path-bearing Clang manifests are portable without losing mappings")
+    func fingerprintsPortableClangManifests() throws {
+        let manager = FileManager.default
+        let root = manager.temporaryDirectory.appendingPathComponent(
+            "helix-portable-clang-manifests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let firstRoot = root.appendingPathComponent("First", isDirectory: true)
+        let copiedRoot = root.appendingPathComponent("Copied", isDirectory: true)
+        for directory in [firstRoot, copiedRoot] {
+            try manager.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true
+            )
+            try Data("typedef int FirstValue;".utf8).write(
+                to: directory.appendingPathComponent("First.h")
+            )
+            try Data("typedef long SecondValue;".utf8).write(
+                to: directory.appendingPathComponent("Second.h")
+            )
+        }
+        defer { try? manager.removeItem(at: root) }
+
+        func writeOverlay(at directory: URL, swapping: Bool) throws -> URL {
+            let first = directory.appendingPathComponent("First.h")
+            let second = directory.appendingPathComponent("Second.h")
+            let document: [String: Any] = [
+                "version": 0,
+                "roots": [
+                    [
+                        "type": "file",
+                        "name": "/virtual/First.h",
+                        "external-contents": swapping
+                            ? second.path : first.path,
+                    ],
+                    [
+                        "type": "file",
+                        "name": "/virtual/Second.h",
+                        "external-contents": swapping
+                            ? first.path : second.path,
+                    ],
+                ],
+            ]
+            let url = directory.appendingPathComponent("overlay.json")
+            try JSONSerialization.data(withJSONObject: document).write(to: url)
+            return url
+        }
+        func overlaySnapshot(
+            at directory: URL
+        ) throws -> BuildCache.CompilerInputs.Snapshot {
+            let overlay = directory.appendingPathComponent("overlay.json")
+            return BuildCache.CompilerInputs.capture(
+                arguments: ["-Xcc", "-ivfsoverlay", "-Xcc", overlay.path],
+                currentModuleName: "Current",
+                workingDirectory: directory,
+                importedModules: []
+            )
+        }
+        func headerMapSnapshot(
+            at directory: URL
+        ) throws -> BuildCache.CompilerInputs.Snapshot {
+            let map = directory.appendingPathComponent("Headers.hmap")
+            try headerMap(
+                key: "First.h",
+                prefix: directory.path + "/",
+                suffix: "First.h"
+            ).write(to: map)
+            return BuildCache.CompilerInputs.capture(
+                arguments: ["-Xcc", "-I", "-Xcc", map.path],
+                currentModuleName: "Current",
+                workingDirectory: directory,
+                importedModules: []
+            )
+        }
+
+        _ = try writeOverlay(at: firstRoot, swapping: false)
+        _ = try writeOverlay(at: copiedRoot, swapping: false)
+        let firstOverlay = try overlaySnapshot(at: firstRoot)
+        let copiedOverlay = try overlaySnapshot(at: copiedRoot)
+        let firstHeaderMap = try headerMapSnapshot(at: firstRoot)
+        let copiedHeaderMap = try headerMapSnapshot(at: copiedRoot)
+        _ = try writeOverlay(at: copiedRoot, swapping: true)
+        let swappedOverlay = try overlaySnapshot(at: copiedRoot)
+
+        #expect(firstOverlay.isComplete)
+        #expect(copiedOverlay.isComplete)
+        #expect(firstOverlay.contentHash == copiedOverlay.contentHash)
+        #expect(firstOverlay.explicitPaths != copiedOverlay.explicitPaths)
+        #expect(swappedOverlay.contentHash != firstOverlay.contentHash)
+        #expect(firstHeaderMap.isComplete)
+        #expect(copiedHeaderMap.isComplete)
+        #expect(firstHeaderMap.contentHash == copiedHeaderMap.contentHash)
+        #expect(firstHeaderMap.explicitPaths != copiedHeaderMap.explicitPaths)
     }
 
     @Test("Common Clang search and explicit-input forms retain content identity")

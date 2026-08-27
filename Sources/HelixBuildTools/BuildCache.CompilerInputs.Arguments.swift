@@ -15,7 +15,7 @@ struct Location: Hashable {
 }
 
 struct ParsedArguments {
-    var values: Set<Location>
+    var values: [Location]
     var isComplete: Bool
     var hasBridgingHeader: Bool
 }
@@ -47,7 +47,11 @@ static func parseArguments(
         "-emit-reference-dependencies-path", "-index-store-path",
         "-module-cache-path", "-sdk-module-cache-path",
     ])
-    var result = Set<Location>()
+    var result: [Location] = []
+    var seen = Set<Location>()
+    func append(_ location: Location) {
+        if seen.insert(location).inserted { result.append(location) }
+    }
     var complete = true
     var hasBridgingHeader = false
     var index = 0
@@ -60,7 +64,7 @@ static func parseArguments(
             }
             if let path = absolutePath(arguments[index + 1], in: workingDirectory),
                !isToolchainOrSDKPath(path) {
-                result.insert(.init(kind: .searchRoot, path: path))
+                append(.init(kind: .searchRoot, path: path))
             }
             index += 2
             continue
@@ -73,7 +77,7 @@ static func parseArguments(
             if let path = absolutePath(arguments[index + 1], in: workingDirectory),
                !isToolchainOrSDKPath(path),
                !belongsToCurrentModule(path, moduleName: currentModuleName) {
-                result.insert(.init(kind: kind, path: path))
+                append(.init(kind: kind, path: path))
                 if kind == .bridgingHeaderInput {
                     hasBridgingHeader = true
                 }
@@ -88,12 +92,12 @@ static func parseArguments(
         if let path = joinedSearchPath(argument),
            let absolute = absolutePath(path, in: workingDirectory),
            !isToolchainOrSDKPath(absolute) {
-            result.insert(.init(kind: .searchRoot, path: absolute))
+            append(.init(kind: .searchRoot, path: absolute))
         } else if let input = explicitInput(argument),
                   let absolute = absolutePath(input.path, in: workingDirectory),
                   !isToolchainOrSDKPath(absolute),
                   !belongsToCurrentModule(absolute, moduleName: currentModuleName) {
-            result.insert(.init(kind: input.kind, path: absolute))
+            append(.init(kind: input.kind, path: absolute))
         }
         index += 1
     }

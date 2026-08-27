@@ -128,9 +128,11 @@ extension FrontendReceipt.ManagedNativeSurface {
         var aliases: [String]
         var representation: FrontendReceipt.Adapter.ImportedNativeType.Representation
         var importedModules: [String]
+        var nativeModuleName: String?
         var objectiveCModuleName: String?
         var objectiveCRuntimeName: String?
         var requiresMainActor: Bool
+        var isolationEvidence: FrontendReceipt.Adapter.ImportedIsolationEvidence
 
         init(_ type: FrontendReceipt.Adapter.ImportedNativeType) {
             canonicalName = type.canonicalName
@@ -139,9 +141,11 @@ extension FrontendReceipt.ManagedNativeSurface {
             aliases = type.aliases.sorted()
             representation = type.representation
             importedModules = Array(Set(type.importedModules)).sorted()
+            nativeModuleName = type.nativeModuleName
             objectiveCModuleName = type.objectiveCModuleName
             objectiveCRuntimeName = type.objectiveCRuntimeName
             requiresMainActor = type.requiresMainActor
+            isolationEvidence = type.isolationEvidence
         }
 
         func restoring(
@@ -155,9 +159,11 @@ extension FrontendReceipt.ManagedNativeSurface {
                 representation: representation,
                 sourceFileLogicalID: sourceFileLogicalID,
                 importedModules: importedModules,
+                nativeModuleName: nativeModuleName,
                 objectiveCModuleName: objectiveCModuleName,
                 objectiveCRuntimeName: objectiveCRuntimeName,
-                requiresMainActor: requiresMainActor
+                requiresMainActor: requiresMainActor,
+                isolationEvidence: isolationEvidence
             )
         }
     }
@@ -261,57 +267,6 @@ extension FrontendReceipt.ManagedNativeSurface {
                 precondition(outcomes.indices.contains(index))
                 return outcomes[index]!
             }
-        }
-    }
-
-    private struct SignatureTypeIndex: Sendable {
-        var types: [FrontendReceipt.Adapter.ImportedNativeType]
-        var indicesByName: [String: Set<Int>]
-
-        init(types: [FrontendReceipt.Adapter.ImportedNativeType]) {
-            self.types = types
-            var indicesByName: [String: Set<Int>] = [:]
-            for (index, type) in types.enumerated() {
-                var names = Set(
-                    [type.canonicalName, type.swiftType] + type.aliases
-                )
-                if let runtimeName = type.objectiveCRuntimeName {
-                    names.insert(runtimeName)
-                    names.insert("__C.\(runtimeName)")
-                }
-                let relativeNames = names
-                for module in type.importedModules {
-                    for name in relativeNames
-                    where !name.hasPrefix(module + ".") {
-                        names.insert(module + "." + name)
-                    }
-                }
-                for name in names where !name.isEmpty {
-                    indicesByName[name, default: []].insert(index)
-                }
-            }
-            self.indicesByName = indicesByName
-        }
-
-        func matching(
-            spellings: [String]
-        ) -> [FrontendReceipt.Adapter.ImportedNativeType] {
-            var indices = Set<Int>()
-            for spelling in spellings {
-                for token in FrontendReceipt.SwiftTypeSpelling.nominalTokens(
-                    in: spelling
-                ) {
-                    var prefix = token
-                    while true {
-                        indices.formUnion(indicesByName[prefix] ?? [])
-                        guard let separator = prefix.lastIndex(of: ".") else {
-                            break
-                        }
-                        prefix = String(prefix[..<separator])
-                    }
-                }
-            }
-            return indices.sorted().map { types[$0] }
         }
     }
 
@@ -860,7 +815,8 @@ extension FrontendReceipt.ManagedNativeSurface {
             objectiveCRuntimeName: representation == .reference
                     && surface.preciseIdentifier.hasPrefix("c:objc(cs)")
                 ? surface.runtimeName : nil,
-            requiresMainActor: surface.requiresMainActor
+            requiresMainActor: surface.requiresMainActor,
+            isolationEvidence: .importedDeclaration
         )
     }
 
@@ -961,6 +917,7 @@ extension FrontendReceipt.ManagedNativeSurface {
     ) -> FrontendReceipt.Adapter.ImportedNativeType {
         var result = type
         result.requiresMainActor = surface.requiresMainActor
+        result.isolationEvidence = .importedDeclaration
         if surface.runtimeName != nil {
             result.objectiveCModuleName = surface.moduleName
         }
@@ -1901,7 +1858,9 @@ extension FrontendReceipt.ManagedNativeSurface {
         let nativeTypes = placeholderNativeTypes(measuredImportedTypes)
         let swiftAliases = try FrontendReceipt.Adapter()
             .makeImportedSwiftTypeAliases(importedTypes)
-        let signatureTypeIndex = SignatureTypeIndex(types: measuredImportedTypes)
+        let signatureTypeIndex = FrontendReceipt.ImportedTypeIndex(
+            types: measuredImportedTypes
+        )
         let operations = surface.operations.compactMap {
             operation -> MeasuredOperation? in
             let matching = Set(operation.witnessFunctions.compactMap {
@@ -2169,7 +2128,7 @@ extension FrontendReceipt.ManagedNativeSurface {
     /// happened to contain it. Only native types named by that candidate's
     /// callable signature are persisted with the operation.
     private static func signatureTypes(
-        index: SignatureTypeIndex,
+        index: FrontendReceipt.ImportedTypeIndex,
         operation: FrontendReceipt.Adapter.ImportedOperation,
         candidate: Candidate
     ) -> [FrontendReceipt.Adapter.ImportedNativeType] {

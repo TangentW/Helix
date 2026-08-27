@@ -5,46 +5,83 @@ enum ExternalReferences {}
 }
 
 extension BuildCache.CompilerInputs.ExternalReferences {
-static func overlayPaths(
+struct Manifest {
+    struct Reference {
+        var logicalID: String
+        var path: String
+    }
+
+    var identityData: Data
+    var references: [Reference]
+}
+
+static func overlayManifest(
     _ data: Data,
     relativeTo directory: URL
-) throws -> [String] {
+) throws -> Manifest {
     guard data.count <= 16 * 1_024 * 1_024 else {
         throw BuildCache.Error.io("VFS overlay exceeds 16 MiB")
     }
     let root = try JSONSerialization.jsonObject(with: data)
-    var paths = Set<String>()
+    var references: [Manifest.Reference] = []
     var visited = 0
-    var pending: [Any] = [root]
-    while let value = pending.popLast() {
+    func canonicalize(_ value: Any, depth: Int) throws -> Any {
         visited += 1
-        guard visited <= 1_000_000 else {
+        guard visited <= 1_000_000, depth <= 256 else {
             throw BuildCache.Error.io("VFS overlay is too complex")
         }
         if let dictionary = value as? [String: Any] {
-            if let external = dictionary["external-contents"] {
-                guard let path = external as? String,
-                      let absolute = normalizedPath(path, relativeTo: directory)
-                else {
-                    throw BuildCache.Error.io("VFS overlay path is invalid")
+            var result: [String: Any] = [:]
+            for key in dictionary.keys.sorted() {
+                guard let child = dictionary[key] else { continue }
+                if key == "external-contents" {
+                    guard let path = child as? String,
+                          let absolute = normalizedPath(
+                              path,
+                              relativeTo: directory
+                          )
+                    else {
+                        throw BuildCache.Error.io(
+                            "VFS overlay path is invalid"
+                        )
+                    }
+                    references.append(.init(
+                        logicalID: "external-content[\(references.count)]",
+                        path: absolute
+                    ))
+                    // The referenced bytes are fingerprinted below under the
+                    // exact structural occurrence. The host path itself is
+                    // not part of portable module identity.
+                    result[key] = "<helix-external-content>"
+                } else {
+                    result[key] = try canonicalize(child, depth: depth + 1)
                 }
-                paths.insert(absolute)
             }
-            pending.append(contentsOf: dictionary.values)
+            return result
         } else if let array = value as? [Any] {
-            pending.append(contentsOf: array)
+            return try array.map { try canonicalize($0, depth: depth + 1) }
         }
+        return value
     }
-    guard paths.count <= 100_000 else {
+    let canonical = try canonicalize(root, depth: 0)
+    guard references.count <= 100_000,
+          JSONSerialization.isValidJSONObject(canonical)
+    else {
         throw BuildCache.Error.io("VFS overlay references too many paths")
     }
-    return paths.sorted()
+    return .init(
+        identityData: try JSONSerialization.data(
+            withJSONObject: canonical,
+            options: [.sortedKeys]
+        ),
+        references: references
+    )
 }
 
-static func headerMapPaths(
+static func headerMapManifest(
     _ data: Data,
     relativeTo directory: URL
-) throws -> [String] {
+) throws -> Manifest {
     let bytes = Array(data)
     guard bytes.count >= 24,
           readUInt32(bytes, at: 0) == 0x686D_6170,
@@ -70,12 +107,14 @@ static func headerMapPaths(
         else { throw BuildCache.Error.io("header map string is invalid") }
         return value
     }
-    var result = Set<String>()
+    var mappings: [(key: String, path: String)] = []
     var populatedBuckets = 0
     for bucket in 0..<bucketCount {
         let offset = 24 + bucket * 12
-        guard readUInt32(bytes, at: offset) != 0 else { continue }
+        let keyOffset = readUInt32(bytes, at: offset)
+        guard keyOffset != 0 else { continue }
         populatedBuckets += 1
+        let key = try string(at: keyOffset)
         let prefix = try string(at: readUInt32(bytes, at: offset + 4))
         let suffix = try string(at: readUInt32(bytes, at: offset + 8))
         guard let absolute = normalizedPath(
@@ -84,12 +123,32 @@ static func headerMapPaths(
         ) else {
             throw BuildCache.Error.io("header map value path is invalid")
         }
-        result.insert(absolute)
+        mappings.append((key, absolute))
     }
-    guard populatedBuckets == entryCount else {
+    mappings.sort { ($0.key, $0.path) < ($1.key, $1.path) }
+    guard populatedBuckets == entryCount,
+          Set(mappings.map(\.key)).count == mappings.count
+    else {
         throw BuildCache.Error.io("header map entry count is invalid")
     }
-    return result.sorted()
+    let identity: [[String: String]] = mappings.map {
+        [
+            "key": $0.key,
+            "external-contents": "<helix-header-content>",
+        ]
+    }
+    return .init(
+        identityData: try JSONSerialization.data(
+            withJSONObject: identity,
+            options: [.sortedKeys]
+        ),
+        references: mappings.enumerated().map { index, mapping in
+            .init(
+                logicalID: "header[\(index)]",
+                path: mapping.path
+            )
+        }
+    )
 }
 
 private static func normalizedPath(

@@ -207,6 +207,80 @@ public struct Store: Sendable {
         }
     }
 
+    /// Returns one already-published value without creating directories,
+    /// waiting for a producer, repairing corruption, or running new work.
+    /// This is the read boundary used by latency-sensitive build phases while
+    /// a separate process may be publishing the same content-addressed fact.
+    public func cachedValue(
+        namespace: BuildCache.Namespace,
+        key: Core.Digest,
+        maximumBytes: Int,
+        validate: (Data) throws -> Void = { _ in }
+    ) throws -> BuildCache.Value? {
+        guard maximumBytes > 0, maximumBytes <= 512 * 1_024 * 1_024 else {
+            throw BuildCache.Error.io("cache payload limit is invalid")
+        }
+        let versionURL = rootURL.appendingPathComponent("v1", isDirectory: true)
+        let namespaceURL = versionURL.appendingPathComponent(
+            namespace.rawValue,
+            isDirectory: true
+        )
+        for directory in [rootURL, versionURL, namespaceURL] {
+            var information = Darwin.stat()
+            guard lstat(directory.path, &information) == 0 else {
+                if errno == ENOENT { return nil }
+                throw BuildCache.Error.io("cannot inspect cache directory")
+            }
+            guard Self.isPrivateDirectory(information) else {
+                throw BuildCache.Error.unsafePath(directory.path)
+            }
+        }
+        try Self.validateAncestorChain(rootURL)
+
+        let lockURL = namespaceURL.appendingPathComponent(".\(key.hex).lock")
+        let lockDescriptor = Darwin.open(
+            lockURL.path,
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW
+        )
+        guard lockDescriptor >= 0 else {
+            if errno == ENOENT { return nil }
+            throw BuildCache.Error.io("cannot open cache lock")
+        }
+        defer {
+            _ = flock(lockDescriptor, LOCK_UN)
+            Darwin.close(lockDescriptor)
+        }
+        var lockInformation = Darwin.stat()
+        guard fstat(lockDescriptor, &lockInformation) == 0,
+              lockInformation.st_mode & S_IFMT == S_IFREG,
+              lockInformation.st_uid == geteuid(),
+              lockInformation.st_mode & 0o177 == 0
+        else {
+            throw BuildCache.Error.unsafePath(lockURL.path)
+        }
+        guard flock(lockDescriptor, LOCK_SH | LOCK_NB) == 0 else {
+            if errno == EWOULDBLOCK || errno == EAGAIN { return nil }
+            throw BuildCache.Error.io("cannot acquire cache read lock")
+        }
+
+        let entryURL = namespaceURL.appendingPathComponent(
+            key.hex,
+            isDirectory: true
+        )
+        guard case let .valid(data) = Self.load(
+            entryURL,
+            namespace: namespace,
+            key: key,
+            maximumBytes: maximumBytes
+        ) else { return nil }
+        do {
+            try validate(data)
+        } catch {
+            return nil
+        }
+        return .init(data: data, source: .hit)
+    }
+
     private static func load(
         _ entryURL: URL,
         namespace: BuildCache.Namespace,

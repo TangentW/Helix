@@ -85,6 +85,87 @@ struct NativeImportDiscoveryTests {
         #expect(retained == [measured])
     }
 
+    @Test("Measured nominal isolation overrides enclosing actor context across overlays")
+    func refinesImportedTypeIsolation() throws {
+        func type(
+            canonicalName: String,
+            source: String,
+            requiresMainActor: Bool,
+            evidence: FrontendReceipt.Adapter.ImportedIsolationEvidence,
+            nativeModuleName: String? = nil
+        ) -> FrontendReceipt.Adapter.ImportedNativeType {
+            .init(
+                canonicalName: canonicalName,
+                swiftType: canonicalName,
+                kind: .reference,
+                aliases: canonicalName == "URLResponse"
+                    ? ["Foundation.URLResponse", "__C.NSURLResponse"]
+                    : ["URLResponse", "__C.NSURLResponse"],
+                representation: .reference,
+                sourceFileLogicalID: source,
+                importedModules: [nativeModuleName ?? "Foundation"],
+                nativeModuleName: nativeModuleName,
+                objectiveCModuleName: "Foundation",
+                objectiveCRuntimeName: "NSURLResponse",
+                requiresMainActor: requiresMainActor,
+                isolationEvidence: evidence
+            )
+        }
+
+        for (contextSource, measuredSource) in [
+            ("A/Source.swift", "Z/Catalog.swift"),
+            ("Z/Source.swift", "A/Catalog.swift"),
+        ] {
+            let merged = try FrontendReceipt.Adapter().mergeImportedNativeTypes(
+                discoveredTypes: [type(
+                    canonicalName: "URLResponse",
+                    source: contextSource,
+                    requiresMainActor: true,
+                    evidence: .enclosingContext
+                )],
+                operationTypes: [type(
+                    canonicalName: "NSURLResponse",
+                    source: measuredSource,
+                    requiresMainActor: false,
+                    evidence: .importedDeclaration,
+                    nativeModuleName: "Foundation"
+                )]
+            )
+            #expect(merged.count == 1)
+            let result = try #require(merged.first)
+            #expect(result.canonicalName == "URLResponse")
+            #expect(!result.requiresMainActor)
+            #expect(result.isolationEvidence == .importedDeclaration)
+            #expect(result.nativeModuleName == "Foundation")
+            #expect(result.sourceFileLogicalID == measuredSource)
+        }
+
+        let shared = try FrontendReceipt.Adapter().mergeImportedNativeTypes(
+            discoveredTypes: [],
+            operationTypes: [
+                type(
+                    canonicalName: "URLResponse",
+                    source: "NativeAPICatalog/UIKit.swift",
+                    requiresMainActor: false,
+                    evidence: .importedDeclaration,
+                    nativeModuleName: "UIKit"
+                ),
+                type(
+                    canonicalName: "URLResponse",
+                    source: "NativeAPICatalog/Foundation.swift",
+                    requiresMainActor: false,
+                    evidence: .importedDeclaration,
+                    nativeModuleName: "Foundation"
+                ),
+            ]
+        )
+        #expect(shared.first?.nativeModuleName == "Foundation")
+        #expect(
+            shared.first?.sourceFileLogicalID
+                == "NativeAPICatalog/Foundation.swift"
+        )
+    }
+
     @Test("Generated Swift type syntax accepts nested collections and rejects code")
     func validatesGeneratedSwiftTypeSyntax() {
         #expect(FrontendReceipt.SwiftTypeSpelling.isGeneratedType("()"))
@@ -4057,7 +4138,7 @@ struct NativeImportDiscoveryTests {
         })
     }
 
-    @Test("Managed native surface selects development and production SDK members")
+    @Test("Managed native surface selects development SDK members and production fails closed")
     func capturesManagedSDKMembers() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "helix-managed-sdk-properties-\(UUID().uuidString)",
@@ -4339,39 +4420,9 @@ struct NativeImportDiscoveryTests {
 
         var productionRequest = request
         productionRequest.callingSurfacePolicy = .managedProductionModule
-        let production = try FrontendReceipt.Adapter().generate(
-            productionRequest
-        )
-        let productionImports = production.receipt.nativeImportCandidates
-        #expect(
-            Set(productionImports.map(\.key))
-                == Set(managed.receipt.nativeImportCandidates.map(\.key))
-        )
-        #expect(productionImports.allSatisfy {
-            $0.isEmittedToDevice && $0.id != nil
-        })
-        let productionShell = try ShellBuild.Materializer().materialize(
-            receipt: production.receipt,
-            sourceRoot: directory
-        )
-        let productionManifest = productionShell.nativeCapabilityManifest
-        #expect(productionManifest.entries.count == productionImports.count)
-        #expect(
-            productionManifest.nativeCallKeys
-                == Set(productionImports.map(\.key))
-        )
-        #expect(
-            productionShell.report.nativeCapabilityManifestHash
-                == .sha256(productionShell.nativeCapabilityManifestBytes)
-        )
-        #expect(
-            productionShell.report.nativeCapabilityCount
-                == UInt32(productionImports.count)
-        )
-        #expect(
-            try productionShell.artifacts()["NativeCapabilities.json"]
-                == productionShell.nativeCapabilityManifestBytes
-        )
+        #expect(throws: FrontendReceipt.Error.self) {
+            try FrontendReceipt.Adapter().generate(productionRequest)
+        }
 
         let nativeTypes = Dictionary(uniqueKeysWithValues:
             managed.receipt.nativeTypes.map { ($0.canonicalName, $0) }

@@ -61,6 +61,7 @@ public struct Application: Sendable {
     let environment: [String: String]
     let executableURL: URL
     let hubControlClient: (any HubControl.ClientProtocol)?
+    let catalogPrewarmLauncher: @Sendable (URL, URL, URL, URL) throws -> Void
 
     public init(
         currentDirectoryURL: URL = URL(
@@ -69,11 +70,16 @@ public struct Application: Sendable {
         ),
         environment: [String: String] = ProcessInfo.processInfo.environment,
         executableURL: URL? = nil,
-        hubControlClient: (any HubControl.ClientProtocol)? = nil
+        hubControlClient: (any HubControl.ClientProtocol)? = nil,
+        catalogPrewarmLauncher: (@Sendable (
+            URL, URL, URL, URL
+        ) throws -> Void)? = nil
     ) {
         files = .init(currentDirectoryURL: currentDirectoryURL)
         self.environment = environment
         self.hubControlClient = hubControlClient
+        self.catalogPrewarmLauncher = catalogPrewarmLauncher
+            ?? CLI.CatalogPrewarmProcess.launch
         if let executableURL {
             self.executableURL = executableURL.standardizedFileURL
         } else if let argument = CommandLine.arguments.first, argument.hasPrefix("/") {

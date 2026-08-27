@@ -233,6 +233,160 @@ struct NativeAPICatalogTests {
         )
     }
 
+    @Test("Catalog planning is automatic, portable, and fail-closed")
+    func plansImportedModuleCatalogs() throws {
+        let manager = FileManager.default
+        let root = manager.temporaryDirectory.appendingPathComponent(
+            "helix-native-catalog-plan-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let firstRoot = root.appendingPathComponent("First", isDirectory: true)
+        let copiedRoot = root.appendingPathComponent("Copied", isDirectory: true)
+        for directory in [firstRoot, copiedRoot] {
+            try manager.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true
+            )
+        }
+        defer { try? manager.removeItem(at: root) }
+        let moduleName = "AnalyticsKit"
+        let moduleBytes = Data("analytics-interface-v1".utf8)
+        try moduleBytes.write(
+            to: firstRoot.appendingPathComponent("\(moduleName).swiftmodule")
+        )
+        try moduleBytes.write(
+            to: copiedRoot.appendingPathComponent("\(moduleName).swiftmodule")
+        )
+        let toolchain = ReleaseCompiler.ToolchainIdentity(
+            fingerprint: "swift-test-fingerprint",
+            versionOutput: "Swift test",
+            targetInfo: "{}",
+            compilerBinaryHash: .sha256("swiftc")
+        )
+        let sdk = SwiftFrontend.Driver.SDKIdentity(
+            name: "iphonesimulator",
+            path: "/Fixture/SDK",
+            buildVersion: "23A340"
+        )
+        func plan(searchRoot: URL) throws -> NativeAPICatalog.BuildPlan {
+            let semanticArguments = [
+                "-parse-as-library", "-swift-version", "6",
+                "-I", searchRoot.path, "-D", "FEATURE",
+            ]
+            let invocation = InterfaceArchive.FrontendInvocation(
+                moduleName: "Feature",
+                targetTriple: "arm64-apple-ios18.0-simulator",
+                sdkName: sdk.name,
+                sdkBuild: sdk.buildVersion,
+                optimization: "-Onone",
+                semanticArguments: semanticArguments
+            )
+            let metadata = InterfaceArchive.ReleaseMetadata(
+                bundleID: "dev.helix.catalog-plan",
+                buildNumber: "1",
+                shellNamespaceID: .derive(
+                    bundleID: "dev.helix.catalog-plan",
+                    buildNumber: "1",
+                    seed: "fixture"
+                ),
+                machOUUIDs: [],
+                targetTriple: invocation.targetTriple,
+                minimumOS: .init(15),
+                xcodeBuild: "17A400",
+                sdkBuild: sdk.buildVersion,
+                frontendInvocation: invocation,
+                transformPipelineHash: ShellBuild.transformPipelineHash,
+                sourceBaselineHash: .sha256("sources")
+            )
+            let compilerArguments = ["-I", searchRoot.path]
+            let inputs = BuildCache.CompilerInputs.capture(
+                arguments: compilerArguments,
+                currentModuleName: invocation.moduleName,
+                workingDirectory: root,
+                importedModules: [moduleName]
+            )
+            return try NativeAPICatalog.Planner().plan(.init(
+                metadata: metadata,
+                importedModules: [
+                    "Swift", "UIKit", moduleName, "Feature.Helpers",
+                ],
+                compilerArguments: compilerArguments,
+                compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc"),
+                workingDirectory: root,
+                toolchain: toolchain,
+                sdk: sdk,
+                compilerInputs: inputs
+            ))
+        }
+
+        let first = try plan(searchRoot: firstRoot)
+        let copied = try plan(searchRoot: copiedRoot)
+        let firstByModule = Dictionary(uniqueKeysWithValues: first.requests.map {
+            ($0.identity.moduleName, $0.identity)
+        })
+        let copiedByModule = Dictionary(uniqueKeysWithValues: copied.requests.map {
+            ($0.identity.moduleName, $0.identity)
+        })
+
+        #expect(first.unresolvedModules.isEmpty)
+        #expect(Set(firstByModule.keys) == ["AnalyticsKit", "UIKit"])
+        #expect(firstByModule == copiedByModule)
+        #expect(firstByModule["AnalyticsKit"]?.provenance == .thirdPartyModule)
+        #expect(firstByModule["UIKit"]?.provenance == .systemSDK)
+
+        try Data("analytics-interface-v2".utf8).write(
+            to: copiedRoot.appendingPathComponent("\(moduleName).swiftmodule")
+        )
+        let changed = try plan(searchRoot: copiedRoot)
+        let changedByModule = Dictionary(uniqueKeysWithValues: changed.requests.map {
+            ($0.identity.moduleName, $0.identity)
+        })
+        #expect(
+            changedByModule["AnalyticsKit"]
+                != firstByModule["AnalyticsKit"]
+        )
+        #expect(changedByModule["UIKit"] == firstByModule["UIKit"])
+
+        var incompleteInputs = BuildCache.CompilerInputs.capture(
+            arguments: ["-I"],
+            currentModuleName: "Feature",
+            workingDirectory: root,
+            importedModules: [moduleName]
+        )
+        incompleteInputs.isComplete = false
+        var incompleteRequest = try #require(first.requests.first).frontendInvocation
+        incompleteRequest.moduleName = "Feature"
+        let incompleteMetadata = InterfaceArchive.ReleaseMetadata(
+            bundleID: "dev.helix.catalog-plan",
+            buildNumber: "1",
+            shellNamespaceID: .derive(
+                bundleID: "dev.helix.catalog-plan",
+                buildNumber: "1",
+                seed: "fixture"
+            ),
+            machOUUIDs: [],
+            targetTriple: incompleteRequest.targetTriple,
+            minimumOS: .init(15),
+            xcodeBuild: "17A400",
+            sdkBuild: sdk.buildVersion,
+            frontendInvocation: incompleteRequest,
+            transformPipelineHash: ShellBuild.transformPipelineHash,
+            sourceBaselineHash: .sha256("sources")
+        )
+        let unresolved = try NativeAPICatalog.Planner().plan(.init(
+            metadata: incompleteMetadata,
+            importedModules: ["UIKit", moduleName],
+            compilerArguments: ["-I"],
+            compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc"),
+            workingDirectory: root,
+            toolchain: toolchain,
+            sdk: sdk,
+            compilerInputs: incompleteInputs
+        ))
+        #expect(unresolved.requests.isEmpty)
+        #expect(unresolved.unresolvedModules == ["AnalyticsKit", "UIKit"])
+    }
+
     @Test("Catalog keeps distinct logical APIs that share one Swift implementation")
     func projectsSharedSwiftImplementation() throws {
         let moduleName = "Fixture"
@@ -292,7 +446,7 @@ struct NativeAPICatalogTests {
             invocation: .init(
                 moduleName: "CatalogConsumer",
                 targetTriple: catalogIdentity.targetTriple,
-                sdkName: "iphonesimulator",
+                sdkName: "iphoneos",
                 sdkBuild: catalogIdentity.sdkProductBuild,
                 optimization: "-Onone",
                 semanticArguments: ["-parse-as-library"]
@@ -326,7 +480,7 @@ struct NativeAPICatalogTests {
             importedModules: [moduleName],
             requiresMainActor: false
         )
-        let usr = "s:5Swift8HashableP9hashValueSivg"
+        let usr = "s:8OtherKit8HashableP9hashValueSivg"
         let operation = FrontendReceipt.Adapter.ImportedOperation(
             silReferences: [
                 "$ss8HashableP9hashValueSivg",
@@ -352,7 +506,7 @@ struct NativeAPICatalogTests {
         )
         let catalogIdentity = identity(module: moduleName)
 
-        #expect(try NativeAPICatalog.Projector.entries(
+        let projected = try NativeAPICatalog.Projector.project(
             projection: projection,
             identity: catalogIdentity,
             invocation: .init(
@@ -363,7 +517,259 @@ struct NativeAPICatalogTests {
                 optimization: "-Onone",
                 semanticArguments: ["-parse-as-library"]
             )
-        ).isEmpty)
+        )
+        #expect(projected.entries.isEmpty)
+        #expect(projected.importedTypes.isEmpty)
+        #expect(projected.operations.isEmpty)
+        #expect(projected.referencedModules == ["OtherKit"])
+    }
+
+    @Test("Frontend consumes exact Catalog snapshots and production fails closed")
+    func consumesCatalogSnapshots() throws {
+        let moduleName = "Fixture"
+        let sourceID = NativeAPICatalog.Projector.sourceFileLogicalID(
+            moduleName: moduleName
+        )
+        let type = FrontendReceipt.Adapter.ImportedNativeType(
+            canonicalName: "Fixture.Counter",
+            swiftType: "Fixture.Counter",
+            kind: .value,
+            aliases: ["Counter"],
+            representation: .opaqueValue,
+            sourceFileLogicalID: sourceID,
+            importedModules: [moduleName],
+            requiresMainActor: false
+        )
+        let usr = "s:7Fixture7CounterV5valueSivg"
+        let operation = FrontendReceipt.Adapter.ImportedOperation(
+            silReferences: ["$s7Fixture7CounterV5valueSivg"],
+            sourceFileLogicalID: sourceID,
+            importedModules: [moduleName],
+            dispatch: .instanceGetter,
+            ownerType: type.swiftType,
+            baseName: "value",
+            argumentLabels: [],
+            parameterSwiftTypes: [type.swiftType],
+            resultSwiftType: "Swift.Int",
+            requiresMainActor: false,
+            declarationUSR: usr,
+            isolationEvidence: .importedDeclaration,
+            isEmittedToDevice: false
+        )
+        let projection = NativeAPICatalog.CompilerProjection(
+            sourceFileLogicalID: sourceID,
+            importedTypes: [type],
+            operations: [operation],
+            modulesByDeclarationUSR: [usr: moduleName]
+        )
+        let catalogIdentity = identity(module: moduleName)
+        let invocation = InterfaceArchive.FrontendInvocation(
+            moduleName: "CatalogConsumer",
+            targetTriple: catalogIdentity.targetTriple,
+            sdkName: "iphonesimulator",
+            sdkBuild: catalogIdentity.sdkProductBuild,
+            optimization: "-Onone",
+            semanticArguments: [
+                "-parse-as-library", "-swift-version", "6",
+            ]
+        )
+        let document = NativeAPICatalog.Document(
+            identity: catalogIdentity,
+            entries: try NativeAPICatalog.Projector.entries(
+                projection: projection,
+                identity: catalogIdentity,
+                invocation: invocation
+            )
+        )
+        let snapshot = NativeAPICatalog.Snapshot(
+            document: document,
+            compilerProjection: projection
+        )
+        let metadata = InterfaceArchive.ReleaseMetadata(
+            bundleID: "dev.helix.catalog-consumer",
+            buildNumber: "1",
+            shellNamespaceID: .derive(
+                bundleID: "dev.helix.catalog-consumer",
+                buildNumber: "1",
+                seed: "fixture"
+            ),
+            machOUUIDs: [],
+            targetTriple: catalogIdentity.targetTriple,
+            minimumOS: catalogIdentity.minimumDeployment,
+            xcodeBuild: catalogIdentity.xcodeProductBuild,
+            sdkBuild: catalogIdentity.sdkProductBuild,
+            frontendInvocation: invocation,
+            transformPipelineHash: ShellBuild.transformPipelineHash,
+            sourceBaselineHash: .sha256("fixture")
+        )
+        let toolchain = ReleaseCompiler.ToolchainIdentity(
+            fingerprint: catalogIdentity.compilerFingerprint,
+            versionOutput: "fixture",
+            targetInfo: "fixture",
+            compilerBinaryHash: .sha256("fixture")
+        )
+        let production = FrontendReceipt.Request(
+            metadata: metadata,
+            configuration: .automaticProjectPolicy(
+                moduleName: invocation.moduleName
+            ),
+            sources: [],
+            nativeAPICatalogs: [snapshot],
+            callingSurfacePolicy: .managedProductionModule
+        )
+        let resolution = try FrontendReceipt.CatalogSurface.resolve(
+            snapshots: production.nativeAPICatalogs,
+            request: production,
+            importedModules: [moduleName],
+            toolchain: toolchain
+        )
+        #expect(resolution.hitModules == [moduleName])
+        #expect(resolution.missingModules.isEmpty)
+        var catalogOperation = operation
+        catalogOperation.catalogEntry = document.entries.first
+        #expect(resolution.operations == [catalogOperation])
+        #expect(resolution.documents == [document])
+
+        var missingProduction = production
+        missingProduction.nativeAPICatalogs = []
+        #expect(throws: FrontendReceipt.Error.self) {
+            try FrontendReceipt.CatalogSurface.resolve(
+                snapshots: [],
+                request: missingProduction,
+                importedModules: [moduleName],
+                toolchain: toolchain
+            )
+        }
+        missingProduction.callingSurfacePolicy = .managedDevelopmentModule
+        let development = try FrontendReceipt.CatalogSurface.resolve(
+            snapshots: [],
+            request: missingProduction,
+            importedModules: [moduleName],
+            toolchain: toolchain
+        )
+        #expect(development.hitModules.isEmpty)
+        #expect(development.missingModules == [moduleName])
+
+        var redundantProjection = projection
+        redundantProjection.importedTypes.append(.init(
+            canonicalName: "Fixture.Unused",
+            swiftType: "Fixture.Unused",
+            kind: .value,
+            aliases: ["Unused"],
+            representation: .opaqueValue,
+            sourceFileLogicalID: sourceID,
+            importedModules: [moduleName],
+            requiresMainActor: false
+        ))
+        redundantProjection.importedTypes.sort {
+            ($0.canonicalName, $0.swiftType)
+                < ($1.canonicalName, $1.swiftType)
+        }
+        let redundantSnapshot = NativeAPICatalog.Snapshot(
+            document: document,
+            compilerProjection: redundantProjection
+        )
+        #expect(throws: FrontendReceipt.Error.self) {
+            try FrontendReceipt.CatalogSurface.resolve(
+                snapshots: [redundantSnapshot],
+                request: production,
+                importedModules: [moduleName],
+                toolchain: toolchain
+            )
+        }
+    }
+
+    @Test("Catalog prewarm jobs are canonical and compiler-bound")
+    func validatesPrewarmJobs() throws {
+        let catalogIdentity = identity(module: "Fixture")
+        let toolchain = ReleaseCompiler.ToolchainIdentity(
+            fingerprint: catalogIdentity.compilerFingerprint,
+            versionOutput: "fixture",
+            targetInfo: "fixture",
+            compilerBinaryHash: .sha256("fixture")
+        )
+        let workingDirectory = URL(fileURLWithPath: "/tmp/helix-work")
+        let request = NativeAPICatalog.BuildRequest(
+            identity: catalogIdentity,
+            frontendInvocation: .init(
+                moduleName: "CatalogConsumer",
+                targetTriple: catalogIdentity.targetTriple,
+                sdkName: "iphoneos",
+                sdkBuild: catalogIdentity.sdkProductBuild,
+                optimization: "-Onone",
+                semanticArguments: [
+                    "-parse-as-library", "-swift-version", "6",
+                ]
+            ),
+            compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc"),
+            workingDirectoryURL: workingDirectory,
+            precomputedToolchain: toolchain,
+            precomputedSDK: .init(
+                name: "iphoneos",
+                path: "/tmp/SDK",
+                buildVersion: catalogIdentity.sdkProductBuild
+            )
+        )
+        let job = NativeAPICatalog.PrewarmJob(
+            cacheRootURL: URL(fileURLWithPath: "/tmp/helix-cache"),
+            workingDirectoryURL: workingDirectory,
+            planRequest: .init(
+                metadata: .init(
+                    bundleID: "dev.helix.prewarm",
+                    buildNumber: "1",
+                    shellNamespaceID: .derive(
+                        bundleID: "dev.helix.prewarm",
+                        buildNumber: "1",
+                        seed: "fixture"
+                    ),
+                    machOUUIDs: [],
+                    targetTriple: catalogIdentity.targetTriple,
+                    minimumOS: catalogIdentity.minimumDeployment,
+                    xcodeBuild: catalogIdentity.xcodeProductBuild,
+                    sdkBuild: catalogIdentity.sdkProductBuild,
+                    frontendInvocation: request.frontendInvocation,
+                    transformPipelineHash: ShellBuild.transformPipelineHash,
+                    sourceBaselineHash: .sha256("fixture")
+                ),
+                importedModules: [catalogIdentity.moduleName],
+                compilerArguments: [],
+                compilerURL: request.compilerURL,
+                workingDirectory: workingDirectory,
+                toolchain: toolchain,
+                sdk: try #require(request.precomputedSDK),
+                compilerInputs: .init(
+                    importedModules: [catalogIdentity.moduleName],
+                    searchRoots: [],
+                    explicitPaths: [],
+                    fileCount: 0,
+                    byteCount: 0,
+                    contentHash: .sha256("fixture"),
+                    isComplete: true
+                )
+            ),
+            requests: [request]
+        )
+        let data = try NativeAPICatalog.PrewarmJobCodec.encode(job)
+        let decoded = try NativeAPICatalog.PrewarmJobCodec.decode(data)
+        #expect(decoded.cacheRootPath == job.cacheRootPath)
+        #expect(decoded.requests.map(\.identity) == [catalogIdentity])
+        #expect(throws: NativeAPICatalog.Error.self) {
+            var invalid = decoded
+            invalid.requests[0].precomputedSDK = nil
+            _ = try NativeAPICatalog.PrewarmJobCodec.encode(invalid)
+        }
+        #expect(throws: NativeAPICatalog.Error.self) {
+            var invalid = decoded
+            invalid.requests[0].compilerURL = URL(
+                fileURLWithPath: "/tmp/untrusted-swiftc"
+            )
+            _ = try NativeAPICatalog.PrewarmJobCodec.encode(invalid)
+        }
+        #expect(throws: NativeAPICatalog.Error.self) {
+            var invalid = decoded
+            invalid.planRequest.compilerInputs.isComplete = false
+            _ = try NativeAPICatalog.PrewarmJobCodec.encode(invalid)
+        }
     }
 
     @Test("Module Catalog is compiler-proven and reused across projects")
@@ -399,6 +805,7 @@ struct NativeAPICatalogTests {
             public final class Payload {
                 public init() {}
             }
+            public struct Dormant {}
             public final class Transformer {
                 public init() {}
                 public func transform(_ value: Payload) -> Payload { value }
@@ -471,26 +878,43 @@ struct NativeAPICatalogTests {
         let builder = NativeAPICatalog.Builder(cache: try .init(
             rootURL: directory.appendingPathComponent("Cache")
         ))
-        let first = try builder.build(.init(
+        let firstRequest = NativeAPICatalog.BuildRequest(
             identity: identity,
             frontendInvocation: invocation(
                 consumer: "FirstApplication",
-                condition: "FIRST_PROJECT",
+                condition: "SHARED_PROJECT",
                 searchPath: firstSearchPath
             ),
             compilerURL: compilerURL,
-            precomputedToolchain: toolchain
-        ))
-        let second = try builder.build(.init(
+            precomputedToolchain: toolchain,
+            precomputedSDK: sdk
+        )
+        #expect(try builder.cached(firstRequest) == nil)
+        let first = try builder.build(firstRequest)
+        let secondRequest = NativeAPICatalog.BuildRequest(
             identity: identity,
             frontendInvocation: invocation(
                 consumer: "SecondApplication",
-                condition: "SECOND_PROJECT",
+                condition: "SHARED_PROJECT",
                 searchPath: secondSearchPath
             ),
             compilerURL: compilerURL,
-            precomputedToolchain: toolchain
-        ))
+            precomputedToolchain: toolchain,
+            precomputedSDK: sdk
+        )
+        let cachedSecond = try builder.cached(secondRequest)
+        let second = try #require(cachedSecond)
+        #expect(try builder.cached(.init(
+            identity: identity,
+            frontendInvocation: invocation(
+                consumer: "ThirdApplication",
+                condition: "DIFFERENT_PROJECT",
+                searchPath: secondSearchPath
+            ),
+            compilerURL: compilerURL,
+            precomputedToolchain: toolchain,
+            precomputedSDK: sdk
+        )) == nil)
 
         #expect(first.metrics.cacheSource == .generated)
         #expect(second.metrics.cacheSource == .hit)
@@ -517,6 +941,9 @@ struct NativeAPICatalogTests {
         #expect(first.metrics.candidateCount >= first.metrics.entryCount)
         #expect(first.snapshot.compilerProjection.importedTypes.contains {
             $0.canonicalName == "CatalogFixture.Payload"
+        })
+        #expect(!first.snapshot.compilerProjection.importedTypes.contains {
+            $0.canonicalName == "CatalogFixture.Dormant"
         })
         try first.snapshot.document.validate()
 

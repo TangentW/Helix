@@ -3,6 +3,14 @@ import HelixCore
 import HelixInterface
 
 extension FrontendReceipt.Adapter {
+    enum ImportedIsolationEvidence: String, Codable, Hashable, Sendable {
+        /// The declaration was unavailable, so isolation is conservatively
+        /// inherited from the source context that mentioned the value.
+        case enclosingContext
+        /// The imported declaration or nominal was measured directly.
+        case importedDeclaration
+    }
+
     struct ImportedNativeType: Codable, Hashable, Sendable {
         enum Representation: String, Codable, Hashable, Sendable {
             case reference
@@ -17,6 +25,9 @@ extension FrontendReceipt.Adapter {
         var representation: Representation
         var sourceFileLogicalID: String
         var importedModules: [String]
+        /// External module that owns reusable compiler-visible TypeOps. Nil
+        /// means the type is rooted in the application source boundary.
+        var nativeModuleName: String? = nil
         /// Exact declaring module recovered from that module's Symbol Graph.
         /// Nil means source-only discovery could not prove provenance.
         var objectiveCModuleName: String? = nil
@@ -25,6 +36,7 @@ extension FrontendReceipt.Adapter {
         /// protocol existentials, and value overlays.
         var objectiveCRuntimeName: String? = nil
         var requiresMainActor: Bool
+        var isolationEvidence: ImportedIsolationEvidence = .enclosingContext
     }
     func discoverImportedNativeTypes(
         documents: [FrontendReceipt.TypedAST.Object],
@@ -349,6 +361,7 @@ extension FrontendReceipt.Adapter {
                 // nominal type. Concrete UIKit references retain their own
                 // MainActor identity until an explicit erasure operation.
                 use.requiresMainActor = false
+                use.isolationEvidence = .importedDeclaration
             }
             guard !use.canonicalName.isEmpty,
                   !use.swiftType.isEmpty,
@@ -380,19 +393,17 @@ extension FrontendReceipt.Adapter {
                         )
                     }
                 }
-                var mergeActorIsolation = true
                 if existing.representation == .opaqueValue,
                    use.representation == .rawRepresentable {
                     existing.kind = use.kind
                     existing.representation = .rawRepresentable
                     existing.requiresMainActor = use.requiresMainActor
-                    mergeActorIsolation = false
+                    existing.isolationEvidence = use.isolationEvidence
                 } else if existing.representation == .rawRepresentable,
                           use.representation == .opaqueValue {
                     // Explicit enum/OptionSet evidence is more precise than
                     // the fallback opaque-value classification, including its
                     // actor-neutral value semantics.
-                    mergeActorIsolation = false
                 } else if existing.kind != use.kind
                             || existing.representation != use.representation {
                     throw FrontendReceipt.Error.invalidRequest(
@@ -401,14 +412,13 @@ extension FrontendReceipt.Adapter {
                             + "\(existing.representation.rawValue) versus "
                             + "\(use.kind.rawValue)/\(use.representation.rawValue)"
                     )
+                } else {
+                    try mergeImportedIsolation(into: &existing, from: use)
                 }
-                existing.sourceFileLogicalID = min(
-                    existing.sourceFileLogicalID,
-                    use.sourceFileLogicalID
-                )
                 existing.importedModules = Array(Set(
                     existing.importedModules + use.importedModules
                 )).sorted()
+                mergeImportedOrigin(into: &existing, from: use)
                 if let existingModule = existing.objectiveCModuleName,
                    let incomingModule = use.objectiveCModuleName,
                    existingModule != incomingModule {
@@ -430,10 +440,6 @@ extension FrontendReceipt.Adapter {
                 existing.aliases = Array(Set(
                     existing.aliases + use.aliases
                 )).sorted()
-                if mergeActorIsolation {
-                    existing.requiresMainActor = existing.requiresMainActor
-                        || use.requiresMainActor
-                }
                 result[use.canonicalName] = existing
             } else {
                 var canonical = use
@@ -449,6 +455,57 @@ extension FrontendReceipt.Adapter {
             !($0.representation == .opaqueValue
                 && preciseAliases.contains($0.canonicalName))
         }.sorted { $0.canonicalName < $1.canonicalName }
+    }
+
+    private func mergeImportedIsolation(
+        into existing: inout ImportedNativeType,
+        from incoming: ImportedNativeType
+    ) throws {
+        switch (existing.isolationEvidence, incoming.isolationEvidence) {
+        case (.importedDeclaration, .importedDeclaration):
+            guard existing.requiresMainActor == incoming.requiresMainActor else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "imported native type \(incoming.canonicalName) has conflicting declaration isolation"
+                )
+            }
+        case (.importedDeclaration, .enclosingContext):
+            break
+        case (.enclosingContext, .importedDeclaration):
+            existing.requiresMainActor = incoming.requiresMainActor
+            existing.isolationEvidence = .importedDeclaration
+        case (.enclosingContext, .enclosingContext):
+            existing.requiresMainActor = existing.requiresMainActor
+                || incoming.requiresMainActor
+        }
+    }
+
+    /// A Catalog module is a compiler context that can render TypeOps, not a
+    /// distinct runtime identity for the nominal. Keep its module and logical
+    /// generated-source path together, prefer any measured external origin to
+    /// a consumer source mention, and choose deterministically when reexports
+    /// make the same type available from more than one Catalog.
+    private func mergeImportedOrigin(
+        into existing: inout ImportedNativeType,
+        from incoming: ImportedNativeType
+    ) {
+        switch (existing.nativeModuleName, incoming.nativeModuleName) {
+        case (.none, .none):
+            existing.sourceFileLogicalID = min(
+                existing.sourceFileLogicalID,
+                incoming.sourceFileLogicalID
+            )
+        case (.none, .some):
+            existing.nativeModuleName = incoming.nativeModuleName
+            existing.sourceFileLogicalID = incoming.sourceFileLogicalID
+        case (.some, .none):
+            break
+        case let (.some(existingModule), .some(incomingModule)):
+            if (incomingModule, incoming.sourceFileLogicalID)
+                < (existingModule, existing.sourceFileLogicalID) {
+                existing.nativeModuleName = incomingModule
+                existing.sourceFileLogicalID = incoming.sourceFileLogicalID
+            }
+        }
     }
 
     /// Clang typedefs may surface under their ABI name in typed AST while SIL

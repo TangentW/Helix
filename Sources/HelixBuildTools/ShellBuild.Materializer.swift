@@ -10,7 +10,7 @@ public enum ShellBuild {
     /// native-call descriptor semantics change. This invalidates local build
     /// facts without changing a shipped protocol or schema version.
     public static let transformPipelineHash = Core.Digest.sha256(
-        "Helix.ShellBuild.DynamicSourceTransform.v1:declaration-groups:frozen-value-hooks:source-body-dispatch:async-original-thunks:native-call-descriptor-v1:objective-c-invoker:objective-c-lightweight-generic-erasure:c-invoker-main-actor-unqualified-reference:swift-adapter-pack-v1:development-native-candidate-emission:production-native-capability-manifest:indexed-source-baseline-metadata:objective-c-declaration-qualified-sil:property-declaration-identity:exact-module-imports:separate-hub-contract-object:module-native-api-catalog:bounded-parallel-native-probes"
+        "Helix.ShellBuild.DynamicSourceTransform.v1:declaration-groups:frozen-value-hooks:source-body-dispatch:async-original-thunks:native-call-descriptor-v1:objective-c-invoker:objective-c-lightweight-generic-erasure:c-invoker-main-actor-unqualified-reference:swift-adapter-pack-v1:development-native-candidate-emission:production-native-capability-manifest:indexed-source-baseline-metadata:objective-c-declaration-qualified-sil:property-declaration-identity:exact-module-imports:separate-hub-contract-object:module-native-api-catalog:bounded-parallel-native-probes:published-catalog-projection:catalog-authoritative-descriptor:measured-native-type-isolation"
     )
 }
 
@@ -824,7 +824,8 @@ public struct Materializer: Sendable {
                         sourceFileLogicalID: $0.sourceFileLogicalID,
                         swiftType: $0.swiftType,
                         representation: representation,
-                        nativeABIEncoding: $0.nativeABIEncoding
+                        nativeABIEncoding: $0.nativeABIEncoding,
+                        nativeModuleName: $0.nativeModuleName
                     )
                 }
             )

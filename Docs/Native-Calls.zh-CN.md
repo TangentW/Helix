@@ -60,10 +60,24 @@ entry，要求它和缓存 Document 逐字义一致。项目局部 Type ID 不�
 稳定 Key。
 
 这条全模块生成路径不会猜测开放泛型、protocol existential、表示未知的 typealias、
-async 声明，或精确探针已经拒绝的 ABI。App frontend 已经证明的具体泛型 specialization
-仍可由现有的源码根调用面路径处理。Catalog-first Prepare 消费与模块 identity 自动发现
-属于后续接入阶段；在完成接入之前，Release 能力发布仍使用下文所述的 build-proven
-imported-type 边界。
+async 声明，或精确探针已经拒绝的 ABI。只有 App frontend 才观察到的具体泛型
+specialization，仍由源码根调用面路径处理。
+
+Xcode Prepare 现在会根据真实捕获的 compiler job、toolchain、SDK、imported module 和
+内容快照自动计算 Catalog identity，并继续跟进 reexport、overlay 和 foreign declaration
+记录的其他 module。Hot Patch 会同步生成并验证完整的可达 Catalog 闭包；任何 module
+无法确定身份都会直接失败。Live Reload 的延迟敏感路径只做一次不等待 producer 的已验证
+缓存读取。未命中时，本次构建先走精确的源码根 frontend，成功后再原子发布一份仅当前
+用户可读的 canonical 预热任务，由后台 worker 生成同一个内容寻址 Catalog，并继续处理
+新发现的 module 引用。项目不需要配置 API 清单，也不需要手工执行预热步骤。
+
+消费端会重新核对 Catalog 与当前 compiler、SDK、target、deployment 和 language mode，
+再根据不透明 compiler projection 重建每条 entry，要求与 Document 完全一致。随后，
+Catalog operation 携带这份已验证 Descriptor 与 Contract 作为权威；消费项目自己的源码
+glob、局部 typealias 和 call-site SIL ownership 写法都不能把调用改名。只有真正穿过已发布
+逻辑参数或返回值边界的原生类型才生成外部 TypeOps，这些 TypeOps 直接 import 类型所属
+module。Receipt 被接受前，每条受支持 Catalog entry 都必须在 Shell 中找到完全相同的
+稳定 Key、Descriptor、Contract、发布策略，以及可执行 Invoker 或 Adapter binding。
 
 ## 从 Patch 到 Runtime 的验证链
 

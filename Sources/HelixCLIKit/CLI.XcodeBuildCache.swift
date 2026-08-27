@@ -13,6 +13,11 @@ struct XcodePrepareInput: Codable, Sendable {
         var contentHash: Core.Digest
     }
 
+    struct NativeAPICatalogIdentity: Codable, Sendable {
+        var document: NativeAPICatalog.Document
+        var compilerProjectionSHA256: Core.Digest
+    }
+
     var schemaVersion: UInt16 = 1
     var profileID: String
     var featureID: String
@@ -22,6 +27,7 @@ struct XcodePrepareInput: Codable, Sendable {
     var metadata: InterfaceArchive.ReleaseMetadata
     var configuration: PatchConfiguration.Document
     var nativeImportCatalog: NativeImportCatalog.Document
+    var nativeAPICatalogs: [NativeAPICatalogIdentity]
     var callingSurfacePolicy: FrontendReceipt.CallingSurfacePolicy
     var sources: [Source]
 }
@@ -96,16 +102,12 @@ func makeHotPatchPrepareIdentity(
     compilerInputs: BuildCache.CompilerInputs.Snapshot,
     metadata: InterfaceArchive.ReleaseMetadata,
     configuration: PatchConfiguration.Document,
-    performance: BuildPerformance.Recorder
+    toolchain: ReleaseCompiler.ToolchainIdentity,
+    nativeAPICatalogs: [NativeAPICatalog.Snapshot]
 ) throws -> (
     inputHash: Core.Digest,
-    toolchain: ReleaseCompiler.ToolchainIdentity,
     sources: [CLI.XcodePrepareInput.Source]
 ) {
-    let toolchain = try ReleaseCompiler.Driver().toolchainIdentity(
-        compilerURL: context.environment.compilerURL,
-        invocationObserver: performance.subprocessObserver
-    )
     let sources = try capture.frontendSources.sorted {
         $0.logicalPath < $1.logicalPath
     }.map { source -> CLI.XcodePrepareInput.Source in
@@ -121,6 +123,12 @@ func makeHotPatchPrepareIdentity(
             contentHash: .sha256(data)
         )
     }
+    let catalogIdentities = try nativeAPICatalogs.map {
+        CLI.XcodePrepareInput.NativeAPICatalogIdentity(
+            document: $0.document,
+            compilerProjectionSHA256: try $0.compilerProjectionDigest()
+        )
+    }
     let input = CLI.XcodePrepareInput(
         profileID: context.profile.id,
         featureID: context.feature.id,
@@ -130,6 +138,7 @@ func makeHotPatchPrepareIdentity(
         metadata: metadata,
         configuration: configuration,
         nativeImportCatalog: .empty,
+        nativeAPICatalogs: catalogIdentities,
         callingSurfacePolicy: .managedProductionModule,
         sources: sources
     )
@@ -138,7 +147,6 @@ func makeHotPatchPrepareIdentity(
             domain: "HLX.Xcode.PrepareInput.v1",
             value: input
         ),
-        toolchain,
         sources
     )
 }

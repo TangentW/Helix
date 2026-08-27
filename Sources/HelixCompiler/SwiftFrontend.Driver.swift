@@ -87,6 +87,12 @@ public struct Driver: Sendable {
         public var name: String
         public var path: String
         public var buildVersion: String
+
+        public init(name: String, path: String, buildVersion: String) {
+            self.name = name
+            self.path = path
+            self.buildVersion = buildVersion
+        }
     }
 
     private struct SDKCacheKey: Hashable, Sendable {
@@ -115,16 +121,19 @@ public struct Driver: Sendable {
 
     public var compilerURL: URL
     public var environment: [String: String]
+    public var defaultWorkingDirectoryURL: URL?
     public var invocationObserver: SwiftFrontend.InvocationObserver?
     private let sdkIdentityCache: SDKIdentityCache
 
     public init(
         compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
         environment: [String: String] = ProcessInfo.processInfo.environment,
+        defaultWorkingDirectoryURL: URL? = nil,
         invocationObserver: SwiftFrontend.InvocationObserver? = nil
     ) {
         self.compilerURL = compilerURL
         self.environment = environment
+        self.defaultWorkingDirectoryURL = defaultWorkingDirectoryURL
         self.invocationObserver = invocationObserver
         sdkIdentityCache = SDKIdentityCache()
     }
@@ -386,6 +395,7 @@ public struct Driver: Sendable {
         process.executableURL = compilerURL
         process.arguments = arguments
         process.currentDirectoryURL = workingDirectory
+            ?? defaultWorkingDirectoryURL
         process.environment = environment
         let stdout: FileHandle
         let stderr: FileHandle

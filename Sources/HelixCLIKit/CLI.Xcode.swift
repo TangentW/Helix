@@ -84,6 +84,7 @@ func executeXcode(_ arguments: [String]) throws -> CLI.Result {
         }
         return .init(exitCode: 0, standardOutput: Self.xcodePostCompileHelp)
     case "doctor": return try doctorXcodeIntegration(tail)
+    case "catalog-prewarm": return try prewarmXcodeCatalogs(tail)
     default:
         throw CLI.Error.usage("unknown xcode command \(command)")
     }
@@ -1366,9 +1367,36 @@ private func performPrepareXcodeShell(
             )
         )
     }
+    let buildCache: BuildCache.Store
+    if let shared = xcodeBuildCacheStore() {
+        buildCache = shared
+    } else {
+        performance.incrementCounter("prepare.build_cache_fallback_count")
+        buildCache = try BuildCache.Store(
+            rootURL: context.environment.profileOutputURL.appendingPathComponent(
+                ".BuildFacts",
+                isDirectory: true
+            )
+        )
+    }
+    let toolchain = try performance.measure("prepare.toolchain_identity") {
+        try ReleaseCompiler.Driver().toolchainIdentity(
+            compilerURL: context.environment.compilerURL,
+            invocationObserver: performance.subprocessObserver
+        )
+    }
+    let nativeAPICatalogs = try resolveXcodeNativeAPICatalogs(
+        context: context,
+        metadata: metadata,
+        importedModules: sourceImports.modules,
+        compilerArguments: capture.analysisJob.arguments,
+        compilerInputs: compilerInputs,
+        toolchain: toolchain,
+        cache: buildCache,
+        performance: performance
+    )
     var prepareInputHash: Core.Digest?
     var prepareIdentitySources: [CLI.XcodePrepareInput.Source]?
-    var precomputedToolchain: ReleaseCompiler.ToolchainIdentity?
     if context.profile.workflow == .hotPatch {
         let identity = try performance.measure("prepare.make_fast_path_identity") {
             try makeHotPatchPrepareIdentity(
@@ -1377,10 +1405,10 @@ private func performPrepareXcodeShell(
                 compilerInputs: compilerInputs,
                 metadata: metadata,
                 configuration: configuration,
-                performance: performance
+                toolchain: toolchain,
+                nativeAPICatalogs: nativeAPICatalogs.snapshots
             )
         }
-        precomputedToolchain = identity.toolchain
         prepareIdentitySources = identity.sources
         if compilerInputs.isComplete {
             prepareInputHash = identity.inputHash
@@ -1418,23 +1446,20 @@ private func performPrepareXcodeShell(
         sources: capture.frontendSources,
         compilerURL: context.environment.compilerURL,
         nativeImportCatalog: .empty,
+        nativeAPICatalogs: nativeAPICatalogs.snapshots,
         callingSurfacePolicy: context.profile.workflow == .liveReload
             ? .managedDevelopmentModule
             : .managedProductionModule
     )
     let indexed = try performance.measure("prepare.frontend_receipt") {
-        if let cache = xcodeBuildCacheStore() {
-            return try FrontendReceipt.CachedAdapter(cache: cache).generate(
-                receiptRequest,
-                compilerCapture: capture.recordBytes,
-                compilerArguments: capture.analysisJob.arguments,
-                workingDirectory: context.environment.sourceRootURL,
-                precomputedToolchain: precomputedToolchain,
-                precomputedCompilerInputs: compilerInputs
-            )
-        }
-        performance.incrementCounter("prepare.build_cache_unavailable_count")
-        return try FrontendReceipt.Adapter().generate(receiptRequest)
+        try FrontendReceipt.CachedAdapter(cache: buildCache).generate(
+            receiptRequest,
+            compilerCapture: capture.recordBytes,
+            compilerArguments: capture.analysisJob.arguments,
+            workingDirectory: context.environment.sourceRootURL,
+            precomputedToolchain: toolchain,
+            precomputedCompilerInputs: compilerInputs
+        )
     }
     performance.merge(indexed.performance)
     if prepareInputHash != nil {
@@ -1491,7 +1516,7 @@ private func performPrepareXcodeShell(
             receipt: indexed.receipt,
             sourceMappings: capture.sourceMappings,
             hubBinding: hubBinding,
-            cache: xcodeBuildCacheStore()
+            cache: buildCache
         )
     }
     performance.setCounter(
@@ -1605,12 +1630,38 @@ private func performPrepareXcodeShell(
         "prepare.rejected_function_count",
         value: UInt64(materialized.report.rejectedFunctionCount)
     )
+    var catalogPrewarmStatus = ""
+    if context.profile.workflow == .liveReload,
+       !nativeAPICatalogs.prewarmRequests.isEmpty {
+        do {
+            try scheduleNativeAPICatalogPrewarm(
+                requests: nativeAPICatalogs.prewarmRequests,
+                cache: buildCache,
+                workingDirectoryURL: context.environment.sourceRootURL,
+                planRequest: nativeAPICatalogs.prewarmPlanRequest,
+                outputDirectoryURL: context.environment.profileOutputURL
+            )
+            performance.incrementCounter(
+                "prepare.catalog_prewarm_scheduled_count"
+            )
+            catalogPrewarmStatus = "Catalog prewarm: scheduled "
+                + "\(nativeAPICatalogs.prewarmRequests.count) module(s)\n"
+        } catch {
+            // Prewarming is an optimization. The exact source-rooted fallback
+            // has already produced this development Shell successfully.
+            performance.incrementCounter(
+                "prepare.catalog_prewarm_launch_failure_count"
+            )
+            catalogPrewarmStatus = "Catalog prewarm: skipped (\(error))\n"
+        }
+    }
     return .init(
         exitCode: 0,
         standardOutput: "Prepared \(context.profile.id) Helix Shell at "
             + "\(context.environment.shellOutputURL.path)\n"
             + "Functions: \(materialized.report.eligibleFunctionCount) eligible, "
             + "\(materialized.report.rejectedFunctionCount) rejected\n"
+            + catalogPrewarmStatus
     )
 }
 

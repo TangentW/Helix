@@ -20,6 +20,19 @@ public struct Snapshot: Sendable {
         self.document = document
         self.compilerProjection = compilerProjection
     }
+
+    /// Stable opaque identity for frontend/build-cache keys. Callers can bind
+    /// cached compiler facts without gaining access to their private schema.
+    public func compilerProjectionDigest() throws -> Core.Digest {
+        .sha256(try Core.CanonicalJSON.encode(compilerProjection))
+    }
+
+    /// Modules referenced through reexports, overlays, protocol defaults, or
+    /// foreign declarations while this module was measured. Prepare follows
+    /// this list automatically to construct the complete Catalog closure.
+    public var referencedModules: [String] {
+        compilerProjection.referencedModules
+    }
 }
 
 struct CompilerProjection: Codable, Hashable, Sendable {
@@ -30,6 +43,7 @@ struct CompilerProjection: Codable, Hashable, Sendable {
     var importedTypes: [FrontendReceipt.Adapter.ImportedNativeType]
     var operations: [FrontendReceipt.Adapter.ImportedOperation]
     var modulesByDeclarationUSR: [String: String]
+    var referencedModules: [String] = []
 }
 }
 
@@ -43,6 +57,9 @@ extension NativeAPICatalog.CompilerProjection {
               importedTypes.count <= 250_000,
               operations.count <= 250_000,
               modulesByDeclarationUSR.count <= 250_000,
+              referencedModules.count <= 256,
+              referencedModules == Array(Set(referencedModules)).sorted(),
+              !referencedModules.contains(moduleName),
               importedTypes == importedTypes.sorted(by: {
                   ($0.canonicalName, $0.swiftType)
                       < ($1.canonicalName, $1.swiftType)
@@ -51,6 +68,7 @@ extension NativeAPICatalog.CompilerProjection {
                 == importedTypes.count,
               importedTypes.allSatisfy({ type in
                   type.sourceFileLogicalID == sourceFileLogicalID
+                      && type.nativeModuleName == nil
                       && type.importedModules == Array(
                           Set(type.importedModules)
                       ).sorted()
@@ -58,6 +76,7 @@ extension NativeAPICatalog.CompilerProjection {
               }),
               operations.allSatisfy({ operation in
                   operation.sourceFileLogicalID == sourceFileLogicalID
+                      && operation.catalogEntry == nil
                       && operation.importedModules == Array(
                           Set(operation.importedModules)
                       ).sorted()
@@ -67,7 +86,11 @@ extension NativeAPICatalog.CompilerProjection {
               modulesByDeclarationUSR.allSatisfy({ usr, module in
                   !usr.isEmpty && usr.utf8.count <= 4_096
                       && module == moduleName
-              })
+              }),
+              (try? NativeAPICatalog.ModuleSelection.catalogModules(
+                  referencedModules,
+                  excluding: moduleName
+              )) == referencedModules
         else {
             throw NativeAPICatalog.Error.invalid(
                 "compiler projection is oversized or noncanonical"
@@ -99,6 +122,65 @@ enum Projector {}
 }
 
 extension NativeAPICatalog.Projector {
+    struct ProjectionResult {
+        var entries: [NativeAPICatalog.Entry]
+        var entriesByOperation: [
+            FrontendReceipt.Adapter.ImportedOperation: NativeAPICatalog.Entry
+        ]
+        var importedTypes: [FrontendReceipt.Adapter.ImportedNativeType]
+        var operations: [FrontendReceipt.Adapter.ImportedOperation]
+        var referencedModules: [String]
+    }
+
+    /// Identity shared by a compiler declaration and the binding generated
+    /// from it. The public native-call callee is deliberately excluded: C and
+    /// Objective-C projection replaces Swift's callable spelling with the
+    /// foreign ABI identity after discovery.
+    private struct GeneratedBindingKey: Hashable {
+        var mangledName: String
+        var sourceFileLogicalID: String
+        var dispatch: NativeImportDiscovery.Dispatch
+        var ownerType: String?
+        var baseName: String
+        var argumentLabels: [String]
+        var parameterSwiftTypes: [String]
+        var invocationParameterSwiftTypes: [String]?
+        var resultSwiftType: String
+        var importedModules: [String]
+        var nativeModuleName: String?
+
+        init(_ declaration: NativeImportDiscovery.Declaration) {
+            mangledName = declaration.mangledName
+            sourceFileLogicalID = declaration.sourceFileLogicalID
+            dispatch = declaration.dispatch
+            ownerType = declaration.ownerType
+            baseName = declaration.baseName
+            argumentLabels = declaration.argumentLabels
+            parameterSwiftTypes = declaration.parameterSwiftTypes
+            invocationParameterSwiftTypes =
+                declaration.invocationParameterSwiftTypes
+            resultSwiftType = declaration.resultSwiftType
+            importedModules = declaration.importedModules
+            nativeModuleName = declaration.nativeModuleName
+        }
+
+        init(_ candidate: NativeImportDiscovery.Candidate) {
+            let generated = candidate.generatedBinding
+            mangledName = generated.declarationMangledName
+            sourceFileLogicalID = generated.sourceFileLogicalID
+            dispatch = generated.dispatch
+            ownerType = generated.ownerType
+            baseName = generated.baseName
+            argumentLabels = generated.argumentLabels
+            parameterSwiftTypes = generated.parameterSwiftTypes
+            invocationParameterSwiftTypes =
+                generated.invocationParameterSwiftTypes
+            resultSwiftType = generated.resultSwiftType
+            importedModules = generated.importedModules
+            nativeModuleName = generated.nativeModuleName
+        }
+    }
+
     static func sourceFileLogicalID(moduleName: String) -> String {
         "NativeAPICatalog/\(moduleName).swift"
     }
@@ -108,6 +190,18 @@ extension NativeAPICatalog.Projector {
         identity: NativeAPICatalog.Identity,
         invocation: InterfaceArchive.FrontendInvocation
     ) throws -> [NativeAPICatalog.Entry] {
+        try project(
+            projection: projection,
+            identity: identity,
+            invocation: invocation
+        ).entries
+    }
+
+    static func project(
+        projection: NativeAPICatalog.CompilerProjection,
+        identity: NativeAPICatalog.Identity,
+        invocation: InterfaceArchive.FrontendInvocation
+    ) throws -> ProjectionResult {
         try projection.validate(moduleName: identity.moduleName)
         let nativeTypes = placeholderNativeTypes(
             projection.importedTypes,
@@ -121,7 +215,10 @@ extension NativeAPICatalog.Projector {
         // cannot collapse or reject otherwise distinct APIs.
         var declarations: [NativeImportDiscovery.Declaration] = []
         var declarationUSRsByCallee: [String: Set<String>] = [:]
-        for operation in projection.operations {
+        var operationIndicesByDeclaration: [
+            GeneratedBindingKey: Set<Int>
+        ] = [:]
+        for (operationIndex, operation) in projection.operations.enumerated() {
             let projected = try FrontendReceipt.Adapter()
                 .makeImportedOperationDeclarations(
                     [operation],
@@ -129,6 +226,12 @@ extension NativeAPICatalog.Projector {
                     nativeTypes: nativeTypes
                 )
             declarations += projected
+            for declaration in projected {
+                operationIndicesByDeclaration[
+                    GeneratedBindingKey(declaration),
+                    default: []
+                ].insert(operationIndex)
+            }
             guard let usr = operation.declarationUSR else { continue }
             for declaration in projected {
                 declarationUSRsByCallee[
@@ -177,20 +280,34 @@ extension NativeAPICatalog.Projector {
         )
         var entries: [NativeAPICatalog.Entry] = []
         entries.reserveCapacity(discovery.candidates.count)
+        var entriesByOperation: [
+            FrontendReceipt.Adapter.ImportedOperation: NativeAPICatalog.Entry
+        ] = [:]
+        var publishedOperationIndices = Set<Int>()
+        var referencedModules = Set(projection.referencedModules)
         for candidate in discovery.candidates {
             let record = candidate.record
             if record.descriptor.target.module != identity.moduleName {
-                // Symbol Graphs can surface a protocol-extension default from
-                // another Swift module on a concrete local type. It is not a
-                // declaration owned by this module and cannot enter this
-                // module's Catalog merely because its probe compiled here.
-                guard record.descriptor.target.backend == .swiftAdapter else {
-                    throw NativeAPICatalog.Error.invalid(
-                        "compiler projection emitted a call owned by another module"
-                    )
-                }
+                // Reexports and overlays can surface Swift, Objective-C, or C
+                // declarations owned by another module. They cannot enter
+                // this document, but Prepare must follow their owning module
+                // so the overall Catalog closure remains complete.
+                referencedModules.insert(record.descriptor.target.module)
                 continue
             }
+            let projectionKey = GeneratedBindingKey(candidate)
+            guard let operationIndices = operationIndicesByDeclaration[
+                projectionKey
+            ], !operationIndices.isEmpty else {
+                throw NativeAPICatalog.Error.invalid(
+                    "Catalog candidate cannot be mapped back to its compiler operation: "
+                        + "\(record.descriptor.canonicalCallee), "
+                        + "symbol=\(projectionKey.mangledName), "
+                        + "owner=\(projectionKey.ownerType ?? "none"), "
+                        + "module=\(projectionKey.nativeModuleName ?? "none")"
+                )
+            }
+            publishedOperationIndices.formUnion(operationIndices)
             let strategy: NativeAPICatalog.BindingStrategy = switch
                 record.descriptor.target.backend {
             case .objectiveCMessage: .objectiveCInvoker
@@ -210,7 +327,7 @@ extension NativeAPICatalog.Projector {
                         record.descriptor.canonicalCallee
                     ] ?? [])
             ).sorted().prefix(64))
-            entries.append(try .init(
+            let entry = try NativeAPICatalog.Entry(
                 descriptor: record.descriptor,
                 contract: record.contract,
                 swiftNames: [record.descriptor.canonicalCallee],
@@ -223,9 +340,35 @@ extension NativeAPICatalog.Projector {
                             + [identity.moduleName]
                     )).sorted()
                 )
-            ))
+            )
+            entries.append(entry)
+            for operationIndex in operationIndices {
+                let operation = projection.operations[operationIndex]
+                if let existing = entriesByOperation[operation],
+                   existing != entry {
+                    throw NativeAPICatalog.Error.invalid(
+                        "Catalog operation maps to conflicting published entries"
+                    )
+                }
+                entriesByOperation[operation] = entry
+            }
         }
-        return entries.sorted { $0.key < $1.key }
+        let publishedOperations = publishedOperationIndices.sorted().map {
+            projection.operations[$0]
+        }
+        return .init(
+            entries: entries.sorted { $0.key < $1.key },
+            entriesByOperation: entriesByOperation,
+            importedTypes: FrontendReceipt.ImportedTypeIndex(
+                types: projection.importedTypes
+            ).logicalBoundaryTypes(for: publishedOperations),
+            operations: publishedOperations,
+            referencedModules: try NativeAPICatalog.ModuleSelection
+                .catalogModules(
+                    Array(referencedModules),
+                    excluding: identity.moduleName
+                )
+        )
     }
 
     private static func placeholderNativeTypes(

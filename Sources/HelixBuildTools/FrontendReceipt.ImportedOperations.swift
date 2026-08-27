@@ -19,14 +19,6 @@ extension FrontendReceipt.Adapter {
             case anyObjectBridge
         }
 
-        enum IsolationEvidence: String, Codable, Hashable, Sendable {
-            /// The declaration was unavailable, so isolation is conservatively
-            /// inherited from the source context that performed the call.
-            case enclosingContext
-            /// A generated SDK probe captured the imported declaration itself.
-            case importedDeclaration
-        }
-
         var silReferences: [String]
         var sourceFileLogicalID: String
         var importedModules: [String]
@@ -60,7 +52,11 @@ extension FrontendReceipt.Adapter {
         var c: FrontendReceipt.CABI.Evidence? = nil
         var witnessFunctions: [String] = []
         var compilerOperation: CompilerOperation? = nil
-        var isolationEvidence: IsolationEvidence = .enclosingContext
+        /// Validated module-level authority attached only while a Catalog is
+        /// consumed by a project. Persisted compiler projections keep this
+        /// nil and reproduce the entry from compiler facts during validation.
+        var catalogEntry: NativeAPICatalog.Entry? = nil
+        var isolationEvidence: ImportedIsolationEvidence = .enclosingContext
         /// Source-observed operations enter the linked baseline. Managed SDK
         /// probes set this to false so first-use candidates remain data-only.
         var isEmittedToDevice: Bool = true
@@ -146,6 +142,39 @@ extension FrontendReceipt.Adapter {
         }
     }
 
+    /// Declaration-level identity intentionally excludes compiler-contextual
+    /// physical ownership spellings. A module Catalog measures those details
+    /// at the declaration itself and is authoritative over a consumer call
+    /// site's SIL convention for the same logical call shape.
+    private struct ImportedOperationAuthorityIdentity: Hashable {
+        var declarationUSR: String?
+        var dispatch: NativeImportDiscovery.Dispatch
+        var ownerType: String
+        var baseName: String
+        var argumentLabels: [String]
+        var parameterSwiftTypes: [String]
+        var parameterProjection: InterfaceArchive.NativeImportParameterProjection
+        var resultSwiftType: String
+        var compilerOperation: ImportedOperation.CompilerOperation?
+        var foreignDispatch: CanonicalSIL.NativeBridgeSymbols.ForeignDispatch
+
+        init(_ operation: ImportedOperation) {
+            declarationUSR = operation.declarationUSR
+                ?? operation.objectiveC?.declarationUSR
+                ?? operation.c?.declarationUSR
+            dispatch = operation.dispatch
+            ownerType = operation.ownerType
+            baseName = operation.baseName
+            argumentLabels = operation.argumentLabels
+            parameterSwiftTypes = operation.parameterSwiftTypes
+            parameterProjection = operation.parameterProjection
+                ?? .identity(parameterCount: operation.parameterSwiftTypes.count)
+            resultSwiftType = operation.resultSwiftType
+            compilerOperation = operation.compilerOperation
+            foreignDispatch = operation.foreignDispatch
+        }
+    }
+
     private struct ObjectiveCModuleEvidenceIdentity: Hashable {
         var evidence: FrontendReceipt.ObjectiveCABI.Evidence
 
@@ -223,14 +252,20 @@ extension FrontendReceipt.Adapter {
         _ operations: [ImportedOperation],
         moduleName: String,
         nativeTypes: [String: Core.TypeID],
-        sourceTypeNames: Set<String> = []
+        sourceTypeNames: Set<String> = [],
+        requiredSourceFileLogicalIDs: Set<String> = []
     ) throws -> [NativeImportDiscovery.Declaration] {
         try canonicalizePhysicalOperations(operations).compactMap {
             operation -> NativeImportDiscovery.Declaration? in
             func omit(_ reason: String) throws -> NativeImportDiscovery.Declaration? {
-                guard operation.compilerOperation == nil else {
+                guard operation.compilerOperation == nil,
+                      !requiredSourceFileLogicalIDs.contains(
+                          operation.sourceFileLogicalID
+                      )
+                else {
                     throw FrontendReceipt.Error.invalidRequest(
-                        "compiler bridge \(operation.ownerType).\(operation.baseName) "
+                        "required imported operation "
+                            + "\(operation.ownerType).\(operation.baseName) "
                             + "cannot be represented: \(reason)"
                     )
                 }
@@ -448,6 +483,7 @@ extension FrontendReceipt.Adapter {
                 foreignDispatch: operation.foreignDispatch,
                 objectiveC: operation.objectiveC,
                 c: operation.c,
+                catalogEntry: operation.catalogEntry,
                 isEmittedToDevice: operation.isEmittedToDevice
             )
         }
@@ -4075,6 +4111,19 @@ extension FrontendReceipt.Adapter {
                     existing.requiresMainActor = existing.requiresMainActor
                         || value.requiresMainActor
                 }
+                switch (existing.catalogEntry, value.catalogEntry) {
+                case let (.some(lhs), .some(rhs)):
+                    guard lhs == rhs else {
+                        throw FrontendReceipt.Error.invalidRequest(
+                            "imported operation \(value.ownerType).\(value.baseName) "
+                                + "has conflicting Native API Catalog authority"
+                        )
+                    }
+                case (.none, .some):
+                    existing.catalogEntry = value.catalogEntry
+                case (.some, .none), (.none, .none):
+                    break
+                }
                 existing.silReferences = Array(Set(
                     existing.silReferences + value.silReferences
                 )).sorted()
@@ -4124,6 +4173,50 @@ extension FrontendReceipt.Adapter {
         }
     }
 
+    func mergingAuthoritativeImportedOperations(
+        source: [ImportedOperation],
+        authoritative: [ImportedOperation]
+    ) throws -> [ImportedOperation] {
+        guard !authoritative.isEmpty else {
+            return try mergeImportedOperations(source)
+        }
+        var authoritativeByIdentity: [
+            ImportedOperationAuthorityIdentity: ImportedOperation
+        ] = [:]
+        for operation in authoritative {
+            let identity = ImportedOperationAuthorityIdentity(operation)
+            guard authoritativeByIdentity.updateValue(
+                operation,
+                forKey: identity
+            ) == nil else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "Native API Catalog contains duplicate declaration authority for "
+                        + "\(operation.ownerType).\(operation.baseName)"
+                )
+            }
+        }
+        var unmatchedSource: [ImportedOperation] = []
+        for operation in source {
+            let identity = ImportedOperationAuthorityIdentity(operation)
+            guard var catalog = authoritativeByIdentity[identity] else {
+                unmatchedSource.append(operation)
+                continue
+            }
+            catalog.silReferences = Array(Set(
+                catalog.silReferences + operation.silReferences
+            )).sorted()
+            catalog.witnessFunctions = Array(Set(
+                catalog.witnessFunctions + operation.witnessFunctions
+            )).sorted()
+            catalog.isEmittedToDevice = catalog.isEmittedToDevice
+                || operation.isEmittedToDevice
+            authoritativeByIdentity[identity] = catalog
+        }
+        return try mergeImportedOperations(
+            unmatchedSource + authoritativeByIdentity.values
+        )
+    }
+
     private func objectiveCABIConflictFields(
         _ lhs: FrontendReceipt.ObjectiveCABI.Evidence,
         _ rhs: FrontendReceipt.ObjectiveCABI.Evidence
@@ -4163,6 +4256,10 @@ extension FrontendReceipt.Adapter {
         _ operation: ImportedOperation,
         aliases: [String: String]
     ) -> ImportedOperation {
+        // Catalog spellings already compiled in the declaring module and are
+        // part of its stable descriptor. Rewriting them from a consumer's
+        // aliases would make NativeCallKey project-dependent.
+        guard operation.catalogEntry == nil else { return operation }
         var result = operation
         result.ownerType = FrontendReceipt.SwiftTypeSpelling
             .replacingNominalAliases(in: operation.ownerType, aliases: aliases)

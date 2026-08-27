@@ -21,8 +21,14 @@ public struct CachedAdapter: Sendable {
         var metadata: InterfaceArchive.ReleaseMetadata
         var configuration: PatchConfiguration.Document
         var nativeImportCatalog: NativeImportCatalog.Document
+        var nativeAPICatalogs: [CatalogIdentity]
         var callingSurfacePolicy: FrontendReceipt.CallingSurfacePolicy
         var sources: [SourceIdentity]
+    }
+
+    private struct CatalogIdentity: Codable, Sendable {
+        var document: NativeAPICatalog.Document
+        var compilerProjectionSHA256: Core.Digest
     }
 
     private struct Payload: Codable, Sendable {
@@ -108,7 +114,14 @@ public struct CachedAdapter: Sendable {
             return output
         }
         let key = try performance.measure("frontend_cache.make_key") {
-            try BuildCache.key(
+            let catalogIdentities = try request.nativeAPICatalogs.map {
+                CatalogIdentity(
+                    document: $0.document,
+                    compilerProjectionSHA256:
+                        try $0.compilerProjectionDigest()
+                )
+            }
+            return try BuildCache.key(
                 domain: "HLX.BuildCache.ModuleFrontend.v1",
                 value: Key(
                     compilerCaptureSHA256: .sha256(compilerCapture),
@@ -117,6 +130,7 @@ public struct CachedAdapter: Sendable {
                     metadata: request.metadata,
                     configuration: request.configuration,
                     nativeImportCatalog: request.nativeImportCatalog,
+                    nativeAPICatalogs: catalogIdentities,
                     callingSurfacePolicy: request.callingSurfacePolicy,
                     sources: states.map {
                         SourceIdentity(

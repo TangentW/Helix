@@ -70,11 +70,10 @@ public static func capture(
         fingerprint.hasher.append(module)
     }
 
-    for location in parsed.values.sorted(by: {
-        ($0.kind.rawValue, $0.path) < ($1.kind.rawValue, $1.path)
-    }) {
+    for (locationIndex, location) in parsed.values.enumerated() {
+        let logicalRoot = "\(location.kind.rawValue)[\(locationIndex)]"
         fingerprint.hasher.append(location.kind.rawValue)
-        fingerprint.hasher.append(location.path)
+        fingerprint.hasher.append(UInt64(locationIndex))
         let original = URL(fileURLWithPath: location.path)
         var information = Darwin.stat()
         if lstat(original.path, &information) != 0 {
@@ -87,7 +86,6 @@ public static func capture(
             continue
         }
         let resolved = original.resolvingSymlinksInPath().standardizedFileURL
-        fingerprint.hasher.append(resolved.path)
         guard lstat(resolved.path, &information) == 0 else {
             fingerprint.hasher.append("unresolved")
             fingerprint.isComplete = false
@@ -103,45 +101,81 @@ public static func capture(
                     64 * 1_024 * 1_024
                 case .searchRoot, .explicitInput: 512 * 1_024 * 1_024
                 }
-                let data = try fingerprint.appendFile(
-                    resolved,
-                    logicalPath: location.path,
-                    maximumBytes: maximumBytes
-                )
+                var externalManifest: ExternalReferences.Manifest?
                 if location.kind == .overlayInput {
-                    for path in try ExternalReferences.overlayPaths(
-                        data,
-                        relativeTo: resolved.deletingLastPathComponent()
-                    ) where !isToolchainOrSDKPath(path) {
-                        additionalExplicitPaths.insert(path)
+                    _ = try fingerprint.appendFile(
+                        resolved,
+                        logicalPath: logicalRoot,
+                        maximumBytes: maximumBytes
+                    ) { data in
+                        let manifest = try ExternalReferences.overlayManifest(
+                            data,
+                            relativeTo: resolved.deletingLastPathComponent()
+                        )
+                        externalManifest = manifest
+                        return manifest.identityData
+                    }
+                } else if location.kind == .searchRoot,
+                          resolved.pathExtension.lowercased() == "hmap" {
+                    _ = try fingerprint.appendFile(
+                        resolved,
+                        logicalPath: logicalRoot,
+                        maximumBytes: maximumBytes
+                    ) { data in
+                        let manifest = try ExternalReferences.headerMapManifest(
+                            data,
+                            relativeTo: resolved.deletingLastPathComponent()
+                        )
+                        externalManifest = manifest
+                        return manifest.identityData
+                    }
+                } else {
+                    _ = try fingerprint.appendFile(
+                        resolved,
+                        logicalPath: logicalRoot,
+                        maximumBytes: maximumBytes
+                    )
+                }
+                if location.kind == .overlayInput {
+                    guard let externalManifest else {
+                        throw BuildCache.Error.io(
+                            "VFS overlay identity is unavailable"
+                        )
+                    }
+                    for reference in externalManifest.references
+                    where !isToolchainOrSDKPath(reference.path) {
+                        additionalExplicitPaths.insert(reference.path)
                         try fingerprint.appendReferencedPath(
-                            URL(fileURLWithPath: path),
-                            logicalPath: "overlay:\(path)"
+                            URL(fileURLWithPath: reference.path),
+                            logicalPath: "\(logicalRoot)/\(reference.logicalID)"
                         )
                     }
                 } else if location.kind == .searchRoot,
                           resolved.pathExtension.lowercased() == "hmap" {
-                    for path in try ExternalReferences.headerMapPaths(
-                        data,
-                        relativeTo: resolved.deletingLastPathComponent()
-                    ) where !isToolchainOrSDKPath(path) {
-                        additionalExplicitPaths.insert(path)
+                    guard let externalManifest else {
+                        throw BuildCache.Error.io(
+                            "header-map identity is unavailable"
+                        )
+                    }
+                    for reference in externalManifest.references
+                    where !isToolchainOrSDKPath(reference.path) {
+                        additionalExplicitPaths.insert(reference.path)
                         try fingerprint.appendReferencedPath(
-                            URL(fileURLWithPath: path),
-                            logicalPath: "header-map:\(path)"
+                            URL(fileURLWithPath: reference.path),
+                            logicalPath: "\(logicalRoot)/\(reference.logicalID)"
                         )
                     }
                 } else if location.kind == .moduleMapInput {
                     try fingerprint.appendReferencedPath(
                         resolved.deletingLastPathComponent(),
-                        logicalPath: "module-map-root:\(resolved.deletingLastPathComponent().path)",
+                        logicalPath: "\(logicalRoot)/module-map-root",
                         compilerInterfacesOnly: true,
                         excluding: resolved
                     )
                 } else if location.kind == .bridgingHeaderInput {
                     try fingerprint.appendReferencedPath(
                         resolved.deletingLastPathComponent(),
-                        logicalPath: "bridging-header-root:\(resolved.deletingLastPathComponent().path)",
+                        logicalPath: "\(logicalRoot)/bridging-header-root",
                         compilerInterfacesOnly: true,
                         excluding: resolved
                     )
@@ -230,7 +264,7 @@ public static func capture(
                     do {
                         try fingerprint.appendFile(
                             target,
-                            logicalPath: "\(location.path)/\(subpath)"
+                            logicalPath: "\(logicalRoot)/\(subpath)"
                         )
                     } catch {
                         fingerprint.isComplete = false
@@ -239,7 +273,7 @@ public static func capture(
                     do {
                         try fingerprint.appendFile(
                             child,
-                            logicalPath: "\(location.path)/\(subpath)"
+                            logicalPath: "\(logicalRoot)/\(subpath)"
                         )
                     } catch {
                         fingerprint.isComplete = false
@@ -260,7 +294,7 @@ public static func capture(
     return .init(
         importedModules: dependencyModules?.sorted() ?? [],
         searchRoots: parsed.values.filter { $0.kind == .searchRoot }
-            .map(\.path).sorted(),
+            .map(\.path),
         explicitPaths: Array(Set(parsed.values.filter {
             $0.kind != .searchRoot
         }.map(\.path)).union(additionalExplicitPaths)).sorted(),

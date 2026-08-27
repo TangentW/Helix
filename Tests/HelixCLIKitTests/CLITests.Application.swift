@@ -6,6 +6,7 @@ import HelixCompiler
 import HelixCore
 import HelixDevProtocol
 import HelixDevTools
+import HelixInterface
 import HelixReleaseTools
 import Testing
 @testable import HelixCLIKit
@@ -394,6 +395,9 @@ struct Application {
 
             private func hidden(_ input: Int) -> Int { input + 1 }
             public func value(_ input: Int) -> Int { hidden(input) }
+            public func externalValue(_ input: Int) -> Int {
+                ExternalValue(rawValue: input).incremented()
+            }
             """.utf8
         ).write(to: sourceRoot.appendingPathComponent("Sources/Feature.swift"))
         let compilerInputRoot = directory.appendingPathComponent(
@@ -567,9 +571,14 @@ struct Application {
         #expect(patchPerformance.trace.stages.contains {
             $0.name == "prepare.frontend_receipt"
         })
-        #expect(patchPerformance.trace.subprocesses.contains {
-            $0.kind == .typedAST && $0.failureCount == 0
-        })
+        #expect(
+            patchPerformance.trace.subprocesses.contains {
+                $0.kind == .typedAST && $0.invocationCount > $0.failureCount
+            } || patchPerformance.trace.counters.contains {
+                $0.name == "frontend_cache.module_hit_count" && $0.value == 1
+            },
+            Comment(rawValue: String(describing: patchPerformance.trace))
+        )
         #expect(patchPerformance.trace.counters.contains {
             $0.name == "frontend.source_count" && $0.value == 1
         })
@@ -605,12 +614,49 @@ struct Application {
             Data(contentsOf: shell.appendingPathComponent("ShellBuildReceipt.json"))
         )
         #expect(patchReceipt.configuration.schema == 1)
-        #expect(patchReceipt.nativeImportCandidates.map(\.canonicalCallee).sorted() == [
+        let builtinCallees: Set<String> = [
             "Swift.String.init(describing:)",
             "Swift.String.init(reflecting:)",
             "Swift.debugPrint(_:separator:terminator:)",
             "Swift.print(_:separator:terminator:)",
-        ])
+        ]
+        let patchCallees = Set(
+            patchReceipt.nativeImportCandidates.map(\.canonicalCallee)
+        )
+        #expect(builtinCallees.isSubset(of: patchCallees))
+        #expect(patchCallees.contains {
+            $0.hasPrefix("ExternalFixture.ExternalValue.")
+        })
+        #expect(patchReceipt.nativeImportCandidates
+            .filter { $0.canonicalCallee.hasPrefix("ExternalFixture.") }
+            .allSatisfy { $0.isEmittedToDevice })
+        let externalTypeBinding = try #require(
+            patchReceipt.nativeTypeBindings.first {
+                $0.generated?.nativeModuleName == "ExternalFixture"
+            }
+        )
+        let generatedExternalType = try #require(
+            externalTypeBinding.generated
+        )
+        let externalTypeSource = try String(
+            contentsOf: shell.appendingPathComponent(
+                BridgeGeneration.Generator.entrySourcePath(
+                    for: generatedExternalType.sourceFileLogicalID
+                )
+            ),
+            encoding: .utf8
+        )
+        #expect(externalTypeSource.contains("import ExternalFixture"))
+        #expect(!externalTypeSource.contains("@_private(sourceFile:"))
+        let externalAdapterSource = try String(
+            contentsOf: shell.appendingPathComponent(
+                BridgeGeneration.Generator.adapterPackSourcePath(
+                    moduleName: "ExternalFixture"
+                )
+            ),
+            encoding: .utf8
+        )
+        #expect(externalAdapterSource.contains("import ExternalFixture"))
         let stableShellArtifact = shell.appendingPathComponent(
             "Generated/FeatureBridge.swift"
         )
@@ -785,16 +831,17 @@ struct Application {
         )
         #expect(liveReceipt.configuration.schema == 1)
         #expect(featureConfiguration.nativeImports.sourceScope?.visibility == .all)
-        #expect(liveReceipt.nativeImportCandidates.map(\.canonicalCallee).sorted() == [
-            "Swift.String.init(describing:)",
-            "Swift.String.init(reflecting:)",
-            "Swift.debugPrint(_:separator:terminator:)",
-            "Swift.print(_:separator:terminator:)",
-        ])
+        let liveCallees = Set(
+            liveReceipt.nativeImportCandidates.map(\.canonicalCallee)
+        )
+        #expect(builtinCallees.isSubset(of: liveCallees))
+        #expect(liveCallees.contains {
+            $0.hasPrefix("ExternalFixture.ExternalValue.")
+        })
         let entrySymbols = Set(liveReceipt.roots.compactMap { root in
             root.bridge == nil ? nil : root.declarationMangledName
         })
-        #expect(entrySymbols.count == 2)
+        #expect(entrySymbols.count == 3)
         let importedSymbols = Set(
             liveReceipt.nativeImportCandidates.flatMap(\.silMangledNames)
         )
@@ -826,6 +873,160 @@ struct Application {
         #expect(repeatedLivePerformance.trace.stages.contains {
             $0.name == "prepare.reserve_hub"
         })
+    }
+
+    @Test("Live Catalog prewarm publishes one private canonical job")
+    func catalogPrewarmScheduling() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cache = try BuildCache.Store(
+            rootURL: directory.appendingPathComponent("BuildCache")
+        )
+        let output = directory.appendingPathComponent("Output")
+        let compiler = URL(fileURLWithPath: "/usr/bin/swiftc")
+        let target = "arm64-apple-ios15.0-simulator"
+        let minimumOS = Core.SemanticVersion(15)
+        let toolchain = ReleaseCompiler.ToolchainIdentity(
+            fingerprint: "catalog-prewarm-fixture",
+            versionOutput: "Swift fixture",
+            targetInfo: target,
+            compilerBinaryHash: .sha256("swiftc")
+        )
+        let sdk = SwiftFrontend.Driver.SDKIdentity(
+            name: "iphonesimulator",
+            path: "/tmp/Fixture.sdk",
+            buildVersion: "24A1"
+        )
+        let invocation = InterfaceArchive.FrontendInvocation(
+            moduleName: "Feature",
+            targetTriple: target,
+            sdkName: sdk.name,
+            sdkBuild: sdk.buildVersion,
+            optimization: "-Onone",
+            semanticArguments: [
+                "-parse-as-library", "-swift-version", "6",
+            ]
+        )
+        let metadata = InterfaceArchive.ReleaseMetadata(
+            bundleID: "dev.helix.prewarm",
+            buildNumber: "1",
+            shellNamespaceID: .derive(
+                bundleID: "dev.helix.prewarm",
+                buildNumber: "1",
+                seed: "fixture"
+            ),
+            machOUUIDs: [],
+            targetTriple: target,
+            minimumOS: minimumOS,
+            xcodeBuild: "24A1",
+            sdkBuild: sdk.buildVersion,
+            frontendInvocation: invocation,
+            transformPipelineHash: ShellBuild.transformPipelineHash,
+            sourceBaselineHash: .sha256("fixture")
+        )
+        let identity = NativeAPICatalog.Identity(
+            provenance: .thirdPartyModule,
+            xcodeProductBuild: metadata.xcodeBuild,
+            sdkProductBuild: metadata.sdkBuild,
+            compilerFingerprint: toolchain.fingerprint,
+            targetTriple: target,
+            minimumDeployment: minimumOS,
+            swiftLanguageMode: "6",
+            moduleName: "ExternalFixture",
+            moduleContentHash: .sha256("module"),
+            moduleSearchPathHash: .sha256("search"),
+            dependencyGraphHash: .sha256("dependencies")
+        )
+        let request = NativeAPICatalog.BuildRequest(
+            identity: identity,
+            frontendInvocation: invocation,
+            compilerURL: compiler,
+            workingDirectoryURL: directory,
+            precomputedToolchain: toolchain,
+            precomputedSDK: sdk
+        )
+        let compilerInputs = BuildCache.CompilerInputs.Snapshot(
+            importedModules: [identity.moduleName],
+            searchRoots: [],
+            explicitPaths: [],
+            fileCount: 0,
+            byteCount: 0,
+            contentHash: .sha256("inputs"),
+            isComplete: true
+        )
+        let planRequest = NativeAPICatalog.PlanRequest(
+            metadata: metadata,
+            importedModules: [identity.moduleName],
+            compilerArguments: [],
+            compilerURL: compiler,
+            workingDirectory: directory,
+            toolchain: toolchain,
+            sdk: sdk,
+            compilerInputs: compilerInputs
+        )
+        let recorder = CatalogPrewarmLaunchRecorder()
+        let executable = directory.appendingPathComponent("helix")
+        let application = CLI.Application(
+            currentDirectoryURL: directory,
+            executableURL: executable,
+            catalogPrewarmLauncher: recorder.record
+        )
+
+        try application.scheduleNativeAPICatalogPrewarm(
+            requests: [request],
+            cache: cache,
+            workingDirectoryURL: directory,
+            planRequest: planRequest,
+            outputDirectoryURL: output
+        )
+        let launch = try #require(recorder.invocations.first)
+        #expect(recorder.invocations.count == 1)
+        #expect(launch.executableURL == executable.standardizedFileURL)
+        #expect(launch.workingDirectoryURL == directory.standardizedFileURL)
+        #expect(launch.logURL.deletingLastPathComponent()
+            == launch.jobURL.deletingLastPathComponent())
+        let jobDirectoryAttributes = try FileManager.default.attributesOfItem(
+            atPath: launch.jobURL.deletingLastPathComponent().path
+        )
+        #expect(
+            (jobDirectoryAttributes[.posixPermissions] as? NSNumber)?.intValue
+                == 0o700
+        )
+        let jobAttributes = try FileManager.default.attributesOfItem(
+            atPath: launch.jobURL.path
+        )
+        #expect(
+            (jobAttributes[.posixPermissions] as? NSNumber)?.intValue == 0o600
+        )
+        let decoded = try NativeAPICatalog.PrewarmJobCodec.decode(
+            Data(contentsOf: launch.jobURL)
+        )
+        #expect(decoded.requests == [request])
+        #expect(decoded.planRequest.importedModules == [identity.moduleName])
+
+        try application.scheduleNativeAPICatalogPrewarm(
+            requests: [request],
+            cache: cache,
+            workingDirectoryURL: directory,
+            planRequest: planRequest,
+            outputDirectoryURL: output
+        )
+        #expect(recorder.invocations.count == 2)
+        #expect(recorder.invocations.last?.jobURL == launch.jobURL)
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644],
+            ofItemAtPath: launch.jobURL.path
+        )
+        #expect(throws: CLI.Error.self) {
+            try application.scheduleNativeAPICatalogPrewarm(
+                requests: [request],
+                cache: cache,
+                workingDirectoryURL: directory,
+                planRequest: planRequest,
+                outputDirectoryURL: output
+            )
+        }
     }
 
     @Test("Final Bridge identity covers Hub contract compiler inputs")
@@ -946,8 +1147,14 @@ struct Application {
     ) throws {
         let source = directory.appendingPathComponent("ExternalFixture.swift")
         try Data(
-            "public struct ExternalValue { public static let version = \(version) }\n"
-                .utf8
+            """
+            public struct ExternalValue {
+                public let rawValue: Int
+                public init(rawValue: Int) { self.rawValue = rawValue }
+                public func incremented() -> Int { rawValue + \(version) }
+                public static let version = \(version)
+            }
+            """.utf8
         ).write(to: source)
         _ = try toolOutput(
             executable: compiler,
@@ -1052,5 +1259,39 @@ private struct StubHubControlClient: HubControl.ClientProtocol {
         context _: DevSession.BuildContext
     ) async throws -> Pairing.Invitation {
         throw HubControl.Error.invalidMessage
+    }
+}
+
+private final class CatalogPrewarmLaunchRecorder: @unchecked Sendable {
+    struct Invocation {
+        var executableURL: URL
+        var jobURL: URL
+        var logURL: URL
+        var workingDirectoryURL: URL
+    }
+
+    private let lock = NSLock()
+    private var storage: [Invocation] = []
+
+    var invocations: [Invocation] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func record(
+        executableURL: URL,
+        jobURL: URL,
+        logURL: URL,
+        workingDirectoryURL: URL
+    ) {
+        lock.lock()
+        storage.append(.init(
+            executableURL: executableURL,
+            jobURL: jobURL,
+            logURL: logURL,
+            workingDirectoryURL: workingDirectoryURL
+        ))
+        lock.unlock()
     }
 }

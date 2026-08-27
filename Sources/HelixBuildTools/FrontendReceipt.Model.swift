@@ -42,6 +42,9 @@ public struct Request: Sendable {
     public var sources: [FrontendReceipt.Source]
     public var compilerURL: URL
     public var nativeImportCatalog: NativeImportCatalog.Document
+    /// Immutable, compiler-derived module surfaces. Xcode integration fills
+    /// these automatically; applications never enumerate native APIs.
+    public var nativeAPICatalogs: [NativeAPICatalog.Snapshot]
     public var callingSurfacePolicy: FrontendReceipt.CallingSurfacePolicy
 
     public init(
@@ -50,6 +53,7 @@ public struct Request: Sendable {
         sources: [FrontendReceipt.Source],
         compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
         nativeImportCatalog: NativeImportCatalog.Document = .empty,
+        nativeAPICatalogs: [NativeAPICatalog.Snapshot] = [],
         callingSurfacePolicy: FrontendReceipt.CallingSurfacePolicy = .configured
     ) {
         self.metadata = metadata
@@ -57,6 +61,10 @@ public struct Request: Sendable {
         self.sources = sources
         self.compilerURL = compilerURL
         self.nativeImportCatalog = nativeImportCatalog
+        self.nativeAPICatalogs = nativeAPICatalogs.sorted {
+            ($0.document.identity.moduleName, $0.document.identity.cacheKey)
+                < ($1.document.identity.moduleName, $1.document.identity.cacheKey)
+        }
         self.callingSurfacePolicy = callingSurfacePolicy
     }
 }

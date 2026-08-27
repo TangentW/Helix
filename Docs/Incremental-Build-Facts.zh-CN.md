@@ -2,11 +2,10 @@
 
 [English](Incremental-Build-Facts.md)
 
-Helix 把“能覆盖多少原生 API”和“构建要花多少时间”分开处理。Prepare 仍然用当前
-Xcode 实际捕获的 Swift frontend 去证明以本次构建已证明 imported native type 为根的
-完整合格调用面，并纳入合格成员签名所需的原生类型；只有所有语义输入完全一致时，
-才复用之前已经证明过的结果。缓存命中只是省时间，不是新的权威来源，也不能凭空
-增加能力。
+Helix 把“能覆盖多少原生 API”和“构建要花多少时间”分开处理。Prepare 会优先消费由
+编译器生成的模块 Catalog，只让源码根 frontend 证明这些快照没有覆盖的 module 或具体
+specialization。任何缓存事实在使用前都要重新匹配当前语义输入并完成校验。缓存命中只是
+省时间，不是新的权威来源，也不能凭空增加能力。
 
 本文说明 Live Reload 与 Hot Patch 共用的 schema 1 实现。项目不需要维护 API 清单，
 不需要冻结，也不需要开发者配置缓存。默认缓存放在当前用户的
@@ -49,7 +48,9 @@ build/fingerprint 绑定，不会逐文件重复扫描；当前模块自己的�
 避免缓存自我失效。如果输入无法可靠解析或稳定读取、遇到无法证明安全的 symlink 模块
 目录，或超过快照上限，本次会关闭模块和细粒度 frontend 复用，继续走权威的无缓存
 构建，不会因为缓存功能而令正常编译失败。目录遍历到达条目上限时会立即停止；overlay
-采用有大小上限的迭代解析，不会先把无界目录或深层结构完整装入内存。
+解析同时限制大小、节点数、引用数与深度。VFS overlay 和二进制 header map 内部的物理
+路径会在 identity 中替换为结构角色，而每个映射实际到达的文件字节会绑定在对应角色下：
+整体搬迁可以复用，但把某个虚拟名字改映射到另一份内容一定会失效。
 
 模块 receipt 是范围最大的快路径；它失效后，权威 frontend 仍能继续复用 symbol
 graph 和单个声明的探测结果。也就是说，业务代码做了一次普通修改，不会因此重新
@@ -69,9 +70,17 @@ Swift/Clang 的物理搜索目录、module map、PCM、resource root 和 module 
 digest 表示。宏等非路径 Clang 参数保持精确，因此跨项目复用不会把不同语义误合并。
 
 Catalog 命中时不会启动 Symbol Graph 或候选探针进程，但缓存中的 compiler projection
-仍要重新规范化、重新分类，而且重建出的 entry 必须和缓存 Document 完全一致。当前阶段
-的 Prepare 尚未切换到 Catalog-first；后续接入会用它替换每次构建里的源码根 Framework
-扩展，而不是再叠加一次全模块扫描。
+仍要重新规范化、重新分类，而且重建出的 entry 必须和缓存 Document 完全一致。Prepare
+会先使用这些已验证 operation，只对缺失 module 集合执行源码根 Framework 扩展。Catalog
+拥有的调用身份不会被消费项目自己的 source scope、typealias 或 call-site SIL ownership
+改写；外部 TypeOps 也只保留真正穿过逻辑参数或返回值边界的类型。
+
+Hot Patch 在发布生产能力基线前，会同步解析完整的可达 Catalog 闭包。Live Reload 则用
+非阻塞 shared lock 读取：条目不存在或正由其他 producer 生成时，Prepare 都不会等待，
+本次直接走权威源码根回退。Shell 成功后才发布仅当前用户可读的 canonical 预热任务。
+utility worker 会重新确认任务仍匹配 compiler、SDK、plan 和 module input，再生成首批
+miss，并递归跟进引用到的 module。任务文件以原子方式发布到 `0700` 目录，权限为
+`0600`；读取使用 `O_NOFOLLOW`、大小上限和文件锁，重复 worker 不会破坏结果。
 
 冷的全模块探测不会再对每个候选逐条查询文件缓存：外层 Catalog key 已经精确表示该
 模块，而每个公开 API 再开一次 lock、读一次 manifest 只会增加线性 I/O，不能带来有效
@@ -111,6 +120,9 @@ bootstrap 的 Clang 二进制，不用 Swift frontend 指纹代替它。
 一个 producer 真正生成，其他调用者等待发布后再验证读取。新条目先写入私有 staging
 目录，再通过 rename 发布。缓存不会进入 App、补丁或签名输入，也不是安全信任根。
 
+延迟敏感路径另有只读入口：它不会创建缓存目录、等待 producer、修复损坏条目或启动
+任何新工作，只尝试取得非阻塞 shared lock；不可立即读取并完整验证时就返回 miss。
+
 ## Xcode 产物怎么更新
 
 Shell 生成目录以一次原子目录切换发布。如果新旧目录的字节和权限完全相同，就什么
@@ -122,6 +134,12 @@ Hot Patch 的 Prepare 在“精确输入一致 + 完整输出 manifest 一致”
 frontend 前直接返回。Live Reload 不复用最终 Prepare state，因为 Hub invitation
 只能消费一次，每次构建必须重新预留；但耗时最大的模块、symbol graph 和 probe 事实
 照常复用，之后只重新生成很小的会话绑定合同。
+
+进入 frontend 前，Prepare 会根据捕获的 compiler 参数和有序 module search 语义自动
+计算 Catalog identity。生产路径会等待全部可达快照，开发路径只读取已经就绪的快照，
+其余部分不阻塞回退。Frontend cache 与 Hot Patch Prepare identity 同时包含 canonical
+Catalog Document 和不透明 compiler projection 的 digest，所以 module surface 变化只会
+精确失效真正消费了它的构建事实。
 
 Bridge 编译现在分成多层精确事实。Objective-C 与受支持的 C 调用使用固定 Runtime
 Invoker；其余 Swift 调用按 module 归入确定性的 Adapter Pack，Pack source 和 Mach-O
@@ -161,6 +179,12 @@ schema 1 构建性能报告会记录决策，但不会泄露完整路径或编�
 - `managed_native.symbol_graph_cache_hit_count`、`_miss_count`；
 - `managed_native.probe_cache_hit_count`、`_miss_count`、
   `cached_rejection_count`；
+- frontend 内的 `native_api_catalog.hit_module_count`、`miss_module_count` 和
+  `entry_count`；
+- `prepare.catalog_planned_module_count`、`catalog_hit_module_count`、
+  `catalog_generated_module_count`、`catalog_miss_module_count`、
+  `catalog_unresolved_module_count`、`catalog_entry_count`，以及后台预热已调度/启动失败
+  计数；
 - `prepare.state_hit_count`、`state_miss_count`、复用/写入产物数和
   `noop_publication_count`；
 - `bridge.state_hit_count`、`state_miss_count`；

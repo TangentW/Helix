@@ -60,6 +60,7 @@ extension NativeImportDiscovery {
             .ordinary
         var objectiveC: FrontendReceipt.ObjectiveCABI.Evidence? = nil
         var c: FrontendReceipt.CABI.Evidence? = nil
+        var catalogEntry: NativeAPICatalog.Entry? = nil
         /// True only when the current source baseline (or explicit policy)
         /// requires this operation in the linked Shell. Managed development
         /// discovery keeps future-use operations as exact data-only records.
@@ -128,12 +129,15 @@ extension NativeImportDiscovery {
             var candidates: [NativeImportDiscovery.Candidate] = []
             var diagnostics: [Core.Diagnostic] = []
             for declaration in declarations.sorted(by: declarationOrder) {
-                guard scope.includes(
-                    logicalPath: declaration.sourceFileLogicalID,
-                    canonicalCallee: declaration.canonicalCallee,
-                    accessLevel: declaration.accessLevel
-                ) else { continue }
-                if let rejection = rejection(
+                if declaration.catalogEntry == nil {
+                    guard scope.includes(
+                        logicalPath: declaration.sourceFileLogicalID,
+                        canonicalCallee: declaration.canonicalCallee,
+                        accessLevel: declaration.accessLevel
+                    ) else { continue }
+                }
+                if declaration.catalogEntry == nil,
+                   let rejection = rejection(
                     for: declaration,
                     scope: scope
                 ) {
@@ -156,13 +160,15 @@ extension NativeImportDiscovery {
                     for: profile,
                     dispatch: declaration.dispatch
                 )
-                let effects = Core.Effects(
+                let inferredEffects = Core.Effects(
                     mayThrow: declaration.inferredEffects.mayThrow,
                     mayAllocate: true,
                     hasExternalSideEffects: operationAccess.hasExternalSideEffects,
                     requiresMainActor: declaration.inferredEffects.requiresMainActor,
                     isAsync: declaration.inferredEffects.isAsync
                 )
+                let effects = declaration.catalogEntry?.descriptor.effects
+                    ?? inferredEffects
                 let objectiveCPhysical: Core.NativeCall.PhysicalSignature? = if
                     !effects.isAsync,
                     let evidence = declaration.objectiveC {
@@ -214,7 +220,7 @@ extension NativeImportDiscovery {
                             ? declaration.c?.moduleName
                             : declaration.declaringModuleName
                 )
-                let contract = if effects.isAsync {
+                let inferredContract = if effects.isAsync {
                     Core.NativeImportContract.suspending(
                         kind: contractKind(for: declaration.dispatch),
                         domain: domain,
@@ -237,6 +243,8 @@ extension NativeImportDiscovery {
                         callbacks: declaration.callbacks
                     )
                 }
+                let contract = declaration.catalogEntry?.contract
+                    ?? inferredContract
                 try contract.validate(effects: effects)
                 let receiverIndex = isInstanceDispatch(declaration.dispatch)
                     ? declaration.signature.parameters.indices.last.flatMap {
@@ -308,6 +316,20 @@ extension NativeImportDiscovery {
                 let key = try Core.NativeCall.Key.derive(
                     descriptor: callDescriptor
                 )
+                if let catalogEntry = declaration.catalogEntry {
+                    guard catalogEntry.support.state == .supported,
+                          catalogEntry.binding != nil,
+                          catalogEntry.key == key,
+                          catalogEntry.descriptor == callDescriptor,
+                          catalogEntry.contract == contract
+                    else {
+                        throw FrontendReceipt.Error.invalidRequest(
+                            "Native API Catalog entry "
+                                + "\(catalogEntry.descriptor.canonicalCallee) "
+                                + "cannot be reproduced by its generated binding"
+                        )
+                    }
+                }
                 candidates.append(
                     .init(
                         record: .init(

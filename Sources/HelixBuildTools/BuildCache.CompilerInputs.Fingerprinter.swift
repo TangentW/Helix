@@ -18,24 +18,28 @@ struct Fingerprinter {
     mutating func appendFile(
         _ url: URL,
         logicalPath: String,
-        maximumBytes: Int = 512 * 1_024 * 1_024
+        maximumBytes: Int = 512 * 1_024 * 1_024,
+        identityTransform: (Data) throws -> Data = { $0 }
     ) throws -> Data {
         let resolved = url.resolvingSymlinksInPath().standardizedFileURL
         let data = try Self.readStableData(
             resolved,
             maximumBytes: maximumBytes
         )
-        let digest = Core.Digest.sha256(data)
+        let physicalDigest = Core.Digest.sha256(data)
         if let previous = seenResolvedFiles[resolved.path] {
             guard previous.byteCount == UInt64(data.count),
-                  previous.hash == digest
+                  previous.hash == physicalDigest
             else {
                 throw BuildCache.Error.io(
                     "compiler input changed between references"
                 )
             }
         } else {
-            seenResolvedFiles[resolved.path] = (UInt64(data.count), digest)
+            seenResolvedFiles[resolved.path] = (
+                UInt64(data.count),
+                physicalDigest
+            )
             fileCount += 1
             let (sum, overflow) = byteCount.addingReportingOverflow(
                 UInt64(data.count)
@@ -46,11 +50,13 @@ struct Fingerprinter {
             byteCount = sum
         }
         // Logical aliases matter to module selection even when they resolve to
-        // the same bytes, so every compiler-visible path enters the identity.
+        // the same bytes, so every compiler-visible role enters the identity.
+        // The resolved host path does not: identical module bytes copied to a
+        // different project or DerivedData root remain the same compiler fact.
+        let identity = try identityTransform(data)
         hasher.append(logicalPath)
-        hasher.append(resolved.path)
-        hasher.append(UInt64(data.count))
-        hasher.append(digest)
+        hasher.append(UInt64(identity.count))
+        hasher.append(Core.Digest.sha256(identity))
         return data
     }
 

@@ -296,17 +296,20 @@ public struct GeneratedNativeType: Codable, Hashable, Sendable {
     public var swiftType: String
     public var representation: Representation
     public var nativeABIEncoding: String?
+    public var nativeModuleName: String?
 
     public init(
         sourceFileLogicalID: String,
         swiftType: String,
         representation: Representation = .reference,
-        nativeABIEncoding: String? = nil
+        nativeABIEncoding: String? = nil,
+        nativeModuleName: String? = nil
     ) {
         self.sourceFileLogicalID = sourceFileLogicalID
         self.swiftType = swiftType
         self.representation = representation
         self.nativeABIEncoding = nativeABIEncoding
+        self.nativeModuleName = nativeModuleName
     }
 }
 
@@ -784,7 +787,9 @@ public struct Document: Codable, Hashable, Sendable {
                     FrontendReceipt.SwiftTypeSpelling.isGeneratedType
                 )
         }()
-        guard sourcePaths.contains(generated.sourceFileLogicalID),
+        let originIsValid = generated.nativeModuleName != nil
+            || sourcePaths.contains(generated.sourceFileLogicalID)
+        guard originIsValid,
               !requiresImportedType || !importedModules.isEmpty,
               generated.nativeModuleName.map({
                   isModulePath($0) && importedModules.contains($0)
@@ -936,6 +941,17 @@ public struct Document: Codable, Hashable, Sendable {
         let expectedSwiftType = isSourceType
             ? String(canonicalName.dropFirst(modulePrefix.count))
             : canonicalName
+        let originIsValid: Bool
+        if let nativeModuleName = generated.nativeModuleName {
+            originIsValid = !isSourceType
+                && isModulePath(nativeModuleName)
+                && importedModules.contains(nativeModuleName)
+                && !sourcePaths.contains(generated.sourceFileLogicalID)
+        } else {
+            originIsValid = sourcePaths.contains(
+                generated.sourceFileLogicalID
+            )
+        }
         let encodingIsValid: Bool = switch generated.representation {
         case .objectiveCStructure:
             generated.nativeABIEncoding.map {
@@ -945,7 +961,7 @@ public struct Document: Codable, Hashable, Sendable {
             generated.nativeABIEncoding == nil
         }
         return encodingIsValid
-            && sourcePaths.contains(generated.sourceFileLogicalID)
+            && originIsValid
             && (isSourceType ? importedModules.isEmpty : !importedModules.isEmpty)
             && generated.swiftType == expectedSwiftType
             && FrontendReceipt.SwiftTypeSpelling.isGeneratedType(generated.swiftType)

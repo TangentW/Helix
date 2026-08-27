@@ -114,11 +114,31 @@ key.
 This whole-module producer deliberately does not invent an ABI for open
 generics, protocol existentials, type aliases whose representation is unknown,
 async declarations, or declarations rejected by the exact probe. Concrete
-generic specializations observed by an application remain available through
-the existing source-rooted compiler path. Catalog-first Prepare consumption
-and automatic identity discovery are separate integration stages; until those
-are connected, Release capability publication continues to use the
-build-proven imported-type boundary described below.
+generic specializations observed only by an application remain available
+through the source-rooted compiler path.
+
+Xcode Prepare now discovers Catalog identities automatically from the captured
+compiler job, toolchain, SDK, imported modules, and content snapshots. It also
+follows module references recorded by reexports, overlays, and foreign
+declarations. Hot Patch builds and validates the complete reachable Catalog
+closure synchronously and fails closed when a module cannot be identified.
+Live Reload performs only a nonblocking validated cache read on its latency
+path. A miss uses the exact source-rooted frontend for that build, then
+publishes an owner-private canonical job and launches a background worker to
+prewarm the same content-addressed Catalog and any newly discovered module
+references. Projects configure neither API lists nor a prewarm step.
+
+The consuming frontend validates every Catalog identity against the current
+compiler, SDK, target, deployment, and language mode, reconstructs every entry
+from its opaque compiler projection, and requires exact document equality.
+Catalog operations then carry that validated Descriptor and Contract as their
+authority; consumer source globs, local aliases, and consumer-specific SIL
+ownership spellings cannot rename the call. Only native types that cross a
+published logical parameter or result boundary receive external TypeOps, and
+those generated TypeOps import their owning module directly. Before a receipt
+is accepted, every supported Catalog entry must have the same stable key,
+Descriptor, Contract, emission policy, and executable Invoker or Adapter
+binding in the resulting Shell.
 
 ## Trust-boundary flow
 
