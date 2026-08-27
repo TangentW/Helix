@@ -159,6 +159,14 @@ struct NativeImportDiscoveryTests {
             in: "(__C.NSBundle.Type, NSBundle.Nested?)",
             aliases: aliases
         ) == "(Bundle.Type, Bundle.Nested?)")
+        #expect(FrontendReceipt.SwiftTypeSpelling.nominalTokens(
+            in: "@MainActor @escaping (UIKit.UIView?, "
+                + "[Foundation.URL: Swift.Result<Foo.Bar, Error>]) "
+                + "-> Swift.Void"
+        ) == [
+            "MainActor", "escaping", "UIKit.UIView", "Foundation.URL",
+            "Swift.Result", "Foo.Bar", "Error", "Swift.Void",
+        ])
 
         let sourceParameters = #"""
         (
@@ -672,13 +680,25 @@ struct NativeImportDiscoveryTests {
         }
         #expect(operationNames.contains { $0.contains(".removeItem(atPath)") })
         let removals = fileManagerOperations.filter { $0.baseName == "removeItem" }
-        #expect(removals.count == 1)
-        #expect(removals.first?.dispatch == .instanceMethod)
-        #expect(removals.first?.argumentLabels == ["atPath"])
-        #expect(removals.first?.parameterSwiftTypes == ["Swift.String", "FileManager"])
-        #expect(removals.first?.resultSwiftType == "()")
-        #expect(removals.first?.mayThrow == true)
-        #expect(removals.first?.parameterProjection == .identity(parameterCount: 2))
+        #expect(removals.count == 2)
+        let pathRemoval = try #require(removals.first {
+            $0.parameterSwiftTypes.first == "Swift.String"
+        })
+        #expect(pathRemoval.dispatch == .instanceMethod)
+        #expect(pathRemoval.argumentLabels == ["atPath"])
+        #expect(pathRemoval.parameterSwiftTypes == ["Swift.String", "FileManager"])
+        #expect(pathRemoval.resultSwiftType == "()")
+        #expect(pathRemoval.mayThrow == true)
+        #expect(pathRemoval.parameterProjection == .identity(parameterCount: 2))
+        let urlRemoval = try #require(removals.first {
+            $0.parameterSwiftTypes.first == "Foundation.URL"
+        })
+        #expect(urlRemoval.argumentLabels == ["at"])
+        #expect(urlRemoval.mayThrow)
+        #expect(expansion.importedTypes.contains {
+            $0.canonicalName == "Foundation.URL"
+                || $0.swiftType == "Foundation.URL"
+        })
 
         let reused = try FrontendReceipt.ManagedNativeSurface.expand(
             importedTypes: importedTypes,
@@ -787,6 +807,104 @@ struct NativeImportDiscoveryTests {
             ["Swift.Int", "Overloaded"],
             ["Swift.String", "Overloaded"],
         ]))
+        #expect(reused.operations == first.operations)
+        #expect(reused.metrics.probeCacheHitCount == reused.metrics.candidateCount)
+        #expect(reused.metrics.probeAttemptCount == 0)
+    }
+
+    @Test("Managed probe cache preserves native signature types")
+    func cachesManagedSDKSignatureTypes() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-managed-signature-cache-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let moduleName = "ManagedSignatureFixture"
+        let sourceURL = directory.appendingPathComponent("External.swift")
+        try Data(
+            """
+            public final class Payload {
+                public init() {}
+            }
+            public final class Factory {
+                public init() {}
+                public func transform(_ value: Payload) -> Payload { value }
+            }
+            """.utf8
+        ).write(to: sourceURL)
+        let frontend = SwiftFrontend.Driver(
+            compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc")
+        )
+        let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        try requireFrontendSuccess(frontend.run(arguments: [
+            sourceURL.path,
+            "-emit-module", "-parse-as-library",
+            "-module-name", moduleName,
+            "-target", "arm64-apple-ios15.0-simulator",
+            "-sdk", sdk.path,
+            "-emit-module-path", directory.appendingPathComponent(
+                "\(moduleName).swiftmodule"
+            ).path,
+        ]))
+        let invocation = InterfaceArchive.FrontendInvocation(
+            moduleName: "ManagedSignatureConsumer",
+            targetTriple: "arm64-apple-ios15.0-simulator",
+            sdkName: sdk.name,
+            sdkBuild: sdk.buildVersion,
+            optimization: "-Onone",
+            semanticArguments: ["-parse-as-library", "-I", directory.path]
+        )
+        let importedTypes: [FrontendReceipt.Adapter.ImportedNativeType] = [
+            .init(
+                canonicalName: "Factory",
+                swiftType: "Factory",
+                kind: .reference,
+                aliases: ["\(moduleName).Factory"],
+                representation: .reference,
+                sourceFileLogicalID: "Sources/Fixture.swift",
+                importedModules: [moduleName],
+                requiresMainActor: false
+            ),
+        ]
+        let cache = try BuildCache.Store(
+            rootURL: directory.appendingPathComponent("Cache")
+        )
+
+        let first = try FrontendReceipt.ManagedNativeSurface.expand(
+            importedTypes: importedTypes,
+            minimumOS: .init(15),
+            frontend: frontend,
+            invocation: invocation,
+            cache: cache,
+            compilerFingerprint: "signature-test-compiler",
+            compilerInputHash: .sha256("signature-test-compiler-inputs")
+        )
+        let reused = try FrontendReceipt.ManagedNativeSurface.expand(
+            importedTypes: importedTypes,
+            minimumOS: .init(15),
+            frontend: frontend,
+            invocation: invocation,
+            cache: cache,
+            compilerFingerprint: "signature-test-compiler",
+            compilerInputHash: .sha256("signature-test-compiler-inputs")
+        )
+
+        #expect(first.importedTypes.contains {
+            $0.canonicalName.hasSuffix("Payload")
+                || $0.swiftType.hasSuffix("Payload")
+        })
+        #expect(first.operations.contains {
+            $0.baseName == "transform"
+                && $0.parameterSwiftTypes.contains {
+                    $0.hasSuffix("Payload")
+                }
+                && $0.resultSwiftType.hasSuffix("Payload")
+        })
+        #expect(reused.importedTypes == first.importedTypes)
         #expect(reused.operations == first.operations)
         #expect(reused.metrics.probeCacheHitCount == reused.metrics.candidateCount)
         #expect(reused.metrics.probeAttemptCount == 0)
@@ -3525,7 +3643,7 @@ struct NativeImportDiscoveryTests {
             output.receipt.nativeTypes.map(\.canonicalName)
         )
         #expect(!importedNativeNames.contains("NSBundle"))
-        #expect(!importedNativeNames.contains("NSCoder"))
+        #expect(importedNativeNames.contains("NSCoder"))
         #expect(!importedNativeNames.contains("NSTimer"))
         #expect(!importedNativeNames.contains("NSFileManager"))
         #expect(importedNativeNames.contains("Timer"))

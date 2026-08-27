@@ -43,6 +43,29 @@ enum SwiftTypeSpelling {
         return result
     }
 
+    /// Returns complete dotted nominal tokens without interpreting the
+    /// surrounding optional, collection, tuple, generic, callback, or
+    /// attribute syntax.
+    static func nominalTokens(in raw: String) -> [String] {
+        var result: [String] = []
+        var token = ""
+        func appendToken() {
+            guard !token.isEmpty else { return }
+            result.append(token)
+            token.removeAll(keepingCapacity: true)
+        }
+        for character in raw {
+            if character == "." || character == "_"
+                || character.isLetter || character.isNumber {
+                token.append(character)
+            } else {
+                appendToken()
+            }
+        }
+        appendToken()
+        return result
+    }
+
     static func isGeneratedType(_ raw: String) -> Bool {
         let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return !value.isEmpty

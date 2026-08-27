@@ -3,8 +3,8 @@
 [English](Incremental-Build-Facts.md)
 
 Helix 把“能覆盖多少原生 API”和“构建要花多少时间”分开处理。Prepare 仍然用当前
-Xcode 实际捕获的 Swift frontend 去证明本次构建已证明 imported native type 边界内
-的完整合格调用面；只有所有语义输入完全一致时，
+Xcode 实际捕获的 Swift frontend 去证明以本次构建已证明 imported native type 为根的
+完整合格调用面，并纳入合格成员签名所需的原生类型；只有所有语义输入完全一致时，
 才复用之前已经证明过的结果。缓存命中只是省时间，不是新的权威来源，也不能凭空
 增加能力。
 
@@ -20,7 +20,7 @@ Xcode 实际捕获的 Swift frontend 去证明本次构建已证明 imported nat
 | SDK identity | `xcrun` 返回的 SDK 路径和 build | Swift driver 实例、SDK 名、`DEVELOPER_DIR`、`TOOLCHAINS` |
 | 模块 frontend | 已验证的 receipt、诊断和工具链 identity | 编译捕获内容、编译器指纹、非 SDK 模块/头文件接口快照、metadata、策略、catalog、配置，以及每个源码的逻辑路径、物理路径和内容 hash |
 | Symbol graph | 已验证的 SDK 模块公开符号图 | 编译器指纹、SDK/frontend invocation、模块名 |
-| 单候选探测 | 某个候选最终测得的零个或多个操作 | 编译器指纹、变换流水线、SDK/frontend invocation、最低系统、规范化候选和边界类型 |
+| 单候选探测 | 某个候选最终测得的操作及其原生签名类型 | 编译器指纹、变换流水线、SDK/frontend invocation、最低系统、规范化候选和边界类型 |
 | Hot Patch Prepare | 完整 Shell 目录和函数计数 | Prepare 精确输入，或输出中的路径、字节、权限、额外文件发生任何变化 |
 | Release 能力投影 | canonical schema 1 Native Capability Manifest 与 digest | Release/Shell identity、capability，以及所有 device-emitted Descriptor、Key、Contract 与 capability 的完整有序集合 |
 | Adapter Pack source | 按原生 module 分组的确定性 Swift Adapter | 编译器指纹、SDK/target/deployment、变换流水线、module、有序 imported module 集合与有序稳定调用 Key |
@@ -56,7 +56,9 @@ graph 和单个声明的探测结果。也就是说，业务代码做了一次�
 
 探测失败也不是一概写缓存。只有经过递归拆分后、可确定复现的单候选拒绝才会缓存；
 临时编译器故障不会变成永久“不支持”。正常探测和校验完成后，才保存候选的最终
-结果。
+结果。每条缓存还只保存该候选的 receiver、参数、回调或返回值实际引用的原生类型。
+因此，签名里首次出现的新类型在缓存命中时不会丢失，结果也不会依赖它第一次恰好
+与哪些候选被分到同一探测批次。
 
 ## 命中前仍然要验证
 
@@ -64,7 +66,7 @@ graph 和单个声明的探测结果。也就是说，业务代码做了一次�
 
 - canonical 编码、schema、key、payload SHA-256 必须一致；
 - receipt 必须完整通过结构校验，并匹配当前源码、metadata 和工具链；
-- symbol graph 和实测操作走与新生成结果相同的验证；
+- symbol graph、实测操作及其原生签名类型走与新生成结果相同的验证；
 - Prepare state 会比较整个生成目录，包括文件权限和意外多出的条目；
 - Adapter Pack、开发期 Adapter、application Bridge 与最终 Bridge state 都会重新检查
   Mach-O 架构和平台。开发期 Adapter 还会检查确定性 install name、UUID、代码签名

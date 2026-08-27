@@ -4,7 +4,8 @@
 
 Helix keeps native API coverage and build cost as separate concerns. Prepare
 still asks the captured Swift frontend to prove the complete qualified callable
-surface within the build-proven imported-native-type boundary;
+surface rooted in the build-proven imported-native-type boundary, including
+native types required by accepted member signatures;
 it now reuses previously proved facts when every semantic input is identical.
 A cache hit is an optimization, never authority and never a capability grant.
 
@@ -21,7 +22,7 @@ override; the normal owner-local location is
 | SDK identity | SDK path and build returned by `xcrun` | Swift driver instance, SDK name, `DEVELOPER_DIR`, and `TOOLCHAINS` |
 | Module frontend | Validated receipt, diagnostics, and toolchain identity | Compiler-capture bytes, compiler fingerprint, non-SDK module/header interface snapshot, metadata, policy, catalog, configuration, and every logical/physical source identity and content hash |
 | Symbol graph | Validated SDK module symbol graph | Compiler fingerprint, SDK/frontend invocation, and module |
-| Managed probe | Zero or more uniquely measured operations for one candidate | Compiler fingerprint, transform pipeline, SDK/frontend invocation, minimum OS, normalized candidate, and imported boundary types |
+| Managed probe | The uniquely measured operations and native signature types for one candidate | Compiler fingerprint, transform pipeline, SDK/frontend invocation, minimum OS, normalized candidate, and imported boundary types |
 | Hot Patch Prepare | Complete generated Shell tree and function counts | Exact Prepare identity plus exact paths, bytes, modes, and absence of unexpected entries |
 | Release capability projection | Canonical schema-1 Native Capability Manifest and digest | Release/Shell identity, capabilities, and the complete ordered set of device-emitted Descriptor, Key, Contract, and capability records |
 | Adapter Pack source | Deterministic Swift adapters grouped by native module | Compiler fingerprint, SDK/target/deployment, transform pipeline, module, ordered imported modules, and ordered stable call keys |
@@ -69,7 +70,10 @@ changed.
 Only deterministic singleton probe rejections are cached. A transient compiler
 failure is not converted into a permanent rejection. Probe batches are split
 as before, and the final per-candidate result is cached only after the normal
-validation path has established it.
+validation path has established it. Each entry also retains only the native
+types actually named by that candidate's receiver, parameters, callbacks, or
+result. This lets a previously unseen signature type survive a cache hit while
+keeping the entry independent of whichever probe batch first produced it.
 
 ## Validation and failure behavior
 
@@ -78,7 +82,8 @@ Every cached value is decoded and semantically validated by its consumer:
 - canonical encoding, schema, key and payload SHA-256 must match;
 - receipts must pass their full structural validation and match current source,
   metadata and toolchain identities;
-- symbol graphs and measured operations pass the same checks as fresh output;
+- symbol graphs, measured operations, and their native signature types pass the
+  same checks as fresh output;
 - Prepare state compares the entire generated tree, including permissions;
 - Adapter Pack, development Adapter, application Bridge, and final Bridge state
   revalidate Mach-O architecture/platform. A development Adapter additionally
