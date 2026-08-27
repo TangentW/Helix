@@ -12,6 +12,23 @@ public func validateConfiguration() throws {
     }
 }
 
+/// Rechecks the bound function pointer, ABI matrix, and device availability.
+public func validateRuntimeABI() throws {
+    try validateConfiguration()
+    guard let item = descriptor.availability.first(where: {
+        $0.platform == environment.platform
+    }) else { return }
+    guard !item.isUnavailable,
+          item.introduced.map({ environment.version >= $0 }) ?? true,
+          item.obsoleted.map({ environment.version < $0 }) ?? true
+    else {
+        throw VM.RuntimeTrap.nativeFailure(
+            "\(descriptor.canonicalCallee) is unavailable on "
+                + "\(environment.platform) \(environment.version) [\(key)]"
+        )
+    }
+}
+
 static func validate(
     key: Core.NativeCall.Key,
     descriptor: Core.NativeCall.Descriptor,

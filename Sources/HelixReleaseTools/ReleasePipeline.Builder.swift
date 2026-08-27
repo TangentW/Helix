@@ -122,6 +122,10 @@ public struct Builder: Sendable {
     public func build(_ request: ReleasePipeline.BuildRequest) throws -> ReleasePipeline.BuildArtifact {
         try request.archive.validate()
         try validate(request)
+        let nativeCapabilityManifest = try request.archive
+            .nativeCapabilityManifest()
+        let nativeCapabilityManifestHash = try nativeCapabilityManifest
+            .contentHash()
 
         let compilation = try ReleaseCompiler.Driver().build(
             .init(
@@ -155,7 +159,10 @@ public struct Builder: Sendable {
             return $0.functionKey.rawValue < $1.functionKey.rawValue
         }
 
-        let target = makeTarget(configuration: request.configuration, archive: request.archive)
+        let target = try makeTarget(
+            configuration: request.configuration,
+            archive: request.archive
+        )
         let descriptor = PatchPackage.PayloadDescriptor(
             backend: .hlbc,
             targetIndex: 0,
@@ -205,6 +212,7 @@ public struct Builder: Sendable {
             bytecodeSHA256: descriptor.sha256,
             bytecodeByteLength: descriptor.byteLength,
             shellInterfaceHash: request.archive.shellInterfaceHash,
+            nativeCapabilityManifestHash: nativeCapabilityManifestHash,
             toolchainFingerprint: compilation.toolchain.fingerprint,
             capabilities: compilation.module.capabilities.sorted(),
             changedFunctions: changed,
@@ -287,14 +295,17 @@ public struct Builder: Sendable {
     private func makeTarget(
         configuration: ReleasePipeline.Configuration,
         archive: InterfaceArchive.Archive
-    ) -> PatchPackage.Target {
-        .init(
+    ) throws -> PatchPackage.Target {
+        let nativeCapabilityManifest = try archive.nativeCapabilityManifest()
+        return .init(
             bundleID: archive.metadata.bundleID,
             marketingVersion: configuration.target.marketingVersion,
             buildNumber: archive.metadata.buildNumber,
             shellNamespaceID: archive.metadata.shellNamespaceID,
             machOUUID: configuration.target.machOUUID,
             shellInterfaceHash: archive.shellInterfaceHash,
+            nativeCapabilityManifestHash: try nativeCapabilityManifest
+                .contentHash(),
             architecture: configuration.target.architecture,
             platform: configuration.target.platform,
             minimumOSVersion: archive.metadata.minimumOS,
@@ -307,9 +318,8 @@ public struct Builder: Sendable {
         _ compilation: ReleaseCompiler.BuildResult,
         archive: InterfaceArchive.Archive
     ) throws {
-        let allowedCalls = Set(
-            archive.nativeImports.filter(\.isEmittedToDevice).map(\.key)
-        )
+        let allowedCalls = try archive.nativeCapabilityManifest()
+            .nativeCallKeys
         let policy = Core.RuntimePolicy(
             acceptedCapabilities: compilation.module.capabilities,
             resourceCeiling: compilation.module.requestedResources,
@@ -330,7 +340,10 @@ public struct Builder: Sendable {
         trustedRoot: PatchPackage.TrustedRoot
     ) throws {
         let trustStore = try PatchPackage.TrustStore(roots: [trustedRoot])
-        let target = makeTarget(configuration: configuration, archive: archive)
+        let target = try makeTarget(
+            configuration: configuration,
+            archive: archive
+        )
         let context = PatchPackage.TargetContext(
             bundleID: target.bundleID,
             marketingVersion: target.marketingVersion,
@@ -338,6 +351,7 @@ public struct Builder: Sendable {
             shellNamespaceID: target.shellNamespaceID,
             machOUUID: target.machOUUID,
             shellInterfaceHash: target.shellInterfaceHash,
+            nativeCapabilityManifestHash: target.nativeCapabilityManifestHash,
             architecture: target.architecture,
             platform: target.platform,
             operatingSystemVersion: target.minimumOSVersion,

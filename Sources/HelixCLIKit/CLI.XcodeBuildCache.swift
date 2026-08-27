@@ -130,7 +130,7 @@ func makeHotPatchPrepareIdentity(
         metadata: metadata,
         configuration: configuration,
         nativeImportCatalog: .empty,
-        callingSurfacePolicy: .configured,
+        callingSurfacePolicy: .managedProductionModule,
         sources: sources
     )
     return (

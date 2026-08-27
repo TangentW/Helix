@@ -73,6 +73,7 @@ public final class Engine: @unchecked Sendable {
     /// One recursive domain protects VM closure captures until Sendable
     /// callback semantics are represented and verified explicitly.
     private let nativeCallbackExecutionGate = VM.NativeCallbackExecutionGate()
+    let nativeCapabilityValidationState = Runtime.NativeCapabilityValidationState()
 
     /// Creates a Runtime engine from generated original and native catalogs.
     ///

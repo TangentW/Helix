@@ -3,7 +3,8 @@
 [简体中文](Incremental-Build-Facts.zh-CN.md)
 
 Helix keeps native API coverage and build cost as separate concerns. Prepare
-still asks the captured Swift frontend to prove the complete callable surface;
+still asks the captured Swift frontend to prove the complete qualified callable
+surface within the build-proven imported-native-type boundary;
 it now reuses previously proved facts when every semantic input is identical.
 A cache hit is an optimization, never authority and never a capability grant.
 
@@ -22,6 +23,7 @@ override; the normal owner-local location is
 | Symbol graph | Validated SDK module symbol graph | Compiler fingerprint, SDK/frontend invocation, and module |
 | Managed probe | Zero or more uniquely measured operations for one candidate | Compiler fingerprint, transform pipeline, SDK/frontend invocation, minimum OS, normalized candidate, and imported boundary types |
 | Hot Patch Prepare | Complete generated Shell tree and function counts | Exact Prepare identity plus exact paths, bytes, modes, and absence of unexpected entries |
+| Release capability projection | Canonical schema-1 Native Capability Manifest and digest | Release/Shell identity, capabilities, and the complete ordered set of device-emitted Descriptor, Key, Contract, and capability records |
 | Adapter Pack source | Deterministic Swift adapters grouped by native module | Compiler fingerprint, SDK/target/deployment, transform pipeline, module, ordered imported modules, and ordered stable call keys |
 | Adapter Pack object | Validated Mach-O for one module Pack | Pack source identity plus toolchain, Xcode build, normalized compiler invocation, complete non-SDK compiler-input snapshot, and module maps |
 | Development Adapter image | Signed Mach-O containing only first-used missing Swift Adapter bodies | Compiler/Xcode/SDK identities, target/deployment/platform/architecture, dependency graph, module, normalized semantic and preserved link arguments, exact generated sources, ordered Descriptor/Key/type/contract records |
@@ -135,7 +137,15 @@ and has its own content-addressed Mach-O cache. A Live Reload build compiles the
 small current Hub contract separately and relocatably links it with the stable
 application object and Pack objects. Hot Patch has no Hub-contract source.
 
-Unused managed-Debug candidates remain data-only receipt records and do not
+Hot Patch uses the managed production policy: every qualified candidate in the
+proved imported-type boundary is device-emitted and included in canonical
+`NativeCapabilities.json`. The generated Bridge derives the same table from its
+Shell imports. Release audit compares both projections with the finalized
+archive and pins the digest in `ReleaseBaseline.json`; a later patch repeats it
+in the signed target. Consequently a Prepare cache hit can reuse the bytes, but
+cannot change which calls the released App authorizes.
+
+Unused managed-development candidates remain data-only receipt records and do not
 inflate the stable Bridge or Pack objects. After HLBC is built, Helix inspects
 its exact import table. Objective-C and supported C first uses need no new
 machine code. Only newly referenced Swift Adapter keys are rendered into one
@@ -164,8 +174,8 @@ paths or compiler arguments. Relevant counters include:
 
 - `frontend_cache.module_hit_count`, `module_miss_count`,
   `module_repair_count`, and `module_bypass_count`;
-- `managed_debug.symbol_graph_cache_hit_count` and `_miss_count`;
-- `managed_debug.probe_cache_hit_count`, `_miss_count`, and
+- `managed_native.symbol_graph_cache_hit_count` and `_miss_count`;
+- `managed_native.probe_cache_hit_count`, `_miss_count`, and
   `cached_rejection_count`;
 - `prepare.state_hit_count`, `state_miss_count`, reused/written artifact counts,
   and `noop_publication_count`;

@@ -1,5 +1,6 @@
 import HelixBytecode
 import HelixCore
+import HelixObjectiveCRuntimeSupport
 import HelixVM
 
 extension Runtime.ObjectiveCInvoker {
@@ -9,6 +10,71 @@ extension Runtime.ObjectiveCInvoker {
     public func validateConfiguration() throws {
         if let constructionFailure {
             throw VM.RuntimeTrap.nativeFailure(constructionFailure)
+        }
+    }
+
+    /// Rechecks the linked OS class, selector, and exact type encodings before
+    /// a production capability table is accepted.
+    public func validateRuntimeABI() throws {
+        try validateConfiguration()
+        try checkAvailability()
+        guard let objectiveC = descriptor.objectiveC else {
+            throw VM.RuntimeTrap.nativeFailure(
+                "Objective-C descriptor metadata is missing"
+            )
+        }
+        let encodings = descriptor.physicalSignature.parameters.map {
+            Runtime.ObjectiveCInvoker.CStringAllocation($0.type.encoding!)
+        }
+        let pointers: [UnsafePointer<CChar>?] = encodings.map {
+            UnsafePointer($0.pointer)
+        }
+        let declaration = Runtime.ObjectiveCInvoker.CStringAllocation(
+            objectiveC.runtimeClassName
+        )
+        let dispatchClass = objectiveC.dispatchClassName.map(
+            Runtime.ObjectiveCInvoker.CStringAllocation.init
+        )
+        let selector = Runtime.ObjectiveCInvoker.CStringAllocation(
+            descriptor.target.entryPoint
+        )
+        let lexicalSuperclass = objectiveC.lexicalSuperclassName.map(
+            Runtime.ObjectiveCInvoker.CStringAllocation.init
+        )
+        let resultEncoding = Runtime.ObjectiveCInvoker.CStringAllocation(
+            descriptor.physicalSignature.result.encoding ?? "v"
+        )
+        let dispatch: HelixRuntimeObjectiveCDispatch = switch
+            descriptor.target.dispatch
+        {
+        case .instance: HelixRuntimeObjectiveCDispatchInstance
+        case .static: HelixRuntimeObjectiveCDispatchClass
+        case .initializer: HelixRuntimeObjectiveCDispatchInitializer
+        case .global:
+            throw VM.RuntimeTrap.nativeFailure(
+                "Objective-C message cannot use global dispatch"
+            )
+        }
+        var nativeResult = HelixRuntimeObjectiveCResult()
+        let succeeded = pointers.withUnsafeBufferPointer { buffer in
+            helix_runtime_objective_c_validate(
+                declaration.pointer,
+                dispatchClass?.pointer,
+                selector.pointer,
+                lexicalSuperclass?.pointer,
+                dispatch,
+                buffer.baseAddress,
+                buffer.count,
+                resultEncoding.pointer,
+                &nativeResult
+            )
+        }
+        guard succeeded,
+              nativeResult.status == HelixRuntimeObjectiveCStatusSuccess
+        else {
+            throw VM.RuntimeTrap.nativeFailure(
+                "\(message(from: &nativeResult)) [\(key)]"
+            )
         }
     }
 

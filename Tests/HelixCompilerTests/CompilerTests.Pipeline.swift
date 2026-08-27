@@ -723,7 +723,9 @@ struct Pipeline {
                 .init(
                     mangledName: dormant.mangledName,
                     canonicalCallee: "UnavailableImportFixture.dormant(_:)",
-                    reason: "not allowlisted into this Shell; ship a new Shell"
+                    reason: "the current Release App did not publish "
+                        + "UnavailableImportFixture.dormant(_:) in its Native "
+                        + "Capability Manifest; this native call requires a normal App release"
                 ),
             ]
         )
@@ -744,7 +746,8 @@ struct Pipeline {
             }
             #expect(mangledName == dormant.mangledName)
             #expect(canonicalCallee == "UnavailableImportFixture.dormant(_:)")
-            #expect(reason.contains("ship a new Shell"))
+            #expect(reason.contains("Native Capability Manifest"))
+            #expect(reason.contains("requires a normal App release"))
             #expect(error.description.contains("UnavailableImportFixture.dormant(_:)"))
         }
     }

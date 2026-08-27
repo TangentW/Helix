@@ -21,7 +21,10 @@ The Hub-installed Release pipeline:
    frontend.
 3. Generates Derived Sources containing permanent declaration bridges, exact
    hashed source-body wrappers where lexical execution is required, and allowed
-   native invokers. Handwritten source files are not changed; Shell compilation
+   native invokers. It automatically promotes every compiler-qualified native
+   candidate within the imported-type boundary proved by this build into the
+   production Native Capability Manifest; no project API list is maintained.
+   Handwritten source files are not changed; Shell compilation
    uses derived copies for observer and async source-body transformation.
    Prepare records an exact semantic-input and output manifest. An unchanged
    subsequent build can return before frontend work only after every generated
@@ -31,6 +34,12 @@ The Hub-installed Release pipeline:
    bootstrap; application source imports and starts nothing.
 5. Finalizes an HLXI archive with the linked Mach-O UUID and preserves the exact
    release source baseline and toolchain artifacts for future patch builds.
+
+The bootstrap retains exactly one production session for the process. Normal
+application code remains unaware of it. Advanced diagnostics or product-owned
+patch controls may call `AppIntegration.requirePatchSession()` to synchronously
+join that same idempotent bootstrap; they must not construct a second
+`ApplicationSession`, Runtime, or Bridge.
 
 The App contains compact route, type, and native-import tables. Sensitive build
 facts such as complete private source context stay in the server-side archive.
@@ -90,17 +99,21 @@ textually unchanged.
 
 Hub discovers native imports automatically from the successful build and
 expands them into individual canonical descriptors, stable keys, and generated
-bindings; the
-device never interprets a project-wide wildcard. An explicit list remains only
-as a lower-level standalone compiler input. Adding a call in a patch works only
-when the released App already contains the matching generated capability and
-its effects are allowed by policy.
+bindings. Release Prepare publishes all qualified Catalog candidates inside
+the imported-native-type boundary already proved by that App frontend, not only
+calls present in the baseline source. The device never interprets a project-
+wide wildcard; an explicit list remains only as a lower-level standalone
+compiler input. This is not whole-framework reflection: a declaration outside
+that proved boundary, or one whose types or ABI are not representable, is
+absent.
 
 Supported Objective-C capabilities share one descriptor-driven executable
-invoker rather than carrying a selector-specific Swift wrapper. The released
-Shell must still contain the exact call descriptor and key; this stage does not
-yet project an entire linked framework Catalog into the production capability
-manifest. Complex Swift overlays continue to use exact generated adapters.
+invoker rather than carrying a selector-specific Swift wrapper. Supported C
+calls share the finite trampoline invoker while retaining their compiler-bound
+addresses. Complex Swift overlays continue to use exact generated Adapter Pack
+entries. A patch may first-use any exact call published in the released schema-1
+Native Capability Manifest when policy permits its effects; an absent call is
+diagnosed as requiring a normal App release.
 
 The full version 1 identity, Catalog, and trust-boundary rules are documented
 in [Native call identity and catalog](Native-Calls.md).
@@ -120,7 +133,8 @@ The client chain includes:
 - an Ed25519 root/leaf certificate model and package signature verification;
 - bounded, sequential download with incremental SHA-256 validation;
 - target checks for bundle/build, Shell interface, Mach-O UUID, architecture,
-  OS range, policy, signer, time, and rollout rules;
+  Native Capability Manifest hash, OS range, policy, signer, time, and rollout
+  rules;
 - a canonical, immutable verified package store;
 - monotonic campaign revisions and anti-rollback state;
 - a nonce-based activation write-ahead log;

@@ -14,6 +14,12 @@ enum DirectCalls {
         var functionSymbols = Set<String>()
         var emittedNativeSymbols = Set<String>()
         var unavailableBySymbol: [String: CanonicalSIL.UnavailableDirectCall] = [:]
+        let productionManifest = try archive.nativeCapabilityManifest()
+        let productionEntries = Dictionary(
+            uniqueKeysWithValues: productionManifest.entries.map {
+                ($0.key, $0)
+            }
+        )
 
         for function in archive.functions {
             let conventions = function.parameterConventions
@@ -108,6 +114,16 @@ enum DirectCalls {
             }
         }
         for item in archive.nativeImports where item.isEmittedToDevice {
+            guard let published = productionEntries[item.key],
+                  published.id == item.id,
+                  published.descriptor == item.descriptor,
+                  published.contract == item.contract,
+                  published.requiredCapability == item.capability
+            else {
+                throw CanonicalSIL.LoweringError.invalidCallTable(
+                    "released NativeImport \(item.canonicalCallee) is absent from its Capability Manifest"
+                )
+            }
             try appendNativeImport(item)
         }
 
@@ -149,8 +165,9 @@ enum DirectCalls {
                 unavailableBySymbol[mangledName] = .init(
                     mangledName: mangledName,
                     canonicalCallee: item.canonicalCallee,
-                    reason: "the operation was cataloged but not selected for this Shell; "
-                        + "add \(item.canonicalCallee) to nativeImports.allow and ship a new Shell"
+                    reason: "the current Release App did not publish "
+                        + "\(item.canonicalCallee) in its Native Capability Manifest; "
+                        + "this native call requires a normal App release"
                 )
             }
         }

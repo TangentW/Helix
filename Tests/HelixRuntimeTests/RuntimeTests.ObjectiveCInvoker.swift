@@ -558,6 +558,25 @@ struct ObjectiveCInvoker {
     func rejectsCatalogRuntimeDrift() throws {
         let fixture = try Fixture()
         let receiver = try fixture.objectValue(HelixRuntimeTestObject())
+        let supported = try fixture.call(
+            member: "echo(_:)",
+            selector: "echo:",
+            dispatch: .instance,
+            kind: .instanceMethod,
+            logicalParameters: [
+                fixture.objectParameter(), .init(type: "Swift.String"),
+            ],
+            logicalResult: "Swift.String",
+            physicalParameters: [
+                .init(
+                    type: fixture.objectABI("Foundation.NSString"),
+                    source: .argument(1)
+                ),
+            ],
+            physicalResult: fixture.objectABI("Foundation.NSString")
+        )
+        try supported.invoker.validateRuntimeABI()
+
         let unsupported = try fixture.call(
             member: "echo(_:)",
             selector: "echo:",
@@ -592,6 +611,9 @@ struct ObjectiveCInvoker {
             ],
             physicalResult: fixture.objectABI("Foundation.NSString")
         )
+        #expect(throws: VM.RuntimeTrap.self) {
+            try wrong.invoker.validateRuntimeABI()
+        }
         #expect(throws: VM.RuntimeTrap.self) {
             _ = try fixture.invoke(
                 wrong,

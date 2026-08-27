@@ -241,43 +241,43 @@ struct NativeImportDiscoveryTests {
         }
 
         let minimumOS = Core.SemanticVersion(15)
-        #expect(FrontendReceipt.ManagedDebugSurface.supportsAvailability(
+        #expect(FrontendReceipt.ManagedNativeSurface.supportsAvailability(
             [],
             minimumOS: minimumOS
         ))
-        #expect(FrontendReceipt.ManagedDebugSurface.supportsAvailability(
+        #expect(FrontendReceipt.ManagedNativeSurface.supportsAvailability(
             try availability(#"[{"domain":"iOS","introduced":{"major":15}}]"#),
             minimumOS: minimumOS
         ))
-        #expect(!FrontendReceipt.ManagedDebugSurface.supportsAvailability(
+        #expect(!FrontendReceipt.ManagedNativeSurface.supportsAvailability(
             try availability(#"[{"domain":"iOS","introduced":{"major":16}}]"#),
             minimumOS: minimumOS
         ))
-        #expect(!FrontendReceipt.ManagedDebugSurface.supportsAvailability(
+        #expect(!FrontendReceipt.ManagedNativeSurface.supportsAvailability(
             try availability(#"[{"domain":"iOS","deprecated":{"major":18}}]"#),
             minimumOS: minimumOS
         ))
-        #expect(!FrontendReceipt.ManagedDebugSurface.supportsAvailability(
+        #expect(!FrontendReceipt.ManagedNativeSurface.supportsAvailability(
             try availability(#"[{"domain":"iOS","obsoleted":{"major":15}}]"#),
             minimumOS: minimumOS
         ))
-        #expect(!FrontendReceipt.ManagedDebugSurface.supportsAvailability(
+        #expect(!FrontendReceipt.ManagedNativeSurface.supportsAvailability(
             try availability(#"[{"domain":"iOS","obsoleted":{"major":18}}]"#),
             minimumOS: minimumOS
         ))
-        #expect(!FrontendReceipt.ManagedDebugSurface.supportsAvailability(
+        #expect(!FrontendReceipt.ManagedNativeSurface.supportsAvailability(
             try availability(
                 #"[{"domain":"Swift","isUnconditionallyDeprecated":true}]"#
             ),
             minimumOS: minimumOS
         ))
-        #expect(!FrontendReceipt.ManagedDebugSurface.supportsAvailability(
+        #expect(!FrontendReceipt.ManagedNativeSurface.supportsAvailability(
             try availability(
                 #"[{"domain":"iOS","isUnconditionallyUnavailable":true}]"#
             ),
             minimumOS: minimumOS
         ))
-        #expect(FrontendReceipt.ManagedDebugSurface.supportsAvailability(
+        #expect(FrontendReceipt.ManagedNativeSurface.supportsAvailability(
             try availability(#"[{"domain":"macOS","deprecated":{"major":12}}]"#),
             minimumOS: minimumOS
         ))
@@ -655,7 +655,7 @@ struct NativeImportDiscoveryTests {
             optimization: "-Onone",
             semanticArguments: ["-parse-as-library"]
         )
-        let expansion = try FrontendReceipt.ManagedDebugSurface.expand(
+        let expansion = try FrontendReceipt.ManagedNativeSurface.expand(
             importedTypes: importedTypes,
             minimumOS: .init(15),
             frontend: frontend,
@@ -680,7 +680,7 @@ struct NativeImportDiscoveryTests {
         #expect(removals.first?.mayThrow == true)
         #expect(removals.first?.parameterProjection == .identity(parameterCount: 2))
 
-        let reused = try FrontendReceipt.ManagedDebugSurface.expand(
+        let reused = try FrontendReceipt.ManagedNativeSurface.expand(
             importedTypes: importedTypes,
             minimumOS: .init(15),
             frontend: frontend,
@@ -758,7 +758,7 @@ struct NativeImportDiscoveryTests {
             rootURL: directory.appendingPathComponent("Cache")
         )
 
-        let first = try FrontendReceipt.ManagedDebugSurface.expand(
+        let first = try FrontendReceipt.ManagedNativeSurface.expand(
             importedTypes: importedTypes,
             minimumOS: .init(15),
             frontend: frontend,
@@ -767,7 +767,7 @@ struct NativeImportDiscoveryTests {
             compilerFingerprint: "overload-test-compiler",
             compilerInputHash: .sha256("overload-test-compiler-inputs")
         )
-        let reused = try FrontendReceipt.ManagedDebugSurface.expand(
+        let reused = try FrontendReceipt.ManagedNativeSurface.expand(
             importedTypes: importedTypes,
             minimumOS: .init(15),
             frontend: frontend,
@@ -794,27 +794,27 @@ struct NativeImportDiscoveryTests {
 
     @Test("Managed probe caching excludes transient compiler failures")
     func classifiesManagedProbeRejections() {
-        #expect(FrontendReceipt.ManagedDebugSurface.isDeterministicProbeRejection(
+        #expect(FrontendReceipt.ManagedNativeSurface.isDeterministicProbeRejection(
             status: 1,
             diagnostics: "fixture.swift:1:1: error: cannot convert value"
         ))
-        #expect(!FrontendReceipt.ManagedDebugSurface.isDeterministicProbeRejection(
+        #expect(!FrontendReceipt.ManagedNativeSurface.isDeterministicProbeRejection(
             status: 9,
             diagnostics: "error: compiler terminated"
         ))
-        #expect(!FrontendReceipt.ManagedDebugSurface.isDeterministicProbeRejection(
+        #expect(!FrontendReceipt.ManagedNativeSurface.isDeterministicProbeRejection(
             status: 1,
             diagnostics: "LLVM ERROR: out of memory\nerror: compiler crashed"
         ))
-        #expect(!FrontendReceipt.ManagedDebugSurface.isDeterministicProbeRejection(
+        #expect(!FrontendReceipt.ManagedNativeSurface.isDeterministicProbeRejection(
             status: 1,
             diagnostics: "warning: no deterministic rejection"
         ))
-        #expect(!FrontendReceipt.ManagedDebugSurface.isDeterministicProbeRejection(
+        #expect(!FrontendReceipt.ManagedNativeSurface.isDeterministicProbeRejection(
             status: 1,
             diagnostics: "fixture.swift:1:1: error: no such module 'UIKit'"
         ))
-        #expect(!FrontendReceipt.ManagedDebugSurface.isDeterministicProbeRejection(
+        #expect(!FrontendReceipt.ManagedNativeSurface.isDeterministicProbeRejection(
             status: 1,
             diagnostics: "error: unable to load standard library"
         ))
@@ -826,7 +826,7 @@ struct NativeImportDiscoveryTests {
             compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc")
         )
         let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
-        let expansion = try FrontendReceipt.ManagedDebugSurface.expand(
+        let expansion = try FrontendReceipt.ManagedNativeSurface.expand(
             importedTypes: [
                 .init(
                     canonicalName: "Timer",
@@ -866,7 +866,7 @@ struct NativeImportDiscoveryTests {
             compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc")
         )
         let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
-        let expansion = try FrontendReceipt.ManagedDebugSurface.expand(
+        let expansion = try FrontendReceipt.ManagedNativeSurface.expand(
             importedTypes: [
                 .init(
                     canonicalName: "UIViewController",
@@ -2035,7 +2035,7 @@ struct NativeImportDiscoveryTests {
                 configuration: configuration,
                 sources: [.init(logicalPath: "Sources/Box.swift", url: sourceURL)],
                 compilerURL: compilerURL,
-                callingSurfacePolicy: .managedDebugModule
+                callingSurfacePolicy: .managedDevelopmentModule
             )
         )
 
@@ -2938,7 +2938,7 @@ struct NativeImportDiscoveryTests {
         )
     }
 
-    @Test("Managed Debug lowers source property accessors through exact imports")
+    @Test("Managed development lowers source property accessors through exact imports")
     func lowersManagedStoredProperties() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "helix-managed-properties-\(UUID().uuidString)",
@@ -3015,7 +3015,7 @@ struct NativeImportDiscoveryTests {
                 configuration: configuration,
                 sources: [.init(logicalPath: "Sources/Counter.swift", url: sourceURL)],
                 compilerURL: compilerURL,
-                callingSurfacePolicy: .managedDebugModule
+                callingSurfacePolicy: .managedDevelopmentModule
             )
         )
         #expect(output.receipt.nativeImportCandidates.map(\.canonicalCallee).sorted() == [
@@ -3117,7 +3117,7 @@ struct NativeImportDiscoveryTests {
         )
     }
 
-    @Test("Managed Debug captures UIKit and Foundation call surfaces end to end")
+    @Test("Managed development captures UIKit and Foundation call surfaces end to end")
     func lowersImportedFrameworkOperations() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "helix-managed-uikit-reference-\(UUID().uuidString)",
@@ -3371,7 +3371,7 @@ struct NativeImportDiscoveryTests {
                 configuration: configuration,
                 sources: [.init(logicalPath: "Sources/Screen.swift", url: sourceURL)],
                 compilerURL: compilerURL,
-                callingSurfacePolicy: .managedDebugModule
+                callingSurfacePolicy: .managedDevelopmentModule
             )
         )
         let labelType = try #require(output.receipt.nativeTypes.first {
@@ -3822,7 +3822,7 @@ struct NativeImportDiscoveryTests {
         )
     }
 
-    @Test("Managed Debug keeps unused generic SDK overloads dormant")
+    @Test("Managed development keeps unused generic SDK overloads dormant")
     func preservesDormantGenericSDKOverloads() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "helix-managed-generic-overload-\(UUID().uuidString)",
@@ -3898,7 +3898,7 @@ struct NativeImportDiscoveryTests {
                     .init(logicalPath: "Constraints.swift", url: sourceURL),
                 ],
                 compilerURL: compilerURL,
-                callingSurfacePolicy: .managedDebugModule
+                callingSurfacePolicy: .managedDevelopmentModule
             )
         )
         let imports = output.receipt.nativeImportCandidates
@@ -3918,7 +3918,7 @@ struct NativeImportDiscoveryTests {
         })
     }
 
-    @Test("Managed Debug captures measured SDK members generically")
+    @Test("Managed native surface selects development and production SDK members")
     func capturesManagedSDKMembers() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "helix-managed-sdk-properties-\(UUID().uuidString)",
@@ -4111,7 +4111,7 @@ struct NativeImportDiscoveryTests {
         }
 
         var managedRequest = request
-        managedRequest.callingSurfacePolicy = .managedDebugModule
+        managedRequest.callingSurfacePolicy = .managedDevelopmentModule
         let managed = try FrontendReceipt.Adapter().generate(managedRequest)
         let managedNames = Set(
             managed.receipt.nativeImportCandidates.map(\.canonicalCallee)
@@ -4197,6 +4197,42 @@ struct NativeImportDiscoveryTests {
         )
         #expect(throwingRemoval.effects.mayThrow)
         #expect(throwingRemoval.contract.kind == .instanceMethod)
+
+        var productionRequest = request
+        productionRequest.callingSurfacePolicy = .managedProductionModule
+        let production = try FrontendReceipt.Adapter().generate(
+            productionRequest
+        )
+        let productionImports = production.receipt.nativeImportCandidates
+        #expect(
+            Set(productionImports.map(\.key))
+                == Set(managed.receipt.nativeImportCandidates.map(\.key))
+        )
+        #expect(productionImports.allSatisfy {
+            $0.isEmittedToDevice && $0.id != nil
+        })
+        let productionShell = try ShellBuild.Materializer().materialize(
+            receipt: production.receipt,
+            sourceRoot: directory
+        )
+        let productionManifest = productionShell.nativeCapabilityManifest
+        #expect(productionManifest.entries.count == productionImports.count)
+        #expect(
+            productionManifest.nativeCallKeys
+                == Set(productionImports.map(\.key))
+        )
+        #expect(
+            productionShell.report.nativeCapabilityManifestHash
+                == .sha256(productionShell.nativeCapabilityManifestBytes)
+        )
+        #expect(
+            productionShell.report.nativeCapabilityCount
+                == UInt32(productionImports.count)
+        )
+        #expect(
+            try productionShell.artifacts()["NativeCapabilities.json"]
+                == productionShell.nativeCapabilityManifestBytes
+        )
 
         let nativeTypes = Dictionary(uniqueKeysWithValues:
             managed.receipt.nativeTypes.map { ($0.canonicalName, $0) }

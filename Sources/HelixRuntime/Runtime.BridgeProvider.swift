@@ -37,8 +37,8 @@ public struct BridgeDescriptor: Hashable, Sendable {
     public var compatibility: Core.Compatibility
     /// Capabilities compiled into the generated Shell interface.
     public var capabilities: Set<Core.Capability>
-    /// Stable native-call capabilities registered by the generated Bridge.
-    public var nativeCallKeys: Set<Core.NativeCall.Key>
+    /// Exact native-call authority embedded in this code-signed Bridge.
+    public var nativeCapabilityManifest: Core.NativeCapability.Manifest
     /// Platform for which the Bridge archive was linked.
     public var platform: Platform
     /// Architecture for which the Bridge archive was linked.
@@ -64,7 +64,7 @@ public struct BridgeDescriptor: Hashable, Sendable {
         minimumOSVersion: Core.SemanticVersion,
         compatibility: Core.Compatibility,
         capabilities: Set<Core.Capability>,
-        nativeCallKeys: Set<Core.NativeCall.Key>,
+        nativeCapabilityManifest: Core.NativeCapability.Manifest,
         platform: Platform,
         architecture: String,
         xcodeBuild: String,
@@ -79,7 +79,7 @@ public struct BridgeDescriptor: Hashable, Sendable {
         self.minimumOSVersion = minimumOSVersion
         self.compatibility = compatibility
         self.capabilities = capabilities
-        self.nativeCallKeys = nativeCallKeys
+        self.nativeCapabilityManifest = nativeCapabilityManifest
         self.platform = platform
         self.architecture = architecture
         self.xcodeBuild = xcodeBuild
@@ -94,15 +94,61 @@ public struct BridgeDescriptor: Hashable, Sendable {
             bundleID, buildNumber, architecture, xcodeBuild, sdkBuild,
             compatibility.compilerFingerprint,
         ]
+        let manifest = nativeCapabilityManifest
+        do {
+            try manifest.validate()
+        } catch {
+            throw Runtime.BridgeProviderError.invalidDescriptor
+        }
+        let nativeCallKeys = manifest.nativeCallKeys
+        let manifestIdentity = manifest.identity
+        let normalizedTriple = manifestIdentity.targetTriple.lowercased()
         guard values.allSatisfy({
                   !$0.isEmpty && $0.utf8.count <= 4_096
                       && !$0.unicodeScalars.contains(where: { $0.value == 0 })
               }), ["arm64", "x86_64"].contains(architecture),
               nativeCallKeys.isEmpty
                 || capabilities.contains(.nativeImportsV1),
+              Set(manifest.capabilities) == capabilities,
+              manifestIdentity.bundleID == bundleID,
+              manifestIdentity.buildNumber == buildNumber,
+              manifestIdentity.shellNamespaceID == shellNamespaceID,
+              manifestIdentity.shellInterfaceHash == shellInterfaceHash,
+              manifestIdentity.minimumOSVersion == minimumOSVersion,
+              manifestIdentity.compatibility == compatibility,
+              manifestIdentity.xcodeBuild == xcodeBuild,
+              manifestIdentity.sdkBuild == sdkBuild,
+              normalizedTriple.hasPrefix(architecture.lowercased() + "-"),
+              Self.matches(platform: platform, targetTriple: normalizedTriple),
               runtimeImageIdentity == .current
         else {
             throw Runtime.BridgeProviderError.invalidDescriptor
+        }
+    }
+
+    /// Native-call keys derived from the manifest rather than duplicated state.
+    public var nativeCallKeys: Set<Core.NativeCall.Key> {
+        nativeCapabilityManifest.nativeCallKeys
+    }
+
+    /// Canonical digest signed into a patch target for this released App.
+    public func nativeCapabilityManifestHash() throws -> Core.Digest {
+        try nativeCapabilityManifest.contentHash()
+    }
+
+    private static func matches(
+        platform: Runtime.BridgeDescriptor.Platform,
+        targetTriple: String
+    ) -> Bool {
+        switch platform {
+        case .iOS:
+            targetTriple.contains("-apple-ios")
+                && !targetTriple.contains("simulator")
+        case .iOSSimulator:
+            targetTriple.contains("-apple-ios")
+                && targetTriple.contains("simulator")
+        case .macOS:
+            targetTriple.contains("-apple-macos")
         }
     }
 }
@@ -125,6 +171,7 @@ public final class BridgeProvider: @unchecked Sendable {
     private let runtimeFactory: RuntimeFactory
     private let shellFactory: ShellFactory
     private let installer: Installer
+    private let shellCache = Runtime.BridgeProvider.ShellCache()
 
     /// Creates a type-erased provider around generated Bridge closures.
     ///
@@ -155,16 +202,23 @@ public final class BridgeProvider: @unchecked Sendable {
         guard runtime.shellInterfaceHash == descriptor.shellInterfaceHash else {
             throw Runtime.BridgeProviderError.interfaceMismatch
         }
+        let shell = try resolvedShell()
+        try validate(shell: shell)
+        try runtime.validateNativeCapabilities(
+            against: descriptor.nativeCapabilityManifest,
+            shell: shell
+        )
         return runtime
     }
 
     /// Creates the frozen verifier interface and checks it against the descriptor.
     public func makeShellInterface() throws -> Verification.ShellInterface {
         try descriptor.validate()
-        let shell = try shellFactory()
+        let shell = try resolvedShell()
         guard shell.interfaceHash == descriptor.shellInterfaceHash else {
             throw Runtime.BridgeProviderError.interfaceMismatch
         }
+        try validate(shell: shell)
         return shell
     }
 
@@ -174,7 +228,53 @@ public final class BridgeProvider: @unchecked Sendable {
         guard runtime.shellInterfaceHash == descriptor.shellInterfaceHash else {
             throw Runtime.BridgeProviderError.interfaceMismatch
         }
+        let shell = try resolvedShell()
+        try validate(shell: shell)
+        try runtime.validateNativeCapabilities(
+            against: descriptor.nativeCapabilityManifest,
+            shell: shell
+        )
         try installer(runtime)
+    }
+
+    private func validate(shell: Verification.ShellInterface) throws {
+        let manifest = descriptor.nativeCapabilityManifest
+        guard shell.interfaceHash == manifest.identity.shellInterfaceHash,
+              shell.compatibility == manifest.identity.compatibility,
+              shell.capabilities == Set(manifest.capabilities),
+              shell.imports.count == manifest.entries.count,
+              manifest.entries.allSatisfy({ entry in
+                  guard let resolved = shell.imports[entry.id] else {
+                      return false
+                  }
+                  return resolved.key == entry.key
+                      && resolved.descriptor == entry.descriptor
+                      && resolved.contract == entry.contract
+                      && resolved.capability == entry.requiredCapability
+              })
+        else {
+            throw Runtime.NativeCapabilityError.shellMismatch
+        }
+    }
+
+    private func resolvedShell() throws -> Verification.ShellInterface {
+        try shellCache.resolve(shellFactory)
+    }
+
+    fileprivate final class ShellCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: Verification.ShellInterface?
+
+        func resolve(
+            _ factory: Runtime.BridgeProvider.ShellFactory
+        ) throws -> Verification.ShellInterface {
+            try lock.withLock {
+                if let value { return value }
+                let resolved = try factory()
+                value = resolved
+                return resolved
+            }
+        }
     }
 }
 

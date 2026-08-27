@@ -3,7 +3,8 @@
 [English](Incremental-Build-Facts.md)
 
 Helix 把“能覆盖多少原生 API”和“构建要花多少时间”分开处理。Prepare 仍然用当前
-Xcode 实际捕获的 Swift frontend 去证明完整调用面；只有所有语义输入完全一致时，
+Xcode 实际捕获的 Swift frontend 去证明本次构建已证明 imported native type 边界内
+的完整合格调用面；只有所有语义输入完全一致时，
 才复用之前已经证明过的结果。缓存命中只是省时间，不是新的权威来源，也不能凭空
 增加能力。
 
@@ -21,6 +22,7 @@ Xcode 实际捕获的 Swift frontend 去证明完整调用面；只有所有语�
 | Symbol graph | 已验证的 SDK 模块公开符号图 | 编译器指纹、SDK/frontend invocation、模块名 |
 | 单候选探测 | 某个候选最终测得的零个或多个操作 | 编译器指纹、变换流水线、SDK/frontend invocation、最低系统、规范化候选和边界类型 |
 | Hot Patch Prepare | 完整 Shell 目录和函数计数 | Prepare 精确输入，或输出中的路径、字节、权限、额外文件发生任何变化 |
+| Release 能力投影 | canonical schema 1 Native Capability Manifest 与 digest | Release/Shell identity、capability，以及所有 device-emitted Descriptor、Key、Contract 与 capability 的完整有序集合 |
 | Adapter Pack source | 按原生 module 分组的确定性 Swift Adapter | 编译器指纹、SDK/target/deployment、变换流水线、module、有序 imported module 集合与有序稳定调用 Key |
 | Adapter Pack object | 单个 module Pack 的已验证 Mach-O | Pack source identity，再加工具链、Xcode build、规范化编译参数、完整非 SDK compiler-input 快照和 module map |
 | 开发期 Adapter image | 只包含首次使用且缺失的 Swift Adapter body 的签名 Mach-O | compiler/Xcode/SDK identity、target/deployment/platform/architecture、依赖图、module、规范化语义参数与保留的链接参数、精确生成源码、有序 Descriptor/Key/type/contract 记录 |
@@ -107,7 +109,13 @@ object 分别缓存。稳定 application Bridge 编译时不包含一次性 Hub 
 application object、各 Pack object 做 relocatable link；Hot Patch 根本不生成 Hub
 contract source。
 
-受管 Debug 未使用候选只保留为 Receipt 数据，不会膨胀稳定 Bridge 或 Pack object。
+Hot Patch 使用受管生产策略：证明边界内所有合格候选都会标记为 device-emitted，并
+写入 canonical `NativeCapabilities.json`。生成 Bridge 会根据 Shell import 得到同一
+张表；Release audit 再把两份投影与 finalized archive 比对，把 digest 固定在
+`ReleaseBaseline.json`，后续补丁还会把它写入签名 target。因此 Prepare 缓存可以复用
+相同字节，却不能改变已发布 App 授权哪些调用。
+
+受管开发未使用候选只保留为 Receipt 数据，不会膨胀稳定 Bridge 或 Pack object。
 HLBC 构建完成后，Helix 会检查它真正使用的 import table。Objective-C 与受支持 C 的
 首次使用不需要生成机器码；只有新引用的 Swift Adapter Key 才会渲染成一份最小开发
 image。完全相同的请求在完整 Mach-O 校验后复用 owner-local cache。缓存仍只负责省时：
@@ -129,8 +137,8 @@ schema 1 构建性能报告会记录决策，但不会泄露完整路径或编�
 
 - `frontend_cache.module_hit_count`、`module_miss_count`、
   `module_repair_count`、`module_bypass_count`；
-- `managed_debug.symbol_graph_cache_hit_count`、`_miss_count`；
-- `managed_debug.probe_cache_hit_count`、`_miss_count`、
+- `managed_native.symbol_graph_cache_hit_count`、`_miss_count`；
+- `managed_native.probe_cache_hit_count`、`_miss_count`、
   `cached_rejection_count`；
 - `prepare.state_hit_count`、`state_miss_count`、复用/写入产物数和
   `noop_publication_count`；

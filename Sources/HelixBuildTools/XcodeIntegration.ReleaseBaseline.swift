@@ -22,6 +22,7 @@ public struct ReleaseBaseline: Codable, Hashable, Sendable {
     public var swiftCompilerFingerprint: String
     public var machOUUIDs: [UUID]
     public var shellInterfaceHash: Core.Digest
+    public var nativeCapabilityManifestSHA256: Core.Digest
     public var interfaceArchiveSHA256: Core.Digest
     public var executableSHA256: Core.Digest
     public var releaseAuditSHA256: Core.Digest
@@ -42,6 +43,7 @@ public struct ReleaseBaseline: Codable, Hashable, Sendable {
         swiftCompilerFingerprint: String,
         machOUUIDs: [UUID],
         shellInterfaceHash: Core.Digest,
+        nativeCapabilityManifestSHA256: Core.Digest,
         interfaceArchiveSHA256: Core.Digest,
         executableSHA256: Core.Digest,
         releaseAuditSHA256: Core.Digest,
@@ -61,6 +63,7 @@ public struct ReleaseBaseline: Codable, Hashable, Sendable {
         self.swiftCompilerFingerprint = swiftCompilerFingerprint
         self.machOUUIDs = machOUUIDs.sorted { $0.uuidString < $1.uuidString }
         self.shellInterfaceHash = shellInterfaceHash
+        self.nativeCapabilityManifestSHA256 = nativeCapabilityManifestSHA256
         self.interfaceArchiveSHA256 = interfaceArchiveSHA256
         self.executableSHA256 = executableSHA256
         self.releaseAuditSHA256 = releaseAuditSHA256

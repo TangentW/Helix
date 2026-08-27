@@ -5,10 +5,10 @@ import HelixCore
 import HelixInterface
 
 extension FrontendReceipt {
-enum ManagedDebugSurface {}
+enum ManagedNativeSurface {}
 }
 
-extension FrontendReceipt.ManagedDebugSurface {
+extension FrontendReceipt.ManagedNativeSurface {
     struct Expansion: Sendable {
         var importedTypes: [FrontendReceipt.Adapter.ImportedNativeType]
         var operations: [FrontendReceipt.Adapter.ImportedOperation]
@@ -233,7 +233,7 @@ extension FrontendReceipt.ManagedDebugSurface {
         candidates = Array(Set(candidates)).sorted(by: candidateOrdering)
         guard candidates.count <= 4_096 else {
             throw FrontendReceipt.Error.frontendFailed(
-                "managed Debug surface exceeds the 4096-operation audit bound"
+                "managed native surface exceeds the 4096-operation audit bound"
             )
         }
 
@@ -260,7 +260,7 @@ extension FrontendReceipt.ManagedDebugSurface {
 
     /// Resolves only the declaring modules needed by source-observed foreign
     /// declarations. It reuses the same content-addressed Symbol Graph cache
-    /// as Managed Debug, but does not nominate or compile API probes.
+    /// as managed native expansion, but does not nominate or compile API probes.
     static func resolveDeclarationModules(
         importedTypes: [FrontendReceipt.Adapter.ImportedNativeType],
         runtimeNames: Set<String>,
@@ -450,7 +450,7 @@ extension FrontendReceipt.ManagedDebugSurface {
         }
         guard let validatedDocument else {
             throw FrontendReceipt.Error.frontendFailed(
-                "managed Debug symbol graph cache was not validated"
+                "managed native symbol graph cache was not validated"
             )
         }
         return validatedDocument
@@ -468,7 +468,7 @@ extension FrontendReceipt.ManagedDebugSurface {
               try Core.CanonicalJSON.encode(payload) == data
         else {
             throw FrontendReceipt.Error.frontendFailed(
-                "managed Debug symbol graph cache payload is invalid"
+                "managed native symbol graph cache payload is invalid"
             )
         }
         try payload.document.validate(expectedModuleName: expectedModuleName)
@@ -995,7 +995,7 @@ extension FrontendReceipt.ManagedDebugSurface {
                 }
                 guard let validatedOperations else {
                     throw FrontendReceipt.Error.frontendFailed(
-                        "managed Debug probe cache was not validated"
+                        "managed native probe cache was not validated"
                     )
                 }
                 let cached = validatedOperations.map {
@@ -1049,7 +1049,7 @@ extension FrontendReceipt.ManagedDebugSurface {
             ) { encoded }
             guard let validatedOperations else {
                 throw FrontendReceipt.Error.frontendFailed(
-                    "managed Debug probe cache was not validated"
+                    "managed native probe cache was not validated"
                 )
             }
             operations += validatedOperations.map {
@@ -1146,7 +1146,7 @@ extension FrontendReceipt.ManagedDebugSurface {
         }
         guard invalidFacts.isEmpty else {
             throw FrontendReceipt.Error.frontendFailed(
-                "managed Debug probe cache payload is invalid for "
+                "managed native probe cache payload is invalid for "
                     + "\(candidate.moduleName).\(candidate.ownerType)."
                     + "\(candidate.memberName): "
                     + invalidFacts.joined(separator: ", ")
@@ -1289,13 +1289,13 @@ extension FrontendReceipt.ManagedDebugSurface {
         )
         defer { try? FileManager.default.removeItem(at: directory) }
 
-        let sourceURL = directory.appendingPathComponent("ManagedDebugSurface.swift")
+        let sourceURL = directory.appendingPathComponent("ManagedNativeSurface.swift")
         let source = renderSource(candidates)
         let contents = Data(source.utf8)
         metrics.generatedProbeSourceBytes += UInt64(contents.count)
         guard contents.count <= 8 * 1_024 * 1_024 else {
             throw FrontendReceipt.Error.frontendFailed(
-                "managed Debug probe source exceeds 8 MiB"
+                "managed native probe source exceeds 8 MiB"
             )
         }
         try contents.write(to: sourceURL, options: .atomic)
@@ -1314,7 +1314,7 @@ extension FrontendReceipt.ManagedDebugSurface {
         )
         let silFile = try CanonicalSIL.File(text: canonicalSIL)
         let state = FrontendReceipt.Adapter.SourceState(
-            logicalPath: "HelixManagedDebug/ManagedDebugSurface.swift",
+            logicalPath: "HelixManagedNative/ManagedNativeSurface.swift",
             url: sourceURL,
             contents: contents,
             contentHash: .sha256(contents)
@@ -1340,9 +1340,9 @@ extension FrontendReceipt.ManagedDebugSurface {
                 }
                 let name = FrontendReceipt.Adapter().baseName(in: item)
                 if let name,
-                   name.hasPrefix("helixManagedDebugSelector"),
+                   name.hasPrefix("helixManagedNativeSelector"),
                    let index = Int(name.dropFirst(
-                       "helixManagedDebugSelector".count
+                       "helixManagedNativeSelector".count
                    )),
                    candidates.indices.contains(index) {
                     propertySelectorsByCandidate[candidates[index], default: []]
@@ -1363,8 +1363,8 @@ extension FrontendReceipt.ManagedDebugSurface {
                 }
                 measuredItems.append(value)
                 guard let name,
-                      name.hasPrefix("helixManagedDebugProbe"),
-                      let index = Int(name.dropFirst("helixManagedDebugProbe".count)),
+                      name.hasPrefix("helixManagedNativeProbe"),
+                      let index = Int(name.dropFirst("helixManagedNativeProbe".count)),
                       candidates.indices.contains(index)
                 else { continue }
                 let candidate = candidates[index]
@@ -1601,7 +1601,7 @@ extension FrontendReceipt.ManagedDebugSurface {
         }
         let mutableReceiver = candidate.dispatch == .instanceValueSetter
             ? "\n    var mutableReceiver = receiver" : ""
-        return "\(isolation)private func helixManagedDebugProbe\(index)("
+        return "\(isolation)private func helixManagedNativeProbe\(index)("
             + "\(parameters.joined(separator: ", ")))\(throwing) {"
             + "\(mutableReceiver)\n    _ = \(tryPrefix)\(call)\n}"
     }
@@ -1627,7 +1627,7 @@ extension FrontendReceipt.ManagedDebugSurface {
         let owner = escapedNominalType(candidate.probeOwnerType)
         let member = escapedIdentifier(candidate.memberName)
         return [
-            "private func helixManagedDebugSelector\(index)() {\n"
+            "private func helixManagedNativeSelector\(index)() {\n"
                 + "    _ = #selector(\(accessor): \(owner).\(member))\n}"
         ]
     }

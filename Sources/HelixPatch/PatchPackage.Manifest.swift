@@ -35,6 +35,8 @@ public struct Target: Codable, Hashable, Sendable {
     public var machOUUID: UUID
     /// Exact callable interface hash of the target Shell.
     public var shellInterfaceHash: Core.Digest
+    /// Canonical native capability table embedded in the target App.
+    public var nativeCapabilityManifestHash: Core.Digest
     /// Target architecture.
     public var architecture: String
     /// Target Apple platform.
@@ -54,6 +56,7 @@ public struct Target: Codable, Hashable, Sendable {
         shellNamespaceID: Core.ShellNamespaceID,
         machOUUID: UUID,
         shellInterfaceHash: Core.Digest,
+        nativeCapabilityManifestHash: Core.Digest,
         architecture: String,
         platform: PatchPackage.Platform,
         minimumOSVersion: Core.SemanticVersion,
@@ -66,6 +69,7 @@ public struct Target: Codable, Hashable, Sendable {
         self.shellNamespaceID = shellNamespaceID
         self.machOUUID = machOUUID
         self.shellInterfaceHash = shellInterfaceHash
+        self.nativeCapabilityManifestHash = nativeCapabilityManifestHash
         self.architecture = architecture
         self.platform = platform
         self.minimumOSVersion = minimumOSVersion

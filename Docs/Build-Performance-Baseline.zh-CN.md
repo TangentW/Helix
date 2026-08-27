@@ -48,6 +48,10 @@ HelixGenerated/<profile>/BuildPerformance.patch.json
 | `bridge` 总计 | 4.692 s | — |
 | `bridge.compile_swift` | 4.645 s | Bridge 的 99.0% |
 
+表格保留了当时报告里的历史指标名。现在同一阶段名为
+`frontend.expand_managed_native_surface`，因为 Release 与开发共用实测调用面，只采用
+不同的发布策略。
+
 一个代表性的冷 Prepare 报告还给出了更细的调用量：
 
 - 1 次 UIKit symbol graph 提取耗时约 14.74 s；

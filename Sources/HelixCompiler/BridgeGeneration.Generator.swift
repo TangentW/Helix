@@ -4010,19 +4010,44 @@ public struct Generator: Sendable {
     private func renderPatchBuildContractFactory(
         archive: InterfaceArchive.Archive
     ) -> String {
-        let calls = archive.nativeImports.compactMap { record -> String? in
-            guard record.isEmittedToDevice, record.id != nil else { return nil }
-            return "Core.NativeCall.Key(rawValue: \(render(record.key.rawValue)))"
-        }.sorted()
-        let renderedCalls = renderGeneratedArray(
-            calls,
-            elementType: "Core.NativeCall.Key",
-            factoryName: "makePatchNativeCallKeys",
-            directIndentation: 24
-        )
         return """
-        \(renderedCalls.declarations.isEmpty
-            ? "" : renderedCalls.declarations + "\n\n")
+            public static func makeNativeCapabilityManifest(
+                from shell: Verification.ShellInterface
+            ) throws -> Core.NativeCapability.Manifest {
+                let manifest = Core.NativeCapability.Manifest(
+                    identity: .init(
+                        bundleID: \(quoted(archive.metadata.bundleID)),
+                        buildNumber: \(quoted(archive.metadata.buildNumber)),
+                        shellNamespaceID: Core.ShellNamespaceID(
+                            rawValue: \(render(archive.metadata.shellNamespaceID.rawValue))
+                        ),
+                        shellInterfaceHash: interfaceHash,
+                        targetTriple: \(quoted(archive.metadata.targetTriple)),
+                        minimumOSVersion: \(render(archive.metadata.minimumOS)),
+                        xcodeBuild: \(quoted(archive.metadata.xcodeBuild)),
+                        sdkBuild: \(quoted(archive.metadata.sdkBuild)),
+                        compatibility: \(render(archive.compatibility))
+                    ),
+                    capabilities: \(renderCapabilities(archive.capabilities)),
+                    entries: shell.imports.values.map { item in
+                        Core.NativeCapability.Entry(
+                            id: item.id,
+                            key: item.key,
+                            descriptor: item.descriptor,
+                            contract: item.contract,
+                            requiredCapability: item.capability
+                        )
+                    }
+                )
+                try manifest.validate()
+                return manifest
+            }
+
+            public static func makeNativeCapabilityManifest() throws
+                -> Core.NativeCapability.Manifest {
+                try makeNativeCapabilityManifest(from: makeShellInterface())
+            }
+
             public static func makePatchBuildContract() throws -> PatchRuntime.BuildContract {
                 try PatchRuntime.BuildContract(
                     bundleID: \(quoted(archive.metadata.bundleID)),
@@ -4034,7 +4059,7 @@ public struct Generator: Sendable {
                     minimumOSVersion: \(render(archive.metadata.minimumOS)),
                     compatibility: \(render(archive.compatibility)),
                     capabilities: \(renderCapabilities(archive.capabilities)),
-                    nativeCallKeys: Set(\(renderedCalls.expression)),
+                    nativeCapabilityManifest: try makeNativeCapabilityManifest(),
                     runtimeImageIdentity: .current
                 )
             }

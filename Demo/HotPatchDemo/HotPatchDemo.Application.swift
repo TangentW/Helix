@@ -1,77 +1,10 @@
-import HelixCore
-import HelixPatch
+import HelixAppIntegration
 import HotPatchFeature
 import UIKit
 
 enum HotPatchDemo {}
 
 extension HotPatchDemo {
-@MainActor
-final class RuntimeOwner {
-    let session: PatchRuntime.ApplicationSession
-
-    init() throws {
-        let rootURL = try Self.requiredResource(
-            name: "HelixTrustedRoot",
-            extension: "json"
-        )
-        let root = try JSONDecoder().decode(
-            PatchPackage.TrustedRoot.self,
-            from: Data(contentsOf: rootURL)
-        )
-        let applicationSupport = try FileManager.default.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-        session = try PatchRuntime.ApplicationSession(
-            installationID: Self.installationID(),
-            storeRootURL: applicationSupport.appendingPathComponent(
-                "HelixPatchStore",
-                isDirectory: true
-            ),
-            trustStore: PatchPackage.TrustStore(roots: [root]),
-            acceptancePolicy: .init(
-                acceptedDistributionPolicies: [.internalHLBC],
-                approvedDistributionPolicyIDs: ["helix-demo-only"]
-            ),
-            nowUnixSeconds: Self.currentUnixTime()
-        )
-    }
-
-    func markHealthy() throws {
-        try session.markHealthy(nowUnixSeconds: Self.currentUnixTime())
-    }
-
-    private static func requiredResource(
-        name: String,
-        extension pathExtension: String
-    ) throws -> URL {
-        guard let url = Bundle.main.url(
-            forResource: name,
-            withExtension: pathExtension
-        ) else {
-            throw CocoaError(.fileNoSuchFile)
-        }
-        return url
-    }
-
-    private static func installationID() -> String {
-        let key = "HelixDemoInstallationID"
-        if let existing = UserDefaults.standard.string(forKey: key) {
-            return existing
-        }
-        let value = UUID().uuidString
-        UserDefaults.standard.set(value, forKey: key)
-        return value
-    }
-
-    private static func currentUnixTime() -> Int64 {
-        Int64(Date().timeIntervalSince1970)
-    }
-}
-
 @MainActor
 final class ScreenViewController: UIViewController {
     private let session: PatchRuntime.ApplicationSession
@@ -228,7 +161,6 @@ final class ScreenViewController: UIViewController {
 @main
 @MainActor
 final class HotPatchDemoApplication: UIResponder, UIApplicationDelegate {
-    private var runtimeOwner: HotPatchDemo.RuntimeOwner?
     var window: UIWindow?
 
     func application(
@@ -236,14 +168,12 @@ final class HotPatchDemoApplication: UIResponder, UIApplicationDelegate {
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
     ) -> Bool {
         do {
-            let owner = try HotPatchDemo.RuntimeOwner()
+            let session = try AppIntegration.requirePatchSession()
             let window = UIWindow(frame: UIScreen.main.bounds)
             window.rootViewController = HotPatchDemo.ScreenViewController(
-                session: owner.session
+                session: session
             )
             window.makeKeyAndVisible()
-            try owner.markHealthy()
-            runtimeOwner = owner
             self.window = window
             return true
         } catch {

@@ -741,7 +741,7 @@ struct Application {
         #expect(livePerformance.workflow == .liveReload)
         #expect(livePerformance.outcome == .success)
         #expect(livePerformance.trace.counters.contains {
-            $0.name == "managed_debug.probe_attempt_count"
+            $0.name == "managed_native.probe_attempt_count"
         })
         #expect(livePerformance.trace.subprocesses.contains {
             $0.kind == .canonicalSIL && $0.invocationCount >= 2

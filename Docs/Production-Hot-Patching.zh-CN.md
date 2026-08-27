@@ -12,9 +12,11 @@ Hub 安装的 Release 流水线会：
 
 1. 从成功的 Xcode 构建自动捕获 Shell namespace、App 身份、编译器、SDK、target、源码 membership 和语义编译参数。
 2. 使用精确 Swift frontend 自动索引 eligible 声明与原生 adapter。
-3. 生成 Derived Sources，其中包含永久声明 Bridge、需要词法执行时按 hash 精确定位的源码 body wrapper，以及已证明的原生 invoker；手写源码保持不变，Shell 编译仅对 observer 与 async 入口使用 derived copy 变换。Prepare 会记录精确语义输入与输出 manifest；后续无变化构建只有在每个生成路径、字节和权限都仍然一致时，才会在 frontend 前直接返回。发生漂移时会回到已验证的内容寻址 frontend 流程，并自动修复产物。
+3. 生成 Derived Sources，其中包含永久声明 Bridge、需要词法执行时按 hash 精确定位的源码 body wrapper，以及已证明的原生 invoker；同时把本次构建已证明的 imported type 边界内、所有编译器验证合格的候选自动发布进生产 Native Capability Manifest，不需要项目维护 API 清单。手写源码保持不变，Shell 编译仅对 observer 与 async 入口使用 derived copy 变换。Prepare 会记录精确语义输入与输出 manifest；后续无变化构建只有在每个生成路径、字节和权限都仍然一致时，才会在 frontend 前直接返回。发生漂移时会回到已验证的内容寻址 frontend 流程，并自动修复产物。
 4. 链接生产安全的 `HelixAppIntegration` 与隐藏自动 bootstrap；业务源码无需 import 或启动 Runtime。
 5. 链接完成后用真实 Mach-O UUID finalize HLXI，并保留精确 Release 源码基线及工具链产物供以后构建补丁。
+
+bootstrap 在进程内只保留一个生产 session，普通业务代码仍不需要感知它。高级诊断或产品自有的补丁控制界面可以调用 `AppIntegration.requirePatchSession()`，同步加入同一个幂等 bootstrap；不能再创建第二个 `ApplicationSession`、Runtime 或 Bridge。
 
 App 内只保留紧凑的路由、类型和 NativeImport 表。完整私有源码上下文等敏感构建信息保留在服务端归档中。
 
@@ -48,7 +50,9 @@ HLBC 是版本化的强类型寄存器字节码，不是序列化 SIL。它把�
 
 Patch Compiler 会递归闭合当前 module 内可达的实现函数。因此，补丁可以在现有源码文件中新增普通顶层 helper 或 class 的 private 实例方法，并从发生变化的已归档 root 调用它；前提是完整具体签名和函数体都落在 HLBC 子集内。这类声明只存在于该不可变 bytecode image 中，不会创建新的 Shell Entry、原生符号、Swift metadata、selector，也不能被原生代码直接调用。Helix 会把 helper 的函数体计入 root 的传递实现指纹，所以即使 root 的调用点文字没有再变化，之后修改 helper 仍会产生不同 generation。
 
-Hub 会从成功构建自动发现 NativeImport，并展开成逐项 canonical Descriptor、稳定 Key 与执行 binding；设备端从不解释“全工程 wildcard”。显式列表只保留为底层 standalone compiler 输入。落在支持矩阵内的 Objective-C capability 共用一个 Descriptor 驱动的可执行调用器，不再携带 selector 专属 Swift wrapper；但 Release Shell 仍必须包含这条调用的精确 Descriptor 与 Key，本阶段尚未把整个已链接 Framework Catalog 投影成生产能力表。复杂 Swift overlay 继续使用精确生成的 Adapter。补丁中新增某个调用的前提是已发布 App 已经包含对应 capability，并且 policy 允许它的 effect。完整的版本 1 身份、Catalog 与信任边界规则见[原生调用身份与 Catalog](Native-Calls.zh-CN.md)。
+Hub 会从成功构建自动发现 NativeImport，并展开成逐项 canonical Descriptor、稳定 Key 与执行 binding。Release Prepare 发布 App frontend 已经证明的 imported native type 边界内全部合格 Catalog 候选，而不只发布 baseline 源码已经调用的项目；设备端从不解释“全工程 wildcard”。显式列表只保留为底层 standalone compiler 输入。这也不是整个 Framework 的运行时反射：边界外声明，或类型/ABI 无法表示的声明，不会进入能力表。
+
+落在支持矩阵内的 Objective-C capability 共用一个 Descriptor 驱动的可执行调用器，不携带 selector 专属 Swift wrapper；受支持的 C 调用共用有限 trampoline Invoker，并保留编译器绑定的精确地址；复杂 Swift overlay 继续使用精确生成的 Adapter Pack entry。补丁可以第一次调用已发布 schema 1 Native Capability Manifest 中的任意精确 entry，前提是 policy 允许其 effect；不存在的调用会明确诊断为需要正常发布新版 App。完整的版本 1 身份、Catalog 与信任边界规则见[原生调用身份与 Catalog](Native-Calls.zh-CN.md)。
 
 这种设计不依赖不稳定的 Swift 符号查找、metadata 猜测或万能 `dlsym` API。代价也很明确：要扩大补丁能调用的原生表面，通常需要重新发版。
 
@@ -60,7 +64,7 @@ Hub 会从成功构建自动发现 NativeImport，并展开成逐项 canonical D
 
 - Ed25519 root/leaf 证书模型与包签名验证；
 - 有界顺序下载和增量 SHA-256 校验；
-- bundle/build、Shell interface、Mach-O UUID、架构、系统范围、policy、signer、时间和 rollout 目标检查；
+- bundle/build、Shell interface、Mach-O UUID、架构、Native Capability Manifest hash、系统范围、policy、signer、时间和 rollout 目标检查；
 - canonical 且不可变的 verified package store；
 - campaign 单调 revision 与 anti-rollback 状态；
 - 基于 nonce 的激活 WAL；

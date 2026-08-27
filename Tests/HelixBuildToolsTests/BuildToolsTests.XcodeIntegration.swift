@@ -92,6 +92,7 @@ struct XcodeIntegrationContract {
                 UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!,
             ],
             shellInterfaceHash: .sha256("shell"),
+            nativeCapabilityManifestSHA256: .sha256("native-capabilities"),
             interfaceArchiveSHA256: .sha256("archive"),
             executableSHA256: .sha256("executable"),
             releaseAuditSHA256: .sha256("audit"),

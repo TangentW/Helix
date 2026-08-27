@@ -18,21 +18,57 @@ struct Metadata {
             seed: "patch-runtime-test"
         )
         let interfaceHash = Core.Digest.sha256("shell")
-        let callKey = Core.NativeCall.Key(rawValue: .sha256("fixture-native-call"))
+        let compatibility = Core.Compatibility(
+            runtime: Core.Versions.runtime,
+            bytecode: Core.Versions.bytecode,
+            interfaceArchive: Core.Versions.interfaceArchive,
+            compilerFingerprint: "test-toolchain"
+        )
+        let nativeContract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        let descriptor = try Core.NativeCall.Descriptor.swiftAdapter(
+            canonicalCallee: "Fixture.nativeValue()",
+            signature: .init(parameters: [], result: "Swift.Int"),
+            effects: .init(),
+            contract: nativeContract
+        )
+        let callKey = try Core.NativeCall.Key.derive(descriptor: descriptor)
+        let manifest = Core.NativeCapability.Manifest(
+            identity: .init(
+                bundleID: "dev.helix.patch-runtime",
+                buildNumber: "7",
+                shellNamespaceID: namespace,
+                shellInterfaceHash: interfaceHash,
+                targetTriple: "arm64-apple-ios15.0-simulator",
+                minimumOSVersion: .init(15),
+                xcodeBuild: "18A1",
+                sdkBuild: "22A1",
+                compatibility: compatibility
+            ),
+            capabilities: [.baselineV1, .nativeImportsV1],
+            entries: [
+                .init(
+                    id: .init(rawValue: 0),
+                    key: callKey,
+                    descriptor: descriptor,
+                    contract: nativeContract
+                ),
+            ]
+        )
         let contract = try PatchRuntime.BuildContract(
             bundleID: "dev.helix.patch-runtime",
             buildNumber: "7",
             shellNamespaceID: namespace,
             shellInterfaceHash: interfaceHash,
             minimumOSVersion: .init(15),
-            compatibility: .init(
-                runtime: .init(1),
-                bytecode: .init(1, 9),
-                interfaceArchive: .init(2, 3),
-                compilerFingerprint: "test-toolchain"
-            ),
+            compatibility: compatibility,
             capabilities: [.baselineV1, .nativeImportsV1],
-            nativeCallKeys: [callKey]
+            nativeCapabilityManifest: manifest
         )
         let process = try PatchRuntime.ProcessIdentity(
             bundleID: "dev.helix.patch-runtime",
@@ -48,6 +84,8 @@ struct Metadata {
         )
         #expect(target.machOUUID == process.executableUUID)
         #expect(target.shellInterfaceHash == interfaceHash)
+        let manifestHash = try manifest.contentHash()
+        #expect(target.nativeCapabilityManifestHash == manifestHash)
         #expect(contract.runtimePolicy().allowedNativeCalls == [callKey])
         #expect(contract.runtimePolicy().productionChannelEnabled)
         #expect(throws: PatchRuntime.Error.invalidBuildContract) {
@@ -59,7 +97,7 @@ struct Metadata {
                 minimumOSVersion: contract.minimumOSVersion,
                 compatibility: contract.compatibility,
                 capabilities: [.baselineV1],
-                nativeCallKeys: [callKey]
+                nativeCapabilityManifest: manifest
             )
         }
         #expect(throws: PatchRuntime.Error.invalidProcessIdentity(

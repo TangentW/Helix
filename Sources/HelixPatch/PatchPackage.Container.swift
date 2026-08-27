@@ -373,7 +373,8 @@ private enum ManifestSchema {
                 target,
                 allowed: [
                     "bundleID", "marketingVersion", "buildNumber", "shellNamespaceID", "machOUUID",
-                    "shellInterfaceHash", "architecture", "platform", "minimumOSVersion",
+                    "shellInterfaceHash", "nativeCapabilityManifestHash",
+                    "architecture", "platform", "minimumOSVersion",
                     "maximumTestedOSVersion", "compatibility",
                 ],
                 context: "target"

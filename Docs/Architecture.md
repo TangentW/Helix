@@ -69,7 +69,14 @@ Both workflows depend on stable, build-specific identities:
   `NativeImportID` is only the compact per-Shell/per-image dispatch slot. A
   patch carries both rather than embedding a process pointer or treating the
   compact slot as authority. See [Native call identity and catalog](Native-Calls.md).
-- A managed-Debug Build Receipt keeps baseline-used native bindings separate
+- A schema-1 `NativeCapability.Manifest` is the single production authority.
+  Release Prepare projects every compiler-qualified candidate in the imported-
+  native-type boundary proved by that build, generated Bridge code embeds the
+  same table, release audit pins its hash, and every signed patch target repeats
+  that hash. Runtime requires exact Manifest/Shell/Registry equality before
+  install and rechecks Objective-C or C device evidence without allowing the
+  immutable production Registry to grow.
+- A managed-development Build Receipt keeps baseline-used native bindings separate
   from dormant, data-only Catalog candidates. An authenticated first use assigns
   a deterministic session-local compact ID after the linked prefix without
   changing the Shell interface hash. Every generation and escaping callback
@@ -836,7 +843,9 @@ can enter the immutable store or become an active generation.
 The runtime already installed in the App contains the bytecode decoder,
 verifier, HLVM, bridge catalog, package trust chain, activation journal, crash
 guard, and rollback logic. A production patch cannot add a new native ability
-that was absent from that Shell.
+that was absent from that Shell's signed-hash-bound Native Capability Manifest.
+Patch Compiler rejects such a first use with a normal-App-release diagnostic;
+the device never attempts a dynamic fallback.
 
 See [Production Hot Patching](Production-Hot-Patching.md) for the full flow.
 

@@ -235,6 +235,154 @@ static Method helix_method(
     return class_getInstanceMethod(declaration_class, selector);
 }
 
+bool helix_runtime_objective_c_validate(
+    const char *declaration_class_name,
+    const char *dispatch_class_name,
+    const char *selector_name,
+    const char *lexical_superclass_name,
+    HelixRuntimeObjectiveCDispatch dispatch,
+    const char *const *parameter_encodings,
+    size_t parameter_count,
+    const char *result_encoding,
+    HelixRuntimeObjectiveCResult *result
+) {
+    if (result == NULL) {
+        return false;
+    }
+    memset(result, 0, sizeof(*result));
+    result->status = HelixRuntimeObjectiveCStatusInvalidInput;
+    if (declaration_class_name == NULL || selector_name == NULL
+        || result_encoding == NULL || parameter_count > 256
+        || (parameter_count > 0 && parameter_encodings == NULL)
+        || (dispatch != HelixRuntimeObjectiveCDispatchInstance
+            && dispatch != HelixRuntimeObjectiveCDispatchClass
+            && dispatch != HelixRuntimeObjectiveCDispatchInitializer)) {
+        helix_set_message(result, @"Objective-C ABI validation input is incomplete");
+        return false;
+    }
+
+    @autoreleasepool {
+        @try {
+            NSString *declaration_name = [NSString
+                stringWithUTF8String:declaration_class_name];
+            Class declaration_owner = declaration_name == nil
+                ? Nil : NSClassFromString(declaration_name);
+            if (declaration_owner == Nil) {
+                result->status = HelixRuntimeObjectiveCStatusClassUnavailable;
+                helix_set_message(result, @"cataloged Objective-C declaration class is unavailable");
+                return false;
+            }
+            Class dispatch_owner = Nil;
+            if (dispatch_class_name != NULL) {
+                NSString *dispatch_name = [NSString
+                    stringWithUTF8String:dispatch_class_name];
+                dispatch_owner = dispatch_name == nil
+                    ? Nil : NSClassFromString(dispatch_name);
+            }
+            bool needs_dispatch_owner = dispatch
+                == HelixRuntimeObjectiveCDispatchClass
+                || dispatch == HelixRuntimeObjectiveCDispatchInitializer;
+            if (needs_dispatch_owner
+                && (dispatch_owner == Nil
+                    || !helix_class_is_or_inherits_from(
+                        dispatch_owner,
+                        declaration_owner
+                    ))) {
+                result->status = HelixRuntimeObjectiveCStatusClassUnavailable;
+                helix_set_message(result, @"cataloged Objective-C dispatch class is unavailable or invalid");
+                return false;
+            }
+            if (!needs_dispatch_owner && dispatch_class_name != NULL) {
+                helix_set_message(result, @"instance dispatch cannot name a dispatch class");
+                return false;
+            }
+
+            Class declaration_class = declaration_owner;
+            if (lexical_superclass_name != NULL) {
+                NSString *super_name = [NSString
+                    stringWithUTF8String:lexical_superclass_name];
+                Class lexical_superclass = super_name == nil
+                    ? Nil : NSClassFromString(super_name);
+                if (lexical_superclass == Nil
+                    || !helix_class_is_or_inherits_from(
+                        lexical_superclass,
+                        declaration_owner
+                    )) {
+                    helix_set_message(result, @"cataloged lexical superclass is invalid");
+                    return false;
+                }
+                declaration_class = lexical_superclass;
+            }
+
+            SEL selector = sel_registerName(selector_name);
+            Method method = helix_method(
+                declaration_owner,
+                declaration_class,
+                selector,
+                dispatch
+            );
+            if (method == NULL) {
+                result->status = HelixRuntimeObjectiveCStatusSelectorUnavailable;
+                helix_set_message(result, @"cataloged Objective-C selector is unavailable");
+                return false;
+            }
+            const char *method_encoding = method_getTypeEncoding(method);
+            NSMethodSignature *signature = method_encoding == NULL
+                ? nil : helix_signature(method_encoding);
+            if (signature == nil
+                || signature.numberOfArguments != parameter_count + 2) {
+                result->status = HelixRuntimeObjectiveCStatusSignatureMismatch;
+                helix_set_message(result, @"Objective-C method arity disagrees with its catalog");
+                return false;
+            }
+            if (!helix_encoding_matches(
+                    result_encoding,
+                    signature.methodReturnType
+                )) {
+                result->status = HelixRuntimeObjectiveCStatusSignatureMismatch;
+                helix_set_message(result, @"Objective-C return encoding disagrees with its catalog");
+                return false;
+            }
+            for (size_t index = 0; index < parameter_count; index += 1) {
+                if (!helix_encoding_matches(
+                        parameter_encodings[index],
+                        [signature getArgumentTypeAtIndex:index + 2]
+                    )) {
+                    result->status = HelixRuntimeObjectiveCStatusSignatureMismatch;
+                    helix_set_message(result, @"Objective-C parameter encoding disagrees with its catalog");
+                    return false;
+                }
+            }
+            if (needs_dispatch_owner && lexical_superclass_name == NULL) {
+                Method dynamic_method = dispatch
+                    == HelixRuntimeObjectiveCDispatchClass
+                    ? class_getClassMethod(dispatch_owner, selector)
+                    : class_getInstanceMethod(dispatch_owner, selector);
+                const char *dynamic_encoding = dynamic_method == NULL
+                    ? NULL : method_getTypeEncoding(dynamic_method);
+                NSMethodSignature *dynamic_signature = dynamic_encoding == NULL
+                    ? nil : helix_signature(dynamic_encoding);
+                if (!helix_signatures_match(signature, dynamic_signature)) {
+                    result->status = HelixRuntimeObjectiveCStatusSignatureMismatch;
+                    helix_set_message(result, @"Objective-C dispatch ABI disagrees with its declaration");
+                    return false;
+                }
+            }
+            result->status = HelixRuntimeObjectiveCStatusSuccess;
+            return true;
+        } @catch (NSException *exception) {
+            result->status = HelixRuntimeObjectiveCStatusException;
+            helix_set_message(
+                result,
+                [NSString stringWithFormat:@"Objective-C exception %@: %@",
+                    helix_bounded_text(exception.name, 128, @"unknown"),
+                    helix_bounded_text(exception.reason, 768, @"no reason")]
+            );
+            return false;
+        }
+    }
+}
+
 bool helix_runtime_objective_c_invoke(
     const char *declaration_class_name,
     const char *dispatch_class_name,

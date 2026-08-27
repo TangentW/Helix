@@ -540,7 +540,7 @@ extension FrontendReceipt.Adapter {
         }.sorted(by: importedOperationOrdering)
     }
 
-    /// Managed Debug probes are additive. A generic SDK implementation may
+    /// Managed native probes are additive. A generic SDK implementation may
     /// reuse one SIL symbol for multiple concrete overlay types, which cannot
     /// be selected by symbol alone. Discard only those speculative references;
     /// source-observed operations remain authoritative and fail closed later.

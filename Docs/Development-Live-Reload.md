@@ -344,7 +344,7 @@ fails the save transaction with a full-build diagnostic. Cross-module
 public/package default changes also require a normal build because one module
 receipt cannot prove that every precompiled caller was replaced.
 
-A managed Debug Shell also audits public members for every module that
+A managed development Shell also audits public members for every module that
 contributes an imported native type proven by the current App build. Helix reads the symbol graph
 from the captured Swift toolchain and exact SDK. The extractor receives only
 the captured module-loading/search arguments it supports; source-only flags
@@ -413,10 +413,13 @@ Objective-C protocol parameter keeps the v1 `AnyObject` logical boundary
 identity while its physical descriptor retains the exact protocol existential.
 The generic invoker checks runtime conformance before dispatch, inside
 `MainActor` when the operation is actor-isolated. Plain `Any` and `AnyObject`
-are not inferred to be protocols. This bounded convenience surface is not
-added to production Shells and does not introduce a new boundary type by
-itself. Runtime lookup is restricted to the descriptor's exact class and
-selector; patch code cannot provide or compose either string.
+are not inferred to be protocols. Development keeps unused qualified candidates
+as data-only Receipt records and promotes them only when one save first uses
+them. Release uses the same measured surface with the managed production policy
+and emits every qualified candidate into its immutable Native Capability
+Manifest. Neither policy introduces a new boundary type by itself. Runtime
+lookup is restricted to the descriptor's exact class and selector; patch code
+cannot provide or compose either string.
 
 For a supported source `class` instance method, the hidden Bridge carries
 `self` as the build-captured reference `TypeID`. Generated `NativeTypeOperations` retain,

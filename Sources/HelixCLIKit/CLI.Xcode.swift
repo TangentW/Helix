@@ -510,6 +510,30 @@ private func auditXcodeProduct(
             label: "finalized HLXI"
         )
         let archive = try InterfaceArchive.Codec.decode(archiveBytes).archive
+        let capabilityManifestBytes = try readRegularFile(
+            context.environment.shellOutputURL.appendingPathComponent(
+                "NativeCapabilities.json"
+            ),
+            maximumBytes: 64 * 1_024 * 1_024,
+            label: "native capability manifest"
+        )
+        let capabilityManifest: Core.NativeCapability.Manifest
+        do {
+            capabilityManifest = try JSONDecoder().decode(
+                Core.NativeCapability.Manifest.self,
+                from: capabilityManifestBytes
+            )
+        } catch {
+            throw CLI.Error.input("cannot decode the native capability manifest")
+        }
+        guard try Core.CanonicalJSON.encode(capabilityManifest)
+                == capabilityManifestBytes,
+              try archive.nativeCapabilityManifest() == capabilityManifest
+        else {
+            throw CLI.Error.input(
+                "native capability manifest does not match the finalized Shell"
+            )
+        }
         let capture = try capturedXcodeFeature(context)
         try validateXcodeArchive(
             archive,
@@ -541,6 +565,9 @@ private func auditXcodeProduct(
             swiftCompilerFingerprint: archive.compatibility.compilerFingerprint,
             machOUUIDs: archive.metadata.machOUUIDs,
             shellInterfaceHash: archive.shellInterfaceHash,
+            nativeCapabilityManifestSHA256: .sha256(
+                capabilityManifestBytes
+            ),
             interfaceArchiveSHA256: .sha256(archiveBytes),
             executableSHA256: .sha256(executableBytes),
             releaseAuditSHA256: .sha256(reportBytes),
@@ -719,7 +746,9 @@ private func performBuildXcodePatch(
     }
     let output = profileRoot.appendingPathComponent("Current", isDirectory: true)
     let outputArtifacts = try performance.measure("patch.encode_artifacts") {
-        [
+        let nativeCapabilityManifest = try archive
+            .nativeCapabilityManifest()
+        return [
             "Patch.hlxp": artifact.packageBytes,
             "Patch.hlbc": artifact.compilation.bytecode,
             "Patch.disassembly": Data((artifact.compilation.disassembly + "\n").utf8),
@@ -728,6 +757,9 @@ private func performBuildXcodePatch(
             "ReleaseAudit.json": try Core.CanonicalJSON.encode(audit),
             "ReleaseBaseline.json": try XcodeIntegration.ReleaseBaselineCodec.encode(
                 baseline
+            ),
+            "NativeCapabilities.json": try Core.CanonicalJSON.encode(
+                nativeCapabilityManifest
             ),
         ]
     }
@@ -785,6 +817,9 @@ private func loadXcodeReleaseBaseline(
         label: "finalized HLXI"
     )
     let archive = try InterfaceArchive.Codec.decode(archiveBytes).archive
+    let nativeCapabilityManifestBytes = try Core.CanonicalJSON.encode(
+        archive.nativeCapabilityManifest()
+    )
     let capture = try capturedXcodeFeature(context)
     try validateXcodeArchive(
         archive,
@@ -827,6 +862,8 @@ private func loadXcodeReleaseBaseline(
           baseline.swiftCompilerFingerprint == archive.compatibility.compilerFingerprint,
           baseline.machOUUIDs == archive.metadata.machOUUIDs,
           baseline.shellInterfaceHash == archive.shellInterfaceHash,
+          baseline.nativeCapabilityManifestSHA256
+            == .sha256(nativeCapabilityManifestBytes),
           baseline.interfaceArchiveSHA256 == .sha256(archiveBytes),
           baseline.releaseAuditSHA256 == .sha256(auditBytes)
     else {
@@ -1382,8 +1419,8 @@ private func performPrepareXcodeShell(
         compilerURL: context.environment.compilerURL,
         nativeImportCatalog: .empty,
         callingSurfacePolicy: context.profile.workflow == .liveReload
-            ? .managedDebugModule
-            : .configured
+            ? .managedDevelopmentModule
+            : .managedProductionModule
     )
     let indexed = try performance.measure("prepare.frontend_receipt") {
         if let cache = xcodeBuildCacheStore() {

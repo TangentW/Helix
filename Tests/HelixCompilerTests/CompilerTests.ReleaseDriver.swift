@@ -1234,7 +1234,7 @@ struct ReleaseDriver {
         )
     }
 
-    @Test("A cataloged but non-emitted callee fails with an allowlist diagnostic")
+    @Test("A cataloged but unpublished callee requires a normal App release")
     func diagnosesNonEmittedNativeImport() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("helix-native-call-denied-\(UUID().uuidString)")
@@ -1273,8 +1273,8 @@ struct ReleaseDriver {
                 return
             }
             #expect(canonicalCallee == "ReleaseDriverFixture.helper(_:)")
-            #expect(reason.contains("nativeImports.allow"))
-            #expect(reason.contains("ship a new Shell"))
+            #expect(reason.contains("Native Capability Manifest"))
+            #expect(reason.contains("normal App release"))
         }
     }
 

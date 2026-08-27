@@ -116,6 +116,35 @@ struct Security {
         }
     }
 
+    @Test("Native capability manifest identity is signed and target-bound")
+    func nativeCapabilityIdentityIsAuthenticated() throws {
+        let fixture = try PatchFixture()
+        let package = try fixture.package(revision: 8)
+
+        var wrongRuntime = fixture.targetContext
+        wrongRuntime.nativeCapabilityManifestHash = .sha256(
+            "different-native-capability-manifest"
+        )
+        #expect(throws: PatchPackage.Error.targetMismatch) {
+            _ = try PatchPackage.Verifier().verify(
+                bytes: package.encoded(),
+                trustStore: fixture.trustStore,
+                targetContext: wrongRuntime,
+                acceptancePolicy: fixture.acceptancePolicy,
+                antiRollbackState: nil,
+                nowUnixSeconds: fixture.now
+            )
+        }
+
+        var tampered = package
+        tampered.manifest.targets[0].nativeCapabilityManifestHash = .sha256(
+            "tampered-native-capability-manifest"
+        )
+        #expect(throws: PatchPackage.Error.invalidPackageSignature) {
+            _ = try fixture.verify(tampered.encoded())
+        }
+    }
+
     @Test("Conflicting rollout lists are rejected before signing")
     func rejectsConflictingRolloutLists() throws {
         let fixture = try PatchFixture()
@@ -567,6 +596,7 @@ struct PatchFixture {
             shellNamespaceID: namespace,
             machOUUID: machOUUID,
             shellInterfaceHash: shellHash,
+            nativeCapabilityManifestHash: .sha256("fixture-native-capabilities"),
             architecture: "arm64",
             platform: .iOSSimulator,
             operatingSystemVersion: .init(18, 0, 0),
@@ -592,6 +622,8 @@ struct PatchFixture {
             shellNamespaceID: namespace,
             machOUUID: machOUUID,
             shellInterfaceHash: shellHash,
+            nativeCapabilityManifestHash:
+                targetContext.nativeCapabilityManifestHash,
             architecture: targetContext.architecture,
             platform: targetContext.platform,
             minimumOSVersion: .init(17, 0, 0),

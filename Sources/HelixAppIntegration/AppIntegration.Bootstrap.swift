@@ -28,6 +28,40 @@ public static var patchSession: PatchRuntime.ApplicationSession? {
     Bootstrap.patchSession
 }
 
+/// Returns the one process-wide production session retained by the automatic
+/// bootstrap. Normal applications do not call this method; it exists for
+/// advanced diagnostics and product-owned patch controls that need direct
+/// access without constructing a second Runtime or Bridge.
+@MainActor
+public static func requirePatchSession() throws -> PatchRuntime.ApplicationSession {
+    Bootstrap.start()
+    guard Bootstrap.status == .running,
+          let session = Bootstrap.patchSession
+    else {
+        if case let .failed(detail) = Bootstrap.status {
+            throw SessionAccessError.startupFailed(detail)
+        }
+        throw SessionAccessError.unavailable
+    }
+    return session
+}
+
+/// Failure to obtain the automatically retained production session.
+public enum SessionAccessError: Swift.Error, Equatable, Sendable,
+    CustomStringConvertible {
+    case unavailable
+    case startupFailed(String)
+
+    public var description: String {
+        switch self {
+        case .unavailable:
+            "the automatic Helix production session is unavailable"
+        case let .startupFailed(detail):
+            "automatic Helix startup failed: \(detail)"
+        }
+    }
+}
+
 }
 
 extension AppIntegration {
@@ -46,11 +80,13 @@ enum Bootstrap {
         guard status == .inactive else { return }
         do {
             let session = try makePatchSession()
-            patchSession = session
             try consumePendingPatch(using: session)
+            patchSession = session
             healthConfirmation = HealthConfirmation(session: session)
             status = .running
         } catch {
+            patchSession = nil
+            healthConfirmation = nil
             let detail = String(describing: error)
             status = .failed(detail)
             logger.error("Automatic Helix startup failed: \(detail, privacy: .public)")

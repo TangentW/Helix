@@ -93,6 +93,60 @@ struct Archive {
         #expect(try candidate.computeShellInterfaceHash() == original.shellInterfaceHash)
     }
 
+    @Test("Capability manifest includes emitted imports and excludes dormant candidates")
+    func projectsProductionNativeAuthority() throws {
+        var archive = try fixture()
+        let contract = Core.NativeImportContract.bounded(
+            kind: .globalFunction,
+            domain: .application,
+            access: .pure,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        func record(
+            _ name: String,
+            id: Core.NativeImportID?,
+            emitted: Bool
+        ) throws -> InterfaceArchive.NativeImportRecord {
+            let descriptor = try Core.NativeCall.Descriptor.swiftAdapter(
+                canonicalCallee: "Fixture.\(name)()",
+                signature: .init(parameters: [], result: "Swift.Int"),
+                effects: .init(),
+                contract: contract
+            )
+            return .init(
+                id: id,
+                key: try Core.NativeCall.Key.derive(descriptor: descriptor),
+                descriptor: descriptor,
+                silMangledNames: ["$s7Fixture\(name.count)\(name)SiyF"],
+                parameterTypes: [],
+                resultType: .int64,
+                contract: contract,
+                isEmittedToDevice: emitted
+            )
+        }
+        let emitted = try record(
+            "published",
+            id: .init(rawValue: 0),
+            emitted: true
+        )
+        let dormant = try record("candidate", id: nil, emitted: false)
+        archive.capabilities.append(.nativeImportsV1)
+        archive.nativeImports = [dormant, emitted]
+        archive.shellInterfaceHash = try archive.computeShellInterfaceHash()
+
+        let manifest = try archive.nativeCapabilityManifest()
+
+        #expect(manifest.identity.bundleID == archive.metadata.bundleID)
+        #expect(manifest.identity.shellInterfaceHash == archive.shellInterfaceHash)
+        #expect(manifest.entries.map(\.key) == [emitted.key])
+        #expect(manifest.entry(for: dormant.key) == nil)
+        #expect(
+            try manifest.contentHash()
+                == .sha256(Core.CanonicalJSON.encode(manifest))
+        )
+    }
+
     @Test("Frontend replay arguments cannot override outputs or load compiler code")
     func rejectsUnsafeFrontendArguments() throws {
         var archive = try fixture()

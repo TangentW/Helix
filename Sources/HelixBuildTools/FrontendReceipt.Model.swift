@@ -12,9 +12,18 @@ public enum CallingSurfacePolicy: String, Codable, Hashable, Sendable {
     /// Uses the exact NativeImport scope resolved for this build. Xcode
     /// integration creates it automatically; headless callers may supply one.
     case configured
-    /// Expands one Debug feature module into exact generated operations. The
-    /// archive still contains no wildcard and eligible Entries take priority.
-    case managedDebugModule
+    /// Expands one development feature module into exact catalog candidates.
+    /// Calls absent from the baseline stay dormant until a trusted session
+    /// requests the corresponding Adapter.
+    case managedDevelopmentModule
+    /// Expands one Release feature module and publishes every qualified
+    /// candidate as immutable production capability. No project allowlist is
+    /// consulted and no device-side registry growth is permitted.
+    case managedProductionModule
+
+    var expandsImportedModules: Bool {
+        self == .managedDevelopmentModule || self == .managedProductionModule
+    }
 }
 
 public struct Source: Hashable, Sendable {

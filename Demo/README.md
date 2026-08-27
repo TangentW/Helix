@@ -4,13 +4,15 @@
 
 - **Helix Hot Patch Demo** builds an audited Release Shell. Edit the marked
   delivery-fee function, then build **Helix Build Patch** to compile, sign, and
-  stage an HLXP without rebuilding or reinstalling the App.
+  stage an HLXP without rebuilding or reinstalling the App. Its product-owned
+  controls use the one process-wide session retained by the automatic bootstrap;
+  they never construct a second Runtime or Bridge.
 - **Helix Live Reload Demo** starts an authenticated Dev Session from the Xcode
   Run action. Edit the marked `viewDidLayoutSubviews` body and save; the running
   page refreshes in place while its counter state and process remain unchanged.
   Presentation values intentionally live in that re-entrant callback rather
   than one-shot hierarchy installation, so the visible test edit exercises the
-  same callback Helix invalidates after activation. The managed Debug Shell
+  same callback Helix invalidates after activation. The managed development Shell
   also measures the public synchronous SDK-member surface whose boundary types
   are representable, including concrete generic owners and supported callback
   parameters. Adding `view.backgroundColor = .black`, UIKit animation calls,

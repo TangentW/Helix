@@ -44,7 +44,8 @@ flowchart TB
 - `FunctionKey` 标识 Swift callable，并纳入 Helix 关心的 ABI 与 effect 信息。
 - `EntryIndex` 是生产 Bridge 使用的紧凑 Shell 路由。
 - `TypeID` 标识已捕获的类型操作；`NativeCallKey` 是 canonical 原生调用 Descriptor 的稳定、与项目无关的身份；`NativeImportID` 只是在单个 Shell 或 image 内使用的紧凑派发下标。Patch 会同时携带 Key 和下标，不保存进程地址，也不会把临时下标当成权限。详见[原生调用身份与 Catalog](Native-Calls.zh-CN.md)。
-- 受管 Debug Build Receipt 会把 baseline 已使用绑定与未使用、纯数据的 Catalog 候选分开。认证事务首次使用候选时，会在已链接前缀之后确定性分配 session-local 紧凑 ID，不改变 Shell interface hash。每个 generation 与 escaping callback 都固定一份不可变能力 snapshot，后续保存不能原地扩张它。
+- schema 1 `NativeCapability.Manifest` 是唯一的生产原生能力权威。Release Prepare 会投影本次构建已经证明的 imported native type 边界内全部编译器合格候选，生成 Bridge 嵌入同一张表，Release audit 固定其 hash，每个签名补丁 target 也重复绑定该 hash。Runtime 安装前要求 Manifest、Shell 与 Registry 完全一致，并重新检查 Objective-C 或 C 的设备证据；不可变生产 Registry 不能在发布后增长。
+- 受管开发 Build Receipt 会把 baseline 已使用绑定与未使用、纯数据的 Catalog 候选分开。认证事务首次使用候选时，会在已链接前缀之后确定性分配 session-local 紧凑 ID，不改变 Shell interface hash。每个 generation 与 escaping callback 都固定一份不可变能力 snapshot，后续保存不能原地扩张它。
 - 落在支持矩阵内的 Objective-C import 共用一个由 Descriptor 驱动的 Runtime 调用器，不再为每个 selector 生成一段 Swift 函数。编译器证据会分别固定声明 class 与类方法/initializer 的实际派发 class、精确 selector/property accessor identity、物理 ABI、Block 生命周期、method family 与错误约定；Objective-C shim 在 `NSInvocation` 前再次核对 class 继承关系、真实 method encoding 和 storage kind。无法安全表示的 Swift overlay 或 ABI shape 仍走精确生成的 Adapter。这是可复用执行机制，不是 wildcard selector 权限。
 - 编译器已经证明、且落在有限标量/Apple geometry ABI 矩阵内的 C function 共用一个 AOT Runtime Invoker。永久 Bridge binding 提供精确 imported declaration 的函数地址；开发期首次使用只能从当前已链接进程解析 Catalog Descriptor 固定的 entry point，下载代码不能选择 symbol 或 pointer。其余 Swift 声明使用生成边界上的类型擦除：baseline 已使用项按原生 module 归入确定性 Adapter Pack，未使用开发候选只在 HLBC 真正 import 时编译精确 body。两条路径的 source 与已验证 Mach-O object 都可独立缓存，不会暴露 Swift 私有泛型 ABI。
 - interface fingerprint 与传递 implementation fingerprint 用于区分函数体修改和 ABI、布局、源文件成员关系或依赖变化。
@@ -105,7 +106,7 @@ Async function root 出于不同原因复用同一套精确 range 源码 body �
 
 发生缺陷时，补丁构建器在归档环境中重新类型检查完整 module，确认只有 eligible implementation 发生变化，把当前支持的 canonical SIL 子集降成 HLBC，执行独立验证，再对补丁包签名。App 在产物进入不可变存储或激活为 generation 前会重新完成设备侧验证。
 
-随 App 安装的 Runtime 已包含字节码解码器、Verifier、HLVM、Bridge Catalog、包信任链、激活日志、Crash Guard 与回滚逻辑。生产补丁无法凭空新增 Shell 发布时不存在的原生能力。
+随 App 安装的 Runtime 已包含字节码解码器、Verifier、HLVM、Bridge Catalog、包信任链、激活日志、Crash Guard 与回滚逻辑。生产补丁无法凭空新增 Shell 的签名 hash 所绑定 Native Capability Manifest 中不存在的原生能力；Patch Compiler 会直接要求正常发布新版 App，设备端不会尝试动态兜底。
 
 完整流程见[生产热补丁](Production-Hot-Patching.zh-CN.md)。
 

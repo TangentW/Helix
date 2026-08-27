@@ -31,6 +31,7 @@ public struct Report: Codable, Hashable, Sendable {
     public var bytecodeSHA256: Core.Digest
     public var bytecodeByteLength: UInt64
     public var shellInterfaceHash: Core.Digest
+    public var nativeCapabilityManifestHash: Core.Digest
     public var toolchainFingerprint: String
     public var capabilities: [Core.Capability]
     public var changedFunctions: [ReleasePipeline.ChangedFunction]
@@ -45,6 +46,7 @@ public struct Report: Codable, Hashable, Sendable {
         bytecodeSHA256: Core.Digest,
         bytecodeByteLength: UInt64,
         shellInterfaceHash: Core.Digest,
+        nativeCapabilityManifestHash: Core.Digest,
         toolchainFingerprint: String,
         capabilities: [Core.Capability],
         changedFunctions: [ReleasePipeline.ChangedFunction],
@@ -58,6 +60,7 @@ public struct Report: Codable, Hashable, Sendable {
         self.bytecodeSHA256 = bytecodeSHA256
         self.bytecodeByteLength = bytecodeByteLength
         self.shellInterfaceHash = shellInterfaceHash
+        self.nativeCapabilityManifestHash = nativeCapabilityManifestHash
         self.toolchainFingerprint = toolchainFingerprint
         self.capabilities = capabilities
         self.changedFunctions = changedFunctions

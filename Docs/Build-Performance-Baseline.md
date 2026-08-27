@@ -42,6 +42,10 @@ The successful unchanged rebuild reported these Helix stages:
 | total `bridge` | 4.692 s | — |
 | `bridge.compile_swift` | 4.645 s | 99.0% of Bridge |
 
+The table preserves the metric name emitted by that historical run. The same
+stage is now named `frontend.expand_managed_native_surface` because Release and
+development use the shared measured surface with different publication policy.
+
 A representative cold Prepare trace exposed the call volume behind those totals:
 
 - one UIKit symbol-graph extraction took about 14.74 seconds;

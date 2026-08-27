@@ -28,8 +28,8 @@ public struct BuildContract: Hashable, Sendable {
     public var compatibility: Core.Compatibility
     /// HLBC capabilities accepted by the audited Shell.
     public var capabilities: Set<Core.Capability>
-    /// Stable native calls compiled and authorized in the Shell.
-    public var nativeCallKeys: Set<Core.NativeCall.Key>
+    /// Complete immutable native-call authority embedded in the Release App.
+    public var nativeCapabilityManifest: Core.NativeCapability.Manifest
     /// Runtime image ABI identity expected by this framework build.
     public var runtimeImageIdentity: Core.RuntimeImageIdentity
 
@@ -42,7 +42,7 @@ public struct BuildContract: Hashable, Sendable {
         minimumOSVersion: Core.SemanticVersion,
         compatibility: Core.Compatibility,
         capabilities: Set<Core.Capability>,
-        nativeCallKeys: Set<Core.NativeCall.Key>,
+        nativeCapabilityManifest: Core.NativeCapability.Manifest,
         runtimeImageIdentity: Core.RuntimeImageIdentity = .current
     ) throws {
         self.bundleID = bundleID
@@ -52,7 +52,7 @@ public struct BuildContract: Hashable, Sendable {
         self.minimumOSVersion = minimumOSVersion
         self.compatibility = compatibility
         self.capabilities = capabilities
-        self.nativeCallKeys = nativeCallKeys
+        self.nativeCapabilityManifest = nativeCapabilityManifest
         self.runtimeImageIdentity = runtimeImageIdentity
         try validate()
     }
@@ -68,19 +68,32 @@ public struct BuildContract: Hashable, Sendable {
             minimumOSVersion: descriptor.minimumOSVersion,
             compatibility: descriptor.compatibility,
             capabilities: descriptor.capabilities,
-            nativeCallKeys: descriptor.nativeCallKeys,
+            nativeCapabilityManifest: descriptor.nativeCapabilityManifest,
             runtimeImageIdentity: descriptor.runtimeImageIdentity
         )
     }
 
     /// Validates required identities before a Runtime graph is assembled.
     public func validate() throws {
+        do {
+            try nativeCapabilityManifest.validate()
+        } catch {
+            throw PatchRuntime.Error.invalidBuildContract
+        }
+        let identity = nativeCapabilityManifest.identity
         guard !bundleID.isEmpty, bundleID.utf8.count <= 4_096,
               !buildNumber.isEmpty, buildNumber.utf8.count <= 256,
               !bundleID.unicodeScalars.contains(where: { $0.value == 0 }),
               !buildNumber.unicodeScalars.contains(where: { $0.value == 0 }),
-              nativeCallKeys.isEmpty
+              nativeCapabilityManifest.nativeCallKeys.isEmpty
                 || capabilities.contains(.nativeImportsV1),
+              Set(nativeCapabilityManifest.capabilities) == capabilities,
+              identity.bundleID == bundleID,
+              identity.buildNumber == buildNumber,
+              identity.shellNamespaceID == shellNamespaceID,
+              identity.shellInterfaceHash == shellInterfaceHash,
+              identity.minimumOSVersion == minimumOSVersion,
+              identity.compatibility == compatibility,
               runtimeImageIdentity == .current
         else {
             throw PatchRuntime.Error.invalidBuildContract
@@ -97,10 +110,15 @@ public struct BuildContract: Hashable, Sendable {
         .init(
             acceptedCapabilities: capabilities,
             resourceCeiling: resourceCeiling,
-            allowedNativeCalls: nativeCallKeys,
+            allowedNativeCalls: nativeCapabilityManifest.nativeCallKeys,
             allowMainActorEntries: capabilities.contains(.mainActorIsolationV1),
             productionChannelEnabled: true
         )
+    }
+
+    /// Canonical identity included in each signed patch target.
+    public func nativeCapabilityManifestHash() throws -> Core.Digest {
+        try nativeCapabilityManifest.contentHash()
     }
 }
 

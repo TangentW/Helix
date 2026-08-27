@@ -43,6 +43,18 @@ struct ShellBuildPipeline {
         #expect(String(decoding: transformed, as: UTF8.self).contains("public dynamic func transform"))
         let artifacts = try output.artifacts()
         #expect(artifacts["Shell.provisional.hlxi"] == output.archiveBytes)
+        #expect(
+            artifacts["NativeCapabilities.json"]
+                == output.nativeCapabilityManifestBytes
+        )
+        #expect(
+            output.report.nativeCapabilityManifestHash
+                == .sha256(output.nativeCapabilityManifestBytes)
+        )
+        #expect(
+            output.report.nativeCapabilityCount
+                == UInt32(output.nativeCapabilityManifest.entries.count)
+        )
         #expect(artifacts["ReloadIndex.json"] == output.reloadIndexBytes)
         #expect(
             artifacts["DerivedSources/Sources/HelixGenerated.Patch.swift"] == transformed
@@ -54,6 +66,8 @@ struct ShellBuildPipeline {
             decoding: try #require(artifacts["Generated/FixtureBridge.swift"]),
             as: UTF8.self
         )
+        #expect(bridge.contains("makeNativeCapabilityManifest()"))
+        #expect(bridge.contains("from shell: Verification.ShellInterface"))
         #expect(bridge.contains("public static func makePatchBuildContract()"))
         #expect(bridge.contains("runtimeImageIdentity: .current"))
         #expect(bridge.contains("#elseif canImport(HelixAppIntegration)"))
@@ -66,9 +80,12 @@ struct ShellBuildPipeline {
         )
         #expect(provider.contains("@_cdecl(\"hlx_bridge_provider_v1\")"))
         #expect(provider.contains("Runtime.BridgeProvider"))
+        #expect(provider.contains("nativeCapabilityManifest:"))
+        #expect(provider.contains("makeNativeCapabilityManifest(from: shell)"))
         #expect(provider.contains(output.report.reloadIndexHash.hex))
         #expect(provider.contains("makeShellInterface: {"))
         #expect(provider.contains("try FixtureBridge.makeShellInterface()"))
+        #expect(provider.contains("makeShellInterface: {\n                    shell\n"))
         #expect(provider.contains("install: { runtime in"))
         #expect(provider.contains("try FixtureBridge.bootstrap(using: runtime)"))
         #expect(provider.contains("#elseif canImport(HelixAppIntegration)"))

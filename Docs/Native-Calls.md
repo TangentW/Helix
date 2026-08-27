@@ -6,7 +6,8 @@ The stable identity, catalog, archive, bytecode, verifier, generic Objective-C
 message invoker, restricted C invoker, and reusable Swift Adapter Packs
 described here are implemented. Catalog-backed on-demand development adapters
 are also implemented for authenticated Simulator and macOS Live Reload; signed
-Release capability projection remains a separate later stage.
+Release capability projection, package binding, and device-side validation are
+implemented as the production `NativeCapability.Manifest` path.
 
 ## Two IDs with different jobs
 
@@ -100,6 +101,43 @@ carry the stable key and, when the bytecode source map has one, the original
 Swift file, line, and column. Runtime logs no longer need a build-local integer
 to identify which API failed.
 
+## Release Native Capability Manifest
+
+Release Prepare uses the managed production calling-surface policy. It promotes
+every compiler-qualified Catalog candidate inside the imported-native-type
+boundary proved by that successful App build; the project does not maintain an
+API allowlist. Baseline-used and newly published candidates therefore share one
+canonical schema-1 `NativeCapability.Manifest`, with dense compact IDs and the
+exact key, descriptor, contract, and required capability for every entry.
+
+The boundary is intentionally evidence-based. It includes members of imported
+native types and concrete generic specializations already proved by the App
+frontend when their complete Bridge types and ABI are representable. It is not
+a wildcard over every declaration in every linked framework, and it does not
+invent new boundary types, open generic specializations, arbitrary selectors,
+C symbols, or Swift ABI calls. A patch may first-use any entry published in the
+released Manifest. If no exact entry exists, Patch Compiler reports that a
+normal App release is required.
+
+The generated Bridge reconstructs the same Manifest from its code-signed Shell
+table, while Prepare also emits canonical `NativeCapabilities.json` for audit.
+Release finalization compares that file with the finalized archive and pins its
+SHA-256 in the release baseline. Every signed patch target repeats the Manifest
+hash alongside the Shell interface hash and Mach-O UUID, so changing any entry
+or Release identity invalidates target verification.
+
+Before a production Runtime is installed, Helix requires the Manifest, Shell,
+and immutable synchronous/asynchronous registries to have exactly the same
+inventory and entry data. Objective-C entries then re-resolve the declared
+class, selector, dispatch target, arity, and complete runtime type encodings on
+the current device. C has no equivalent runtime signature metadata, so its
+preflight instead verifies the compiler-bound address, configured finite
+trampoline shape, availability, and policy; it never accepts a patch-provided
+pointer or signature. Successful device ABI evidence pins one Manifest hash per
+Runtime Engine and is reused thereafter; a different hash is rejected,
+structural equality is checked on every entry path, and failures are never
+cached.
+
 ## Generic Objective-C execution
 
 A compiler-proven Objective-C declaration whose logical and physical types fit
@@ -159,7 +197,7 @@ storage, and result length before decoding the result.
 This removes per-method executable Bridge code for supported Objective-C calls;
 it does not permit arbitrary selectors. Every executable call must still be an
 exact compiler-proved descriptor. The linked Shell keeps used imports in its
-compact baseline and the authenticated build receipt keeps unused managed-Debug
+compact baseline and the authenticated build receipt keeps unused managed-development
 candidates. On first use, the development compiler deterministically assigns a
 session-local slot after the linked prefix and the App constructs the same
 generic invoker from that descriptor. The Shell interface hash does not change.

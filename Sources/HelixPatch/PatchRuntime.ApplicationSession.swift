@@ -123,6 +123,10 @@ public final class ApplicationSession: @unchecked Sendable {
         else {
             throw PatchRuntime.Error.runtimeShellMismatch
         }
+        try runtime.validateNativeCapabilities(
+            against: build.nativeCapabilityManifest,
+            shell: shell
+        )
         try installBridge(runtime)
         guard Runtime.Bridge.shared.installedInterfaceHash == build.shellInterfaceHash else {
             throw PatchRuntime.Error.bridgeNotInstalled
@@ -316,6 +320,7 @@ public func targetContext(
         shellNamespaceID: shellNamespaceID,
         machOUUID: process.executableUUID,
         shellInterfaceHash: shellInterfaceHash,
+        nativeCapabilityManifestHash: try nativeCapabilityManifestHash(),
         architecture: process.architecture,
         platform: process.platform,
         operatingSystemVersion: process.operatingSystemVersion,

@@ -68,6 +68,20 @@ bool helix_runtime_objective_c_object_conforms_to_protocol(
     const char *protocol_name
 );
 
+/// Revalidates one cataloged declaration against the Objective-C metadata in
+/// the running OS before a production Runtime accepts its capability table.
+bool helix_runtime_objective_c_validate(
+    const char *declaration_class_name,
+    const char *dispatch_class_name,
+    const char *selector_name,
+    const char *lexical_superclass_name,
+    HelixRuntimeObjectiveCDispatch dispatch,
+    const char *const *parameter_encodings,
+    size_t parameter_count,
+    const char *result_encoding,
+    HelixRuntimeObjectiveCResult *result
+);
+
 /// Executes only the supplied, already-cataloged class/selector/signature.
 /// Object results are returned at +1 and must be consumed exactly once.
 bool helix_runtime_objective_c_invoke(

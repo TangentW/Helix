@@ -26,17 +26,19 @@ public struct BridgeProviderGenerator: Sendable {
 
     public func generate(
         archive: InterfaceArchive.Archive,
+        nativeCapabilityManifest: Core.NativeCapability.Manifest,
         reloadIndexHash: Core.Digest
     ) throws -> ShellBuild.BridgeProviderSource {
         try archive.validate()
+        try nativeCapabilityManifest.validate()
+        guard try archive.nativeCapabilityManifest()
+                == nativeCapabilityManifest
+        else {
+            throw ShellBuild.Error.nativeImportBindingMismatch
+        }
         let moduleName = archive.metadata.frontendInvocation.moduleName
         let bridgeType = "\(moduleName)Bridge"
         let target = try parseTarget(archive.metadata.targetTriple)
-        let calls = archive.nativeImports.compactMap { record -> String? in
-            guard record.isEmittedToDevice, record.id != nil else { return nil }
-            return "Core.NativeCall.Key(rawValue: try Core.Digest(hex: "
-                + "\(String(reflecting: record.key.rawValue.hex))))"
-        }.sorted()
         let capabilities = archive.capabilities.sorted().map {
             "Core.Capability(rawValue: \(String(reflecting: $0.rawValue)))"
         }
@@ -47,6 +49,7 @@ public struct BridgeProviderGenerator: Sendable {
         private enum HelixBridgeProviderStorage {
             static let provider: Runtime.BridgeProvider? = {
                 do {
+                    let shell = try \(bridgeType).makeShellInterface()
                     let descriptor = Runtime.BridgeDescriptor(
                         bundleID: \(String(reflecting: archive.metadata.bundleID)),
                         buildNumber: \(String(reflecting: archive.metadata.buildNumber)),
@@ -59,7 +62,8 @@ public struct BridgeProviderGenerator: Sendable {
                         minimumOSVersion: \(render(archive.metadata.minimumOS)),
                         compatibility: \(render(archive.compatibility)),
                         capabilities: Set(\(renderArray(capabilities))),
-                        nativeCallKeys: Set(\(renderArray(calls))),
+                        nativeCapabilityManifest: try \(bridgeType)
+                            .makeNativeCapabilityManifest(from: shell),
                         platform: .\(target.platformCase),
                         architecture: \(String(reflecting: target.architecture)),
                         xcodeBuild: \(String(reflecting: archive.metadata.xcodeBuild)),
@@ -79,7 +83,7 @@ public struct BridgeProviderGenerator: Sendable {
                             )
                         },
                         makeShellInterface: {
-                            try \(bridgeType).makeShellInterface()
+                            shell
                         },
                         install: { runtime in
                             try \(bridgeType).bootstrap(using: runtime)

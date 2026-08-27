@@ -183,7 +183,7 @@ public struct Adapter: Sendable {
             discoveredTypes: discoveredImportedTypes,
             operationTypes: importedOperationSurface.types
         )
-        if request.callingSurfacePolicy == .managedDebugModule {
+        if request.callingSurfacePolicy.expandsImportedModules {
             let observedDeclarationUSRs: Set<String> = Set(
                 importedOperationSurface.operations.compactMap {
                     operation in
@@ -204,9 +204,9 @@ public struct Adapter: Sendable {
                 }.flatMap { $0 }
             )
             let managedSurface = try performance.measure(
-                "frontend.expand_managed_debug_surface"
+                "frontend.expand_managed_native_surface"
             ) {
-                try FrontendReceipt.ManagedDebugSurface.expand(
+                try FrontendReceipt.ManagedNativeSurface.expand(
                     importedTypes: importedTypes,
                     minimumOS: request.metadata.minimumOS,
                     frontend: frontend,
@@ -219,55 +219,55 @@ public struct Adapter: Sendable {
                 )
             }
             performance.setCounter(
-                "managed_debug.imported_type_count",
+                "managed_native.imported_type_count",
                 value: UInt64(managedSurface.importedTypes.count)
             )
             performance.setCounter(
-                "managed_debug.measured_operation_count",
+                "managed_native.measured_operation_count",
                 value: UInt64(managedSurface.operations.count)
             )
             performance.setCounter(
-                "managed_debug.module_count",
+                "managed_native.module_count",
                 value: managedSurface.metrics.moduleCount
             )
             performance.setCounter(
-                "managed_debug.candidate_count",
+                "managed_native.candidate_count",
                 value: managedSurface.metrics.candidateCount
             )
             performance.setCounter(
-                "managed_debug.symbol_graph_cache_hit_count",
+                "managed_native.symbol_graph_cache_hit_count",
                 value: managedSurface.metrics.symbolGraphCacheHitCount
             )
             performance.setCounter(
-                "managed_debug.symbol_graph_cache_miss_count",
+                "managed_native.symbol_graph_cache_miss_count",
                 value: managedSurface.metrics.symbolGraphCacheMissCount
             )
             performance.setCounter(
-                "managed_debug.probe_cache_hit_count",
+                "managed_native.probe_cache_hit_count",
                 value: managedSurface.metrics.probeCacheHitCount
             )
             performance.setCounter(
-                "managed_debug.probe_cache_miss_count",
+                "managed_native.probe_cache_miss_count",
                 value: managedSurface.metrics.probeCacheMissCount
             )
             performance.setCounter(
-                "managed_debug.cached_rejection_count",
+                "managed_native.cached_rejection_count",
                 value: managedSurface.metrics.cachedRejectionCount
             )
             performance.setCounter(
-                "managed_debug.probe_attempt_count",
+                "managed_native.probe_attempt_count",
                 value: managedSurface.metrics.probeAttemptCount
             )
             performance.setCounter(
-                "managed_debug.failed_probe_count",
+                "managed_native.failed_probe_count",
                 value: managedSurface.metrics.failedProbeCount
             )
             performance.setCounter(
-                "managed_debug.rejected_singleton_count",
+                "managed_native.rejected_singleton_count",
                 value: managedSurface.metrics.rejectedSingletonCount
             )
             performance.setCounter(
-                "managed_debug.generated_probe_source_bytes",
+                "managed_native.generated_probe_source_bytes",
                 value: managedSurface.metrics.generatedProbeSourceBytes
             )
             importedTypes = managedSurface.importedTypes
@@ -298,7 +298,8 @@ public struct Adapter: Sendable {
             let measuredManagedOperations = managedSurface.operations.compactMap {
                 operation -> FrontendReceipt.Adapter.ImportedOperation? in
                 var operation = operation
-                operation.isEmittedToDevice = false
+                operation.isEmittedToDevice = request.callingSurfacePolicy
+                    == .managedProductionModule
                 operation.silReferences.removeAll(
                     where: observedCallbackSymbols.contains
                 )
@@ -341,7 +342,7 @@ public struct Adapter: Sendable {
                 let resolution = try performance.measure(
                     "frontend.resolve_native_declaration_modules"
                 ) {
-                    try FrontendReceipt.ManagedDebugSurface
+                    try FrontendReceipt.ManagedNativeSurface
                         .resolveDeclarationModules(
                             importedTypes: importedTypes,
                             runtimeNames: unresolvedRuntimeNames,
@@ -1115,10 +1116,10 @@ extension FrontendReceipt.Adapter {
         moduleName: String,
         sources: [FrontendReceipt.Source]
     ) throws -> PatchConfiguration.Document {
-        guard policy == .managedDebugModule else { return configuration }
+        guard policy.expandsImportedModules else { return configuration }
         guard var module = configuration.modules[moduleName] else {
             throw FrontendReceipt.Error.invalidRequest(
-                "managed Debug calling surface has no module configuration for \(moduleName)"
+                "managed native calling surface has no module configuration for \(moduleName)"
             )
         }
         var result = configuration

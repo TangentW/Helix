@@ -1,6 +1,6 @@
 # 原生调用身份与 Catalog
 
-本文记录 Helix 已实现的版本 1 原生调用基线：HLBC 要调用 App 中已有代码时，如何描述这次调用、如何确定稳定身份，以及每一层如何验证权限。稳定 Descriptor、Key、Catalog、Archive、Bytecode、Verifier、Objective-C 通用消息调用器、受限 C 调用器与可复用 Swift Adapter Pack 都已经落地；基于 Catalog 的开发期按需 Adapter 也已用于认证后的 Simulator/macOS Live Reload，签名 Release capability 投影仍属于后续阶段。
+本文记录 Helix 已实现的版本 1 原生调用基线：HLBC 要调用 App 中已有代码时，如何描述这次调用、如何确定稳定身份，以及每一层如何验证权限。稳定 Descriptor、Key、Catalog、Archive、Bytecode、Verifier、Objective-C 通用消息调用器、受限 C 调用器与可复用 Swift Adapter Pack 都已经落地；基于 Catalog 的开发期按需 Adapter 已用于认证后的 Simulator/macOS Live Reload，生产 `NativeCapability.Manifest`、签名补丁绑定与设备侧校验也已经落地。
 
 ## 两种 ID，各做一件事
 
@@ -51,6 +51,16 @@ Release Archive 保存完整 Descriptor 和 Contract；设备投影保留相同�
 
 重复下标和重复稳定 Key 都会被拒绝。诊断会携带稳定 Key；Source Map 可用时还会指出原始 Swift 文件、行和列。运行日志不再只能依赖某次构建临时分配的整数来定位 API。
 
+## Release Native Capability Manifest
+
+Release Prepare 使用受管生产调用面策略。它会把本次成功 App 构建已经证明的 imported native type 边界内，所有经编译器逐项验证合格的 Catalog 候选自动发布出去；项目不需要维护 API 白名单。baseline 已使用项和这批候选共同形成唯一的 schema 1 `NativeCapability.Manifest`，每条记录都有连续紧凑 ID、精确 Key、Descriptor、Contract 与 required capability。
+
+这个范围以编译证据为准：它覆盖 App frontend 已经证明、完整 Bridge 类型和 ABI 均可表示的 imported native type 成员，以及已证明的具体泛型 specialization。它不是“所有已链接 Framework 的任意声明”通配符，也不会凭空加入新的 boundary type、开放泛型 specialization、任意 selector、C symbol 或 Swift ABI 调用。补丁可以第一次使用已发布 Manifest 中的任意 entry；不存在完全一致的 entry 时，Patch Compiler 会直接说明需要正常发布新版 App。
+
+生成 Bridge 会根据代码签名保护的 Shell 表重建同一份 Manifest；Prepare 同时输出 canonical `NativeCapabilities.json` 供审计。Release finalize 会把它与最终 Archive 独立比对，并将 SHA-256 固定到 Release baseline。每个签名补丁 target 还会同时携带 Manifest hash、Shell interface hash 与 Mach-O UUID，所以能力内容或 Release 身份只要有一处变化，target 验证就会失败。
+
+生产 Runtime 安装前，Helix 要求 Manifest、Shell 以及不可变的同步/异步 Registry 在条目集合和条目内容上完全一致。Objective-C entry 还会在当前设备重新解析声明 class、selector、派发目标、参数个数与完整 runtime type encoding。C runtime 没有同等的签名反射能力，因此它会验证编译期绑定地址、有限 trampoline 配置、availability 与 policy，绝不接受补丁提供的 pointer 或 signature。设备 ABI 首次成功后会为该 Runtime Engine 固定唯一 Manifest hash 并复用证据；换成另一份 hash 会被拒绝，结构一致性每条入口仍会检查，失败也不会进入缓存。
+
 ## Objective-C 通用执行路径
 
 如果编译器已经证明一条 Objective-C 声明的逻辑类型和物理类型落在支持矩阵内，它会直接绑定到同一个 `Runtime.ObjectiveCInvoker`。Bridge Generator 只输出结构化 Descriptor，不再为每个 selector 生成一段 Swift wrapper。当前通用矩阵包括 Objective-C object/Optional object、精确位宽的整数和浮点数、`Bool`、常见 CoreGraphics/UIKit struct、属性、实例/类方法、initializer、受支持的 `NSError **` 导入，以及一组可复用的同步 Objective-C Block 形状。无法证明表示等价的 Swift value overlay 仍然走精确生成的 Swift Adapter。
@@ -66,7 +76,7 @@ Release Archive 保存完整 Descriptor 和 Contract；设备投影保留相同�
 
 Swift 层先把已经验证的 VM value 和 callback 权限投影成 ABI slot；一个很小的 Objective-C shim 再到 Catalog 指定的声明 class（或已固定的词法 superclass）上解析精确 selector，逐项比较运行时 type encoding 和 storage kind，并验证另行记录的 class 派发目标确实继承该声明 class，然后通过 `NSInvocation` 调用实际 receiver。这样既保留普通 Objective-C override 的动态派发，也不会让只存在于意外动态子类上的 selector 扩张 Catalog 权限。receiver 继承关系直接从 Objective-C runtime 的真实 class hierarchy 读取，不依赖可被对象重写的 `isKindOfClass:`；普通动态 override 的完整 ABI 也必须与目录声明一致后才能执行。属性调用直接使用编译器已经证明的 accessor selector，不要求系统运行时一定保留可选的 Objective-C property metadata；UIKit 等系统 Framework 即使裁掉这类元数据也能正常调用。Shim 还会捕获 Objective-C exception，处理 initializer 与 retained/autoreleased method family，并在一个明确的 ownership 边界把 object result 交回 Swift。Runtime 解码前会再次检查 receiver class、平台 availability、nilability、struct encoding/size/alignment、deadline、MainActor 入口、临时存储上限和返回长度。
 
-这条路径消除了受支持 Objective-C 调用的逐方法可执行 Bridge，但它绝不是任意 selector 入口：每次调用仍必须有编译器证明的精确 Descriptor。已链接 Shell 用紧凑 ID 保存实际使用项，认证 Build Receipt 则保存尚未使用的 managed-Debug 候选。开发代码第一次使用候选时，Compiler 会在已链接前缀之后确定性分配 session-local ID，App 再从 Descriptor 构造同一个通用 Invoker；Shell interface hash 不会变化。这种 Registry 增长只允许发生在认证开发事务中，生产环境仍只能使用随 Release 发布的能力投影。
+这条路径消除了受支持 Objective-C 调用的逐方法可执行 Bridge，但它绝不是任意 selector 入口：每次调用仍必须有编译器证明的精确 Descriptor。已链接 Shell 用紧凑 ID 保存实际使用项，认证 Build Receipt 则保存尚未使用的受管开发候选。开发代码第一次使用候选时，Compiler 会在已链接前缀之后确定性分配 session-local ID，App 再从 Descriptor 构造同一个通用 Invoker；Shell interface hash 不会变化。这种 Registry 增长只允许发生在认证开发事务中，生产环境仍只能使用随 Release 发布的能力 Manifest。
 
 ## 受限 C 通用调用路径
 

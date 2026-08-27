@@ -832,6 +832,7 @@ struct ReleasePipeline {
         let generatedBridge = try #require(bridge.sourceFiles["Generated/FixtureBridge.swift"])
         #expect(generatedBridge.contains(decoded.shellInterfaceHash.hex))
         #expect(generatedBridge.contains("makeShellInterface()"))
+        #expect(generatedBridge.contains("makeNativeCapabilityManifest()"))
         #expect(generatedBridge.contains("Verification.ResolvedEntry("))
         #expect(generatedBridge.contains("parameterConventions: [.owned]"))
         #expect(generatedBridge.contains("Verification.ResolvedNativeImport("))

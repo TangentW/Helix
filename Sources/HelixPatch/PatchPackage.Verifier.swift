@@ -22,6 +22,8 @@ public struct TargetContext: Sendable, Hashable {
     public var machOUUID: UUID
     /// Exact callable interface hash of the linked Shell.
     public var shellInterfaceHash: Core.Digest
+    /// Exact native capability manifest embedded in the linked App.
+    public var nativeCapabilityManifestHash: Core.Digest
     /// Running process architecture.
     public var architecture: String
     /// Running Apple platform.
@@ -41,6 +43,7 @@ public struct TargetContext: Sendable, Hashable {
         shellNamespaceID: Core.ShellNamespaceID,
         machOUUID: UUID,
         shellInterfaceHash: Core.Digest,
+        nativeCapabilityManifestHash: Core.Digest,
         architecture: String,
         platform: PatchPackage.Platform,
         operatingSystemVersion: Core.SemanticVersion,
@@ -53,6 +56,7 @@ public struct TargetContext: Sendable, Hashable {
         self.shellNamespaceID = shellNamespaceID
         self.machOUUID = machOUUID
         self.shellInterfaceHash = shellInterfaceHash
+        self.nativeCapabilityManifestHash = nativeCapabilityManifestHash
         self.architecture = architecture
         self.platform = platform
         self.operatingSystemVersion = operatingSystemVersion
@@ -347,6 +351,9 @@ public struct Verifier: Sendable {
               target.shellNamespaceID == context.shellNamespaceID,
               target.machOUUID == context.machOUUID,
               target.shellInterfaceHash.constantTimeEquals(context.shellInterfaceHash),
+              target.nativeCapabilityManifestHash.constantTimeEquals(
+                  context.nativeCapabilityManifestHash
+              ),
               target.architecture == context.architecture,
               target.platform == context.platform,
               context.operatingSystemVersion >= target.minimumOSVersion,

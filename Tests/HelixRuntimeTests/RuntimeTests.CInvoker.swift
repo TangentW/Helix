@@ -27,6 +27,7 @@ struct CInvoker {
             physicalParameters: [fixture.int64ABI, fixture.int64ABI],
             physicalResult: fixture.int64ABI
         )
+        try addition.invoker.validateRuntimeABI()
         #expect(try fixture.invoke(
             addition,
             arguments: [fixture.integer(19), fixture.integer(23)]

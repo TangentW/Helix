@@ -706,7 +706,7 @@ does not by itself certify a physical device or distribution channel.
   text, Optional, Array, Dictionary, and Set values, and every operation has a
   64 KiB output bound. No App catalog setup, generic metadata, witness table,
   new opcode, or contract version is required.
-- Managed Debug measurement of public members for every module contributing an
+- Managed native measurement of public members for every module contributing an
   imported native type proven by the current App build. The captured toolchain's symbol graph
   nominates minimum-OS-valid, nondeprecated APIs, and the same typed
   AST/canonical SIL pipeline records only unique, Bridge-compatible
@@ -727,10 +727,12 @@ does not by itself certify a physical device or distribution channel.
   exact scalar, common structure, property, initializer, supported
   `NSError **`, and reusable Block shapes take this route. Swift-only overlays
   or ABI shapes outside that matrix retain an exact generated Swift adapter.
-  A baseline-used adapter is grouped into a deterministic, separately cached
-  per-module Pack; an unused candidate remains data-only until a later HLBC
-  image actually imports it, at which point qualified Simulator/macOS Live
-  Reload compiles and caches only that exact body. A compiler-proven imported C
+  Development groups baseline-used adapters into deterministic, separately
+  cached per-module Packs; an unused candidate remains data-only until a later
+  HLBC image actually imports it, at which point qualified Simulator/macOS Live
+  Reload compiles and caches only that exact body. Release instead places every
+  qualified candidate and required Adapter Pack entry in its immutable Native
+  Capability Manifest. A compiler-proven imported C
   function uses the shared restricted C invoker when it fits the finite
   homogeneous-scalar or supported Apple-geometry AOT matrix. Baseline imports
   use a Bridge-bound declaration address; authenticated development first use
@@ -753,8 +755,8 @@ does not by itself certify a physical device or distribution channel.
   Objective-C protocol inputs retain the exact `AnyObject`
   ABI while the generated invoker decodes the exact existential type, inside
   MainActor isolation when required.
-  Production Shells do not receive this convenience surface, and it does not
-  introduce a new boundary type by itself.
+  Neither workflow lets this measured surface introduce a new boundary type by
+  itself.
 - Objective-C superclass dispatch and address-form Optional control flow when
   their exact native operations were generated for the App build. Same-type receiver casts are
   accepted only as aliases of one reference `TypeID`, and Optional payload takes
@@ -771,7 +773,7 @@ does not by itself certify a physical device or distribution channel.
 ### Synchronous closure capability matrix
 
 This matrix is the reviewed v1 closure baseline. Native rows still require an
-exact build-captured or managed-Debug-generated NativeImport whose full callable
+exact build-captured or managed-native-generated NativeImport whose full callable
 contract passes the checks above; the examples are illustrative, not an
 exhaustive API list.
 
@@ -893,9 +895,11 @@ exhaustive API list.
   function exists. The accompanying `NativeImportID` is only that Shell's
   compact dispatch slot. A production patch
   also cannot add a framework or use an SDK operation absent from the App after
-  that build was released. The broad managed-Debug surface above works because
-  a normal Debug build records exact candidate Descriptors; a session may
-  promote only those records and must still establish an executable binding.
+  that build was released. Managed development works because a normal Debug
+  build records exact candidate Descriptors; a session may promote only those
+  records and must still establish an executable binding. Managed production
+  publishes all qualified candidates from the same proved boundary in its
+  signed Native Capability Manifest; it cannot grow that immutable table later.
 
 ## Development Live Reload boundary
 
@@ -913,8 +917,8 @@ unsupported bytecode syntax or arbitrary native code.
 | Change an existing computed property or subscript | Supported for exact synchronous getter/setter roots when the receiver, parameters, result, effects, and body are representable. This includes `mutating get`, `nonmutating set`, static/class/global forms, source extensions, per-accessor access control, and normal/declared-error value writeback. Explicit `_read`/`_modify`, async, typed throws, availability-constrained or generic declarations/contexts, unnameable private nested receivers, and recursive Native accessor replacement remain fail-closed |
 | Change an existing stored-property `willSet` or `didSet` body | Directly declared synchronous global, eligible captured struct, and source reference-class observers are independently patchable through an exact hashed in-place wrapper in the derived source. Implicit/custom old/new-value names, baseline fallback, private same-file access, direct value-storage mutation, and transactional value-receiver writeback are preserved. Static/class, inherited, lazy/wrapped, weak/unowned/Objective-C, availability/generic, actor/global-actor, baseline-magic-literal, old/new-value ABI-shape changes, and direct self-property assignment from a reference observer fail closed; observer Native replacement is never emitted |
 | Use explicit `inout`, mutate an actor root, or change an existing native static/class method | One synchronous eligible Shell `inout` parameter is supported. Multiple/async regions remain rejected; actor executors and native metatype ABI are not implemented |
-| Call an existing private/internal/public declaration from that body | Supported only when it resolves to a same-image function, eligible Shell Entry, a linked exact NativeImport, or an exact managed-Debug receipt candidate that the authenticated transaction can bind |
-| First use a public SDK member in a managed Debug body | Supported automatically for a uniquely measured, nondeprecated synchronous initializer, instance/static method, or readable/writable property when every boundary type is representable and the declaration is valid at the App minimum OS. The normal Debug build records eligible unused calls as data-only candidates. On first actual import, supported Objective-C shapes use the shared invoker, supported C shapes use the restricted invoker with the Descriptor-fixed linked symbol, and a representable Swift/overlay shape compiles only its exact Adapter body on qualified Simulator/macOS. The resulting key receives a deterministic session-local ID and is transferred in one authenticated `DevelopmentPayload`; physical iOS requires a rebuild for a missing Swift Adapter. This includes a separately compiler-proven zero-argument `Type()` construction and members of a concrete SDK generic specialization already proven by the build; no project API list is edited. Other inherited implicit constructors, project-subclass constructors, and open/unspecialized generic owners do not expand the source boundary. Closure-bearing members require the exact synchronous, nonthrowing bridge-and-failure-value profile above; declaration-level `@escaping`/`@autoclosure` and inherited MainActor restrictions are preserved. Async SDK declarations, completion-handler conversion, unfamiliar error bridges, subscripts, unsupported actor hops, and unrepresentable signatures require a full build; suspending NativeImports currently come from exact project-source discovery or the lower-level explicit catalog |
+| Call an existing private/internal/public declaration from that body | Supported only when it resolves to a same-image function, eligible Shell Entry, a linked exact NativeImport, or an exact managed-development receipt candidate that the authenticated transaction can bind |
+| First use a public SDK member in a managed development body | Supported automatically for a uniquely measured, nondeprecated synchronous initializer, instance/static method, or readable/writable property when every boundary type is representable and the declaration is valid at the App minimum OS. The normal Debug build records eligible unused calls as data-only candidates. On first actual import, supported Objective-C shapes use the shared invoker, supported C shapes use the restricted invoker with the Descriptor-fixed linked symbol, and a representable Swift/overlay shape compiles only its exact Adapter body on qualified Simulator/macOS. The resulting key receives a deterministic session-local ID and is transferred in one authenticated `DevelopmentPayload`; physical iOS requires a rebuild for a missing Swift Adapter. This includes a separately compiler-proven zero-argument `Type()` construction and members of a concrete SDK generic specialization already proven by the build; no project API list is edited. Other inherited implicit constructors, project-subclass constructors, and open/unspecialized generic owners do not expand the source boundary. Closure-bearing members require the exact synchronous, nonthrowing bridge-and-failure-value profile above; declaration-level `@escaping`/`@autoclosure` and inherited MainActor restrictions are preserved. Async SDK declarations, completion-handler conversion, unfamiliar error bridges, subscripts, unsupported actor hops, and unrepresentable signatures require a full build; suspending NativeImports currently come from exact project-source discovery or the lower-level explicit catalog |
 | Add an ordinary top-level helper, private class instance method, or computed accessor in an existing source file | Supported when reachable from a changed root and its concrete signature/body fit HLBC; it remains private to that image |
 | Ordinary direct recursion | Resolves to the function in the same immutable HLBC image |
 | Deliberately call the previous generation from source | Not supported by HLBC; save/activate a restoring generation instead |

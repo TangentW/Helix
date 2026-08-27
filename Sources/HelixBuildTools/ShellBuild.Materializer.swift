@@ -10,7 +10,7 @@ public enum ShellBuild {
     /// native-call descriptor semantics change. This invalidates local build
     /// facts without changing a shipped protocol or schema version.
     public static let transformPipelineHash = Core.Digest.sha256(
-        "Helix.ShellBuild.DynamicSourceTransform.v1:declaration-groups:frozen-value-hooks:source-body-dispatch:async-original-thunks:native-call-descriptor-v1:objective-c-invoker:objective-c-lightweight-generic-erasure:c-invoker-main-actor-unqualified-reference:swift-adapter-pack-v1:development-native-candidate-emission:indexed-source-baseline-metadata:objective-c-declaration-qualified-sil:property-declaration-identity:exact-module-imports:separate-hub-contract-object"
+        "Helix.ShellBuild.DynamicSourceTransform.v1:declaration-groups:frozen-value-hooks:source-body-dispatch:async-original-thunks:native-call-descriptor-v1:objective-c-invoker:objective-c-lightweight-generic-erasure:c-invoker-main-actor-unqualified-reference:swift-adapter-pack-v1:development-native-candidate-emission:production-native-capability-manifest:indexed-source-baseline-metadata:objective-c-declaration-qualified-sil:property-declaration-identity:exact-module-imports:separate-hub-contract-object"
     )
 }
 
@@ -56,6 +56,8 @@ public struct Report: Codable, Hashable, Sendable {
     public var archiveDigest: Core.Digest
     public var archiveContainerHash: Core.Digest
     public var shellInterfaceHash: Core.Digest
+    public var nativeCapabilityManifestHash: Core.Digest
+    public var nativeCapabilityCount: UInt32
     public var sourceBaselineHash: Core.Digest
     public var reloadIndexHash: Core.Digest
     public var eligibleFunctionCount: UInt32
@@ -83,6 +85,8 @@ public struct AdapterPackReport: Codable, Hashable, Sendable {
 public struct Output: Sendable {
     public var archive: InterfaceArchive.Archive
     public var archiveBytes: Data
+    public var nativeCapabilityManifest: Core.NativeCapability.Manifest
+    public var nativeCapabilityManifestBytes: Data
     public var bridge: BridgeGeneration.Output
     public var transformedSources: [String: Data]
     public var reloadIndex: ReloadIndex.Document
@@ -93,6 +97,7 @@ public struct Output: Sendable {
     public func artifacts() throws -> [String: Data] {
         var result: [String: Data] = [
             "Shell.provisional.hlxi": archiveBytes,
+            "NativeCapabilities.json": nativeCapabilityManifestBytes,
             "ReloadIndex.json": reloadIndexBytes,
         ]
         for (path, source) in bridge.sourceFiles {
@@ -350,6 +355,11 @@ public struct Materializer: Sendable {
             rootsByMangledName: rootsByMangledName
         )
         let reloadIndexHash = try reloadIndex.contentHash()
+        let nativeCapabilityManifest = try indexed.archive
+            .nativeCapabilityManifest()
+        let nativeCapabilityManifestBytes = try Core.CanonicalJSON.encode(
+            nativeCapabilityManifest
+        )
         var bridge = try BridgeGeneration.Generator().generate(
             archive: indexed.archive,
             moduleName: indexed.archive.metadata.frontendInvocation.moduleName,
@@ -376,6 +386,7 @@ public struct Materializer: Sendable {
         }
         let provider = try ShellBuild.BridgeProviderGenerator().generate(
             archive: indexed.archive,
+            nativeCapabilityManifest: nativeCapabilityManifest,
             reloadIndexHash: reloadIndexHash
         )
         guard bridge.sourceFiles.updateValue(
@@ -442,6 +453,12 @@ public struct Materializer: Sendable {
             archiveDigest: try indexed.archive.archiveDigest(),
             archiveContainerHash: .sha256(archiveBytes),
             shellInterfaceHash: indexed.archive.shellInterfaceHash,
+            nativeCapabilityManifestHash: .sha256(
+                nativeCapabilityManifestBytes
+            ),
+            nativeCapabilityCount: UInt32(
+                nativeCapabilityManifest.entries.count
+            ),
             sourceBaselineHash: indexed.archive.metadata.sourceBaselineHash,
             reloadIndexHash: reloadIndexHash,
             eligibleFunctionCount: UInt32(indexed.eligibleCount),
@@ -465,6 +482,8 @@ public struct Materializer: Sendable {
         return .init(
             archive: indexed.archive,
             archiveBytes: archiveBytes,
+            nativeCapabilityManifest: nativeCapabilityManifest,
+            nativeCapabilityManifestBytes: nativeCapabilityManifestBytes,
             bridge: bridge,
             transformedSources: transformedSources,
             reloadIndex: reloadIndex,

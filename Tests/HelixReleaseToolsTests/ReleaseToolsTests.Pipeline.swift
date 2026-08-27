@@ -71,6 +71,12 @@ struct Pipeline {
         #expect(artifact.report.changedFunctions.count == 1)
         #expect(artifact.report.packageSHA256 == .sha256(artifact.packageBytes))
         #expect(artifact.report.bytecodeSHA256 == .sha256(artifact.compilation.bytecode))
+        let nativeCapabilityHash = try fixture.archive
+            .nativeCapabilityManifest().contentHash()
+        #expect(
+            artifact.report.nativeCapabilityManifestHash
+                == nativeCapabilityHash
+        )
         // CryptoKit may hedge Ed25519 signatures, so reproducibility applies to
         // the compiled payload and signed manifest rather than envelope bytes.
         #expect(rebuilt.compilation.bytecode == artifact.compilation.bytecode)
@@ -79,6 +85,10 @@ struct Pipeline {
 
         let decoded = try PatchPackage.Container.decode(artifact.packageBytes)
         #expect(decoded.manifest.payloads.count == 1)
+        #expect(
+            decoded.manifest.targets[0].nativeCapabilityManifestHash
+                == nativeCapabilityHash
+        )
         let payload = try #require(decoded.payloads[fixture.configuration.payloadPath])
         let bytecode = try Bytecode.Decoder.decode(payload)
         #expect(bytecode.module.entries.count == 1)
@@ -133,9 +143,8 @@ struct Pipeline {
             runtimePolicy: .init(
                 acceptedCapabilities: artifact.compilation.module.capabilities,
                 resourceCeiling: artifact.compilation.module.requestedResources,
-                allowedNativeCalls: Set(
-                    fixture.archive.nativeImports.filter(\.isEmittedToDevice).map(\.key)
-                ),
+                allowedNativeCalls: try fixture.archive
+                    .nativeCapabilityManifest().nativeCallKeys,
                 allowMainActorEntries: artifact.compilation.module.capabilities
                     .contains(.mainActorIsolationV1)
             ),
@@ -367,6 +376,8 @@ private struct Fixture {
             shellNamespaceID: archive.metadata.shellNamespaceID,
             machOUUID: machOUUID,
             shellInterfaceHash: archive.shellInterfaceHash,
+            nativeCapabilityManifestHash: try archive
+                .nativeCapabilityManifest().contentHash(),
             architecture: configuration.target.architecture,
             platform: configuration.target.platform,
             operatingSystemVersion: .init(17),
