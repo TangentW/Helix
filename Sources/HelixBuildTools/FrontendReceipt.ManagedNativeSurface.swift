@@ -127,6 +127,7 @@ extension FrontendReceipt.ManagedNativeSurface {
         var representation: FrontendReceipt.Adapter.ImportedNativeType.Representation
         var importedModules: [String]
         var objectiveCModuleName: String?
+        var objectiveCRuntimeName: String?
         var requiresMainActor: Bool
 
         init(_ type: FrontendReceipt.Adapter.ImportedNativeType) {
@@ -137,6 +138,7 @@ extension FrontendReceipt.ManagedNativeSurface {
             representation = type.representation
             importedModules = type.importedModules.sorted()
             objectiveCModuleName = type.objectiveCModuleName
+            objectiveCRuntimeName = type.objectiveCRuntimeName
             requiresMainActor = type.requiresMainActor
         }
     }
@@ -616,6 +618,10 @@ extension FrontendReceipt.ManagedNativeSurface {
         result.requiresMainActor = surface.requiresMainActor
         if surface.runtimeName != nil {
             result.objectiveCModuleName = surface.moduleName
+        }
+        if result.kind == .reference,
+           surface.preciseIdentifier.hasPrefix("c:objc(cs)") {
+            result.objectiveCRuntimeName = surface.runtimeName
         }
         // An unspecialized generic SDK spelling is not an alias of any one
         // concrete frozen specialization. Adding it to every specialization

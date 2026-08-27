@@ -112,7 +112,7 @@ Swift 失败 helper 也在同一边界归一化。当前 frontend 为 `precondit
 
 symbol graph 中 `UIViewController.view: UIView!` 这类隐式解包 Optional 仍是合法探针语法，会由 frontend 测成精确 Optional ABI，不会在编译前被丢弃。
 
-对于受支持的源码 `class` 实例方法，隐藏 Bridge 会把 `self` 作为当前构建捕获的引用 `TypeID` 传入。生成的 `NativeTypeOperations` 负责 retain、identity 与类型验证，不把进程指针写进 HLBC。这条路径解决了 class method receiver；具体属性或方法操作仍必须拥有受支持的 Shell Entry 或精确 NativeImport。上面的实测成员路径会为已经证明的形状提供这种精确 import。async 或 generic SDK 成员、超出精确同步 callback profile 的带 closure 成员、subscript、actor executor hop，以及超出当前 Bridge 可表示类型面的参数/结果都不会被猜测模拟，当前需要正常构建。本阶段的 suspending NativeImport 来自精确的项目源码发现或显式 catalog；受管 SDK 测量路径不会推断 async 声明，也不会把 completion handler 自动转换为 async。
+对于受支持的源码 `class` 实例方法，隐藏 Bridge 会把 `self` 作为当前构建捕获的引用 `TypeID` 传入。项目 class 使用静态生成的 TypeOps；Compiler 已证明的 Objective-C class 则使用共享的数据驱动 TypeOps。两者都负责 retain、identity 与类型验证，不把进程指针写进 HLBC。这条路径解决了 class method receiver；具体属性或方法操作仍必须拥有受支持的 Shell Entry 或精确 NativeImport。上面的实测成员路径会为已经证明的形状提供这种精确 import。async 或 generic SDK 成员、超出精确同步 callback profile 的带 closure 成员、subscript、actor executor hop，以及超出当前 Bridge 可表示类型面的参数/结果都不会被猜测模拟，当前需要正常构建。本阶段的 suspending NativeImport 来自精确的项目源码发现或显式 catalog；受管 SDK 测量路径不会推断 async 声明，也不会把 completion handler 自动转换为 async。
 
 Swift SIL 通常把 class receiver 写成 `@guaranteed self`。每个已记录的 Entry 或 NativeImport descriptor 会分别记录值以 owned 还是 borrowed 方式跨越边界。Helix 保留物理 SIL convention 来验证调用：borrowed→borrowed 直接传递，borrowed→owned 才插入一次强类型 VM copy；owned 物理值不能满足 borrowed 边界，否则会抹掉源码层的 consume。同 image 的局部调用仍要求 ownership ABI 完全一致。这样既不会因无害的 borrow spelling 错误拒绝 private 实例 helper，也没有放宽类型、effect、address 或 capability 检查。
 

@@ -181,6 +181,9 @@ public struct TypeRecord: Codable, Hashable, Sendable {
     public var swiftTypeAliases: [String]
     public var kind: InterfaceArchive.TypeKind
     public var layoutFingerprint: Core.Digest
+    /// Exact Objective-C runtime class identity for data-driven reference
+    /// TypeOps. Nil means the Shell must provide a statically typed factory.
+    public var objectiveCRuntimeName: String?
     public var isCopyable: Bool
     public var requiresMainActor: Bool
     public var isEmittedToDevice: Bool
@@ -192,6 +195,7 @@ public struct TypeRecord: Codable, Hashable, Sendable {
         swiftTypeAliases: [String] = [],
         kind: InterfaceArchive.TypeKind,
         layoutFingerprint: Core.Digest,
+        objectiveCRuntimeName: String? = nil,
         isCopyable: Bool,
         requiresMainActor: Bool = false,
         isEmittedToDevice: Bool,
@@ -202,6 +206,7 @@ public struct TypeRecord: Codable, Hashable, Sendable {
         self.swiftTypeAliases = swiftTypeAliases
         self.kind = kind
         self.layoutFingerprint = layoutFingerprint
+        self.objectiveCRuntimeName = objectiveCRuntimeName
         self.isCopyable = isCopyable
         self.requiresMainActor = requiresMainActor
         self.isEmittedToDevice = isEmittedToDevice
@@ -756,6 +761,14 @@ public struct Archive: Codable, Hashable, Sendable {
                   type.swiftTypeAliases.allSatisfy(
                       Self.isValidNativeTypeAlias
                   ),
+                  type.objectiveCRuntimeName.map(
+                      Core.NativeCall.isCanonicalObjectiveCRuntimeClassName
+                  ) ?? true,
+                  type.objectiveCRuntimeName == nil || (
+                      type.kind == .reference
+                          && type.isCopyable
+                          && type.estimatedSize > 0
+                  ),
                   Core.TypeID.derive(
                       namespace: metadata.shellNamespaceID,
                       canonicalType: type.canonicalName
@@ -1042,6 +1055,7 @@ public struct Archive: Codable, Hashable, Sendable {
                     canonicalName: type.canonicalName,
                     kind: type.kind,
                     layoutFingerprint: type.layoutFingerprint,
+                    objectiveCRuntimeName: type.objectiveCRuntimeName,
                     isCopyable: type.isCopyable,
                     requiresMainActor: type.requiresMainActor,
                     estimatedSize: type.estimatedSize
@@ -1111,6 +1125,7 @@ private struct DeviceType: Codable {
     var canonicalName: String
     var kind: InterfaceArchive.TypeKind
     var layoutFingerprint: Core.Digest
+    var objectiveCRuntimeName: String?
     var isCopyable: Bool
     var requiresMainActor: Bool
     var estimatedSize: UInt64

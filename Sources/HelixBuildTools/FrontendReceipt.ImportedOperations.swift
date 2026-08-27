@@ -3547,6 +3547,7 @@ extension FrontendReceipt.Adapter {
                 representation: .reference,
                 source: source,
                 importedModules: importedModules,
+                objectiveCRuntimeName: runtimeName,
                 requiresMainActor: requiresMainActor
             )
         }()
@@ -3578,6 +3579,7 @@ extension FrontendReceipt.Adapter {
                     representation: .reference,
                     source: source,
                     importedModules: importedModules,
+                    objectiveCRuntimeName: name,
                     requiresMainActor: requiresMainActor
                 )
             )

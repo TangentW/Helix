@@ -2134,6 +2134,36 @@ struct Interpreter {
         #expect(opaqueCopy.value(as: NonHashableValue.self)?.values == [4, 5])
     }
 
+    @Test("Data-driven Objective-C TypeOps preserve identity and reject bridging")
+    func objectiveCReferenceTypeOperations() throws {
+        let typeID = Core.TypeID.derive(
+            namespace: namespace(),
+            canonicalType: "Foundation.NSString"
+        )
+        let operations = VM.NativeTypeOperations.objectiveCReference(
+            id: typeID,
+            canonicalName: "Foundation.NSString",
+            layoutFingerprint: .sha256("Foundation.NSString.reference.v1"),
+            referenceClass: NSString.self,
+            accepts: { $0 is NSString }
+        )
+        let string = NSMutableString(string: "shared")
+        let boxed = try operations.box(string)
+        let copied = try operations.copy(boxed)
+        let copiedString: NSMutableString? = copied.value()
+
+        #expect(boxed == copied)
+        #expect(copiedString === string)
+        #expect(operations.referenceClass?.metatype === NSString.self)
+        #expect(throws: VM.RuntimeTrap.self) {
+            _ = try operations.box(NSObject())
+        }
+        #expect(throws: VM.RuntimeTrap.self) {
+            // Swift values must not enter through implicit AnyObject bridging.
+            _ = try operations.box(42)
+        }
+    }
+
     @Test("MainActor native TypeOps reject background boxing")
     func mainActorNativeTypeRejectsBackgroundAccess() async {
         let typeID = Core.TypeID.derive(

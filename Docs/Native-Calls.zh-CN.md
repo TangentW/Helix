@@ -69,6 +69,8 @@ Release Prepare 使用受管生产调用面策略。它会把本次成功 App �
 
 Runtime 注册时会遍历已经验证的 Shell 文档，通过唯一一处数据驱动构造点建立全部 Objective-C invoker；生成源码里不再为每个 selector 重复一份 `ResolvedNativeImport` 或 `ObjectiveCInvoker` 表达式。显式 factory 也只允许用于 builtin 或精确 Swift Adapter backend，Objective-C/C Descriptor 不能借 factory 绕过各自的通用 ABI 校验路径。
 
+imported Objective-C reference type 现在也遵循同一原则。Compiler 会把精确 runtime class name 写进 native type row，并让它参与 Shell hash；Bridge 启动时由唯一 helper 把全部这类数据行变成 checked TypeOps，每次装箱都只有在 Objective-C 继承元数据确认对象属于该 class 时才通过。这样无需为每个 class 生成一份泛型 Swift factory，同时不会把 Clang enum/struct、protocol existential、Swift value overlay 或项目 class 误当成动态 Objective-C reference。
+
 模块归属不会根据 `UI`/`NS` 前缀或 class 所在模块猜测。普通方法和属性会用精确 Clang USR 查询已导入模块索引，因此 category 可以属于另一个 Framework；继承 initializer 则以 Swift 构造表达式的具体 class 模块为准，实际分配该具体类型，而不是错误地分配 `init` 声明所在的 superclass。归属不唯一时继续走 Swift Adapter。
 
 自定义 Objective-C 属性 accessor 还必须通过编译器 `#selector` 探针恢复精确 getter 或 setter，不能从 Swift 源码名称猜 selector。Descriptor 会把“API 声明 class”和“类消息/初始化实际派发 class”分开记录。例如，继承来的 `UIButton.setAnimationsEnabled` 以 `UIView` 声明做权限和 ABI 校验，但类消息仍发给 `UIButton`；继承来的 `UIViewController()` 在 `NSObject` 上解析 `init`，实际分配的仍是 `UIViewController`。两种身份都会进入稳定 Key。只有 Typed AST mangling 能精确证明源码 metatype 或构造结果时，Compiler 才使用这条通用路径；否则保留 Swift Adapter。

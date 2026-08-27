@@ -91,6 +91,15 @@ Both workflows depend on stable, build-specific identities:
   `NSInvocation`; unsupported Swift
   overlays and ABI shapes retain the exact generated-adapter route. This is a
   reusable execution mechanism, not wildcard selector authority.
+- Compiler-proven Objective-C class types also share one data-driven TypeOps
+  constructor. Their exact runtime class identity is part of the schema-1
+  device projection and Shell hash. The generated Bridge reads those type rows
+  from the validated Shell document, resolves each linked class once, and uses
+  immutable Objective-C ancestry metadata to validate every boxed object. It
+  does not emit one generic Swift `NativeTypeOperations` specialization per
+  class. Clang enums/structures, Objective-C protocol existentials, Swift value
+  overlays, and project Swift classes cannot enter this path; they retain their
+  exact typed factory or value-codec boundary.
 - Compiler-proven C functions within the finite scalar/Apple-geometry ABI
   matrix share one AOT Runtime invoker. A permanent Bridge binding supplies the
   address of the exact imported declaration. Development first use may resolve

@@ -45,6 +45,7 @@ extension Verification.ShellInterface {
                     canonicalName: item.canonicalName,
                     kind: kind,
                     layoutFingerprint: item.layoutFingerprint,
+                    objectiveCRuntimeName: item.objectiveCRuntimeName,
                     isCopyable: item.isCopyable,
                     requiresMainActor: item.requiresMainActor,
                     estimatedSize: item.estimatedSize

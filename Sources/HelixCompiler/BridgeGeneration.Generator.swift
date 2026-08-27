@@ -193,11 +193,17 @@ public struct GeneratedNativeImport: Hashable, Sendable {
 }
 
 public struct NativeTypeBinding: Hashable, Sendable {
+    public enum Strategy: String, Hashable, Sendable {
+        case factory
+        case objectiveCReference
+    }
+
     public var id: Core.TypeID
     public var canonicalName: String
     public var layoutFingerprint: Core.Digest
     public var requiresMainActor: Bool
-    public var operationsExpression: String
+    public var strategy: Strategy
+    public var operationsExpression: String?
     public var importedModules: [String]
     public var generated: BridgeGeneration.GeneratedNativeType?
 
@@ -206,7 +212,8 @@ public struct NativeTypeBinding: Hashable, Sendable {
         canonicalName: String,
         layoutFingerprint: Core.Digest,
         requiresMainActor: Bool = false,
-        operationsExpression: String,
+        strategy: Strategy = .factory,
+        operationsExpression: String? = nil,
         importedModules: [String] = [],
         generated: BridgeGeneration.GeneratedNativeType? = nil
     ) {
@@ -214,6 +221,7 @@ public struct NativeTypeBinding: Hashable, Sendable {
         self.canonicalName = canonicalName
         self.layoutFingerprint = layoutFingerprint
         self.requiresMainActor = requiresMainActor
+        self.strategy = strategy
         self.operationsExpression = operationsExpression
         self.importedModules = importedModules.sorted()
         self.generated = generated
@@ -3488,19 +3496,38 @@ public struct Generator: Sendable {
                   record.canonicalName == binding.canonicalName,
                   record.layoutFingerprint == binding.layoutFingerprint,
                   record.requiresMainActor == binding.requiresMainActor,
-                  isUsableExpression(binding.operationsExpression),
                   binding.importedModules == Array(Set(binding.importedModules)).sorted(),
                   binding.importedModules.allSatisfy(isValidModulePath)
             else {
                 throw BridgeGeneration.Error.nativeTypeBindingMismatch(binding.id)
             }
-            if let generated = binding.generated {
-                try validateGeneratedNativeType(
-                    generated,
-                    binding: binding,
-                    record: record,
-                    archive: archive
-                )
+            switch binding.strategy {
+            case .factory:
+                guard binding.operationsExpression.map(isUsableExpression) == true,
+                      record.objectiveCRuntimeName == nil
+                else {
+                    throw BridgeGeneration.Error.nativeTypeBindingMismatch(binding.id)
+                }
+                if let generated = binding.generated {
+                    try validateGeneratedNativeType(
+                        generated,
+                        binding: binding,
+                        record: record,
+                        archive: archive
+                    )
+                }
+            case .objectiveCReference:
+                guard binding.operationsExpression == nil,
+                      binding.generated == nil,
+                      !binding.importedModules.isEmpty,
+                      record.kind == .reference,
+                      record.isCopyable,
+                      record.objectiveCRuntimeName.map(
+                          Core.NativeCall.isCanonicalObjectiveCRuntimeClassName
+                      ) == true
+                else {
+                    throw BridgeGeneration.Error.nativeTypeBindingMismatch(binding.id)
+                }
             }
         }
     }
@@ -4070,8 +4097,13 @@ public struct Generator: Sendable {
                 }
             }
         }
-        let typeExpressions = types.sorted(by: { $0.id.rawValue < $1.id.rawValue })
-            .map(\.operationsExpression)
+        let sortedTypes = types.sorted { $0.id.rawValue < $1.id.rawValue }
+        let typeExpressions = sortedTypes.compactMap { binding in
+            binding.strategy == .factory ? binding.operationsExpression : nil
+        }
+        let hasObjectiveCTypeOperations = sortedTypes.contains {
+            $0.strategy == .objectiveCReference
+        }
         let synchronousInvokers = renderGeneratedArray(
             synchronousImportExpressions,
             elementType: "any VM.NativeInvoker",
@@ -4092,6 +4124,16 @@ public struct Generator: Sendable {
             factoryName: "makeNativeTypeOperations",
             directIndentation: 16
         )
+        let objectiveCTypeHelper = hasObjectiveCTypeOperations ? """
+            private static func makeObjectiveCNativeTypeOperations() throws
+                -> [VM.NativeTypeOperations] {
+                let shell = try makeShellInterface()
+                return try shell.types.values
+                    .filter { $0.objectiveCRuntimeName != nil }
+                    .sorted { $0.id.rawValue < $1.id.rawValue }
+                    .map { try Runtime.ObjectiveCTypeOperations.make(shellType: $0) }
+            }
+        """ : ""
         let objectiveCHelper = hasObjectiveCInvokers ? """
             private static func makeObjectiveCNativeInvokers() throws
                 -> [any VM.NativeInvoker] {
@@ -4106,6 +4148,7 @@ public struct Generator: Sendable {
         """ : ""
         let helpers = [
             objectiveCHelper,
+            objectiveCTypeHelper,
             synchronousInvokers.declarations,
             asynchronousInvokers.declarations,
             nativeTypeOperations.declarations,
@@ -4113,6 +4156,9 @@ public struct Generator: Sendable {
         let synchronousExpression = hasObjectiveCInvokers
             ? "try makeObjectiveCNativeInvokers() + \(synchronousInvokers.expression)"
             : synchronousInvokers.expression
+        let nativeTypeExpression = hasObjectiveCTypeOperations
+            ? "try makeObjectiveCNativeTypeOperations() + \(nativeTypeOperations.expression)"
+            : nativeTypeOperations.expression
         return """
         \(helpers.isEmpty ? "" : helpers + "\n\n")
             public static func makeNativeCatalog() throws -> VM.NativeCatalog {
@@ -4124,7 +4170,7 @@ public struct Generator: Sendable {
             }
 
             public static func makeNativeTypeCatalog() throws -> VM.NativeTypeCatalog {
-                try VM.NativeTypeCatalog(\(nativeTypeOperations.expression))
+                try VM.NativeTypeCatalog(\(nativeTypeExpression))
             }
 
             public static func makeRuntime(

@@ -185,6 +185,64 @@ struct Archive {
         #expect(try first.computeShellInterfaceHash() != changed.computeShellInterfaceHash())
     }
 
+    @Test("Objective-C runtime type identity is hashed and validated")
+    func objectiveCTypeIdentityContract() throws {
+        var archive = try fixture()
+        let typeID = Core.TypeID.derive(
+            namespace: archive.metadata.shellNamespaceID,
+            canonicalType: "UIKit.UIView"
+        )
+        archive.capabilities.append(.nativeTypesV1)
+        archive.nativeTypes = [
+            .init(
+                id: typeID,
+                canonicalName: "UIKit.UIView",
+                kind: .reference,
+                layoutFingerprint: .sha256("UIKit.UIView.reference.v1"),
+                objectiveCRuntimeName: "UIView",
+                isCopyable: true,
+                isEmittedToDevice: true,
+                estimatedSize: 8
+            ),
+        ]
+        archive.shellInterfaceHash = try archive.computeShellInterfaceHash()
+        try archive.validate()
+
+        var withoutRuntimeIdentity = archive
+        withoutRuntimeIdentity.nativeTypes[0].objectiveCRuntimeName = nil
+        withoutRuntimeIdentity.shellInterfaceHash = try withoutRuntimeIdentity
+            .computeShellInterfaceHash()
+        #expect(
+            withoutRuntimeIdentity.shellInterfaceHash
+                != archive.shellInterfaceHash
+        )
+
+        for invalid in ["UIView ", "UI View", "UIView;load"] {
+            var malformed = archive
+            malformed.nativeTypes[0].objectiveCRuntimeName = invalid
+            malformed.shellInterfaceHash = try malformed
+                .computeShellInterfaceHash()
+            #expect(throws: InterfaceArchive.Error.self) {
+                try malformed.validate()
+            }
+        }
+
+        var valueType = archive
+        valueType.nativeTypes[0].kind = .value
+        valueType.shellInterfaceHash = try valueType.computeShellInterfaceHash()
+        #expect(throws: InterfaceArchive.Error.self) {
+            try valueType.validate()
+        }
+
+        var noncopyable = archive
+        noncopyable.nativeTypes[0].isCopyable = false
+        noncopyable.shellInterfaceHash = try noncopyable
+            .computeShellInterfaceHash()
+        #expect(throws: InterfaceArchive.Error.self) {
+            try noncopyable.validate()
+        }
+    }
+
     @Test("Swift native aliases remain server-side compiler metadata")
     func nativeAliasesDoNotChangeDeviceInterface() throws {
         var original = try fixture()

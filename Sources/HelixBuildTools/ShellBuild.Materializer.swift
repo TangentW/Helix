@@ -799,11 +799,17 @@ public struct Materializer: Sendable {
             )] else {
                 throw ShellBuild.Error.nativeTypeBindingMismatch
             }
+            let strategy: BridgeGeneration.NativeTypeBinding.Strategy
+            switch binding.strategy {
+            case .factory: strategy = .factory
+            case .objectiveCReference: strategy = .objectiveCReference
+            }
             return .init(
                 id: type.id,
                 canonicalName: type.canonicalName,
                 layoutFingerprint: type.layoutFingerprint,
                 requiresMainActor: type.requiresMainActor,
+                strategy: strategy,
                 operationsExpression: binding.operationsExpression,
                 importedModules: binding.importedModules,
                 generated: binding.generated.map {

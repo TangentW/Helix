@@ -100,6 +100,7 @@ public struct ResolvedNativeType: Codable, Hashable, Sendable {
     public var canonicalName: String
     public var kind: Verification.NativeTypeKind
     public var layoutFingerprint: Core.Digest
+    public var objectiveCRuntimeName: String?
     public var isCopyable: Bool
     public var requiresMainActor: Bool
     public var estimatedSize: UInt64
@@ -109,6 +110,7 @@ public struct ResolvedNativeType: Codable, Hashable, Sendable {
         canonicalName: String,
         kind: Verification.NativeTypeKind,
         layoutFingerprint: Core.Digest,
+        objectiveCRuntimeName: String? = nil,
         isCopyable: Bool,
         requiresMainActor: Bool = false,
         estimatedSize: UInt64
@@ -117,6 +119,7 @@ public struct ResolvedNativeType: Codable, Hashable, Sendable {
         self.canonicalName = canonicalName
         self.kind = kind
         self.layoutFingerprint = layoutFingerprint
+        self.objectiveCRuntimeName = objectiveCRuntimeName
         self.isCopyable = isCopyable
         self.requiresMainActor = requiresMainActor
         self.estimatedSize = estimatedSize
@@ -181,6 +184,22 @@ public struct ShellInterface: Sendable {
             throw Verification.Error.invalidShellInterface(
                 "native call keys must be unique across compact import slots"
             )
+        }
+        for type in types.values {
+            guard !type.canonicalName.isEmpty,
+                  type.objectiveCRuntimeName.map(
+                      Core.NativeCall.isCanonicalObjectiveCRuntimeClassName
+                  ) ?? true,
+                  type.objectiveCRuntimeName == nil || (
+                      type.kind == .reference
+                          && type.isCopyable
+                          && type.estimatedSize > 0
+                  )
+            else {
+                throw Verification.Error.invalidShellInterface(
+                    "native type \(type.id) has invalid Objective-C runtime identity"
+                )
+            }
         }
         for index in entries.keys.sorted() {
             guard let entry = entries[index] else { continue }

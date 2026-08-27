@@ -363,6 +363,19 @@ public struct ObjectiveCMetadata: Codable, Hashable, Sendable {
     }
 }
 
+/// Returns whether `value` is the canonical Objective-C runtime class
+/// identity accepted by native descriptors. Type metadata and call metadata
+/// deliberately share this grammar so neither side can reinterpret a class
+/// name at runtime.
+public static func isCanonicalObjectiveCRuntimeClassName(
+    _ value: String
+) -> Bool {
+    (try? Core.NativeCall.Descriptor.normalizeIdentifierPath(
+        value,
+        label: "Objective-C runtime class"
+    )) == value
+}
+
 public struct PhysicalSignature: Codable, Hashable, Sendable {
     public var callingConvention: Core.NativeCall.CallingConvention
     public var parameters: [Core.NativeCall.ABIParameter]

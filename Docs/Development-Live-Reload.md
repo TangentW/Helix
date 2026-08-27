@@ -422,8 +422,10 @@ lookup is restricted to the descriptor's exact class and selector; patch code
 cannot provide or compose either string.
 
 For a supported source `class` instance method, the hidden Bridge carries
-`self` as the build-captured reference `TypeID`. Generated `NativeTypeOperations` retain,
-identify, and validate the object without exposing a process pointer in HLBC.
+`self` as the build-captured reference `TypeID`. Statically generated TypeOps
+for project classes, or the shared data-driven TypeOps path for compiler-proven
+Objective-C classes, retain, identify, and validate the object without exposing
+a process pointer in HLBC.
 This establishes the receiver path for class methods; individual property and
 method operations still need a supported Shell entry or exact NativeImport.
 The measured member path above supplies those exact imports for its proven

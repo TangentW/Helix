@@ -1535,6 +1535,7 @@ extension FrontendReceipt.Adapter {
                     ),
                     kind: imported.kind,
                     layoutFingerprint: layoutFingerprint,
+                    objectiveCRuntimeName: imported.objectiveCRuntimeName,
                     isCopyable: true,
                     requiresMainActor: imported.requiresMainActor,
                     isEmittedToDevice: true,
@@ -1745,6 +1746,27 @@ extension FrontendReceipt.Adapter {
             }
             if let imported = importedByName[item.canonicalName] {
                 let structure = objectiveCStructures[item.id]
+                if let runtimeName = item.objectiveCRuntimeName {
+                    guard item.kind == .reference,
+                          item.isCopyable,
+                          structure == nil,
+                          imported.objectiveCRuntimeName == runtimeName,
+                          Core.NativeCall.isCanonicalObjectiveCRuntimeClassName(
+                              runtimeName
+                          )
+                    else {
+                        throw FrontendReceipt.Error.invalidRequest(
+                            "Objective-C reference \(item.canonicalName) disagrees with its runtime identity"
+                        )
+                    }
+                    return .init(
+                        canonicalName: item.canonicalName,
+                        layoutFingerprint: item.layoutFingerprint,
+                        requiresMainActor: item.requiresMainActor,
+                        strategy: .objectiveCReference,
+                        importedModules: imported.importedModules
+                    )
+                }
                 let representation: ShellBuildReceipt.GeneratedNativeType.Representation =
                     if structure != nil {
                         .objectiveCStructure

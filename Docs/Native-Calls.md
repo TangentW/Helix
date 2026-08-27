@@ -163,6 +163,15 @@ selector. Explicit factories are now restricted to builtin or exact Swift
 adapter backends, so an Objective-C or C descriptor cannot bypass its generic,
 ABI-checked execution path.
 
+The same rule now applies to imported Objective-C reference types. Compiler
+evidence records the exact runtime class name in the native type row, and that
+identity participates in the Shell hash. One Bridge helper turns all such rows
+into checked TypeOps at startup; each box is accepted only when Objective-C
+ancestry metadata says the object is an instance of that class. This removes
+per-class generic Swift factories without treating a Clang enum/structure,
+protocol existential, Swift value overlay, or project class as a dynamic
+Objective-C reference.
+
 Module provenance is not inferred from `UI`/`NS` prefixes or from the owning
 class alone. Ordinary methods and properties resolve their exact Clang USR in
 the imported module indexes, so a category can belong to a framework different

@@ -3379,11 +3379,14 @@ struct NativeImportDiscoveryTests {
         })
         #expect(labelType.kind == .reference)
         #expect(labelType.requiresMainActor)
+        #expect(labelType.objectiveCRuntimeName == "UILabel")
         let labelBinding = try #require(output.receipt.nativeTypeBindings.first {
             $0.canonicalName == "UILabel"
         })
         #expect(labelBinding.importedModules.contains("UIKit"))
-        #expect(labelBinding.generated?.swiftType == "UILabel")
+        #expect(labelBinding.strategy == .objectiveCReference)
+        #expect(labelBinding.operationsExpression == nil)
+        #expect(labelBinding.generated == nil)
         let labelGetterBinding = try #require(output.receipt.nativeImportBindings.first {
             $0.generated?.dispatch == .instanceGetter
         })
@@ -3407,6 +3410,21 @@ struct NativeImportDiscoveryTests {
         missingTypeImport.nativeTypeBindings[labelTypeBindingIndex].importedModules = []
         #expect(throws: ShellBuildReceipt.Error.self) {
             try missingTypeImport.validate()
+        }
+
+        var forgedTypeStrategy = output.receipt
+        forgedTypeStrategy.nativeTypeBindings[labelTypeBindingIndex].strategy = .factory
+        forgedTypeStrategy.nativeTypeBindings[labelTypeBindingIndex]
+            .operationsExpression = "ForgedFactory.make()"
+        #expect(throws: ShellBuildReceipt.Error.self) {
+            try forgedTypeStrategy.validate()
+        }
+
+        var forgedDynamicExpression = output.receipt
+        forgedDynamicExpression.nativeTypeBindings[labelTypeBindingIndex]
+            .operationsExpression = "ForgedFactory.make()"
+        #expect(throws: ShellBuildReceipt.Error.self) {
+            try forgedDynamicExpression.validate()
         }
 
         var missingGetterImport = output.receipt
@@ -3665,10 +3683,11 @@ struct NativeImportDiscoveryTests {
         #expect(sessionTaskSpellings.isSuperset(of: [
             "NSURLSessionDataTask", "URLSessionDataTask",
         ]))
-        let generated = try #require(shell.bridge.sourceFiles.values.first {
+        #expect(primaryBridge.contains("makeObjectiveCNativeTypeOperations"))
+        #expect(primaryBridge.contains("Runtime.ObjectiveCTypeOperations.make("))
+        #expect(!shell.bridge.sourceFiles.values.contains {
             $0.contains("estimatedByteCount: { (_: UILabel)")
         })
-        #expect(generated.contains("import UIKit"))
         #expect(shell.bridge.sourceFiles.values.contains {
             $0.contains("argument0.label")
         })
@@ -4241,12 +4260,20 @@ struct NativeImportDiscoveryTests {
         )
         #expect(nativeTypes["UIColor"]?.requiresMainActor == false)
         #expect(nativeTypes["UIScreen"]?.requiresMainActor == true)
-        let generatedTypes = managed.receipt.nativeTypeBindings.compactMap(\.generated)
-        #expect(generatedTypes.contains { $0.swiftType == "Bundle" })
-        #expect(generatedTypes.contains { $0.swiftType == "ProcessInfo" })
-        #expect(!generatedTypes.contains {
-            $0.swiftType == "NSBundle" || $0.swiftType == "NSProcessInfo"
-        })
+        #expect(nativeTypes["Bundle"]?.objectiveCRuntimeName == "NSBundle")
+        #expect(
+            nativeTypes["ProcessInfo"]?.objectiveCRuntimeName
+                == "NSProcessInfo"
+        )
+        let typeBindings = Dictionary(uniqueKeysWithValues:
+            managed.receipt.nativeTypeBindings.map { ($0.canonicalName, $0) }
+        )
+        for name in ["UIColor", "UIScreen", "Bundle", "ProcessInfo"] {
+            let binding = try #require(typeBindings[name])
+            #expect(binding.strategy == .objectiveCReference)
+            #expect(binding.operationsExpression == nil)
+            #expect(binding.generated == nil)
+        }
 
         let developmentImports = try promotedDevelopmentImports(
             in: managed.receipt.nativeImportCandidates
@@ -4282,6 +4309,8 @@ struct NativeImportDiscoveryTests {
         #expect(!generated.contains("UIApplication.shared"))
         #expect(!generated.contains("Bundle.main"))
         #expect(generated.contains("Runtime.ObjectiveCInvoker("))
+        #expect(generated.contains("makeObjectiveCNativeTypeOperations"))
+        #expect(generated.contains("Runtime.ObjectiveCTypeOperations.make("))
         #expect(!generated.contains("UIView.areAnimationsEnabled"))
         #expect(!generated.contains("ProcessInfo.processInfo"))
         #expect(!generated.contains("argument0.isHidden"))

@@ -20,6 +20,10 @@ extension FrontendReceipt.Adapter {
         /// Exact declaring module recovered from that module's Symbol Graph.
         /// Nil means source-only discovery could not prove provenance.
         var objectiveCModuleName: String? = nil
+        /// Exact Objective-C runtime class identity proven by Clang import or
+        /// the declaring module's Symbol Graph. Nil for Swift-only references,
+        /// protocol existentials, and value overlays.
+        var objectiveCRuntimeName: String? = nil
         var requiresMainActor: Bool
     }
     func discoverImportedNativeTypes(
@@ -118,6 +122,7 @@ extension FrontendReceipt.Adapter {
                             representation: .reference,
                             source: source,
                             importedModules: importedModules,
+                            objectiveCRuntimeName: runtimeName,
                             requiresMainActor: requiresMainActor
                         )
                     )
@@ -184,9 +189,10 @@ extension FrontendReceipt.Adapter {
             ? importedTypealiases.first : nil
         let swiftType = isSelectorType(discovered)
             ? "ObjectiveC.Selector" : discovered
-        let canonical = Self.objectiveCNominalIdentity(
+        let objectiveCRuntimeName = Self.objectiveCNominalIdentity(
             inMangledType: mangled
-        ) ?? clangTypealias ?? swiftType
+        )
+        let canonical = objectiveCRuntimeName ?? clangTypealias ?? swiftType
         guard let representation = importedNominalRepresentation(
             mangled,
             spelling: swiftType
@@ -201,6 +207,8 @@ extension FrontendReceipt.Adapter {
             representation: representation,
             source: source,
             importedModules: importedModules,
+            objectiveCRuntimeName: representation == .reference
+                ? objectiveCRuntimeName : nil,
             requiresMainActor: representation == .reference && requiresMainActor
         )
     }
@@ -290,6 +298,7 @@ extension FrontendReceipt.Adapter {
         representation: ImportedNativeType.Representation,
         source: SourceState,
         importedModules: [String],
+        objectiveCRuntimeName: String? = nil,
         requiresMainActor: Bool
     ) -> ImportedNativeType {
         .init(
@@ -300,6 +309,7 @@ extension FrontendReceipt.Adapter {
             representation: representation,
             sourceFileLogicalID: source.logicalPath,
             importedModules: importedModules,
+            objectiveCRuntimeName: objectiveCRuntimeName,
             requiresMainActor: requiresMainActor
         )
     }
@@ -342,10 +352,19 @@ extension FrontendReceipt.Adapter {
             }
             guard !use.canonicalName.isEmpty,
                   !use.swiftType.isEmpty,
-                  !use.importedModules.isEmpty
+                  !use.importedModules.isEmpty,
+                  use.objectiveCRuntimeName.map(
+                      Core.NativeCall.isCanonicalObjectiveCRuntimeClassName
+                  ) ?? true,
+                  use.objectiveCRuntimeName == nil || use.kind == .reference
             else {
                 throw FrontendReceipt.Error.invalidRequest(
-                    "imported native type metadata is incomplete"
+                    "imported native type metadata is incomplete for "
+                        + "\(use.canonicalName) (Swift: \(use.swiftType), "
+                        + "kind: \(use.kind.rawValue), modules: "
+                        + "\(use.importedModules.joined(separator: ",")), "
+                        + "Objective-C runtime: "
+                        + "\(use.objectiveCRuntimeName ?? "none"))"
                 )
             }
             if var existing = result[use.canonicalName] {
@@ -399,6 +418,15 @@ extension FrontendReceipt.Adapter {
                 }
                 existing.objectiveCModuleName = existing.objectiveCModuleName
                     ?? use.objectiveCModuleName
+                if let existingRuntimeName = existing.objectiveCRuntimeName,
+                   let incomingRuntimeName = use.objectiveCRuntimeName,
+                   existingRuntimeName != incomingRuntimeName {
+                    throw FrontendReceipt.Error.invalidRequest(
+                        "imported native type \(use.canonicalName) has conflicting Objective-C runtime identities"
+                    )
+                }
+                existing.objectiveCRuntimeName = existing.objectiveCRuntimeName
+                    ?? use.objectiveCRuntimeName
                 existing.aliases = Array(Set(
                     existing.aliases + use.aliases
                 )).sorted()

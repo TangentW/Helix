@@ -255,6 +255,79 @@ public struct NativeTypeOperations: Sendable {
         ).attachingReferenceClass(Value.self)
     }
 
+    /// Creates reference TypeOps from an immutable runtime class identity.
+    /// The caller supplies the metadata lookup result and an independent
+    /// instance predicate; this keeps Objective-C runtime access out of VM
+    /// while avoiding one generic Swift factory specialization per class.
+    public static func objectiveCReference(
+        id: Core.TypeID,
+        canonicalName: String,
+        layoutFingerprint: Core.Digest,
+        requiresMainActor: Bool = false,
+        estimatedSize: UInt64 = UInt64(MemoryLayout<AnyObject>.stride),
+        referenceClass: AnyClass,
+        accepts: @escaping @Sendable (AnyObject) -> Bool
+    ) -> Self {
+        let capturedClass = VM.NativeReferenceClass(referenceClass)
+
+        @Sendable func makeBox(_ object: AnyObject) -> VM.NativeValue {
+            VM.NativeValue(
+                typeID: id,
+                canonicalTypeName: canonicalName,
+                layoutFingerprint: layoutFingerprint,
+                estimatedByteCount: max(
+                    estimatedSize,
+                    UInt64(MemoryLayout<AnyObject>.stride)
+                ),
+                storage: object,
+                referencedObject: object,
+                equals: { lhs, rhs in
+                    (lhs as AnyObject) === (rhs as AnyObject)
+                },
+                hash: { storage, hasher in
+                    hasher.combine(ObjectIdentifier(storage as AnyObject))
+                },
+                describe: { String(describing: $0) }
+            )
+        }
+
+        return Self(
+            id: id,
+            canonicalName: canonicalName,
+            kind: .reference,
+            layoutFingerprint: layoutFingerprint,
+            isCopyable: true,
+            requiresMainActor: requiresMainActor,
+            estimatedSize: estimatedSize,
+            referenceClass: capturedClass,
+            nativeABI: nil,
+            boxStorage: { storage in
+                // `as AnyObject` can bridge Swift values. Reject them before
+                // the cast so a scalar cannot masquerade as an Objective-C
+                // reference merely because Foundation can allocate a box.
+                guard Mirror(reflecting: storage).displayStyle == .class else {
+                    throw VM.RuntimeTrap.nativeTypeMismatch(expected: id)
+                }
+                let object = storage as AnyObject
+                guard accepts(object) else {
+                    throw VM.RuntimeTrap.nativeTypeMismatch(expected: id)
+                }
+                return makeBox(object)
+            },
+            copyStorage: { value in
+                guard value.typeID == id,
+                      value.layoutFingerprint == layoutFingerprint,
+                      value.canonicalTypeName == canonicalName,
+                      let object = value.referencedObject,
+                      accepts(object)
+                else {
+                    throw VM.RuntimeTrap.nativeTypeMismatch(expected: id)
+                }
+                return makeBox(object)
+            }
+        )
+    }
+
     /// Creates TypeOps for a copyable Swift value whose layout and equality
     /// semantics are intentionally opaque to HLBC. Copies preserve a stable
     /// box identity, while a value returned from a mutating native adapter is

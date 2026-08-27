@@ -250,10 +250,16 @@ public struct GeneratedNativeImport: Codable, Hashable, Sendable {
 }
 
 public struct NativeTypeBinding: Codable, Hashable, Sendable {
+    public enum Strategy: String, Codable, Hashable, Sendable {
+        case factory
+        case objectiveCReference
+    }
+
     public var canonicalName: String
     public var layoutFingerprint: Core.Digest
     public var requiresMainActor: Bool
-    public var operationsExpression: String
+    public var strategy: Strategy
+    public var operationsExpression: String?
     public var importedModules: [String]
     public var generated: ShellBuildReceipt.GeneratedNativeType?
 
@@ -261,13 +267,15 @@ public struct NativeTypeBinding: Codable, Hashable, Sendable {
         canonicalName: String,
         layoutFingerprint: Core.Digest,
         requiresMainActor: Bool = false,
-        operationsExpression: String,
+        strategy: Strategy = .factory,
+        operationsExpression: String? = nil,
         importedModules: [String] = [],
         generated: ShellBuildReceipt.GeneratedNativeType? = nil
     ) {
         self.canonicalName = canonicalName
         self.layoutFingerprint = layoutFingerprint
         self.requiresMainActor = requiresMainActor
+        self.strategy = strategy
         self.operationsExpression = operationsExpression
         self.importedModules = importedModules.sorted()
         self.generated = generated
@@ -561,6 +569,13 @@ public struct Document: Codable, Hashable, Sendable {
                 "an exact Swift symbol cannot be both an Entry and a NativeImport"
             )
         }
+        let nativeTypesByBindingIdentity = Dictionary(
+            grouping: nativeTypes,
+            by: {
+                "\($0.canonicalName):\($0.layoutFingerprint.hex):"
+                    + "\($0.requiresMainActor)"
+            }
+        )
         guard nativeTypes == nativeTypes.sorted(by: { $0.id.rawValue < $1.id.rawValue }),
               Set(nativeTypes.map(\.id)).count == nativeTypes.count,
               nativeTypeBindings == nativeTypeBindings.sorted(by: {
@@ -571,17 +586,20 @@ public struct Document: Codable, Hashable, Sendable {
                   "\($0.canonicalName):\($0.layoutFingerprint.hex):\($0.requiresMainActor)"
               }).count == nativeTypeBindings.count,
               nativeTypeBindings.allSatisfy({
-                  !$0.canonicalName.isEmpty
-                      && Self.isBoundExpression($0.operationsExpression)
-                      && $0.importedModules == Array(Set($0.importedModules)).sorted()
-                      && $0.importedModules.allSatisfy(Self.isModulePath)
-                      && Self.isValidGeneratedNativeType(
-                          $0.generated,
-                          canonicalName: $0.canonicalName,
-                          moduleName: metadata.frontendInvocation.moduleName,
-                          importedModules: $0.importedModules,
-                          sourcePaths: sourcePaths
-                      )
+                  let binding = $0
+                  let identity = "\(binding.canonicalName):"
+                      + "\(binding.layoutFingerprint.hex):"
+                      + "\(binding.requiresMainActor)"
+                  guard let records = nativeTypesByBindingIdentity[identity],
+                        records.count == 1,
+                        let record = records.first
+                  else { return false }
+                  return Self.isValidNativeTypeBinding(
+                      binding,
+                      record: record,
+                      moduleName: metadata.frontendInvocation.moduleName,
+                      sourcePaths: sourcePaths
+                  )
               }), Set(nativeTypeBindings.map {
                   "\($0.canonicalName):\($0.layoutFingerprint.hex):\($0.requiresMainActor)"
               }) == Set(nativeTypes.filter(\.isEmittedToDevice).map {
@@ -931,6 +949,40 @@ public struct Document: Codable, Hashable, Sendable {
             && (isSourceType ? importedModules.isEmpty : !importedModules.isEmpty)
             && generated.swiftType == expectedSwiftType
             && FrontendReceipt.SwiftTypeSpelling.isGeneratedType(generated.swiftType)
+    }
+
+    private static func isValidNativeTypeBinding(
+        _ binding: ShellBuildReceipt.NativeTypeBinding,
+        record: InterfaceArchive.TypeRecord,
+        moduleName: String,
+        sourcePaths: Set<String>
+    ) -> Bool {
+        guard !binding.canonicalName.isEmpty,
+              binding.importedModules
+                == Array(Set(binding.importedModules)).sorted(),
+              binding.importedModules.allSatisfy(Self.isModulePath)
+        else { return false }
+        switch binding.strategy {
+        case .factory:
+            return binding.operationsExpression.map(Self.isBoundExpression) == true
+                && record.objectiveCRuntimeName == nil
+                && Self.isValidGeneratedNativeType(
+                    binding.generated,
+                    canonicalName: binding.canonicalName,
+                    moduleName: moduleName,
+                    importedModules: binding.importedModules,
+                    sourcePaths: sourcePaths
+                )
+        case .objectiveCReference:
+            return binding.operationsExpression == nil
+                && binding.generated == nil
+                && !binding.importedModules.isEmpty
+                && record.kind == .reference
+                && record.isCopyable
+                && record.objectiveCRuntimeName.map(
+                    Core.NativeCall.isCanonicalObjectiveCRuntimeClassName
+                ) == true
+        }
     }
 
     private static func isSafeLogicalPath(_ path: String) -> Bool {
