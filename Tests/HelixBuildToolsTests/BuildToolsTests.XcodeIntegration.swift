@@ -7,7 +7,7 @@ import Testing
 extension BuildToolsTests {
 @Suite("Xcode host integration contract")
 struct XcodeIntegrationContract {
-    @Test("Hot Patch Prepare state is canonical and rejects unsafe manifests")
+    @Test("Prepare state is canonical and rejects unsafe manifests")
     func prepareStateCodec() throws {
         let state = XcodeIntegration.PrepareState(
             inputHash: .sha256("input"),
@@ -26,7 +26,8 @@ struct XcodeIntegrationContract {
                 ),
             ],
             eligibleFunctionCount: 3,
-            rejectedFunctionCount: 1
+            rejectedFunctionCount: 1,
+            requiresNativeAPICatalogRefresh: true
         )
         let data = try XcodeIntegration.PrepareStateCodec.encode(state)
         #expect(try XcodeIntegration.PrepareStateCodec.decode(data) == state)

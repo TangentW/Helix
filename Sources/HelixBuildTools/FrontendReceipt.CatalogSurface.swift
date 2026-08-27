@@ -1,3 +1,4 @@
+import HelixBytecode
 import HelixCompiler
 import HelixCore
 import HelixInterface
@@ -7,10 +8,19 @@ enum CatalogSurface {}
 }
 
 extension FrontendReceipt.CatalogSurface {
+    struct MaterializedCapability: Sendable {
+        var record: InterfaceArchive.NativeImportRecord
+        var binding: ShellBuildReceipt.NativeImportBinding
+    }
+
     struct Resolution: Sendable {
         var documents: [NativeAPICatalog.Document]
         var importedTypes: [FrontendReceipt.Adapter.ImportedNativeType]
         var operations: [FrontendReceipt.Adapter.ImportedOperation]
+        var capabilities: [
+            NativeAPICatalog.CompilerProjection.PublishedCapability
+        ]
+        var nativeTypeNamesByPlaceholder: [Core.TypeID: String]
         var modulesByDeclarationUSR: [String: String]
         var hitModules: [String]
         var missingModules: [String]
@@ -32,6 +42,8 @@ extension FrontendReceipt.CatalogSurface {
                 documents: [],
                 importedTypes: [],
                 operations: [],
+                capabilities: [],
+                nativeTypeNamesByPlaceholder: [:],
                 modulesByDeclarationUSR: [:],
                 hitModules: [],
                 missingModules: []
@@ -59,17 +71,11 @@ extension FrontendReceipt.CatalogSurface {
         }
 
         var snapshotsByModule: [String: NativeAPICatalog.Snapshot] = [:]
-        var projectionsByModule: [
-            String: NativeAPICatalog.Projector.ProjectionResult
-        ] = [:]
         for snapshot in snapshots {
             let document = snapshot.document
             let identity = document.identity
             do {
-                try document.validate()
-                try snapshot.compilerProjection.validate(
-                    moduleName: identity.moduleName
-                )
+                try snapshot.validateIfNeeded()
             } catch {
                 throw FrontendReceipt.Error.invalidRequest(
                     "Native API Catalog \(identity.moduleName) is invalid: \(error)"
@@ -87,29 +93,7 @@ extension FrontendReceipt.CatalogSurface {
                     "Native API Catalog \(identity.moduleName) disagrees with the current compiler, SDK, target, deployment, or language mode"
                 )
             }
-            let projected: NativeAPICatalog.Projector.ProjectionResult
-            do {
-                projected = try NativeAPICatalog.Projector.project(
-                    projection: snapshot.compilerProjection,
-                    identity: identity,
-                    invocation: request.metadata.frontendInvocation
-                )
-            } catch {
-                throw FrontendReceipt.Error.invalidRequest(
-                    "Native API Catalog \(identity.moduleName) cannot reproduce its compiler projection: \(error)"
-                )
-            }
-            guard projected.entries == document.entries,
-                  projected.importedTypes
-                    == snapshot.compilerProjection.importedTypes,
-                  projected.operations == snapshot.compilerProjection.operations
-            else {
-                throw FrontendReceipt.Error.invalidRequest(
-                    "Native API Catalog \(identity.moduleName) document and compiler projection disagree"
-                )
-            }
             snapshotsByModule[identity.moduleName] = snapshot
-            projectionsByModule[identity.moduleName] = projected
         }
 
         var requiredModuleSet = Set(requiredModules)
@@ -135,25 +119,20 @@ extension FrontendReceipt.CatalogSurface {
         let consumed = requiredModules.compactMap { snapshotsByModule[$0] }
         let documents = consumed.map(\.document)
         do {
-            _ = try NativeAPICatalog.Registry(documents: documents)
+            _ = try NativeAPICatalog.Registry(validatedDocuments: documents)
         } catch {
             throw FrontendReceipt.Error.invalidRequest(
                 "Native API Catalog snapshots conflict: \(error)"
             )
         }
-        var modulesByDeclarationUSR: [String: String] = [:]
-        for snapshot in consumed {
-            for (usr, module) in snapshot.compilerProjection
-                .modulesByDeclarationUSR {
-                if let existing = modulesByDeclarationUSR[usr],
-                   existing != module {
-                    throw FrontendReceipt.Error.invalidRequest(
-                        "Native API Catalog declaration \(usr) has conflicting module ownership"
-                    )
-                }
-                modulesByDeclarationUSR[usr] = module
-            }
-        }
+        // Clang USRs identify the declaring method, not the concrete class
+        // through which an inherited initializer or member was measured. Its
+        // Catalog entry remains exact through the owner and descriptor; the
+        // USR-only module hint is authoritative only when the complete
+        // Catalog closure agrees on one module.
+        let modulesByDeclarationUSR = uniqueDeclarationModules(
+            consumed.map { $0.compilerProjection.modulesByDeclarationUSR }
+        )
         let hitModules = consumed.map { $0.document.identity.moduleName }
             .sorted()
         let missingModules = requiredModules.filter {
@@ -169,19 +148,21 @@ extension FrontendReceipt.CatalogSurface {
         var operations: [FrontendReceipt.Adapter.ImportedOperation] = []
         for snapshot in consumed {
             let module = snapshot.document.identity.moduleName
-            guard let projected = projectionsByModule[module] else {
-                throw FrontendReceipt.Error.invalidRequest(
-                    "Native API Catalog \(module) has no validated projection"
-                )
-            }
-            for original in snapshot.compilerProjection.operations {
-                guard let entry = projected.entriesByOperation[original] else {
+            let entriesByKey = Dictionary(uniqueKeysWithValues:
+                snapshot.document.entries.map { ($0.key, $0) }
+            )
+            for (original, key) in zip(
+                snapshot.compilerProjection.operations,
+                snapshot.compilerProjection.publishedEntryKeys
+            ) {
+                guard let entry = entriesByKey[key] else {
                     throw FrontendReceipt.Error.invalidRequest(
-                        "Native API Catalog \(module) operation has no published entry"
+                        "Native API Catalog \(module) operation has no indexed entry"
                     )
                 }
                 var operation = original
                 operation.catalogEntry = entry
+                operation.catalogAuthorityKey = entry.key
                 operations.append(operation)
             }
         }
@@ -195,10 +176,321 @@ extension FrontendReceipt.CatalogSurface {
                 }
             },
             operations: operations,
+            capabilities: consumed.flatMap {
+                $0.compilerProjection.publishedCapabilities
+            }.sorted { $0.entryKey < $1.entryKey },
+            nativeTypeNamesByPlaceholder: try nativeTypeNamesByPlaceholder(
+                consumed
+            ),
             modulesByDeclarationUSR: modulesByDeclarationUSR,
             hitModules: hitModules,
             missingModules: missingModules
         )
+    }
+
+    private static func nativeTypeNamesByPlaceholder(
+        _ snapshots: [NativeAPICatalog.Snapshot]
+    ) throws -> [Core.TypeID: String] {
+        var result: [Core.TypeID: String] = [:]
+        for snapshot in snapshots {
+            let module = snapshot.document.identity.moduleName
+            for type in snapshot.compilerProjection.importedTypes {
+                let placeholder = NativeAPICatalog.Projector.placeholderTypeID(
+                    type,
+                    moduleName: module
+                )
+                if let existing = result[placeholder],
+                   existing != type.canonicalName {
+                    throw FrontendReceipt.Error.invalidRequest(
+                        "Native API Catalog placeholder TypeID collision"
+                    )
+                }
+                result[placeholder] = type.canonicalName
+            }
+        }
+        return result
+    }
+
+    static func materializeCapabilities(
+        _ resolution: Resolution,
+        nativeTypes: [String: Core.TypeID],
+        emittedSymbols: Set<String>,
+        emitCompleteSurface: Bool
+    ) throws -> [MaterializedCapability] {
+        var typeRemapping: [Core.TypeID: Core.TypeID] = [:]
+        for (placeholder, canonicalName) in
+            resolution.nativeTypeNamesByPlaceholder
+        {
+            guard let concrete = nativeTypes[canonicalName] else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "Native API Catalog type \(canonicalName) has no project TypeID"
+                )
+            }
+            typeRemapping[placeholder] = concrete
+        }
+        let typeHexRemapping = Dictionary(uniqueKeysWithValues:
+            typeRemapping.map {
+                ($0.key.rawValue.hex, $0.value.rawValue.hex)
+            }
+        )
+        var materialized = try resolution.capabilities.map { capability in
+            var record = capability.record
+            var binding = capability.binding
+            record.parameterTypes = try record.parameterTypes.map {
+                try remap($0, nativeTypes: typeRemapping)
+            }
+            record.resultType = try remap(
+                record.resultType,
+                nativeTypes: typeRemapping
+            )
+            record.silMangledNames = record.silMangledNames.map {
+                remapNativeBridgeSymbol($0, typeHex: typeHexRemapping)
+            }.sorted()
+            if var generated = binding.generated {
+                generated.declarationMangledName = remapNativeBridgeSymbol(
+                    generated.declarationMangledName,
+                    typeHex: typeHexRemapping
+                )
+                binding.generated = generated
+            }
+            return MaterializedCapability(
+                record: record,
+                binding: binding
+            )
+        }
+
+        // Every physical symbol variant must share one publication state.
+        // Grow from source-observed symbols so default-argument and generic
+        // projections backed by the same SIL implementation move together.
+        var activeSymbols = emittedSymbols
+        if !emitCompleteSurface {
+            var changed = true
+            while changed {
+                changed = false
+                for capability in materialized
+                where !Set(capability.record.silMangledNames)
+                    .isDisjoint(with: activeSymbols) {
+                    let previous = activeSymbols.count
+                    activeSymbols.formUnion(capability.record.silMangledNames)
+                    changed = changed || activeSymbols.count != previous
+                }
+            }
+        }
+        for index in materialized.indices {
+            materialized[index].record.isEmittedToDevice =
+                emitCompleteSurface
+                || !Set(materialized[index].record.silMangledNames)
+                    .isDisjoint(with: activeSymbols)
+        }
+        return materialized.sorted { $0.record.key < $1.record.key }
+    }
+
+    private static func remap(
+        _ type: Bytecode.ValueType,
+        nativeTypes: [Core.TypeID: Core.TypeID]
+    ) throws -> Bytecode.ValueType {
+        switch type {
+        case let .native(placeholder):
+            guard let concrete = nativeTypes[placeholder] else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "Native API Catalog capability references an unknown placeholder TypeID"
+                )
+            }
+            return .native(concrete)
+        case let .array(element):
+            return .array(try remap(element, nativeTypes: nativeTypes))
+        case let .dictionary(key, value):
+            return .dictionary(
+                key: try remap(key, nativeTypes: nativeTypes),
+                value: try remap(value, nativeTypes: nativeTypes)
+            )
+        case let .set(element):
+            return .set(try remap(element, nativeTypes: nativeTypes))
+        case let .address(element):
+            return .address(try remap(element, nativeTypes: nativeTypes))
+        case let .mutableCell(element):
+            return .mutableCell(try remap(element, nativeTypes: nativeTypes))
+        case let .nonOwningReference(kind, element):
+            return .nonOwningReference(
+                kind: kind,
+                pointee: try remap(element, nativeTypes: nativeTypes)
+            )
+        case let .arrayState(kind, element):
+            return .arrayState(
+                kind: kind,
+                element: try remap(element, nativeTypes: nativeTypes)
+            )
+        case let .dictionaryState(key, value):
+            return .dictionaryState(
+                key: try remap(key, nativeTypes: nativeTypes),
+                value: try remap(value, nativeTypes: nativeTypes)
+            )
+        case let .closure(signature):
+            return .closure(.init(
+                parameters: try signature.parameters.map {
+                    try remap($0, nativeTypes: nativeTypes)
+                },
+                parameterConventions: signature.parameterConventions,
+                result: try remap(
+                    signature.result,
+                    nativeTypes: nativeTypes
+                ),
+                thrownType: try signature.thrownType.map {
+                    try remap($0, nativeTypes: nativeTypes)
+                },
+                effects: signature.effects
+            ))
+        case let .tuple(elements):
+            return .tuple(try elements.map {
+                try remap($0, nativeTypes: nativeTypes)
+            })
+        case let .optional(element):
+            return .optional(try remap(element, nativeTypes: nativeTypes))
+        case .void, .never, .bool, .integer, .float, .string, .any,
+             .local, .error:
+            return type
+        }
+    }
+
+    private static func remapNativeBridgeSymbol(
+        _ symbol: String,
+        typeHex: [String: String]
+    ) -> String {
+        let unaryPrefixes = [
+            "$hlx_native_raw_init_",
+            "$hlx_native_any_object_bridge_",
+            "$hlx_native_option_set_literal_",
+            "$hlx_native_selector_init_",
+        ]
+        for prefix in unaryPrefixes where symbol.hasPrefix(prefix) {
+            let value = String(symbol.dropFirst(prefix.count))
+            guard let replacement = typeHex[value] else { return symbol }
+            return prefix + replacement
+        }
+        let upcastPrefix = "$hlx_native_upcast_"
+        guard symbol.hasPrefix(upcastPrefix) else { return symbol }
+        let components = symbol.dropFirst(upcastPrefix.count).split(
+            separator: "_",
+            omittingEmptySubsequences: false
+        )
+        guard components.count == 2 else { return symbol }
+        let source = String(components[0])
+        let target = String(components[1])
+        guard let remappedSource = typeHex[source],
+              let remappedTarget = typeHex[target]
+        else { return symbol }
+        return upcastPrefix + remappedSource + "_" + remappedTarget
+    }
+
+    static func uniqueDeclarationModules(
+        _ mappings: [[String: String]]
+    ) -> [String: String] {
+        var candidates: [String: Set<String>] = [:]
+        for mapping in mappings {
+            for (usr, module) in mapping {
+                candidates[usr, default: []].insert(module)
+            }
+        }
+        return Dictionary(uniqueKeysWithValues: candidates.compactMap {
+            usr, modules in
+            guard modules.count == 1, let module = modules.first else {
+                return nil
+            }
+            return (usr, module)
+        })
+    }
+
+    static func operationsRelevantToSource(
+        _ catalog: [FrontendReceipt.Adapter.ImportedOperation],
+        source: [FrontendReceipt.Adapter.ImportedOperation]
+    ) -> [FrontendReceipt.Adapter.ImportedOperation] {
+        guard !source.isEmpty else { return [] }
+        let sourceUSRs = Set(source.compactMap(declarationUSR))
+        let sourceSymbols = Set(source.flatMap(\.silReferences))
+        let sourceObjectiveCTargets = Set(source.compactMap { operation in
+            operation.objectiveC.map {
+                ObjectiveCTarget(
+                    runtimeClassName: $0.runtimeClassName,
+                    selector: $0.selector,
+                    dispatch: operation.dispatch
+                )
+            }
+        })
+        let sourceCTargets = Set(source.compactMap { operation in
+            operation.c.map {
+                CTarget(symbol: $0.symbol, dispatch: operation.dispatch)
+            }
+        })
+        let sourceCompilerOperations = Set(source.compactMap { operation in
+            operation.compilerOperation.map {
+                CompilerOperationTarget(
+                    operation: $0,
+                    dispatch: operation.dispatch,
+                    baseName: operation.baseName
+                )
+            }
+        })
+        return catalog.filter { operation in
+            if let usr = declarationUSR(operation),
+               sourceUSRs.contains(usr) {
+                return true
+            }
+            if !Set(operation.silReferences).isDisjoint(
+                with: sourceSymbols
+            ) {
+                return true
+            }
+            if let evidence = operation.objectiveC,
+               sourceObjectiveCTargets.contains(.init(
+                    runtimeClassName: evidence.runtimeClassName,
+                    selector: evidence.selector,
+                    dispatch: operation.dispatch
+               )) {
+                return true
+            }
+            if let evidence = operation.c,
+               sourceCTargets.contains(.init(
+                    symbol: evidence.symbol,
+                    dispatch: operation.dispatch
+               )) {
+                return true
+            }
+            if let compilerOperation = operation.compilerOperation,
+               sourceCompilerOperations.contains(.init(
+                    operation: compilerOperation,
+                    dispatch: operation.dispatch,
+                    baseName: operation.baseName
+               )) {
+                return true
+            }
+            return false
+        }
+    }
+
+    private struct ObjectiveCTarget: Hashable {
+        var runtimeClassName: String
+        var selector: String
+        var dispatch: NativeImportDiscovery.Dispatch
+    }
+
+    private struct CTarget: Hashable {
+        var symbol: String
+        var dispatch: NativeImportDiscovery.Dispatch
+    }
+
+    private struct CompilerOperationTarget: Hashable {
+        var operation: FrontendReceipt.Adapter.ImportedOperation
+            .CompilerOperation
+        var dispatch: NativeImportDiscovery.Dispatch
+        var baseName: String
+    }
+
+    private static func declarationUSR(
+        _ operation: FrontendReceipt.Adapter.ImportedOperation
+    ) -> String? {
+        operation.declarationUSR
+            ?? operation.objectiveC?.declarationUSR
+            ?? operation.c?.declarationUSR
     }
 
     static func validatePublishedEntries(

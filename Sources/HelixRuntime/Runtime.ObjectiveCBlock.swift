@@ -172,7 +172,9 @@ extension Runtime.ObjectiveCBlock {
             parameterIndex: parameterIndex,
             from: callbackValue
         )
-        guard callback.signature == signature else {
+        guard callback.signature == signature
+                || callback.signature.isMainActorRestriction(of: signature)
+        else {
             throw VM.RuntimeTrap.nativeFailure(
                 "Objective-C Block callback signature mismatch"
             )
@@ -181,7 +183,7 @@ extension Runtime.ObjectiveCBlock {
             callback: callback,
             catalog: context.nativeTypeCatalog
         )
-        return try makeBlock(box: box, signature: signature)
+        return try makeBlock(box: box, signature: callback.signature)
     }
 
     private static func makeBlock(

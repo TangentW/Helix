@@ -61,8 +61,13 @@ public struct CInvoker: VM.NativeInvoker {
         guard constructionFailure == nil else {
             throw VM.RuntimeTrap.nativeFailure(constructionFailure!)
         }
-        guard arguments.count == parameterTypes.count,
-              zip(arguments, parameterTypes).allSatisfy({ $0.0.matches($0.1) })
+        guard VM.NativeInvocationABI.argumentsAreCompatible(
+            arguments,
+            with: parameterTypes,
+            callbackParameterIndices: Set(
+                contract.callbacks.map { Int($0.parameterIndex) }
+            )
+        )
         else {
             throw VM.RuntimeTrap.nativeFailure(
                 "C invocation arguments disagree with verified types"

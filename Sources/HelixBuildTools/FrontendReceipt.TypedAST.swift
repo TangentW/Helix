@@ -90,6 +90,17 @@ struct Demangler {
 }
 
 enum ValueTypeParser {
+    /// Returns true only for values whose complete semantics are owned by the
+    /// VM without consulting an imported or source nominal table. A Clang
+    /// bridge may accept one of these spellings, but that does not make the
+    /// native representation the same logical type.
+    static func isBuiltinValueSpelling(
+        _ spelling: String,
+        allowVoid: Bool = false
+    ) -> Bool {
+        parse(spelling, allowVoid: allowVoid) != nil
+    }
+
     static func parse(
         _ spelling: String,
         allowVoid: Bool,
@@ -238,12 +249,6 @@ enum ValueTypeParser {
             : value
         let name = existential.hasPrefix("Swift.")
             ? String(existential.dropFirst(6)) : existential
-        if let id = nativeTypes[value] {
-            return .native(id)
-        }
-        if let key = localTypes[value] {
-            return .local(key)
-        }
         switch name {
         case "Bool": return .bool
         case "Int": return .integer(bitWidth: 64, signed: true)
@@ -263,8 +268,19 @@ enum ValueTypeParser {
         case "Substring": return .array(.string)
         case "Any": return .any
         case "Error": return .error
-        default: return nil
+        default: break
         }
+        // Catalog aliases describe source interoperability, but they cannot
+        // replace HLBC's built-in value semantics. For example NSString may
+        // advertise Swift.String as a bridge alias while a String parameter
+        // must still cross the VM as text rather than an opaque native box.
+        if let id = nativeTypes[value] {
+            return .native(id)
+        }
+        if let key = localTypes[value] {
+            return .local(key)
+        }
+        return nil
     }
 
     private static func optionalWrappedType(_ value: String) -> String? {

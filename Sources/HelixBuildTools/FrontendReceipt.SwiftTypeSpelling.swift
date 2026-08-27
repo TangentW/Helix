@@ -4,6 +4,91 @@ import Foundation
 /// boundary, not a semantic resolver; frozen ValueType checks remain separate.
 extension FrontendReceipt {
 enum SwiftTypeSpelling {
+    /// Returns an equality-only spelling for a native boundary type. This does
+    /// not rewrite the declaration emitted by a Catalog; it only folds names
+    /// that the Swift compiler prints both qualified and unqualified for the
+    /// same standard-library declaration.
+    static func canonicalABIIdentity(_ raw: String) -> String {
+        replacingNominalAliases(
+            in: raw.trimmingCharacters(in: .whitespacesAndNewlines),
+            aliases: ["Swift.MainActor": "MainActor"]
+        )
+    }
+
+    /// Compares the value shape of two observations of one declaration. Typed
+    /// AST expressions can omit callback attributes that remain present in a
+    /// declaration-level Catalog (for example when an optional callback is
+    /// passed as `nil`). Once the declaration USR and call projection agree,
+    /// those attributes are refinements supplied by the Catalog, not overload
+    /// identity. Optionality and every parameter/result value type remain part
+    /// of the match so a different logical specialization cannot be absorbed.
+    static func catalogAuthorityMatchIdentity(_ raw: String) -> String {
+        let value = canonicalABIIdentity(raw)
+        if let callback = FrontendReceipt.FunctionTypeSpelling
+            .callbackBoundary(in: value) {
+            let parameterSpellings = FrontendReceipt.FunctionTypeSpelling
+                .parameterSpellings(
+                    in: callback.function.declaredSpelling
+                ) ?? callback.function.parameters
+            let parameters = parameterSpellings.map(
+                catalogAuthorityMatchIdentity
+            )
+            var function = "(\(parameters.joined(separator: ",")))"
+            if callback.function.isAsync { function += " async" }
+            if callback.function.isThrowing { function += " throws" }
+            function += " -> "
+                + catalogAuthorityMatchIdentity(callback.function.result)
+            return callback.isOptional
+                ? "Swift.Optional<\(function)>" : function
+        }
+        if let wrapped = optionalWrappedType(value) {
+            return "Swift.Optional<"
+                + catalogAuthorityMatchIdentity(wrapped) + ">"
+        }
+        if value.hasPrefix("any ") {
+            return "any " + catalogAuthorityMatchIdentity(
+                String(value.dropFirst("any ".count))
+            )
+        }
+        if value.hasPrefix("["), value.hasSuffix("]") {
+            let body = String(value.dropFirst().dropLast())
+            guard let components = splitTopLevel(body, separator: ":") else {
+                return value
+            }
+            if components.count == 2 {
+                return "Swift.Dictionary<"
+                    + catalogAuthorityMatchIdentity(components[0]) + ","
+                    + catalogAuthorityMatchIdentity(components[1]) + ">"
+            }
+            if components.count == 1 {
+                return "Swift.Array<"
+                    + catalogAuthorityMatchIdentity(components[0]) + ">"
+            }
+            return value
+        }
+        if value.hasPrefix("("), value.hasSuffix(")"),
+           let components = splitTopLevel(
+               String(value.dropFirst().dropLast()),
+               separator: ","
+           ) {
+            let types = components.map {
+                catalogAuthorityMatchIdentity(removingTupleLabel($0))
+            }
+            return "(" + types.joined(separator: ",") + ")"
+        }
+        if let open = value.firstIndex(of: "<"), value.hasSuffix(">") {
+            let arguments = String(
+                value[value.index(after: open)..<value.index(before: value.endIndex)]
+            )
+            if let components = splitTopLevel(arguments, separator: ",") {
+                return canonicalStandardNominal(String(value[..<open])) + "<"
+                    + components.map(catalogAuthorityMatchIdentity)
+                        .joined(separator: ",") + ">"
+            }
+        }
+        return canonicalStandardNominal(value)
+    }
+
     /// Rewrites only complete nominal tokens, preserving the surrounding
     /// optional, collection, tuple, generic, and function-type syntax.
     static func replacingNominalAliases(
@@ -148,6 +233,39 @@ enum SwiftTypeSpelling {
         ["()", "Void", "Swift.Void"].contains(
             value.trimmingCharacters(in: .whitespacesAndNewlines)
         )
+    }
+
+    private static func optionalWrappedType(_ value: String) -> String? {
+        if value.hasSuffix("?") || value.hasSuffix("!") {
+            return String(value.dropLast())
+        }
+        for prefix in ["Optional<", "Swift.Optional<"]
+        where value.hasPrefix(prefix) && value.hasSuffix(">") {
+            return String(value.dropFirst(prefix.count).dropLast())
+        }
+        return nil
+    }
+
+    private static func removingTupleLabel(_ raw: String) -> String {
+        guard let components = splitTopLevel(raw, separator: ":"),
+              components.count == 2,
+              isModulePath(components[0])
+        else { return raw }
+        return components[1]
+    }
+
+    private static func canonicalStandardNominal(_ raw: String) -> String {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let unqualified = value.hasPrefix("Swift.")
+            ? String(value.dropFirst("Swift.".count)) : value
+        let standard: Set<String> = [
+            "Any", "Bool", "Character", "Double", "Error", "Float",
+            "Int", "Int8", "Int16", "Int32", "Int64", "Never", "String",
+            "Substring", "UInt", "UInt8", "UInt16", "UInt32", "UInt64",
+            "Void",
+        ]
+        guard standard.contains(unqualified) else { return value }
+        return unqualified == "Void" ? "()" : "Swift.\(unqualified)"
     }
 
     private static func splitTopLevel(

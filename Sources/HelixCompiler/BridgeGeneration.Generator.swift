@@ -264,15 +264,25 @@ public struct GeneratedNativeType: Hashable, Sendable {
         "makeNativeType_\(id.rawValue.hex)"
     }
 
+    public static func exportSymbol(id: Core.TypeID) -> String {
+        "hlx_native_type_ops_v1_\(id.rawValue.hex)"
+    }
+
+    public static func exportFunctionName(id: Core.TypeID) -> String {
+        "helixExportNativeTypeOperations_\(id.rawValue.hex)"
+    }
+
     public static func bindingExpression(
         sourceFileLogicalID: String,
         id: Core.TypeID,
         canonicalName: String,
         layoutFingerprint: Core.Digest,
         requiresMainActor: Bool,
-        estimatedSize: UInt64
+        estimatedSize: UInt64,
+        precomputedGroupName: String? = nil
     ) -> String {
-        let group = groupName(sourceFileLogicalID: sourceFileLogicalID)
+        let group = precomputedGroupName
+            ?? groupName(sourceFileLogicalID: sourceFileLogicalID)
         let factory = factoryName(id: id)
         return "\(group).\(factory)(id: Core.TypeID(rawValue: try! Core.Digest(hex: "
             + "\(String(reflecting: id.rawValue.hex)))), canonicalName: "
@@ -319,14 +329,21 @@ public struct Generator: Sendable {
     public func generateDevelopmentAdapterFiles(
         applicationModuleName: String,
         bindings: [BridgeGeneration.NativeImportBinding],
-        records: [InterfaceArchive.NativeImportRecord]
+        records: [InterfaceArchive.NativeImportRecord],
+        nativeTypeBindings: [BridgeGeneration.NativeTypeBinding] = [],
+        nativeTypeRecords: [InterfaceArchive.TypeRecord] = []
     ) throws -> [String: String] {
         guard BridgeGeneration.isValidSwiftIdentifier(applicationModuleName),
-              !bindings.isEmpty,
+              !bindings.isEmpty || !nativeTypeBindings.isEmpty,
               bindings.count == records.count,
+              nativeTypeBindings.count == nativeTypeRecords.count,
               Set(bindings.map(\.id)).count == bindings.count,
               Set(bindings.map(\.key)).count == bindings.count,
-              Set(records.compactMap(\.id)).count == records.count
+              Set(records.compactMap(\.id)).count == records.count,
+              Set(nativeTypeBindings.map(\.id)).count
+                == nativeTypeBindings.count,
+              Set(nativeTypeRecords.map(\.id)).count
+                == nativeTypeRecords.count
         else { throw BridgeGeneration.Error.incompleteNativeImportBindings }
         let recordsByID = Dictionary(
             uniqueKeysWithValues: records.compactMap { record in
@@ -383,6 +400,62 @@ public struct Generator: Sendable {
                 nativeModuleName: module,
                 bindings: values.map(\.1),
                 records: recordsByID
+            )
+        }
+        let typeRecordsByID = Dictionary(
+            uniqueKeysWithValues: nativeTypeRecords.map { ($0.id, $0) }
+        )
+        let generatedTypes = try nativeTypeBindings.map { binding -> (
+            BridgeGeneration.NativeTypeBinding,
+            BridgeGeneration.GeneratedNativeType,
+            InterfaceArchive.TypeRecord
+        ) in
+            guard binding.strategy == .factory,
+                  let generated = binding.generated,
+                  let record = typeRecordsByID[binding.id],
+                  record.id == binding.id,
+                  record.canonicalName == binding.canonicalName,
+                  record.layoutFingerprint == binding.layoutFingerprint,
+                  record.requiresMainActor == binding.requiresMainActor,
+                  record.isEmittedToDevice,
+                  record.isCopyable,
+                  record.objectiveCRuntimeName == nil,
+                  binding.operationsExpression
+                    == BridgeGeneration.GeneratedNativeType.bindingExpression(
+                        sourceFileLogicalID: generated.sourceFileLogicalID,
+                        id: record.id,
+                        canonicalName: record.canonicalName,
+                        layoutFingerprint: record.layoutFingerprint,
+                        requiresMainActor: record.requiresMainActor,
+                        estimatedSize: record.estimatedSize
+                    ),
+                  BridgeGeneration.Generator.generatedRepresentation(
+                    generated.representation,
+                    matches: record.kind
+                  ),
+                  BridgeGeneration.Generator.nativeABIEncodingIsValid(
+                    generated
+                  )
+            else {
+                throw BridgeGeneration.Error.nativeTypeBindingMismatch(
+                    binding.id
+                )
+            }
+            return (binding, generated, record)
+        }
+        for (source, values) in Dictionary(
+            grouping: generatedTypes,
+            by: { $0.1.sourceFileLogicalID }
+        ).sorted(by: { $0.key < $1.key }) {
+            let path = "Development/Types_"
+                + Core.Digest.sha256(source).hex + ".swift"
+            guard files[path] == nil else {
+                throw BridgeGeneration.Error.outputCollision(path)
+            }
+            files[path] = try renderDevelopmentNativeTypeFile(
+                applicationModuleName: applicationModuleName,
+                sourceFileLogicalID: source,
+                values: values
             )
         }
         guard !files.isEmpty else {
@@ -2353,11 +2426,13 @@ public struct Generator: Sendable {
             )
             """
         case .opaqueValue:
-            guard record.kind == .value else {
+            guard record.kind == .value || record.kind == .enumeration else {
                 throw BridgeGeneration.Error.nativeTypeBindingMismatch(binding.id)
             }
+            let factory = record.kind == .enumeration
+                ? "opaqueEnumeration" : "opaqueValue"
             operations = """
-            VM.NativeTypeOperations.opaqueValue(
+            VM.NativeTypeOperations.\(factory)(
                 id: id,
                 canonicalName: canonicalName,
                 layoutFingerprint: layoutFingerprint,
@@ -2451,6 +2526,87 @@ public struct Generator: Sendable {
                 bindings: sorted,
                 groupName: groupName
             ))
+        }
+        lines.append("")
+        return lines.joined(separator: "\n")
+    }
+
+    private func renderDevelopmentNativeTypeFile(
+        applicationModuleName: String,
+        sourceFileLogicalID: String,
+        values: [(
+            BridgeGeneration.NativeTypeBinding,
+            BridgeGeneration.GeneratedNativeType,
+            InterfaceArchive.TypeRecord
+        )]
+    ) throws -> String {
+        guard isSafeLogicalPath(sourceFileLogicalID), !values.isEmpty else {
+            throw BridgeGeneration.Error.incompleteNativeTypeBindings
+        }
+        let externalModules = Set(values.compactMap { $0.1.nativeModuleName })
+        guard externalModules.count <= 1,
+              values.allSatisfy({ value in
+                  value.1.sourceFileLogicalID == sourceFileLogicalID
+                      && isValidGeneratedSwiftTypeSpelling(value.1.swiftType)
+                      && value.0.importedModules
+                        == Array(Set(value.0.importedModules)).sorted()
+                      && value.0.importedModules.allSatisfy(isValidModulePath)
+                      && (value.1.nativeModuleName.map {
+                          value.0.importedModules.contains($0)
+                      } ?? value.0.importedModules.isEmpty)
+              })
+        else {
+            throw BridgeGeneration.Error.incompleteNativeTypeBindings
+        }
+        let imports = Array(Set(values.flatMap { $0.0.importedModules }))
+            .sorted().map { "import \($0)" }
+        var lines = [
+            "// Generated by Helix Development Adapter Generator. Do not edit.",
+        ]
+        if externalModules.isEmpty {
+            lines.append(
+                "@_private(sourceFile: \(quoted(URL(fileURLWithPath: sourceFileLogicalID).lastPathComponent))) import \(applicationModuleName)"
+            )
+        }
+        lines += imports + ["import Foundation"]
+            + BridgeGeneration.RuntimeImports.productionLines
+        let groupName = BridgeGeneration.GeneratedNativeType.groupName(
+            sourceFileLogicalID: sourceFileLogicalID
+        )
+        lines += ["", "enum \(groupName) {"]
+        let sorted = values.sorted { $0.0.id.rawValue < $1.0.id.rawValue }
+        for (offset, value) in sorted.enumerated() {
+            if offset > 0 { lines.append("") }
+            lines.append(indent(
+                try renderGeneratedNativeTypeFactory(
+                    binding: value.0,
+                    generated: value.1,
+                    record: value.2
+                ),
+                spaces: 4
+            ))
+        }
+        lines.append("}")
+        for value in sorted {
+            let binding = value.0
+            let export = BridgeGeneration.GeneratedNativeType.exportSymbol(
+                id: binding.id
+            )
+            let function = BridgeGeneration.GeneratedNativeType
+                .exportFunctionName(id: binding.id)
+            guard let expression = binding.operationsExpression else {
+                throw BridgeGeneration.Error.nativeTypeBindingMismatch(
+                    binding.id
+                )
+            }
+            lines += [
+                "",
+                "@_cdecl(\(quoted(export)))",
+                "public func \(function)() -> UnsafeMutableRawPointer? {",
+                "    let body = Runtime.NativeTypeOperationsBody(\(expression))",
+                "    return Unmanaged.passRetained(body).toOpaque()",
+                "}",
+            ]
         }
         lines.append("")
         return lines.joined(separator: "\n")
@@ -2576,7 +2732,8 @@ public struct Generator: Sendable {
                 + renderDecode(
                     expression: "arguments[\(offset)]",
                     shape: pair.0,
-                    type: pair.1
+                    type: pair.1,
+                    nativeInvocationContext: "context"
                 )
         }
         let resultShape = try parseSwiftType(generated.resultSwiftType)
@@ -3041,9 +3198,11 @@ public struct Generator: Sendable {
         switch (shape, type) {
         case (.named, .any):
             if let inputEncoder {
-                return "try \(inputEncoder).encodeAny(\(expression))"
+                return "try \(inputEncoder).encodeAny(\(expression), "
+                    + "nativeTypeCatalog: \(nativeCatalog))"
             }
-            return "try Runtime.BridgeValueCodec.encodeAny(\(expression))"
+            return "try Runtime.BridgeValueCodec.encodeAny(\(expression), "
+                + "nativeTypeCatalog: \(nativeCatalog))"
         case (.named, .bool), (.named, .integer), (.named, .float), (.named, .string):
             if let inputEncoder {
                 return "try \(inputEncoder).encode(\(expression))"
@@ -3235,6 +3394,7 @@ public struct Generator: Sendable {
                 expression: "nativeArguments[\(index)]",
                 shape: pair.0,
                 type: pair.1,
+                nativeCatalog: nativeCatalog,
                 frozenValueTypes: frozenValueTypes
             )
         }
@@ -3273,13 +3433,22 @@ public struct Generator: Sendable {
         expression: String,
         shape: SwiftTypeShape,
         type: Bytecode.ValueType,
+        nativeCatalog: String? = nil,
+        nativeInvocationContext: String? = nil,
         frozenValueTypes: [
             Bytecode.LocalTypeKey: InterfaceArchive.FrozenValueTypeRecord
         ] = [:]
     ) -> String {
         switch (shape, type) {
         case (.named, .any):
-            return "try Runtime.BridgeValueCodec.decodeAny(\(expression))"
+            if let nativeInvocationContext {
+                return "try Runtime.BridgeValueCodec.decodeAny(\(expression), "
+                    + "context: \(nativeInvocationContext))"
+            }
+            let catalog = nativeCatalog
+                ?? "try Runtime.Bridge.shared.requireNativeTypeCatalog()"
+            return "try Runtime.BridgeValueCodec.decodeAny(\(expression), "
+                + "nativeTypeCatalog: \(catalog))"
         case let (.named(name), .bool), let (.named(name), .integer),
              let (.named(name), .float), let (.named(name), .string):
             return "try Runtime.BridgeValueCodec.decode(\(expression), as: \(name).self)"
@@ -3307,6 +3476,8 @@ public struct Generator: Sendable {
                 expression: "wrapped",
                 shape: wrappedShape,
                 type: wrappedType,
+                nativeCatalog: nativeCatalog,
+                nativeInvocationContext: nativeInvocationContext,
                 frozenValueTypes: frozenValueTypes
             )
             return "try Runtime.BridgeValueCodec.decodeOptional(\(expression)) { wrapped in "
@@ -3316,6 +3487,8 @@ public struct Generator: Sendable {
                 expression: "element",
                 shape: elementShape,
                 type: elementType,
+                nativeCatalog: nativeCatalog,
+                nativeInvocationContext: nativeInvocationContext,
                 frozenValueTypes: frozenValueTypes
             )
             return "try Runtime.BridgeValueCodec.decodeArray(\(expression), elementType: "
@@ -3325,12 +3498,16 @@ public struct Generator: Sendable {
                 expression: "key",
                 shape: keyShape,
                 type: keyType,
+                nativeCatalog: nativeCatalog,
+                nativeInvocationContext: nativeInvocationContext,
                 frozenValueTypes: frozenValueTypes
             )
             let decodedValue = renderDecode(
                 expression: "value",
                 shape: valueShape,
                 type: valueType,
+                nativeCatalog: nativeCatalog,
+                nativeInvocationContext: nativeInvocationContext,
                 frozenValueTypes: frozenValueTypes
             )
             return "try Runtime.BridgeValueCodec.decodeDictionary(\(expression), keyType: "
@@ -3342,6 +3519,8 @@ public struct Generator: Sendable {
                 expression: "element",
                 shape: elementShape,
                 type: elementType,
+                nativeCatalog: nativeCatalog,
+                nativeInvocationContext: nativeInvocationContext,
                 frozenValueTypes: frozenValueTypes
             )
             return "try Runtime.BridgeValueCodec.decodeSet(\(expression), elementType: "
@@ -3353,6 +3532,8 @@ public struct Generator: Sendable {
                     expression: "\(temporary)[\(offset)]",
                     shape: pair.0,
                     type: pair.1,
+                    nativeCatalog: nativeCatalog,
+                    nativeInvocationContext: nativeInvocationContext,
                     frozenValueTypes: frozenValueTypes
                 )
             }
@@ -3594,7 +3775,7 @@ public struct Generator: Sendable {
         switch representation {
         case .reference: kind == .reference
         case .rawRepresentable: kind == .value || kind == .enumeration
-        case .opaqueValue: kind == .value
+        case .opaqueValue: kind == .value || kind == .enumeration
         case .objectiveCStructure: kind == .value
         }
     }
@@ -3764,7 +3945,7 @@ public struct Generator: Sendable {
                   generated.argumentLabels == ["_"],
                   record.parameterTypes.count == 1,
                   record.resultType == .void,
-                  generated.resultSwiftType == "Swift.Void"
+                  Core.NativeCall.isVoid(generated.resultSwiftType)
             else {
                 throw mismatch("static setter dispatch")
             }
@@ -4179,10 +4360,10 @@ public struct Generator: Sendable {
             nativeTypeOperations.declarations,
         ].filter { !$0.isEmpty }.joined(separator: "\n\n")
         let synchronousExpression = hasObjectiveCInvokers
-            ? "try makeObjectiveCNativeInvokers() + \(synchronousInvokers.expression)"
+            ? "(try makeObjectiveCNativeInvokers()) + (\(synchronousInvokers.expression))"
             : synchronousInvokers.expression
         let nativeTypeExpression = hasObjectiveCTypeOperations
-            ? "try makeObjectiveCNativeTypeOperations() + \(nativeTypeOperations.expression)"
+            ? "(try makeObjectiveCNativeTypeOperations()) + (\(nativeTypeOperations.expression))"
             : nativeTypeOperations.expression
         return """
         \(helpers.isEmpty ? "" : helpers + "\n\n")

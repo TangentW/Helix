@@ -127,29 +127,38 @@ public struct Adapter: Sendable {
             try CanonicalSIL.File(text: operationSIL)
         }
         let moduleName = request.metadata.frontendInvocation.moduleName
-        let configuredCallingSurface = try callingSurfaceConfiguration(
-            request.configuration,
-            policy: request.callingSurfacePolicy,
-            moduleName: moduleName,
-            sources: orderedSources
-        )
-        let effectiveConfiguration = configuration(
-            configuredCallingSurface,
-            allowing: Array(NativeImportCatalog.Builtins.automaticCallees),
-            moduleName: moduleName
-        )
-        try effectiveConfiguration.validate()
+        let effectiveConfiguration = try performance.measure(
+            "frontend.resolve_calling_surface"
+        ) {
+            let configured = try callingSurfaceConfiguration(
+                request.configuration,
+                policy: request.callingSurfacePolicy,
+                moduleName: moduleName,
+                sources: orderedSources
+            )
+            let effective = configuration(
+                configured,
+                allowing: Array(NativeImportCatalog.Builtins.automaticCallees),
+                moduleName: moduleName
+            )
+            try effective.validate()
+            return effective
+        }
         let sourceByPhysicalPath = Dictionary(
             uniqueKeysWithValues: sourceStates.map {
                 ($0.url.resolvingSymlinksInPath().standardizedFileURL.path, $0)
             }
         )
-        let sourceNominals = try discoverSourceNominals(
-            documents: documents,
-            sourcesByPhysicalPath: sourceByPhysicalPath,
-            moduleName: moduleName,
-            demangled: demangled
-        )
+        let sourceNominals = try performance.measure(
+            "frontend.discover_source_nominals"
+        ) {
+            try discoverSourceNominals(
+                documents: documents,
+                sourcesByPhysicalPath: sourceByPhysicalPath,
+                moduleName: moduleName,
+                demangled: demangled
+            )
+        }
         let sourceNominalsByName = Dictionary(uniqueKeysWithValues: sourceNominals.map {
             ($0.canonicalName, $0)
         })
@@ -157,31 +166,33 @@ public struct Adapter: Sendable {
             sourceNominals: sourceNominals,
             moduleName: moduleName
         )
-        let discoveredImportedTypes = try discoverImportedNativeTypes(
-            documents: documents,
-            sourcesByPhysicalPath: sourceByPhysicalPath,
-            moduleName: moduleName,
-            demangled: demangled
-        )
-        var importedOperationSurface = try discoverImportedOperationSurface(
-            documents: documents,
-            sourcesByPhysicalPath: sourceByPhysicalPath,
-            moduleName: moduleName,
-            demangled: demangled,
-            silFile: operationSILFile
-        )
-        importedOperationSurface.operations = try performance.measure(
-            "frontend.resolve_objective_c_selectors"
+        let discoveredImportedTypes = try performance.measure(
+            "frontend.discover_imported_types"
         ) {
-            try FrontendReceipt.ObjectiveCSelectorResolver.resolve(
-                operations: importedOperationSurface.operations,
-                frontend: frontend,
-                invocation: request.metadata.frontendInvocation
+            try discoverImportedNativeTypes(
+                documents: documents,
+                sourcesByPhysicalPath: sourceByPhysicalPath,
+                moduleName: moduleName,
+                demangled: demangled
             )
         }
-        var importedTypes = try mergeImportedNativeTypes(
-            discoveredTypes: discoveredImportedTypes,
-            operationTypes: importedOperationSurface.types
+        var importedOperationSurface = try performance.measure(
+            "frontend.discover_imported_operations"
+        ) {
+            try discoverImportedOperationSurface(
+                documents: documents,
+                sourcesByPhysicalPath: sourceByPhysicalPath,
+                moduleName: moduleName,
+                demangled: demangled,
+                silFile: operationSILFile,
+                performance: performance
+            )
+        }
+        let sourceObservedImportedTypeNames = Set(
+            (discoveredImportedTypes + importedOperationSurface.types)
+                .flatMap { type in
+                    [type.canonicalName, type.swiftType] + type.aliases
+                }
         )
         var requiredImportedOperationSourceIDs = Set<String>()
         let catalogSurface = try performance.measure(
@@ -208,236 +219,35 @@ public struct Adapter: Sendable {
                 $0 + $1.entries.count
             })
         )
-        if request.callingSurfacePolicy.expandsImportedModules {
-            let observedDeclarationUSRs: Set<String> = Set(
-                importedOperationSurface.operations.compactMap {
-                    operation in
-                    if operation.objectiveC?.moduleName == nil,
-                       let usr = operation.objectiveC?.declarationUSR {
-                        return usr
-                    }
-                    if operation.c?.moduleName == nil {
-                        return operation.c?.declarationUSR
-                    }
-                    return nil
-                }
+        var importedTypes = try performance.measure(
+            "frontend.merge_imported_types"
+        ) {
+            try mergeImportedNativeTypes(
+                discoveredTypes: discoveredImportedTypes,
+                operationTypes: importedOperationSurface.types
+                    + (request.callingSurfacePolicy.expandsImportedModules
+                        ? catalogSurface.importedTypes
+                        : [])
             )
-            let observedCModules = Set(
-                importedOperationSurface.operations.compactMap { operation in
-                    operation.c?.moduleName == nil
-                        ? operation.importedModules : nil
-                }.flatMap { $0 }
-            )
-            let missingModules = Set(catalogSurface.missingModules)
-            let fallbackTypes = importedTypes.compactMap {
-                type -> ImportedNativeType? in
-                var type = type
-                type.importedModules = type.importedModules.filter {
-                    guard let root = $0.split(separator: ".").first else {
-                        return false
-                    }
-                    return missingModules.contains(String(root))
-                }
-                return type.importedModules.isEmpty ? nil : type
-            }
-            let fallbackCModules = observedCModules.filter {
-                guard let root = $0.split(separator: ".").first else {
-                    return false
-                }
-                return missingModules.contains(String(root))
-            }
-            let managedSurface: FrontendReceipt.ManagedNativeSurface
-                .Expansion? = if missingModules.isEmpty {
-                nil
-            } else {
-                try performance.measure(
-                    "frontend.expand_managed_native_surface"
-                ) {
-                    try FrontendReceipt.ManagedNativeSurface.expand(
-                        importedTypes: fallbackTypes,
-                        minimumOS: request.metadata.minimumOS,
-                        frontend: frontend,
-                        invocation: request.metadata.frontendInvocation,
-                        declarationUSRs: observedDeclarationUSRs,
-                        candidateModules: fallbackCModules,
-                        cache: cache,
-                        compilerFingerprint: toolchain.fingerprint,
-                        compilerInputHash: compilerInputHash
-                    )
-                }
-            }
-            performance.setCounter(
-                "managed_native.imported_type_count",
-                value: UInt64(managedSurface?.importedTypes.count ?? 0)
-            )
-            performance.setCounter(
-                "managed_native.measured_operation_count",
-                value: UInt64(managedSurface?.operations.count ?? 0)
-            )
-            performance.setCounter(
-                "managed_native.module_count",
-                value: managedSurface?.metrics.moduleCount ?? 0
-            )
-            performance.setCounter(
-                "managed_native.candidate_count",
-                value: managedSurface?.metrics.candidateCount ?? 0
-            )
-            performance.setCounter(
-                "managed_native.symbol_graph_cache_hit_count",
-                value: managedSurface?.metrics.symbolGraphCacheHitCount ?? 0
-            )
-            performance.setCounter(
-                "managed_native.symbol_graph_cache_miss_count",
-                value: managedSurface?.metrics.symbolGraphCacheMissCount ?? 0
-            )
-            performance.setCounter(
-                "managed_native.probe_cache_hit_count",
-                value: managedSurface?.metrics.probeCacheHitCount ?? 0
-            )
-            performance.setCounter(
-                "managed_native.probe_cache_miss_count",
-                value: managedSurface?.metrics.probeCacheMissCount ?? 0
-            )
-            performance.setCounter(
-                "managed_native.cached_rejection_count",
-                value: managedSurface?.metrics.cachedRejectionCount ?? 0
-            )
-            performance.setCounter(
-                "managed_native.probe_attempt_count",
-                value: managedSurface?.metrics.probeAttemptCount ?? 0
-            )
-            performance.setCounter(
-                "managed_native.failed_probe_count",
-                value: managedSurface?.metrics.failedProbeCount ?? 0
-            )
-            performance.setCounter(
-                "managed_native.rejected_singleton_count",
-                value: managedSurface?.metrics.rejectedSingletonCount ?? 0
-            )
-            performance.setCounter(
-                "managed_native.generated_probe_source_bytes",
-                value: managedSurface?.metrics.generatedProbeSourceBytes ?? 0
-            )
-            let measuredImportedTypes = catalogSurface.importedTypes
-                + (managedSurface?.importedTypes ?? [])
-            importedTypes = try mergeImportedNativeTypes(
-                discoveredTypes: importedTypes,
-                operationTypes: measuredImportedTypes
-            )
-            let declarationModules = try mergedDeclarationModules(
-                catalogSurface.modulesByDeclarationUSR,
-                managedSurface?.modulesByDeclarationUSR ?? [:]
-            )
-            importedOperationSurface.operations = try
-                applyingObjectiveCInitializerTypeModules(
-                    to: importedOperationSurface.operations,
-                    importedTypes: importedTypes
+        }
+        try performance.measure("frontend.bind_native_api_catalogs") {
+            if request.callingSurfacePolicy.expandsImportedModules {
+                // Consumer ASTs may spell one imported nominal through a
+                // Clang alias while the declaring-module Catalog uses its
+                // Swift overlay name (for example NSURLResourceKey versus
+                // URLResourceKey). Normalize the source observation before
+                // matching declaration projections; Catalog operations
+                // themselves remain untouched.
+                let catalogComparisonAliases = try makeImportedSwiftTypeAliases(
+                    importedTypes
                 )
-            importedOperationSurface.operations =
-                applyingObjectiveCDeclarationModules(
-                    to: importedOperationSurface.operations,
-                    modulesByUSR: declarationModules
-                )
-            importedOperationSurface.operations =
-                applyingCDeclarationModules(
-                    to: importedOperationSurface.operations,
-                    modulesByUSR: declarationModules
-                )
-            let observedCallbackSymbols = Set(
-                importedOperationSurface.operations.filter { operation in
-                    operation.parameterSwiftTypes.contains {
-                        FrontendReceipt.FunctionTypeSpelling
-                            .callbackBoundary(in: $0) != nil
-                    }
-                }.flatMap(\.silReferences)
-            )
-            let catalogOperations = catalogSurface.operations.map {
-                operation -> FrontendReceipt.Adapter.ImportedOperation in
-                var operation = operation
-                operation.isEmittedToDevice = request.callingSurfacePolicy
-                    == .managedProductionModule
-                return operation
-            }
-            requiredImportedOperationSourceIDs.formUnion(
-                catalogOperations.map(\.sourceFileLogicalID)
-            )
-            let fallbackOperations = (managedSurface?.operations ?? []).compactMap {
-                operation -> FrontendReceipt.Adapter.ImportedOperation? in
-                var operation = operation
-                operation.isEmittedToDevice = false
-                operation.silReferences.removeAll(
-                    where: observedCallbackSymbols.contains
-                )
-                return operation.silReferences.isEmpty ? nil : operation
-            }
-            importedOperationSurface.operations = try
-                applyingMeasuredObjectiveCEvidence(
-                    to: importedOperationSurface.operations,
-                    measured: catalogOperations + fallbackOperations
-                )
-            let sourceAndCatalogOperations = try
-                mergingAuthoritativeImportedOperations(
-                    source: importedOperationSurface.operations,
-                    authoritative: catalogOperations
-                )
-            let additiveFallbackOperations = unambiguousAdditiveImportedOperations(
-                fallbackOperations,
-                authoritative: sourceAndCatalogOperations
-            )
-            // Development fallback is rooted only in source-observed types and
-            // still excludes ambiguous generic symbols. A validated module
-            // Catalog carries exact owner/USR identity and is authoritative.
-            importedOperationSurface.operations = try mergeImportedOperations(
-                sourceAndCatalogOperations + additiveFallbackOperations
-            )
-        } else {
-            let unresolvedObjectiveCEvidence = importedOperationSurface.operations
-                .compactMap(\.objectiveC)
-                .filter { $0.moduleName == nil }
-            let unresolvedRuntimeNames = Set(
-                unresolvedObjectiveCEvidence.map(\.runtimeClassName)
-            )
-            let unresolvedCOperations = importedOperationSurface.operations
-                .filter { $0.c != nil && $0.c?.moduleName == nil }
-            let unresolvedDeclarationUSRs = Set(
-                unresolvedObjectiveCEvidence.map(\.declarationUSR)
-                    + unresolvedCOperations.compactMap { $0.c?.declarationUSR }
-            )
-            let candidateModules = Set(
-                unresolvedCOperations.flatMap(\.importedModules)
-            )
-            if !unresolvedRuntimeNames.isEmpty
-                || !unresolvedDeclarationUSRs.isEmpty {
-                let resolution = try performance.measure(
-                    "frontend.resolve_native_declaration_modules"
-                ) {
-                    try FrontendReceipt.ManagedNativeSurface
-                        .resolveDeclarationModules(
-                            importedTypes: importedTypes,
-                            runtimeNames: unresolvedRuntimeNames,
-                            declarationUSRs: unresolvedDeclarationUSRs,
-                            candidateModules: candidateModules,
-                            minimumOS: request.metadata.minimumOS,
-                            frontend: frontend,
-                            invocation: request.metadata.frontendInvocation,
-                            cache: cache,
-                            compilerFingerprint: toolchain.fingerprint,
-                            compilerInputHash: compilerInputHash
+                importedOperationSurface.operations = importedOperationSurface
+                    .operations.map {
+                        applyingSwiftTypeAliases(
+                            $0,
+                            aliases: catalogComparisonAliases
                         )
-                }
-                performance.setCounter(
-                    "native_declaration_module.module_count",
-                    value: resolution.metrics.moduleCount
-                )
-                performance.setCounter(
-                    "native_declaration_module.symbol_graph_cache_hit_count",
-                    value: resolution.metrics.symbolGraphCacheHitCount
-                )
-                performance.setCounter(
-                    "native_declaration_module.symbol_graph_cache_miss_count",
-                    value: resolution.metrics.symbolGraphCacheMissCount
-                )
-                importedTypes = resolution.importedTypes
+                    }
                 importedOperationSurface.operations = try
                     applyingObjectiveCInitializerTypeModules(
                         to: importedOperationSurface.operations,
@@ -446,57 +256,221 @@ public struct Adapter: Sendable {
                 importedOperationSurface.operations =
                     applyingObjectiveCDeclarationModules(
                         to: importedOperationSurface.operations,
-                        modulesByUSR:
-                            resolution.modulesByDeclarationUSR
+                        modulesByUSR: catalogSurface.modulesByDeclarationUSR
                     )
                 importedOperationSurface.operations =
                     applyingCDeclarationModules(
                         to: importedOperationSurface.operations,
-                        modulesByUSR: resolution.modulesByDeclarationUSR
+                        modulesByUSR: catalogSurface.modulesByDeclarationUSR
                     )
+                let relevantCatalogOperations = FrontendReceipt.CatalogSurface
+                    .operationsRelevantToSource(
+                        catalogSurface.operations,
+                        source: importedOperationSurface.operations
+                    )
+                performance.setCounter(
+                    "native_api_catalog.relevant_operation_count",
+                    value: UInt64(relevantCatalogOperations.count)
+                )
+                let catalogOperations = relevantCatalogOperations.map {
+                    operation -> FrontendReceipt.Adapter.ImportedOperation in
+                    var operation = operation
+                    operation.isEmittedToDevice = request.callingSurfacePolicy
+                        == .managedProductionModule
+                    return operation
+                }
+                requiredImportedOperationSourceIDs.formUnion(
+                    catalogOperations.map(\.sourceFileLogicalID)
+                )
+                importedOperationSurface.operations = try
+                    applyingMeasuredObjectiveCEvidence(
+                        to: importedOperationSurface.operations,
+                        measured: catalogOperations
+                    )
+                importedOperationSurface.operations = try
+                    mergingAuthoritativeImportedOperations(
+                        source: importedOperationSurface.operations,
+                        authoritative: catalogOperations,
+                        comparisonAliases: catalogComparisonAliases
+                    )
+            } else {
+                let unresolvedObjectiveCEvidence = importedOperationSurface
+                    .operations.compactMap(\.objectiveC)
+                    .filter { $0.moduleName == nil }
+                let unresolvedRuntimeNames = Set(
+                    unresolvedObjectiveCEvidence.map(\.runtimeClassName)
+                )
+                let unresolvedCOperations = importedOperationSurface.operations
+                    .filter { $0.c != nil && $0.c?.moduleName == nil }
+                let unresolvedDeclarationUSRs = Set(
+                    unresolvedObjectiveCEvidence.map(\.declarationUSR)
+                        + unresolvedCOperations.compactMap {
+                            $0.c?.declarationUSR
+                        }
+                )
+                let candidateModules = Set(
+                    unresolvedCOperations.flatMap(\.importedModules)
+                )
+                if !unresolvedRuntimeNames.isEmpty
+                    || !unresolvedDeclarationUSRs.isEmpty {
+                    let resolution = try performance.measure(
+                        "frontend.resolve_native_declaration_modules"
+                    ) {
+                        try FrontendReceipt.ManagedNativeSurface
+                            .resolveDeclarationModules(
+                                importedTypes: importedTypes,
+                                runtimeNames: unresolvedRuntimeNames,
+                                declarationUSRs: unresolvedDeclarationUSRs,
+                                candidateModules: candidateModules,
+                                minimumOS: request.metadata.minimumOS,
+                                frontend: frontend,
+                                invocation:
+                                    request.metadata.frontendInvocation,
+                                cache: cache,
+                                compilerFingerprint: toolchain.fingerprint,
+                                compilerInputHash: compilerInputHash
+                            )
+                    }
+                    performance.setCounter(
+                        "native_declaration_module.module_count",
+                        value: resolution.metrics.moduleCount
+                    )
+                    performance.setCounter(
+                        "native_declaration_module.symbol_graph_cache_hit_count",
+                        value: resolution.metrics.symbolGraphCacheHitCount
+                    )
+                    performance.setCounter(
+                        "native_declaration_module.symbol_graph_cache_miss_count",
+                        value: resolution.metrics.symbolGraphCacheMissCount
+                    )
+                    importedTypes = resolution.importedTypes
+                    importedOperationSurface.operations = try
+                        applyingObjectiveCInitializerTypeModules(
+                            to: importedOperationSurface.operations,
+                            importedTypes: importedTypes
+                        )
+                    importedOperationSurface.operations =
+                        applyingObjectiveCDeclarationModules(
+                            to: importedOperationSurface.operations,
+                            modulesByUSR:
+                                resolution.modulesByDeclarationUSR
+                        )
+                    importedOperationSurface.operations =
+                        applyingCDeclarationModules(
+                            to: importedOperationSurface.operations,
+                            modulesByUSR: resolution.modulesByDeclarationUSR
+                        )
+                }
             }
         }
-        let objectiveCStructures = try objectiveCStructureTypes(
-            in: importedOperationSurface.operations,
-            targetTriple: request.metadata.frontendInvocation.targetTriple
+        // Catalog property evidence is compiler-authored and already exact.
+        // Only declarations missing that evidence need a narrow fallback
+        // probe, keeping repeated project builds off the Swift frontend.
+        performance.setCounter(
+            "objective_c_selector.fallback_count",
+            value: UInt64(
+                FrontendReceipt.ObjectiveCSelectorResolver
+                    .unresolvedCandidateCount(
+                        in: importedOperationSurface.operations
+                    )
+            )
         )
-        let provisionalNativeTypes = try makeNativeTypes(
-            request.nativeImportCatalog,
-            sourceNominals: sourceNominals,
-            importedTypes: importedTypes,
-            mainActorReferenceTypes: [],
-            metadata: request.metadata,
-            objectiveCStructures: objectiveCStructures
-        )
-        let nativeTypeIDs = try makeNativeTypeLookup(
-            records: provisionalNativeTypes,
-            importedTypes: importedTypes,
-            sourceNominals: sourceNominals
-        )
+        importedOperationSurface.operations = try performance.measure(
+            "frontend.resolve_objective_c_selectors"
+        ) {
+            try FrontendReceipt.ObjectiveCSelectorResolver.resolve(
+                operations: importedOperationSurface.operations,
+                frontend: frontend,
+                invocation: request.metadata.frontendInvocation
+            )
+        }
+        let objectiveCStructures = try performance.measure(
+            "frontend.resolve_native_structures"
+        ) {
+            try objectiveCStructureTypes(
+                in: catalogSurface.operations
+                    + importedOperationSurface.operations,
+                targetTriple: request.metadata.frontendInvocation.targetTriple
+            )
+        }
+        let provisionalNativeTypes = try performance.measure(
+            "frontend.make_provisional_native_types"
+        ) {
+            try makeNativeTypes(
+                request.nativeImportCatalog,
+                sourceNominals: sourceNominals,
+                importedTypes: importedTypes,
+                mainActorReferenceTypes: [],
+                metadata: request.metadata,
+                objectiveCStructures: objectiveCStructures
+            )
+        }
+        let nativeTypeIDs = try performance.measure(
+            "frontend.make_native_type_lookup"
+        ) {
+            try makeNativeTypeLookup(
+                records: provisionalNativeTypes,
+                importedTypes: importedTypes,
+                sourceNominals: sourceNominals
+            )
+        }
         let resolvedNativeTypeIDs = Set(nativeTypeIDs.values)
-        let declarationTypeEnvironment = try silFile.typeEnvironment.includingNativeTypes(
-            nativeTypeIDs,
-            kinds: Dictionary(uniqueKeysWithValues: provisionalNativeTypes.compactMap {
-                resolvedNativeTypeIDs.contains($0.id) ? ($0.id, $0.kind) : nil
-            }),
-            requiresMainActor: Set(provisionalNativeTypes.compactMap {
-                $0.requiresMainActor && resolvedNativeTypeIDs.contains($0.id) ? $0.id : nil
-            })
-        )
+        let declarationTypeEnvironment = try performance.measure(
+            "frontend.make_type_environment"
+        ) {
+            try silFile.typeEnvironment.includingNativeTypes(
+                nativeTypeIDs,
+                kinds: Dictionary(uniqueKeysWithValues:
+                    provisionalNativeTypes.compactMap {
+                        resolvedNativeTypeIDs.contains($0.id)
+                            ? ($0.id, $0.kind) : nil
+                    }
+                ),
+                requiresMainActor: Set(provisionalNativeTypes.compactMap {
+                    $0.requiresMainActor
+                            && resolvedNativeTypeIDs.contains($0.id)
+                        ? $0.id : nil
+                })
+            )
+        }
         let localValueTypes = makeLocalValueTypeLookup(sourceNominals)
-        var importedSwiftTypeAliases = try makeImportedSwiftTypeAliases(
-            importedTypes
-        )
+        var importedSwiftTypeAliases = try performance.measure(
+            "frontend.make_imported_type_aliases"
+        ) {
+            try makeImportedSwiftTypeAliases(importedTypes)
+        }
         let modulePrefix = moduleName + "."
         for (qualified, relative) in sourceNominalAliasIndex.exact
         where qualified.hasPrefix(modulePrefix) {
             importedSwiftTypeAliases[qualified] = relative
         }
-        importedOperationSurface.operations = try mergeImportedOperations(
-            importedOperationSurface.operations.map {
-                applyingSwiftTypeAliases($0, aliases: importedSwiftTypeAliases)
-            }
-        )
+        importedOperationSurface.operations = try performance.measure(
+            "frontend.normalize_imported_operations"
+        ) {
+            try mergeImportedOperations(
+                importedOperationSurface.operations.map {
+                    applyingSwiftTypeAliases(
+                        $0,
+                        aliases: importedSwiftTypeAliases
+                    )
+                }
+            )
+        }
+        let catalogCapabilities = try performance.measure(
+            "frontend.materialize_native_api_catalogs"
+        ) {
+            try FrontendReceipt.CatalogSurface.materializeCapabilities(
+                catalogSurface,
+                nativeTypes: nativeTypeIDs,
+                emittedSymbols: Set(
+                    importedOperationSurface.operations
+                        .filter(\.isEmittedToDevice)
+                        .flatMap(\.silReferences)
+                ),
+                emitCompleteSurface: request.callingSurfacePolicy
+                    == .managedProductionModule
+            )
+        }
         let retainedRequiredOperationSourceIDs = Set(
             importedOperationSurface.operations.map(\.sourceFileLogicalID)
         ).intersection(requiredImportedOperationSourceIDs)
@@ -510,14 +484,20 @@ public struct Adapter: Sendable {
                     ).sorted().joined(separator: ", ")
             )
         }
-        let importedOperationDeclarations = try makeImportedOperationDeclarations(
-            importedOperationSurface.operations,
-            moduleName: moduleName,
-            nativeTypes: nativeTypeIDs,
-            sourceTypeNames: Set(sourceNominals.map(\.canonicalName)),
-            requiredSourceFileLogicalIDs: requiredImportedOperationSourceIDs
-        )
+        let importedOperationDeclarations = try performance.measure(
+            "frontend.make_imported_operation_declarations"
+        ) {
+            try makeImportedOperationDeclarations(
+                importedOperationSurface.operations,
+                moduleName: moduleName,
+                nativeTypes: nativeTypeIDs,
+                sourceTypeNames: Set(sourceNominals.map(\.canonicalName)),
+                requiredSourceFileLogicalIDs:
+                    requiredImportedOperationSourceIDs
+            )
+        }
         var drafts: [Draft] = []
+        try performance.measure("frontend.index_source_declarations") {
         for document in documents {
             guard let filename = document["filename"] as? String,
                   let source = sourceByPhysicalPath[
@@ -551,36 +531,48 @@ public struct Adapter: Sendable {
                 drafts: &drafts
             )
         }
+        }
         guard Set(drafts.map { $0.candidate.mangledName }).count == drafts.count else {
             throw FrontendReceipt.Error.malformedAST(
                 "typed AST contains duplicate function symbols"
             )
         }
-        let archivedSymbols = Set(drafts.map { $0.candidate.mangledName })
-        for index in drafts.indices {
-            let symbol = drafts[index].candidate.mangledName
-            guard let function = silFile.function(mangledName: symbol) else {
-                throw FrontendReceipt.Error.missingSILFunction(symbol)
+        try performance.measure("frontend.fingerprint_declarations") {
+            let archivedSymbols = Set(drafts.map {
+                $0.candidate.mangledName
+            })
+            for index in drafts.indices {
+                let symbol = drafts[index].candidate.mangledName
+                guard let function = silFile.function(mangledName: symbol)
+                else {
+                    throw FrontendReceipt.Error.missingSILFunction(symbol)
+                }
+                drafts[index].candidate.implementationFingerprint =
+                    ReleaseCompiler.ImplementationFingerprint.compute(
+                        root: function,
+                        in: silFile,
+                        archivedSymbols: archivedSymbols
+                    )
             }
-            drafts[index].candidate.implementationFingerprint =
-                ReleaseCompiler.ImplementationFingerprint.compute(
-                    root: function,
-                    in: silFile,
-                    archivedSymbols: archivedSymbols
-                )
         }
-        try validateNativeAnchors(drafts, sources: sourceStates)
+        try performance.measure("frontend.validate_native_anchors") {
+            try validateNativeAnchors(drafts, sources: sourceStates)
+        }
         let mainActorReferenceTypes = Set(drafts.compactMap { draft in
             draft.candidate.effects.requiresMainActor ? draft.referenceReceiverType : nil
         })
-        let nativeTypeRecords = try makeNativeTypes(
-            request.nativeImportCatalog,
-            sourceNominals: sourceNominals,
-            importedTypes: importedTypes,
-            mainActorReferenceTypes: mainActorReferenceTypes,
-            metadata: request.metadata,
-            objectiveCStructures: objectiveCStructures
-        )
+        var nativeTypeRecords = try performance.measure(
+            "frontend.make_native_types"
+        ) {
+            try makeNativeTypes(
+                request.nativeImportCatalog,
+                sourceNominals: sourceNominals,
+                importedTypes: importedTypes,
+                mainActorReferenceTypes: mainActorReferenceTypes,
+                metadata: request.metadata,
+                objectiveCStructures: objectiveCStructures
+            )
+        }
         guard nativeTypeRecords.map(\.id) == provisionalNativeTypes.map(\.id) else {
             throw FrontendReceipt.Error.invalidRequest(
                 "native type identity changed while resolving actor isolation"
@@ -594,11 +586,15 @@ public struct Adapter: Sendable {
             configuration: effectiveConfiguration,
             moduleName: moduleName
         )
-        let frozenValueTypes = try makeFrozenValueTypes(
-            referencedBy: drafts.map(\.candidate),
-            sourceNominals: sourceNominals,
-            typeEnvironment: declarationTypeEnvironment
-        )
+        let frozenValueTypes = try performance.measure(
+            "frontend.make_frozen_value_types"
+        ) {
+            try makeFrozenValueTypes(
+                referencedBy: drafts.map(\.candidate),
+                sourceNominals: sourceNominals,
+                typeEnvironment: declarationTypeEnvironment
+            )
+        }
         var explicitNativeImports = try NativeImportCatalog.Builtins.merging(
             makeNativeImportCandidates(
                 request.nativeImportCatalog,
@@ -619,18 +615,20 @@ public struct Adapter: Sendable {
             interfaceArchive: Core.Versions.interfaceArchive,
             compilerFingerprint: toolchain.fingerprint
         )
-        let preliminary = try ReleaseCompiler.Indexer().index(
-            .init(
-                metadata: request.metadata,
-                compatibility: compatibility,
-                configuration: effectiveConfiguration,
-                sources: sourceRecords,
-                declarations: drafts.map(\.candidate),
-                nativeImportCandidates: explicitNativeImports,
-                nativeTypes: nativeTypeRecords,
-                frozenValueTypes: frozenValueTypes
+        let preliminary = try performance.measure("frontend.preliminary_index") {
+            try ReleaseCompiler.Indexer().index(
+                .init(
+                    metadata: request.metadata,
+                    compatibility: compatibility,
+                    configuration: effectiveConfiguration,
+                    sources: sourceRecords,
+                    declarations: drafts.map(\.candidate),
+                    nativeImportCandidates: explicitNativeImports,
+                    nativeTypes: nativeTypeRecords,
+                    frozenValueTypes: frozenValueTypes
+                )
             )
-        )
+        }
         let entrySymbols = Set(preliminary.archive.functions.compactMap { function in
             function.patchability.isEligible ? function.mangledName : nil
         })
@@ -638,25 +636,32 @@ public struct Adapter: Sendable {
             explicitNativeImports,
             excludingEntrySymbols: entrySymbols
         )
-        var discovery = try NativeImportDiscovery.Engine().discover(
-            declarations: drafts.compactMap { draft in
-                entrySymbols.contains(draft.candidate.mangledName)
-                    ? nil : draft.nativeImportDeclaration
-            } + importedOperationDeclarations,
-            metadata: request.metadata,
-            configuration: effectiveConfiguration,
-            nativeTypeKinds: Dictionary(uniqueKeysWithValues:
-                nativeTypeRecords.map { ($0.id, $0.kind) }
+        var discovery = try performance.measure("frontend.discover_native_imports") {
+            try NativeImportDiscovery.Engine().discover(
+                declarations: drafts.compactMap { draft in
+                    entrySymbols.contains(draft.candidate.mangledName)
+                        ? nil : draft.nativeImportDeclaration
+                } + importedOperationDeclarations,
+                metadata: request.metadata,
+                configuration: effectiveConfiguration,
+                nativeTypeKinds: Dictionary(uniqueKeysWithValues:
+                    nativeTypeRecords.map { ($0.id, $0.kind) }
+                )
             )
-        )
+        }
         // Selection is anchored to SIL symbols so an explicit Catalog entry may
         // safely rename a source-discovered operation while overriding its factory.
         let scopedNativeImportSymbols = Set(
             discovery.candidates.flatMap(\.record.silMangledNames)
         )
-        let nativeImportCandidates = try mergeNativeImportCandidates(
+        let discoveredNativeImportCandidates = try mergeNativeImportCandidates(
             explicit: explicitNativeImports,
             discovered: &discovery,
+            moduleName: request.metadata.frontendInvocation.moduleName
+        )
+        let nativeImportCandidates = try mergeNativeAPICatalogCandidates(
+            discoveredNativeImportCandidates,
+            catalog: catalogCapabilities.map(\.record),
             moduleName: request.metadata.frontendInvocation.moduleName
         )
         let scopedNativeImportRecords = nativeImportCandidates.filter {
@@ -671,22 +676,45 @@ public struct Adapter: Sendable {
         )
         let resolvedConfiguration = configuration(
             effectiveConfiguration,
-            allowing: scopedNativeImportCallees,
+            allowing: nativeImportPublicationCallees(
+                candidates: nativeImportCandidates,
+                sourceScopedCallees: scopedNativeImportCallees,
+                policy: request.callingSurfacePolicy
+            ),
             moduleName: request.metadata.frontendInvocation.moduleName
         )
-
-        let indexed = try ReleaseCompiler.Indexer().index(
-            .init(
-                metadata: request.metadata,
-                compatibility: compatibility,
-                configuration: resolvedConfiguration,
-                sources: sourceRecords,
-                declarations: drafts.map(\.candidate),
-                nativeImportCandidates: nativeImportCandidates,
-                nativeTypes: nativeTypeRecords,
-                frozenValueTypes: frozenValueTypes
+        if request.callingSurfacePolicy == .managedDevelopmentModule {
+            let publishedTypeIDs = developmentNativeTypePublicationIDs(
+                nativeTypeLookup: nativeTypeIDs,
+                sourceObservedTypeNames: sourceObservedImportedTypeNames,
+                sourceReferenceTypeNames: Set(
+                    sourceNominals.compactMap {
+                        $0.kind == .reference ? $0.canonicalName : nil
+                    }
+                ),
+                functions: preliminary.archive.functions,
+                nativeImports: nativeImportCandidates
             )
-        )
+            for index in nativeTypeRecords.indices {
+                nativeTypeRecords[index].isEmittedToDevice =
+                    publishedTypeIDs.contains(nativeTypeRecords[index].id)
+            }
+        }
+
+        let indexed = try performance.measure("frontend.final_index") {
+            try ReleaseCompiler.Indexer().index(
+                .init(
+                    metadata: request.metadata,
+                    compatibility: compatibility,
+                    configuration: resolvedConfiguration,
+                    sources: sourceRecords,
+                    declarations: drafts.map(\.candidate),
+                    nativeImportCandidates: nativeImportCandidates,
+                    nativeTypes: nativeTypeRecords,
+                    frozenValueTypes: frozenValueTypes
+                )
+            )
+        }
         let finalEntrySymbols = Set(indexed.archive.functions.compactMap { function in
             function.patchability.isEligible ? function.mangledName : nil
         })
@@ -695,21 +723,39 @@ public struct Adapter: Sendable {
                 "Entry eligibility changed while resolving the managed NativeImport surface"
             )
         }
-        let nativeImportBindings = try (
-            makeNativeImportBindings(
+        let nativeImportBindings = try performance.measure(
+            "frontend.make_native_import_bindings"
+        ) {
+            try mergeNativeImportBindings(
+                makeNativeImportBindings(
+                    catalog: request.nativeImportCatalog,
+                    archive: indexed.archive
+                ) + makeDiscoveredNativeImportBindings(
+                    discovery.candidates,
+                    archive: indexed.archive
+                ) + NativeImportCatalog.Builtins.bindings(
+                    archive: indexed.archive
+                ),
+                catalog: catalogCapabilities.map(\.binding),
+                moduleName: request.metadata.frontendInvocation.moduleName
+            )
+        }
+        let resolvedObjectiveCStructureABIs = try performance.measure(
+            "frontend.resolve_native_structure_abis"
+        ) {
+            try objectiveCStructureABIs(in: indexed.archive)
+        }
+        let nativeTypeBindings = try performance.measure(
+            "frontend.make_native_type_bindings"
+        ) {
+            try makeNativeTypeBindings(
                 catalog: request.nativeImportCatalog,
-                archive: indexed.archive
-            ) + makeDiscoveredNativeImportBindings(
-                discovery.candidates,
-                archive: indexed.archive
-            ) + NativeImportCatalog.Builtins.bindings(archive: indexed.archive)
-        ).sorted { $0.key.rawValue < $1.key.rawValue }
-        let nativeTypeBindings = try makeNativeTypeBindings(
-            catalog: request.nativeImportCatalog,
-            archive: indexed.archive,
-            sourceNominals: sourceNominals,
-            importedTypes: importedTypes
-        )
+                archive: indexed.archive,
+                sourceNominals: sourceNominals,
+                importedTypes: importedTypes,
+                objectiveCStructures: resolvedObjectiveCStructureABIs
+            )
+        }
         let eligibleNames = finalEntrySymbols
         var roots: [ShellBuildReceipt.Root] = []
         for draft in drafts {
@@ -755,14 +801,18 @@ public struct Adapter: Sendable {
             frozenValueTypes: indexed.archive.frozenValueTypes,
             nativeTypeBindings: nativeTypeBindings
         )
-        try receipt.validate()
-        try FrontendReceipt.CatalogSurface.validatePublishedEntries(
-            catalogSurface.documents,
-            receipt: receipt,
-            policy: request.callingSurfacePolicy,
-            diagnostics: discovery.diagnostics,
-            discoveredCandidates: discovery.candidates
-        )
+        try performance.measure("frontend.validate_receipt") {
+            try receipt.validate()
+        }
+        try performance.measure("frontend.validate_catalog_publication") {
+            try FrontendReceipt.CatalogSurface.validatePublishedEntries(
+                catalogSurface.documents,
+                receipt: receipt,
+                policy: request.callingSurfacePolicy,
+                diagnostics: discovery.diagnostics,
+                discoveredCandidates: discovery.candidates
+            )
+        }
         performance.setCounter(
             "frontend.declaration_count",
             value: UInt64(receipt.declarations.count)
@@ -832,10 +882,7 @@ public struct Adapter: Sendable {
         }
         for snapshot in request.nativeAPICatalogs {
             do {
-                try snapshot.document.validate()
-                try snapshot.compilerProjection.validate(
-                    moduleName: snapshot.document.identity.moduleName
-                )
+                try snapshot.validateIfNeeded()
             } catch {
                 throw FrontendReceipt.Error.invalidRequest(
                     "Native API Catalog \(snapshot.document.identity.moduleName) is invalid: \(error)"
@@ -883,6 +930,46 @@ extension FrontendReceipt.Adapter {
         var url: URL
         var contents: Data
         var contentHash: Core.Digest
+        private var lineStartUTF8Offsets: [Int]
+
+        init(
+            logicalPath: String,
+            url: URL,
+            contents: Data,
+            contentHash: Core.Digest
+        ) {
+            self.logicalPath = logicalPath
+            self.url = url
+            self.contents = contents
+            self.contentHash = contentHash
+            var starts = [0]
+            starts.reserveCapacity(contents.count / 32 + 1)
+            for (offset, byte) in contents.enumerated()
+            where byte == UInt8(ascii: "\n") && offset + 1 <= contents.count {
+                starts.append(offset + 1)
+            }
+            lineStartUTF8Offsets = starts
+        }
+
+        func sourceLocation(atUTF8Offset offset: Int) -> Core.SourceLocation? {
+            guard offset >= 0, offset <= contents.count else { return nil }
+            var lower = lineStartUTF8Offsets.startIndex
+            var upper = lineStartUTF8Offsets.endIndex
+            while lower < upper {
+                let middle = lower + (upper - lower) / 2
+                if lineStartUTF8Offsets[middle] <= offset {
+                    lower = middle + 1
+                } else {
+                    upper = middle
+                }
+            }
+            let lineIndex = max(0, lower - 1)
+            return .init(
+                file: url.path,
+                line: lineIndex + 1,
+                column: offset - lineStartUTF8Offsets[lineIndex] + 1
+            )
+        }
     }
 
     enum SourceNominalKind: Equatable, Sendable {
@@ -1393,6 +1480,119 @@ extension FrontendReceipt.Adapter {
         return records.sorted { $0.key.rawValue < $1.key.rawValue }
     }
 
+    func mergeNativeAPICatalogCandidates(
+        _ records: [InterfaceArchive.NativeImportRecord],
+        catalog: [InterfaceArchive.NativeImportRecord],
+        moduleName: String
+    ) throws -> [InterfaceArchive.NativeImportRecord] {
+        var merged = Dictionary(
+            uniqueKeysWithValues: records.map { ($0.key, $0) }
+        )
+        for candidate in catalog {
+            guard var existing = merged[candidate.key] else {
+                merged[candidate.key] = candidate
+                continue
+            }
+            guard existing.id == nil,
+                  candidate.id == nil,
+                  existing.descriptor == candidate.descriptor,
+                  existing.parameterTypes == candidate.parameterTypes,
+                  existing.parameterProjection == candidate.parameterProjection,
+                  existing.resultType == candidate.resultType,
+                  existing.contract == candidate.contract,
+                  existing.capability == candidate.capability,
+                  existing.abiAdapter == candidate.abiAdapter
+            else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "module \(moduleName) source and Native API Catalog disagree for "
+                        + "\(candidate.canonicalCallee) [\(candidate.key)]"
+                )
+            }
+            existing.silMangledNames = Array(Set(
+                existing.silMangledNames + candidate.silMangledNames
+            )).sorted()
+            existing.isEmittedToDevice = existing.isEmittedToDevice
+                || candidate.isEmittedToDevice
+            merged[candidate.key] = existing
+        }
+        return merged.values.sorted { $0.key < $1.key }
+    }
+
+    func mergeNativeImportBindings(
+        _ bindings: [ShellBuildReceipt.NativeImportBinding],
+        catalog: [ShellBuildReceipt.NativeImportBinding],
+        moduleName: String
+    ) throws -> [ShellBuildReceipt.NativeImportBinding] {
+        var merged: [
+            Core.NativeCall.Key: ShellBuildReceipt.NativeImportBinding
+        ] = [:]
+        for binding in bindings {
+            if let existing = merged[binding.key], existing != binding {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "module \(moduleName) discovered duplicate bindings for "
+                        + "NativeCallKey \(binding.key)"
+                )
+            }
+            merged[binding.key] = binding
+        }
+        for binding in catalog {
+            if let existing = merged[binding.key],
+               existing.strategy != binding.strategy {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "module \(moduleName) source and Native API Catalog select "
+                        + "different execution strategies for NativeCallKey "
+                        + "\(binding.key)"
+                )
+            }
+            // The module-level projection is authoritative for compiler
+            // spellings and reusable Pack placement. A consumer observation
+            // can use aliases while still deriving the same stable key.
+            merged[binding.key] = binding
+        }
+        return merged.values.sorted { $0.key < $1.key }
+    }
+
+    func nativeImportPublicationCallees(
+        candidates: [InterfaceArchive.NativeImportRecord],
+        sourceScopedCallees: [String],
+        policy: FrontendReceipt.CallingSurfacePolicy
+    ) -> [String] {
+        guard policy == .managedProductionModule else {
+            return Array(Set(sourceScopedCallees)).sorted()
+        }
+        // Source scope controls which imports can affect the current module's
+        // inferred effects. Production publication is intentionally broader:
+        // every compiler-qualified Catalog capability must receive a compact
+        // release ID even when the baseline source never references it.
+        return Array(Set(candidates.compactMap {
+            $0.isEmittedToDevice ? $0.canonicalCallee : nil
+        })).sorted()
+    }
+
+    func developmentNativeTypePublicationIDs(
+        nativeTypeLookup: [String: Core.TypeID],
+        sourceObservedTypeNames: Set<String>,
+        sourceReferenceTypeNames: Set<String>,
+        functions: [InterfaceArchive.FunctionRecord],
+        nativeImports: [InterfaceArchive.NativeImportRecord]
+    ) -> Set<Core.TypeID> {
+        var result = Set(
+            sourceObservedTypeNames.union(sourceReferenceTypeNames)
+                .compactMap { nativeTypeLookup[$0] }
+        )
+        for function in functions where function.patchability.isEligible {
+            for type in function.parameterTypes + [function.resultType] {
+                result.formUnion(type.referencedNativeTypeIDs)
+            }
+        }
+        for nativeImport in nativeImports where nativeImport.isEmittedToDevice {
+            for type in nativeImport.parameterTypes + [nativeImport.resultType] {
+                result.formUnion(type.referencedNativeTypeIDs)
+            }
+        }
+        return result
+    }
+
     func applyNativeImportEffectEnvelope(
         _ records: [InterfaceArchive.NativeImportRecord],
         to drafts: inout [Draft],
@@ -1441,85 +1641,16 @@ extension FrontendReceipt.Adapter {
         return result
     }
 
-    func mergedDeclarationModules(
-        _ lhs: [String: String],
-        _ rhs: [String: String]
-    ) throws -> [String: String] {
-        var result = lhs
-        for (usr, module) in rhs {
-            if let existing = result[usr], existing != module {
-                throw FrontendReceipt.Error.invalidRequest(
-                    "imported declaration \(usr) has conflicting module ownership"
-                )
-            }
-            result[usr] = module
-        }
-        return result
-    }
-
     func makeDiscoveredNativeImportBindings(
         _ candidates: [NativeImportDiscovery.Candidate],
         archive: InterfaceArchive.Archive
-    ) -> [ShellBuildReceipt.NativeImportBinding] {
+    ) throws -> [ShellBuildReceipt.NativeImportBinding] {
         let cataloged = Dictionary(
             uniqueKeysWithValues: archive.nativeImports.map { ($0.key, $0) }
         )
-        return candidates.compactMap { candidate in
-            guard let record = cataloged[candidate.record.key] else {
-                return nil
-            }
-            let generated = candidate.generatedBinding
-            let dispatch: ShellBuildReceipt.GeneratedNativeImport.Dispatch = switch generated.dispatch {
-            case .globalFunction: .globalFunction
-            case .initializer: .initializer
-            case .staticMethod: .staticMethod
-            case .nativeUpcast: .nativeUpcast
-            case .anyObjectBridge: .anyObjectBridge
-            case .staticGetter: .staticGetter
-            case .staticSetter: .staticSetter
-            case .instanceMethod: .instanceMethod
-            case .instanceGetter: .instanceGetter
-            case .instanceSetter: .instanceSetter
-            case .instanceValueSetter: .instanceValueSetter
-            }
-            if record.descriptor.target.backend == .objectiveCMessage {
-                return .init(
-                    key: record.key,
-                    strategy: .objectiveCInvoker
-                )
-            }
-            if record.descriptor.target.backend == .cFunction,
-               let function = generated.cFunction {
-                return .init(
-                    key: record.key,
-                    strategy: .cInvoker,
-                    importedModules: [function.moduleName],
-                    cFunction: .init(
-                        moduleName: function.moduleName,
-                        swiftName: function.swiftName,
-                        parameterSwiftTypes: function.parameterSwiftTypes,
-                        resultSwiftType: function.resultSwiftType
-                    )
-                )
-            }
-            return .init(
-                key: record.key,
-                strategy: .generatedSwiftAdapter,
-                importedModules: generated.importedModules,
-                generated: .init(
-                    declarationMangledName: generated.declarationMangledName,
-                    sourceFileLogicalID: generated.sourceFileLogicalID,
-                    dispatch: dispatch,
-                    ownerType: generated.ownerType,
-                    baseName: generated.baseName,
-                    argumentLabels: generated.argumentLabels,
-                    parameterSwiftTypes: generated.parameterSwiftTypes,
-                    invocationParameterSwiftTypes:
-                        generated.invocationParameterSwiftTypes,
-                    resultSwiftType: generated.resultSwiftType,
-                    nativeModuleName: generated.nativeModuleName
-                )
-            )
+        return try candidates.compactMap { candidate in
+            guard cataloged[candidate.record.key] != nil else { return nil }
+            return try candidate.shellBuildBinding()
         }.sorted { $0.key.rawValue < $1.key.rawValue }
     }
 
@@ -1742,7 +1873,11 @@ extension FrontendReceipt.Adapter {
         Array(Set(imported.aliases + [
             imported.canonicalName,
             imported.swiftType,
-        ])).filter { $0 != canonicalName }.sorted()
+        ])).filter {
+            $0 != canonicalName
+                && !FrontendReceipt.ValueTypeParser
+                    .isBuiltinValueSpelling($0)
+        }.sorted()
     }
 
     func makeLocalValueTypeLookup(
@@ -1843,7 +1978,8 @@ extension FrontendReceipt.Adapter {
         catalog: NativeImportCatalog.Document,
         archive: InterfaceArchive.Archive,
         sourceNominals: [SourceNominal],
-        importedTypes: [ImportedNativeType]
+        importedTypes: [ImportedNativeType],
+        objectiveCStructures: [Core.TypeID: Core.NativeCall.ABIType]
     ) throws -> [ShellBuildReceipt.NativeTypeBinding] {
         let byName = Dictionary(uniqueKeysWithValues: catalog.nativeTypes.map {
             ($0.canonicalName, $0)
@@ -1854,9 +1990,28 @@ extension FrontendReceipt.Adapter {
         let importedByName = Dictionary(uniqueKeysWithValues: importedTypes.map {
             ($0.canonicalName, $0)
         })
-        let objectiveCStructures = try objectiveCStructureABIs(in: archive)
+        let generatedSourceIDs = Set(
+            sourceNominals.map(\.sourceFileLogicalID)
+                + importedTypes.map(\.sourceFileLogicalID)
+        )
+        let groupNames = Dictionary(uniqueKeysWithValues:
+            generatedSourceIDs.map {
+                ($0, BridgeGeneration.GeneratedNativeType.groupName(
+                    sourceFileLogicalID: $0
+                ))
+            }
+        )
+        let candidateTypeIDs = archive.nativeImports.reduce(
+            into: Set<Core.TypeID>()
+        ) { result, nativeImport in
+            nativeImport.parameterTypes.forEach {
+                result.formUnion($0.referencedNativeTypeIDs)
+            }
+            result.formUnion(nativeImport.resultType.referencedNativeTypeIDs)
+        }
         return try archive.nativeTypes.compactMap { item in
-            guard item.isEmittedToDevice else { return nil }
+            guard item.isEmittedToDevice || candidateTypeIDs.contains(item.id)
+            else { return nil }
             if let candidate = byName[item.canonicalName] {
                 guard candidate.layoutFingerprint == item.layoutFingerprint else {
                     throw FrontendReceipt.Error.invalidRequest(
@@ -1937,7 +2092,10 @@ extension FrontendReceipt.Adapter {
                     canonicalName: item.canonicalName,
                     layoutFingerprint: item.layoutFingerprint,
                     requiresMainActor: item.requiresMainActor,
-                    estimatedSize: item.estimatedSize
+                    estimatedSize: item.estimatedSize,
+                    precomputedGroupName: groupNames[
+                        generated.sourceFileLogicalID
+                    ]
                 )
                 return .init(
                     canonicalName: item.canonicalName,
@@ -1969,7 +2127,10 @@ extension FrontendReceipt.Adapter {
                 canonicalName: item.canonicalName,
                 layoutFingerprint: item.layoutFingerprint,
                 requiresMainActor: item.requiresMainActor,
-                estimatedSize: item.estimatedSize
+                estimatedSize: item.estimatedSize,
+                precomputedGroupName: groupNames[
+                    generated.sourceFileLogicalID
+                ]
             )
             return .init(
                 canonicalName: item.canonicalName,
@@ -1979,8 +2140,8 @@ extension FrontendReceipt.Adapter {
                 generated: generated
             )
         }.sorted {
-            ($0.canonicalName, $0.layoutFingerprint.hex)
-                < ($1.canonicalName, $1.layoutFingerprint.hex)
+            ($0.canonicalName, $0.layoutFingerprint)
+                < ($1.canonicalName, $1.layoutFingerprint)
         }
     }
 

@@ -115,9 +115,14 @@ public actor ConnectionBroker {
 
     /// Reserves the code embedded by an Xcode build before final linking.
     public func reserveAutomaticInvitation(
+        reusing existing: Pairing.Reservation? = nil,
         now: Date = Date()
     ) async throws -> Pairing.Reservation {
-        try await authority.reserve(kind: .automaticXcode, now: now)
+        try await authority.reserve(
+            kind: .automaticXcode,
+            reusing: existing,
+            now: now
+        )
     }
 
     /// Imports an automatic reservation created by another same-user process.

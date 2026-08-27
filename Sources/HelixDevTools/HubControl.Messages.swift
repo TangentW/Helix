@@ -60,7 +60,7 @@ public struct Rendezvous: Codable, Hashable, Sendable {
 /// The minimal set of mutations Xcode is allowed to request.
 public enum Command: Codable, Hashable, Sendable {
     /// Reserve the code embedded into the App before its final link.
-    case reserveAutomaticInvitation
+    case reserveAutomaticInvitation(reusing: Pairing.Reservation?)
     /// Persist an exact Build Context and bind its pre-link reservation.
     case registerAndActivate(
         invitationID: DevProtocol.InvitationID,
@@ -79,8 +79,15 @@ public enum Command: Codable, Hashable, Sendable {
 
     fileprivate func validate() throws {
         switch self {
-        case .reserveAutomaticInvitation, .serviceSnapshot,
-             .buildContexts, .createManualInvitation, .manualInvitations:
+        case let .reserveAutomaticInvitation(reservation):
+            if let reservation {
+                try reservation.validate()
+                guard reservation.kind == .automaticXcode else {
+                    throw HubControl.Error.invalidMessage
+                }
+            }
+        case .serviceSnapshot, .buildContexts, .createManualInvitation,
+             .manualInvitations:
             break
         case let .registerAndActivate(invitationID, context):
             guard invitationID.rawValue != Self.zeroUUID else {

@@ -17,6 +17,66 @@ struct SwiftAdapterClassifierTests {
         ) == .modulePack("Foundation"))
     }
 
+    @Test("Swift overlays on imported types retain extension module ownership")
+    func importedTypeOverlayModulePack() {
+        let usr = "s:So13NSFileManagerC10FoundationE10enumerator2at"
+        #expect(NativeImportDiscovery.SwiftAdapterClassifier
+            .declarationModule(in: usr) == "Foundation")
+        #expect(classifier.classify(
+            declarationUSR: usr,
+            hasCompilerOperation: false,
+            adapterTypeSpellings: [
+                "FileManager",
+                "FileManager.DirectoryEnumerationOptions",
+            ],
+            applicationTypeNames: [],
+            applicationModuleName: "Demo"
+        ) == .modulePack("Foundation"))
+        #expect(NativeImportDiscovery.SwiftAdapterClassifier
+            .declarationModule(
+                in: "s:SS10FoundationE18localizedCapitalizedSSvg"
+            ) == "Foundation")
+        #expect(NativeImportDiscovery.SwiftAdapterClassifier
+            .declarationModule(
+                in: "s:So4TypeC10FoundationE5value8OtherKitE"
+            ) == nil)
+    }
+
+    @Test("Standard-library generic witnesses do not manufacture modules")
+    func standardLibraryGenericWitness() {
+        let usr =
+            "s:s20_SwiftNewtypeWrapperPsSHRzSH8RawValueSYRpzrlE04hashE0Sivp"
+        #expect(NativeImportDiscovery.SwiftAdapterClassifier
+            .declarationModule(in: usr) == "Swift")
+        #expect(classifier.classify(
+            declarationUSR: usr,
+            hasCompilerOperation: false,
+            adapterTypeSpellings: ["UIKit.UIFont.Weight", "Swift.Int"],
+            applicationTypeNames: [],
+            applicationModuleName: "Demo"
+        ) == .modulePack("Swift"))
+    }
+
+    @Test("Validated Catalog ownership can classify declarations without a USR")
+    func catalogModulePack() {
+        #expect(classifier.classify(
+            authoritativeModuleName: "Foundation",
+            declarationUSR: nil,
+            hasCompilerOperation: false,
+            adapterTypeSpellings: ["Foundation.ListFormatter"],
+            applicationTypeNames: [],
+            applicationModuleName: "Demo"
+        ) == .modulePack("Foundation"))
+        #expect(classifier.classify(
+            authoritativeModuleName: "Foundation",
+            declarationUSR: "s:5UIKit6UIViewC",
+            hasCompilerOperation: false,
+            adapterTypeSpellings: ["Foundation.ListFormatter"],
+            applicationTypeNames: [],
+            applicationModuleName: "Demo"
+        ) == .application(.noExternalSwiftDeclaration))
+    }
+
     @Test("Application dependencies and synthesized calls stay project-local")
     func applicationAdapters() {
         #expect(classifier.classify(

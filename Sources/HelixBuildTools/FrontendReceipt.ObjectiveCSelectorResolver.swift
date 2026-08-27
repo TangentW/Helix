@@ -76,6 +76,12 @@ extension FrontendReceipt.ObjectiveCSelectorResolver {
         }
     }
 
+    static func unresolvedCandidateCount(
+        in operations: [FrontendReceipt.Adapter.ImportedOperation]
+    ) -> Int {
+        Set(operations.compactMap(candidate)).count
+    }
+
     private static func candidate(
         _ operation: FrontendReceipt.Adapter.ImportedOperation
     ) -> Candidate? {

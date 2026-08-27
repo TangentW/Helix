@@ -21,6 +21,118 @@ public enum Binding: String, Codable, Hashable, Sendable {
     case cInvoker
 }
 
+public enum NativeTypeKind: String, Codable, Hashable, Sendable {
+    case value
+    case reference
+    case enumeration
+}
+
+public enum NativeTypeBinding: String, Codable, Hashable, Sendable {
+    /// Runtime creates reference TypeOps from an exact Objective-C class name.
+    case objectiveCReference
+    /// A signed development image exports concrete Swift TypeOps.
+    case swiftAdapter
+}
+
+public struct NativeType: Codable, Hashable, Sendable {
+    public var id: Core.TypeID
+    public var canonicalName: String
+    public var kind: DevProtocol.DevelopmentPayload.NativeTypeKind
+    public var layoutFingerprint: Core.Digest
+    public var objectiveCRuntimeName: String?
+    public var isCopyable: Bool
+    public var requiresMainActor: Bool
+    public var estimatedSize: UInt64
+    public var binding: DevProtocol.DevelopmentPayload.NativeTypeBinding
+    /// Nil means this exact type was already published in the session.
+    public var imageIndex: UInt16?
+    public var exportSymbol: String?
+
+    public init(
+        id: Core.TypeID,
+        canonicalName: String,
+        kind: DevProtocol.DevelopmentPayload.NativeTypeKind,
+        layoutFingerprint: Core.Digest,
+        objectiveCRuntimeName: String? = nil,
+        isCopyable: Bool,
+        requiresMainActor: Bool = false,
+        estimatedSize: UInt64,
+        binding: DevProtocol.DevelopmentPayload.NativeTypeBinding,
+        imageIndex: UInt16? = nil,
+        exportSymbol: String? = nil
+    ) {
+        self.id = id
+        self.canonicalName = canonicalName
+        self.kind = kind
+        self.layoutFingerprint = layoutFingerprint
+        self.objectiveCRuntimeName = objectiveCRuntimeName
+        self.isCopyable = isCopyable
+        self.requiresMainActor = requiresMainActor
+        self.estimatedSize = estimatedSize
+        self.binding = binding
+        self.imageIndex = imageIndex
+        self.exportSymbol = exportSymbol
+    }
+
+    public func validate(imageCount: Int) throws {
+        guard !canonicalName.isEmpty,
+              canonicalName.utf8.count <= 4_096,
+              !canonicalName.unicodeScalars.contains(where: { $0.value == 0 }),
+              estimatedSize > 0,
+              estimatedSize <= UInt64(16 * 1_024 * 1_024),
+              kind != .reference || isCopyable,
+              objectiveCRuntimeName.map(
+                  Core.NativeCall.isCanonicalObjectiveCRuntimeClassName
+              ) ?? true
+        else {
+            throw DevProtocol.Error.invalidArtifact(
+                "development native type descriptor is inconsistent"
+            )
+        }
+        if let imageIndex {
+            guard Int(imageIndex) < imageCount else {
+                throw DevProtocol.Error.invalidArtifact(
+                    "development native type references an unknown Adapter image"
+                )
+            }
+        }
+        switch binding {
+        case .objectiveCReference:
+            guard kind == .reference,
+                  objectiveCRuntimeName != nil,
+                  imageIndex == nil,
+                  exportSymbol == nil
+            else {
+                throw DevProtocol.Error.invalidArtifact(
+                    "Objective-C development type has an executable Adapter"
+                )
+            }
+        case .swiftAdapter:
+            guard objectiveCRuntimeName == nil else {
+                throw DevProtocol.Error.invalidArtifact(
+                    "Swift development type has an Objective-C runtime identity"
+                )
+            }
+            if imageIndex == nil {
+                guard exportSymbol == nil else {
+                    throw DevProtocol.Error.invalidArtifact(
+                        "an existing session TypeOps cannot name a new export"
+                    )
+                }
+            } else {
+                guard let exportSymbol,
+                      exportSymbol == "hlx_native_type_ops_v1_\(id.rawValue.hex)",
+                      exportSymbol.utf8.count <= 256
+                else {
+                    throw DevProtocol.Error.invalidArtifact(
+                        "development TypeOps export does not match TypeID"
+                    )
+                }
+            }
+        }
+    }
+}
+
 public struct NativeImport: Codable, Hashable, Sendable {
     public var id: Core.NativeImportID
     public var key: Core.NativeCall.Key
@@ -183,6 +295,7 @@ public struct Manifest: Codable, Hashable, Sendable {
     public var bytecodeLength: UInt64
     public var bytecodeSHA256: Core.Digest
     public var nativeImports: [DevProtocol.DevelopmentPayload.NativeImport]
+    public var nativeTypes: [DevProtocol.DevelopmentPayload.NativeType]
     public var images: [DevProtocol.DevelopmentPayload.Image]
 
     public init(
@@ -194,6 +307,7 @@ public struct Manifest: Codable, Hashable, Sendable {
         bytecodeLength: UInt64,
         bytecodeSHA256: Core.Digest,
         nativeImports: [DevProtocol.DevelopmentPayload.NativeImport] = [],
+        nativeTypes: [DevProtocol.DevelopmentPayload.NativeType] = [],
         images: [DevProtocol.DevelopmentPayload.Image] = []
     ) {
         self.schemaVersion = schemaVersion
@@ -204,6 +318,7 @@ public struct Manifest: Codable, Hashable, Sendable {
         self.bytecodeLength = bytecodeLength
         self.bytecodeSHA256 = bytecodeSHA256
         self.nativeImports = nativeImports.sorted { $0.id < $1.id }
+        self.nativeTypes = nativeTypes.sorted { $0.id.rawValue < $1.id.rawValue }
         self.images = images
     }
 
@@ -223,10 +338,16 @@ public struct Manifest: Codable, Hashable, Sendable {
               bytecodeLength > 0,
               bytecodeLength <= UInt64(64 * 1_024 * 1_024),
               nativeImports.count <= 65_536,
+              nativeTypes.count <= 65_536,
               images.count <= 1_024,
               nativeImports == nativeImports.sorted(by: { $0.id < $1.id }),
               Set(nativeImports.map(\.id)).count == nativeImports.count,
               Set(nativeImports.map(\.key)).count == nativeImports.count,
+              nativeTypes == nativeTypes.sorted(by: {
+                  $0.id.rawValue < $1.id.rawValue
+              }),
+              Set(nativeTypes.map(\.id)).count == nativeTypes.count,
+              Set(nativeTypes.map(\.canonicalName)).count == nativeTypes.count,
               Set(images.map(\.installName)).count == images.count,
               Set(images.map(\.uuid)).count == images.count
         else {
@@ -236,10 +357,14 @@ public struct Manifest: Codable, Hashable, Sendable {
         }
         try images.forEach { try $0.validate() }
         try nativeImports.forEach { try $0.validate(imageCount: images.count) }
-        let referenced = Set(nativeImports.compactMap(\.imageIndex).map(Int.init))
+        try nativeTypes.forEach { try $0.validate(imageCount: images.count) }
+        let referenced = Set(
+            (nativeImports.compactMap(\.imageIndex)
+                + nativeTypes.compactMap(\.imageIndex)).map(Int.init)
+        )
         guard referenced == Set(images.indices) else {
             throw DevProtocol.Error.invalidArtifact(
-                "development Adapter images must each have at least one import"
+                "development Adapter images must each publish an import or TypeOps"
             )
         }
     }
@@ -260,6 +385,7 @@ public struct Artifact: Hashable, Sendable {
         targetTriple: String,
         bytecode: Data,
         nativeImports: [DevProtocol.DevelopmentPayload.NativeImport] = [],
+        nativeTypes: [DevProtocol.DevelopmentPayload.NativeType] = [],
         imageDescriptors: [DevProtocol.DevelopmentPayload.Image] = [],
         images: [Data] = []
     ) {
@@ -271,6 +397,7 @@ public struct Artifact: Hashable, Sendable {
             bytecodeLength: UInt64(bytecode.count),
             bytecodeSHA256: .sha256(bytecode),
             nativeImports: nativeImports,
+            nativeTypes: nativeTypes,
             images: imageDescriptors
         )
         self.bytecode = bytecode
@@ -384,6 +511,7 @@ public struct Artifact: Hashable, Sendable {
             targetTriple: manifest.targetTriple,
             bytecode: bytecode,
             nativeImports: manifest.nativeImports,
+            nativeTypes: manifest.nativeTypes,
             imageDescriptors: manifest.images,
             images: images
         )

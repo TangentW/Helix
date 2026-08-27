@@ -444,6 +444,35 @@ struct ObjectiveCABI {
         #expect(optionalView?.parameters.first?.type.kind == .object)
         #expect(optionalView?.parameters.first?.type.isNullable == true)
 
+        let anyParameter = FrontendReceipt.ObjectiveCABI.physicalSignature(
+            evidence: makeEvidence(
+                parameters: [
+                    .init(
+                        swiftABIType: "@guaranteed Swift.AnyObject",
+                        source: .argument(0)
+                    ),
+                ],
+                result: "()"
+            ),
+            logicalParameterTypes: [.any],
+            logicalResultType: .void,
+            nativeTypeKinds: [:],
+            targetTriple: "arm64-apple-ios15.0-simulator"
+        )
+        #expect(anyParameter?.parameters.first?.type.kind == .object)
+
+        let anyResult = FrontendReceipt.ObjectiveCABI.physicalSignature(
+            evidence: makeEvidence(
+                parameters: [],
+                result: "@autoreleased Swift.AnyObject"
+            ),
+            logicalParameterTypes: [],
+            logicalResultType: .any,
+            nativeTypeKinds: [:],
+            targetTriple: "arm64-apple-ios15.0-simulator"
+        )
+        #expect(anyResult == nil)
+
         let genericObject = FrontendReceipt.ObjectiveCABI.physicalSignature(
             evidence: makeEvidence(
                 parameters: [

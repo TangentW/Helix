@@ -146,10 +146,10 @@ Pack source 与 Pack object 是两层独立的内容寻址事实。source identi
 
 认证 Live Reload 会把未使用候选保留为纯数据，不把它们提前展开成永久 Bridge 机器码。新 HLBC 确实引用到缺失 Swift 候选时，Hub 才使用捕获到的真实 compiler job，仅生成这些 Key 对应的 Adapter body，签名并校验一份确定性的 Mach-O image。缓存身份包含 compiler、Xcode/SDK、target、deployment、依赖图、规范化编译/链接参数、生成源码、Descriptor 与 Contract；Objective-C 和 C 候选不会进入这条编译路径。
 
-版本 1 `DevelopmentPayload` 会把 HLBC、精确提升的 import、Adapter image 描述、hash 和 image bytes 组成一个认证事务。App 会重新检查 compiler fingerprint、SDK build、target、Shell hash、Descriptor/Key、Mach-O 架构/平台/install name/UUID、代码签名、依赖规则与导出 symbol。随后先构造“baseline + 当前 session”的候选原生表，用它验证 HLBC，最后才原子激活 generation。失败事务即使已经映射了不可卸载 image，也只会把它计入进程预算，不会发布 import，更不会替换当前代码。每个 generation 以及 escaping callback 的 lease 都固定一份不可变能力快照。
+版本 1 `DevelopmentPayload` 会把 HLBC、精确提升的 import 与 native type、Adapter image 描述、hash 和 image bytes 组成一个认证事务。源码也可能在没有新增调用时单独依赖原生类型，例如使用 `is`、`as?` 或 metatype；因此 Helix 会独立提升源码可达的 TypeOps，不会只从 import 参数和返回值反推。App 会重新检查 compiler fingerprint、SDK build、target、Shell hash、Descriptor/Key、native type identity/layout、Mach-O 架构/平台/install name/UUID、代码签名、依赖规则与导出 symbol。随后先构造“baseline + 当前 session”的候选 import 表和 TypeOps 表，用它们验证 HLBC，最后才原子激活 generation。失败事务即使已经映射了不可卸载 image，也只会把它计入进程预算，不会发布 import 或 type，更不会替换当前代码。每个 generation 以及 escaping callback 的 lease 都固定一份不可变能力快照。
 
 两次重叠保存可能在彼此尚未激活时分别编译同一个缺失 Adapter。对 session 内完全等价的 import，发布是幂等的：第二次激活会复用已经发布的 invoker，不再映射或重复计费多余 image。这不是按名字兜底；identity、Descriptor、ABI、contract 或 binding 只要有任何差异就会 fail closed，而混合事务仍会在发布前加载真正新增 import 所需的全部 image。
 
-当前只认证 Simulator 与 macOS 的按需 Swift Adapter；物理 iOS 会明确拒绝并要求重新构建 App，直到开发签名与加载矩阵有独立证据。开发传输也不再接受裸 HLBC：即使没有 Adapter，仍使用版本 1 envelope。重连 identity 会报告已发布的开发 Key 与已映射 Adapter 资源，Hub 可以复用同一 session Registry，而不重复编译已经激活的 Adapter。
+当前只认证 Simulator 与 macOS 的按需 Swift Adapter；物理 iOS 会明确拒绝并要求重新构建 App，直到开发签名与加载矩阵有独立证据。开发传输也不再接受裸 HLBC：即使没有 Adapter，仍使用版本 1 envelope。重连 identity 会报告精确的 `NativeCallKey` 到 `NativeImportID` 映射、已发布开发 `TypeID` 清单，以及已映射 Adapter 的资源总量。Hub 必须保留已经写进活动字节码的紧凑 ID，才能安全复用同一 session Registry，而不重复编译已经激活的 Adapter。协议边界会拒绝重复 Key、重复 ID、重复 type、非规范排序，以及没有活动 HLBC generation 却携带原生清单的身份。
 
 产品、协议、Catalog、Archive 和 Bytecode 版本全部保持为 1。

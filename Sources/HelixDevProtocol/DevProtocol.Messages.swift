@@ -38,6 +38,20 @@ public struct ActiveFunctionRoute: Codable, Hashable, Sendable {
     }
 }
 
+/// Stable reconnect identity for one session-published NativeImport.
+///
+/// The compact ID is part of already activated bytecode, so a reconnect must
+/// preserve the exact Key-to-ID mapping rather than recomputing it from keys.
+public struct ActiveDevelopmentNativeImport: Codable, Hashable, Sendable {
+    public var id: Core.NativeImportID
+    public var key: Core.NativeCall.Key
+
+    public init(id: Core.NativeImportID, key: Core.NativeCall.Key) {
+        self.id = id
+        self.key = key
+    }
+}
+
 public struct BuildIdentity: Codable, Hashable, Sendable {
     public var protocolVersion: UInt16
     public var sessionID: UUID
@@ -95,9 +109,12 @@ public struct SessionIdentity: Codable, Hashable, Sendable {
     public var highestAppliedSourceRevision: DevProtocol.SourceRevision
     public var activeGenerationID: DevProtocol.GenerationID?
     public var activeFunctionRoutes: [DevProtocol.ActiveFunctionRoute]
-    /// Session-local NativeCall capabilities published by successful HLBC
-    /// development transactions. They are reconnect inventory, not release ABI.
-    public var activeDevelopmentNativeCallKeys: [Core.NativeCall.Key]
+    /// Session-local capabilities published by successful HLBC development
+    /// transactions. They are reconnect inventory, not release ABI.
+    public var activeDevelopmentNativeImports: [
+        DevProtocol.ActiveDevelopmentNativeImport
+    ]
+    public var activeDevelopmentNativeTypeIDs: [Core.TypeID]
     public var loadedDevelopmentAdapterCount: UInt32
     public var loadedDevelopmentAdapterBytes: UInt64
     public var loadedNativeImageCount: UInt32
@@ -123,7 +140,10 @@ public struct SessionIdentity: Codable, Hashable, Sendable {
         highestAppliedSourceRevision: DevProtocol.SourceRevision = .init(rawValue: 0),
         activeGenerationID: DevProtocol.GenerationID? = nil,
         activeFunctionRoutes: [DevProtocol.ActiveFunctionRoute] = [],
-        activeDevelopmentNativeCallKeys: [Core.NativeCall.Key] = [],
+        activeDevelopmentNativeImports: [
+            DevProtocol.ActiveDevelopmentNativeImport
+        ] = [],
+        activeDevelopmentNativeTypeIDs: [Core.TypeID] = [],
         loadedDevelopmentAdapterCount: UInt32 = 0,
         loadedDevelopmentAdapterBytes: UInt64 = 0,
         loadedNativeImageCount: UInt32 = 0,
@@ -150,8 +170,12 @@ public struct SessionIdentity: Codable, Hashable, Sendable {
         self.activeFunctionRoutes = activeFunctionRoutes.sorted {
             $0.functionKey.description < $1.functionKey.description
         }
-        self.activeDevelopmentNativeCallKeys = activeDevelopmentNativeCallKeys
-            .sorted()
+        self.activeDevelopmentNativeImports = activeDevelopmentNativeImports
+            .sorted { lhs, rhs in
+                lhs.id == rhs.id ? lhs.key < rhs.key : lhs.id < rhs.id
+            }
+        self.activeDevelopmentNativeTypeIDs = activeDevelopmentNativeTypeIDs
+            .sorted { $0.rawValue < $1.rawValue }
         self.loadedDevelopmentAdapterCount = loadedDevelopmentAdapterCount
         self.loadedDevelopmentAdapterBytes = loadedDevelopmentAdapterBytes
         self.loadedNativeImageCount = loadedNativeImageCount

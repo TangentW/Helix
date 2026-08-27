@@ -5,10 +5,31 @@ import HelixCore
 public enum CanonicalSIL {}
 
 extension CanonicalSIL {
+public enum InstructionFamily: Int, CaseIterable, Sendable {
+    case functionReference
+    case methodReference
+    case application
+    case valueForwarding
+    case enumConstruction
+    case globalAccess
+    case structConstruction
+    case existentialReference
+}
+
 public struct Function: Hashable, Sendable {
     public var mangledName: String
     public var loweredType: String
-    public var body: String
+    public var body: String {
+        didSet {
+            bodyLines = Self.splitBody(body)
+            instructionLineIndices = Self.indexInstructions(bodyLines)
+        }
+    }
+    /// Pre-split normalized instructions. Frontend adapters often perform
+    /// several independent provenance queries over one function; retaining
+    /// this derived view avoids repeatedly allocating the same line array.
+    public private(set) var bodyLines: [String]
+    private var instructionLineIndices: [[Int]]
     public var isolation: CanonicalSIL.FunctionIsolation
     public var declarationLocation: Core.SourceLocation?
     var debugLineLocations: [CanonicalSIL.DebugLineLocation]
@@ -24,6 +45,8 @@ public struct Function: Hashable, Sendable {
         self.mangledName = mangledName
         self.loweredType = loweredType
         self.body = body
+        bodyLines = Self.splitBody(body)
+        instructionLineIndices = Self.indexInstructions(bodyLines)
         self.isolation = isolation
         declarationLocation = nil
         debugLineLocations = []
@@ -35,7 +58,20 @@ public struct Function: Hashable, Sendable {
     /// SIL body line. Body lines are one-based, matching lowering diagnostics.
     public func sourceLocation(atBodyLine line: Int) -> Core.SourceLocation? {
         guard line > 0 else { return nil }
-        return debugLineLocations.first { $0.line == line }?.location
+        var lower = debugLineLocations.startIndex
+        var upper = debugLineLocations.endIndex
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2
+            if debugLineLocations[middle].line < line {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
+        guard lower < debugLineLocations.endIndex,
+              debugLineLocations[lower].line == line
+        else { return nil }
+        return debugLineLocations[lower].location
     }
 
     init(
@@ -50,11 +86,91 @@ public struct Function: Hashable, Sendable {
         self.mangledName = mangledName
         self.loweredType = loweredType
         self.body = body
+        bodyLines = Self.splitBody(body)
+        instructionLineIndices = Self.indexInstructions(bodyLines)
         self.isolation = isolation
         self.declarationLocation = declarationLocation
         self.debugLineLocations = debugLineLocations
         hasStrippedDebugMetadata = true
         self.isExternalDefinition = isExternalDefinition
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.mangledName == rhs.mangledName
+            && lhs.loweredType == rhs.loweredType
+            && lhs.body == rhs.body
+            && lhs.isolation == rhs.isolation
+            && lhs.declarationLocation == rhs.declarationLocation
+            && lhs.debugLineLocations == rhs.debugLineLocations
+            && lhs.hasStrippedDebugMetadata == rhs.hasStrippedDebugMetadata
+            && lhs.isExternalDefinition == rhs.isExternalDefinition
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(mangledName)
+        hasher.combine(loweredType)
+        hasher.combine(body)
+        hasher.combine(isolation)
+        hasher.combine(declarationLocation)
+        hasher.combine(debugLineLocations)
+        hasher.combine(hasStrippedDebugMetadata)
+        hasher.combine(isExternalDefinition)
+    }
+
+    /// Returns zero-based line indices for a coarse SIL instruction family.
+    /// The index is derived from `body` and deliberately excluded from value
+    /// identity. Consumers still parse the selected lines fail-closed.
+    public func bodyLineIndices(
+        for family: CanonicalSIL.InstructionFamily
+    ) -> [Int] {
+        instructionLineIndices[family.rawValue]
+    }
+
+    private static func splitBody(_ body: String) -> [String] {
+        body.split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+    }
+
+    private static func indexInstructions(_ lines: [String]) -> [[Int]] {
+        var result = Array(
+            repeating: [Int](),
+            count: CanonicalSIL.InstructionFamily.allCases.count
+        )
+        for (index, line) in lines.enumerated() {
+            func record(_ family: CanonicalSIL.InstructionFamily) {
+                result[family.rawValue].append(index)
+            }
+            if line.contains(" = function_ref @") {
+                record(.functionReference)
+            }
+            if line.contains("_method ") {
+                record(.methodReference)
+            }
+            if line.contains("apply ") {
+                record(.application)
+            }
+            if line.contains("begin_borrow ")
+                || line.contains("copy_value ")
+                || line.contains("move_value ")
+                || line.contains("begin_access [read] ")
+                || line.contains("begin_access [modify] ") {
+                record(.valueForwarding)
+            }
+            if line.contains(" = enum $") {
+                record(.enumConstruction)
+            }
+            if line.contains("global_addr @")
+                || line.contains("global_value @") {
+                record(.globalAccess)
+            }
+            if line.contains(" = struct $") {
+                record(.structConstruction)
+            }
+            if line.contains("init_existential_ref") {
+                record(.existentialReference)
+            }
+        }
+        return result
     }
 }
 

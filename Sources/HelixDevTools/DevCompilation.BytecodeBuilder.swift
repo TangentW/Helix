@@ -1,5 +1,6 @@
 import Foundation
 import HelixBuildTools
+import HelixBytecode
 import HelixCompiler
 import HelixCore
 import HelixDevProtocol
@@ -24,11 +25,21 @@ public actor BytecodeBuilder {
     private let adapterBuild: @Sendable (
         DevCompilation.AdapterBuildRequest
     ) throws -> DevCompilation.AdapterImage
+    private let nativeSurfaceResolve: (@Sendable () throws
+        -> ShellBuildReceipt.Document)?
     private let adapterOutputDirectory: URL?
+    private let initialDevelopmentImports: [
+        DevProtocol.ActiveDevelopmentNativeImport
+    ]
+    private var nativeCapabilityPlan: DevCompilation.NativeCapabilityPlan?
     private var activeFunctions: Set<Core.FunctionKey>
     private var activeDevelopmentKeys: Set<Core.NativeCall.Key>
+    private var activeDevelopmentTypeIDs: Set<Core.TypeID> = []
     private var pendingDevelopmentKeys: [
         DevProtocol.GenerationID: Set<Core.NativeCall.Key>
+    ] = [:]
+    private var pendingDevelopmentTypeIDs: [
+        DevProtocol.GenerationID: Set<Core.TypeID>
     ] = [:]
 
     public init(
@@ -40,7 +51,12 @@ public actor BytecodeBuilder {
         adapterCache: BuildCache.Store? = nil,
         requestedResources: Core.ResourceLimits = .init(),
         initiallyActiveFunctions: Set<Core.FunctionKey> = [],
-        initiallyActiveDevelopmentKeys: Set<Core.NativeCall.Key> = [],
+        initiallyActiveDevelopmentImports: [
+            DevProtocol.ActiveDevelopmentNativeImport
+        ] = [],
+        initiallyActiveDevelopmentTypeIDs: Set<Core.TypeID> = [],
+        nativeSurfaceResolve: (@Sendable () throws
+            -> ShellBuildReceipt.Document)? = nil,
         adapterBuild: (@Sendable (
             DevCompilation.AdapterBuildRequest
         ) throws -> DevCompilation.AdapterImage)? = nil,
@@ -53,6 +69,21 @@ public actor BytecodeBuilder {
         self.adapterOutputDirectory = adapterOutputDirectory
         self.requestedResources = requestedResources
         self.driver = driver
+        initialDevelopmentImports = initiallyActiveDevelopmentImports
+        let capabilityCache = adapterCache ?? BuildCache.defaultStore()
+        self.nativeSurfaceResolve = nativeSurfaceResolve ?? {
+            guard let receipt, let capabilityCache else {
+                throw DevCompilation.NativeCapabilityError.discoveryFailed(
+                    "the owner-local build cache is unavailable"
+                )
+            }
+            return try DevCompilation.NativeSurfaceResolver(
+                manifest: manifest,
+                receipt: receipt,
+                compilerURL: compilerURL,
+                cache: capabilityCache
+            ).resolve()
+        }
         self.adapterBuild = adapterBuild ?? { request in
             try DevCompilation.DefaultAdapterBuilder(
                 runner: ProcessExecution.Runner(),
@@ -60,14 +91,22 @@ public actor BytecodeBuilder {
             ).build(request)
         }
         activeFunctions = initiallyActiveFunctions
-        activeDevelopmentKeys = initiallyActiveDevelopmentKeys
+        activeDevelopmentKeys = Set(initiallyActiveDevelopmentImports.map(\.key))
+        activeDevelopmentTypeIDs = initiallyActiveDevelopmentTypeIDs
+        nativeCapabilityPlan = nil
     }
 
     public func build(
         _ request: DevSession.BuildRequest
     ) async throws -> DevSession.BuildOutcome {
+        let initialCapabilityPlan: DevCompilation.NativeCapabilityPlan?
         do {
             try validateFrozenInputs()
+            initialCapabilityPlan = try makeNativeCapabilityPlan()
+            guard initialCapabilityPlan != nil
+                    || (activeDevelopmentKeys.isEmpty
+                        && activeDevelopmentTypeIDs.isEmpty)
+            else { throw ContractError.invalidActiveNativeState }
         } catch {
             return .rebuildRequired(
                 diagnostic(
@@ -82,21 +121,39 @@ public actor BytecodeBuilder {
         try validate(request)
 
         do {
-            let capabilityPlan = try makeNativeCapabilityPlan()
-            let result = try driver.build(
-                .init(
-                    archive: archive,
-                    sourceFiles: manifest.sourceFiles.map {
-                        URL(fileURLWithPath: $0.absolutePath)
-                    },
-                    selectedFunctionKeys: request.candidateFunctionKeys,
-                    compilerURL: compilerURL,
-                    enforceToolchainFingerprint: true,
-                    requestedResources: requestedResources,
-                    developmentNativeImports:
-                        capabilityPlan?.developmentImports ?? []
+            var capabilityPlan = initialCapabilityPlan
+            let result: ReleaseCompiler.BuildResult
+            do {
+                result = try compile(
+                    request,
+                    capabilityPlan: capabilityPlan
                 )
-            )
+            } catch let error as CanonicalSIL.LoweringError {
+                guard error.requiresNativeSurfaceResolution,
+                      let nativeSurfaceResolve,
+                      var resolvedPlan = capabilityPlan
+                else { throw error }
+                let discovered: ShellBuildReceipt.Document
+                do {
+                    discovered = try nativeSurfaceResolve()
+                } catch let error as DevCompilation.NativeCapabilityError {
+                    throw error
+                } catch {
+                    throw DevCompilation.NativeCapabilityError
+                        .discoveryFailed(String(describing: error))
+                }
+                try validate(request)
+                guard try resolvedPlan.incorporate(discovered) else {
+                    throw error
+                }
+                let resolvedResult = try compile(
+                    request,
+                    capabilityPlan: resolvedPlan
+                )
+                nativeCapabilityPlan = resolvedPlan
+                capabilityPlan = resolvedPlan
+                result = resolvedResult
+            }
             let replacements = Set(result.changedFunctions.map(\.key))
             let restorations = activeFunctions
                 .intersection(request.candidateFunctionKeys)
@@ -162,7 +219,15 @@ public actor BytecodeBuilder {
         ) {
             activeDevelopmentKeys.formUnion(additions)
         }
+        if let additions = pendingDevelopmentTypeIDs.removeValue(
+            forKey: offer.generationID
+        ) {
+            activeDevelopmentTypeIDs.formUnion(additions)
+        }
         pendingDevelopmentKeys = pendingDevelopmentKeys.filter {
+            $0.key > offer.generationID
+        }
+        pendingDevelopmentTypeIDs = pendingDevelopmentTypeIDs.filter {
             $0.key > offer.generationID
         }
         return true
@@ -216,10 +281,6 @@ public actor BytecodeBuilder {
         guard activeFunctions.isSubset(of: eligibleKeys) else {
             throw ContractError.invalidActiveFunctionState
         }
-        let candidateKeys = Set(archive.nativeImports.map(\.key))
-        guard activeDevelopmentKeys.isSubset(of: candidateKeys) else {
-            throw ContractError.invalidActiveNativeState
-        }
         if archive.nativeImports.contains(where: { !$0.isEmittedToDevice }),
            receipt == nil {
             throw ContractError.missingNativeCapabilityReceipt
@@ -229,8 +290,41 @@ public actor BytecodeBuilder {
     private func makeNativeCapabilityPlan() throws
         -> DevCompilation.NativeCapabilityPlan?
     {
+        if let nativeCapabilityPlan { return nativeCapabilityPlan }
         guard let receipt else { return nil }
-        return try .init(archive: archive, receipt: receipt)
+        let plan = try DevCompilation.NativeCapabilityPlan(
+            archive: archive,
+            receipt: receipt,
+            activeDevelopmentImports: initialDevelopmentImports,
+            activeDevelopmentTypeIDs: activeDevelopmentTypeIDs
+        )
+        guard activeDevelopmentKeys.isSubset(of: plan.allKeys),
+              activeDevelopmentTypeIDs.isSubset(of: plan.allTypeIDs)
+        else { throw ContractError.invalidActiveNativeState }
+        nativeCapabilityPlan = plan
+        return plan
+    }
+
+    private func compile(
+        _ request: DevSession.BuildRequest,
+        capabilityPlan: DevCompilation.NativeCapabilityPlan?
+    ) throws -> ReleaseCompiler.BuildResult {
+        try driver.build(
+            .init(
+                archive: archive,
+                sourceFiles: manifest.sourceFiles.map {
+                    URL(fileURLWithPath: $0.absolutePath)
+                },
+                selectedFunctionKeys: request.candidateFunctionKeys,
+                compilerURL: compilerURL,
+                enforceToolchainFingerprint: true,
+                requestedResources: requestedResources,
+                developmentNativeImports:
+                    capabilityPlan?.developmentImports ?? [],
+                developmentNativeTypes:
+                    capabilityPlan?.developmentTypes ?? []
+            )
+        )
     }
 
     private func makeDevelopmentPayload(
@@ -243,7 +337,11 @@ public actor BytecodeBuilder {
         let requirements = result.module.imports.filter {
             !baselineKeys.contains($0.key)
         }.sorted { $0.id < $1.id }
-        guard !requirements.isEmpty else {
+        let moduleTypeIDs = result.module.referencedNativeTypeIDs.subtracting(
+            capabilityPlan?.baselineTypeIDs
+                ?? Set(archive.nativeTypes.filter(\.isEmittedToDevice).map(\.id))
+        )
+        guard !requirements.isEmpty || !moduleTypeIDs.isEmpty else {
             return try DevProtocol.DevelopmentPayload.Artifact(
                 shellInterfaceHash: archive.shellInterfaceHash,
                 compilerFingerprint: manifest.swiftCompilerFingerprint,
@@ -263,12 +361,30 @@ public actor BytecodeBuilder {
             records.append(record)
             bindings.append(try capabilityPlan.binding(for: record))
         }
+        let referencedTypeIDs = records.reduce(into: Set<Core.TypeID>()) {
+            result, record in
+            record.parameterTypes.forEach {
+                result.formUnion($0.referencedNativeTypeIDs)
+            }
+            result.formUnion(record.resultType.referencedNativeTypeIDs)
+        }.union(moduleTypeIDs).subtracting(capabilityPlan.baselineTypeIDs)
+        let typeRecords = try referencedTypeIDs.sorted(by: {
+            $0.rawValue < $1.rawValue
+        }).map { try capabilityPlan.typeRecord(for: $0) }
+        let typeBindings = try typeRecords.map {
+            try capabilityPlan.typeBinding(for: $0)
+        }
         let newSwiftPairs = Array(zip(records, bindings)).filter { pair in
             pair.1.strategy == .generatedSwiftAdapter
                 && !activeDevelopmentKeys.contains(pair.0.key)
         }
+        let newSwiftTypePairs = Array(zip(typeRecords, typeBindings)).filter {
+            pair in
+            pair.1.strategy == .factory
+                && !activeDevelopmentTypeIDs.contains(pair.0.id)
+        }
         let adapterImage: DevCompilation.AdapterImage?
-        if newSwiftPairs.isEmpty {
+        if newSwiftPairs.isEmpty && newSwiftTypePairs.isEmpty {
             adapterImage = nil
         } else {
             guard let adapterOutputDirectory else {
@@ -283,12 +399,18 @@ public actor BytecodeBuilder {
                     records: newSwiftPairs.map(\.0),
                     bindings: try newSwiftPairs.map {
                         try $0.1.bridgeBinding(for: $0.0)
+                    },
+                    nativeTypeRecords: newSwiftTypePairs.map(\.0),
+                    nativeTypeBindings: try newSwiftTypePairs.map {
+                        try $0.1.bridgeBinding(for: $0.0)
                     }
                 )
             )
             guard let adapterImage,
                   !adapterImage.bytes.isEmpty,
                   Set(adapterImage.keys) == Set(newSwiftPairs.map(\.0.key)),
+                  Set(adapterImage.typeIDs)
+                    == Set(newSwiftTypePairs.map(\.0.id)),
                   adapterImage.descriptor.installName
                     == adapterImage.installName
             else {
@@ -311,6 +433,7 @@ public actor BytecodeBuilder {
             )
         }
         let newlyBuiltKeys = Set(adapterImage?.keys ?? [])
+        let newlyBuiltTypeIDs = Set(adapterImage?.typeIDs ?? [])
         let nativeImports = try zip(records, bindings).map { record, binding in
             let isNewSwift = newlyBuiltKeys.contains(record.key)
             let payloadBinding: DevProtocol.DevelopmentPayload.Binding
@@ -345,6 +468,44 @@ public actor BytecodeBuilder {
                     ) : nil
             )
         }
+        let nativeTypes = try zip(typeRecords, typeBindings).map {
+            record, binding -> DevProtocol.DevelopmentPayload.NativeType in
+            let payloadKind: DevProtocol.DevelopmentPayload.NativeTypeKind =
+                switch record.kind {
+                case .value: .value
+                case .reference: .reference
+                case .enumeration: .enumeration
+                }
+            let payloadBinding: DevProtocol.DevelopmentPayload
+                .NativeTypeBinding
+            switch binding.strategy {
+            case .objectiveCReference:
+                payloadBinding = .objectiveCReference
+            case .factory:
+                guard binding.generated != nil else {
+                    throw DevCompilation.NativeCapabilityError
+                        .unsupportedDevelopmentBinding(record.canonicalName)
+                }
+                payloadBinding = .swiftAdapter
+            }
+            let isNewSwift = newlyBuiltTypeIDs.contains(record.id)
+            return .init(
+                id: record.id,
+                canonicalName: record.canonicalName,
+                kind: payloadKind,
+                layoutFingerprint: record.layoutFingerprint,
+                objectiveCRuntimeName: record.objectiveCRuntimeName,
+                isCopyable: record.isCopyable,
+                requiresMainActor: record.requiresMainActor,
+                estimatedSize: record.estimatedSize,
+                binding: payloadBinding,
+                imageIndex: isNewSwift ? 0 : nil,
+                exportSymbol: isNewSwift
+                    ? BridgeGeneration.GeneratedNativeType.exportSymbol(
+                        id: record.id
+                    ) : nil
+            )
+        }
         let artifact = DevProtocol.DevelopmentPayload.Artifact(
             shellInterfaceHash: archive.shellInterfaceHash,
             compilerFingerprint: manifest.swiftCompilerFingerprint,
@@ -352,12 +513,19 @@ public actor BytecodeBuilder {
             targetTriple: manifest.targetTriple,
             bytecode: result.bytecode,
             nativeImports: nativeImports,
+            nativeTypes: nativeTypes,
             imageDescriptors: imageDescriptor.map { [$0] } ?? [],
             images: adapterImage.map { [$0.bytes] } ?? []
         )
         let payload = try artifact.encoded()
         recordPendingDevelopmentKeys(
             Set(records.map(\.key)).subtracting(activeDevelopmentKeys),
+            for: generationID
+        )
+        recordPendingDevelopmentTypeIDs(
+            Set(typeRecords.map(\.id)).subtracting(
+                activeDevelopmentTypeIDs
+            ),
             for: generationID
         )
         return payload
@@ -377,6 +545,23 @@ public actor BytecodeBuilder {
         )
         for generationID in stale {
             pendingDevelopmentKeys.removeValue(forKey: generationID)
+        }
+    }
+
+    private func recordPendingDevelopmentTypeIDs(
+        _ typeIDs: Set<Core.TypeID>,
+        for generationID: DevProtocol.GenerationID
+    ) {
+        guard !typeIDs.isEmpty else {
+            pendingDevelopmentTypeIDs.removeValue(forKey: generationID)
+            return
+        }
+        pendingDevelopmentTypeIDs[generationID] = typeIDs
+        let stale = pendingDevelopmentTypeIDs.keys.sorted().dropLast(
+            Self.maximumPendingCapabilityTransactions
+        )
+        for generationID in stale {
+            pendingDevelopmentTypeIDs.removeValue(forKey: generationID)
         }
     }
 
@@ -506,7 +691,8 @@ public actor BytecodeBuilder {
     ) throws -> DevSession.BuildOutcome {
         switch error {
         case .receiptMismatch, .tooManyImports, .missingBinding,
-             .unsupportedDevelopmentBinding, .invalidAdapterRequest,
+             .missingNativeTypeBinding, .unsupportedDevelopmentBinding,
+             .invalidAdapterRequest,
              .deviceAdapterUnqualified:
             return .rebuildRequired(
                 diagnostic(
@@ -517,7 +703,8 @@ public actor BytecodeBuilder {
                 )
             )
         case .compilerResultMismatch, .adapterCompilationFailed,
-             .adapterSigningFailed, .invalidAdapterImage:
+             .adapterSigningFailed, .invalidAdapterImage,
+             .discoveryFailed:
             throw diagnostic(
                 code: "HLXLR207",
                 message: error.description,
@@ -576,6 +763,31 @@ private enum ContractError: Error, CustomStringConvertible {
             "the restored Dev Session references a native call that is absent from HLXI"
         case .missingNativeCapabilityReceipt:
             "HLXI contains development NativeImport candidates but no Shell Build Receipt"
+        }
+    }
+}
+
+private extension CanonicalSIL.LoweringError {
+    var requiresNativeSurfaceResolution: Bool {
+        switch self {
+        case .unboundCallee, .unavailableNativeImport,
+             .unsupportedType, .callSignatureMismatch:
+            true
+        case let .unsupportedInstruction(_, text):
+            // A first use can mention a native type before the callee itself
+            // (constructors commonly begin with a metatype). Resolve the
+            // source-authenticated surface before deciding the instruction is
+            // outside HLBC. A failed retry leaves the previous plan untouched.
+            [
+                " = metatype $@", " = upcast ",
+                " = unchecked_ref_cast ", " = unconditional_checked_cast ",
+                " = checked_cast_", " = objc_metatype_to_object ",
+                " = thick_to_objc_metatype ", " = ref_to_bridge_object ",
+                " = bridge_object_to_ref ",
+            ].contains { text.contains($0) }
+        case .functionSelection, .malformedSIL,
+             .undefinedValue, .invalidCallTable:
+            false
         }
     }
 }

@@ -18,6 +18,7 @@ struct AnyWireContract {
 
     @Test("Any v1 exposes a closed, VM-managed payload set")
     func payloadPolicy() {
+        let nativeType = Core.TypeID(rawValue: .sha256("Any.NativeReference"))
         #expect(Bytecode.DynamicType.integer(.int).isAnyPayloadV1)
         #expect(Bytecode.DynamicType.optional(.any).isAnyPayloadV1)
         #expect(Bytecode.DynamicType.array(.any).isAnyPayloadV1)
@@ -34,6 +35,19 @@ struct AnyWireContract {
         #expect(Bytecode.DynamicType.set(.character).isAnyPayloadV1)
         #expect(Bytecode.DynamicType.substring.isAnyPayloadV1)
         #expect(Bytecode.DynamicType.arraySlice(.integer(.int)).isAnyPayloadV1)
+        #expect(Bytecode.DynamicType.native(nativeType).isAnyPayloadV1)
+        #expect(
+            Bytecode.DynamicType.native(nativeType).storageType
+                == .native(nativeType)
+        )
+        #expect(
+            Bytecode.DynamicType.native(nativeType)
+                .isNativeBridgeMaterializableV1
+        )
+        #expect(
+            !Bytecode.DynamicType.native(nativeType)
+                .isSwiftBridgeMaterializableV1
+        )
         #expect(!Bytecode.DynamicType.any.isAnyPayloadV1)
         #expect(!Bytecode.DynamicType.tuple([]).isAnyPayloadV1)
         #expect(
@@ -129,6 +143,72 @@ struct AnyWireContract {
                 .init(label: "value", type: .string),
             ]).isAnyPayloadV1
         )
+    }
+
+    @Test("Module native type dependencies include values, casts, and hosted classes")
+    func collectsModuleNativeTypeDependencies() {
+        let valueTypeID = Core.TypeID(rawValue: .sha256("module-value"))
+        let castTypeID = Core.TypeID(rawValue: .sha256("module-cast"))
+        let superclassTypeID = Core.TypeID(
+            rawValue: .sha256("module-superclass")
+        )
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "root",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .void,
+            registerTypes: [
+                .any,
+                .optional(.native(castTypeID)),
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .checkedCastAny(
+                            result: .init(rawValue: 1),
+                            value: .init(rawValue: 0),
+                            targetType: .optional(.native(castTypeID))
+                        ),
+                        .returnValue(nil),
+                    ]
+                ),
+            ]
+        )
+        let module = Bytecode.Module(
+            name: "NativeTypeDependencyFixture",
+            shellInterfaceHash: .sha256("module-native-type-dependencies"),
+            compatibility: .init(
+                runtime: Core.Versions.runtime,
+                bytecode: Core.Versions.bytecode,
+                interfaceArchive: Core.Versions.interfaceArchive,
+                compilerFingerprint: "fixture"
+            ),
+            localTypes: [
+                .init(
+                    key: .init(rawValue: "Hosted"),
+                    kind: .class(
+                        fields: [
+                            .init(
+                                name: "values",
+                                type: .array(.native(valueTypeID))
+                            ),
+                        ],
+                        hostedSuperclass: .init(typeID: superclassTypeID),
+                        hostedMethods: []
+                    )
+                ),
+            ],
+            functions: [function]
+        )
+
+        #expect(module.referencedNativeTypeIDs == [
+            valueTypeID,
+            castTypeID,
+            superclassTypeID,
+        ])
     }
 
     @Test("Closed protocol instructions round-trip and disassemble deterministically")

@@ -201,6 +201,74 @@ struct ObjectiveCInvoker {
         #expect(inheritedNative.value(as: HelixRuntimeTestDerived.self) != nil)
     }
 
+    @Test("Logical Any parameters bridge through Objective-C id")
+    func nativeReferenceInsideAny() throws {
+        let fixture = try Fixture()
+        let receiver = HelixRuntimeTestObject()
+        let named = HelixRuntimeTestNamedObject()
+        named.name = "native-any"
+        let receiverValue = try fixture.objectValue(receiver)
+        let namedValue = try fixture.objectValue(named)
+        let erased = VM.Value.any(.init(
+            dynamicType: .native(fixture.objectTypeID),
+            payload: namedValue
+        ))
+        let call = try fixture.call(
+            member: "recordNamingObject(_:)",
+            selector: "recordNamingObject:",
+            dispatch: .instance,
+            kind: .instanceMethod,
+            access: .write,
+            logicalParameters: [
+                fixture.objectParameter(),
+                .init(type: "Swift.Any"),
+            ],
+            logicalResult: "Swift.Void",
+            valueParameterTypes: [.native(fixture.objectTypeID), .any],
+            physicalParameters: [
+                .init(
+                    type: fixture.objectABI(
+                        "any HelixRuntimeTestNaming & AnyObject"
+                    ),
+                    source: .argument(1)
+                ),
+            ],
+            physicalResult: .void,
+            effects: .init(hasExternalSideEffects: true)
+        )
+
+        #expect(
+            try fixture.invoke(
+                call,
+                arguments: [receiverValue, erased]
+            ) == .returned(nil)
+        )
+        #expect(receiver.invocationCount == 1)
+
+        let anyResult = try fixture.call(
+            member: "identityObject(_:)",
+            selector: "identityObject:",
+            dispatch: .instance,
+            kind: .instanceMethod,
+            logicalParameters: [
+                fixture.objectParameter(),
+                fixture.objectParameter(),
+            ],
+            logicalResult: "Swift.Any",
+            valueResultType: .any,
+            physicalParameters: [
+                .init(
+                    type: fixture.objectABI("Swift.AnyObject"),
+                    source: .argument(1)
+                ),
+            ],
+            physicalResult: fixture.objectABI("Swift.AnyObject")
+        )
+        #expect(throws: VM.RuntimeTrap.self) {
+            try anyResult.invoker.validateConfiguration()
+        }
+    }
+
     @Test("Bitwise-copyable structure codecs are general and preserve layout")
     func structureRoundTrip() throws {
         let fixture = try Fixture()

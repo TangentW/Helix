@@ -139,10 +139,30 @@ enum DirectCalls {
                 == developmentNativeImports.count,
               developmentNativeImports.allSatisfy({ candidate in
                   guard candidate.isEmittedToDevice,
-                        let id = candidate.id,
-                        !baselineIDs.contains(id),
-                        var archived = archivedCandidates[candidate.key],
-                        !archived.isEmittedToDevice,
+                        let id = candidate.id
+                  else { return false }
+                  if baselineIDs.contains(id) {
+                      guard var archived = archivedCandidates[candidate.key],
+                            archived.isEmittedToDevice,
+                            archived.id == id,
+                            Set(archived.silMangledNames).isSubset(
+                                of: candidate.silMangledNames
+                            )
+                      else { return false }
+                      archived.silMangledNames = candidate.silMangledNames
+                      return archived == candidate
+                  }
+                  guard var archived = archivedCandidates[candidate.key]
+                  else {
+                      return (try? candidate.descriptor.validate(
+                          contract: candidate.contract
+                      )) != nil
+                          && (try? Core.NativeCall.Key.derive(
+                              descriptor: candidate.descriptor
+                          )) == candidate.key
+                          && !candidate.silMangledNames.isEmpty
+                  }
+                  guard !archived.isEmittedToDevice,
                         archived.id == nil
                   else { return false }
                   archived.id = id

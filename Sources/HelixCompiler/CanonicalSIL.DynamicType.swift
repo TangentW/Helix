@@ -148,6 +148,9 @@ enum DynamicType {
         if case let .local(key) = storage {
             return .local(key)
         }
+        if case let .native(id) = storage {
+            return .native(id)
+        }
         if case .closure = storage {
             throw CanonicalSIL.LoweringError.unsupportedType(
                 "VM-owned Any cannot carry closure dynamic type \(spelling)"

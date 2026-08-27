@@ -56,6 +56,7 @@ FOUNDATION_EXPORT CGPoint HelixRuntimeTestCApplyPointTransform(
 - (NSString *)copyName;
 - (void)recordString:(NSString *)value;
 - (void)recordNamingObject:(id<HelixRuntimeTestNaming>)object;
+- (id)identityObject:(id)object;
 - (float)scaleFloat:(float)value;
 - (double)scaleDouble:(double)value;
 - (HelixRuntimeTestPoint)translatePoint:(HelixRuntimeTestPoint)point

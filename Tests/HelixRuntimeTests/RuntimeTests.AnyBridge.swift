@@ -1,5 +1,6 @@
 import Foundation
 import HelixBytecode
+import HelixCore
 import HelixVM
 import Testing
 @testable import HelixRuntime
@@ -7,6 +8,10 @@ import Testing
 extension RuntimeTests {
 @Suite("Swift Any bridge")
 struct AnyBridge {
+    private struct NativeSnapshot: Hashable, Sendable {
+        var count: Int
+    }
+
     @Test("Heterogeneous standard-library graphs round-trip without native objects")
     func heterogeneousGraphRoundTrip() throws {
         let input: [String: Any] = [
@@ -150,6 +155,135 @@ struct AnyBridge {
         )
         #expect(decodedCGFloat as? CGFloat == cgFloat)
         #expect(decodedCGFloat is Double == false)
+    }
+
+    @Test("Authenticated native references materialize through recursive Any")
+    func materializesNativeReferencesWithCatalog() throws {
+        let typeID = Core.TypeID(rawValue: .sha256("AnyBridge.NativeReference"))
+        let catalog = try VM.NativeTypeCatalog([
+            .objectiveCReference(
+                id: typeID,
+                canonicalName: "Foundation.NSObject",
+                layoutFingerprint: .sha256("AnyBridge.NativeReference.Layout"),
+                referenceClass: NSObject.self,
+                accepts: { _ in true }
+            ),
+        ])
+        let object = NSObject()
+        let encoded = try Runtime.BridgeValueCodec.encodeAny(
+            object,
+            nativeTypeCatalog: catalog
+        )
+        guard case let .any(erased) = encoded else {
+            Issue.record("expected a native Any payload")
+            return
+        }
+        #expect(erased.dynamicType == .native(typeID))
+
+        let decoded = try Runtime.BridgeValueCodec.decodeAny(
+            encoded,
+            nativeTypeCatalog: catalog
+        ) as AnyObject
+        #expect(ObjectIdentifier(decoded) == ObjectIdentifier(object))
+        #expect(throws: VM.RuntimeTrap.self) {
+            _ = try Runtime.BridgeValueCodec.decodeAny(encoded)
+        }
+        #expect(throws: Runtime.BridgeInputError.self) {
+            _ = try Runtime.BridgeValueCodec.encodeAny(object)
+        }
+
+        let array = try Runtime.BridgeValueCodec.encodeAny(
+            [object],
+            nativeTypeCatalog: catalog
+        )
+        let decodedArray = try Runtime.BridgeValueCodec.decodeAny(
+            array,
+            nativeTypeCatalog: catalog
+        )
+        guard let first = Mirror(reflecting: decodedArray).children.first?.value else {
+            Issue.record("expected an array containing the native reference")
+            return
+        }
+        #expect(Mirror(reflecting: decodedArray).children.count == 1)
+        #expect(
+            ObjectIdentifier(first as AnyObject) == ObjectIdentifier(object)
+        )
+    }
+
+    @Test("Authenticated native values materialize through recursive Any")
+    func materializesNativeValuesWithCatalog() throws {
+        let typeID = Core.TypeID(rawValue: .sha256("AnyBridge.NativeSnapshot"))
+        let typeName = String(reflecting: NativeSnapshot.self)
+        let catalog = try VM.NativeTypeCatalog([
+            .opaqueValue(
+                id: typeID,
+                canonicalName: typeName,
+                layoutFingerprint: .sha256("AnyBridge.NativeSnapshot.Layout"),
+                clone: { (value: NativeSnapshot) in value }
+            ),
+        ])
+        let snapshot = NativeSnapshot(count: 7)
+
+        let encoded = try Runtime.BridgeValueCodec.encodeAny(
+            snapshot,
+            nativeTypeCatalog: catalog
+        )
+        guard let decoded = try Runtime.BridgeValueCodec.decodeAny(
+            encoded,
+            nativeTypeCatalog: catalog
+        ) as? NativeSnapshot else {
+            Issue.record("expected the authenticated native value")
+            return
+        }
+        #expect(decoded == snapshot)
+
+        let encodedArray = try Runtime.BridgeValueCodec.encodeAny(
+            [snapshot],
+            nativeTypeCatalog: catalog
+        )
+        guard let decodedArray = try Runtime.BridgeValueCodec.decodeAny(
+            encodedArray,
+            nativeTypeCatalog: catalog
+        ) as? [NativeSnapshot] else {
+            Issue.record("expected an array of authenticated native values")
+            return
+        }
+        #expect(decodedArray == [snapshot])
+    }
+
+    @Test("Any rejects native values whose frozen ownership is noncopyable")
+    func rejectsNoncopyableNativeValues() throws {
+        let typeID = Core.TypeID(rawValue: .sha256("AnyBridge.Noncopyable"))
+        let typeName = String(reflecting: NativeSnapshot.self)
+        let catalog = try VM.NativeTypeCatalog([
+            .init(
+                id: typeID,
+                canonicalName: typeName,
+                kind: .value,
+                layoutFingerprint: .sha256("AnyBridge.Noncopyable.Layout"),
+                isCopyable: false,
+                estimatedSize: 8,
+                clone: { (value: NativeSnapshot) in value }
+            ),
+        ])
+        let snapshot = NativeSnapshot(count: 7)
+        #expect(throws: Runtime.BridgeInputError.self) {
+            _ = try Runtime.BridgeValueCodec.encodeAny(
+                snapshot,
+                nativeTypeCatalog: catalog
+            )
+        }
+
+        let boxed = try catalog.box(snapshot, as: typeID)
+        let erased = VM.Value.any(
+            .init(dynamicType: .native(typeID), payload: .native(boxed))
+        )
+        #expect(throws: VM.RuntimeTrap.self) {
+            _ = try Runtime.BridgeValueCodec.decodeAny(
+                erased,
+                nativeTypeCatalog: catalog
+            )
+        }
     }
 
     @Test("The Any wrapper participates in node and depth accounting")

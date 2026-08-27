@@ -70,6 +70,7 @@ private struct NativeCallDescriptor {
     var parameterConventions: [Bytecode.ParameterConvention]
     var resultType: Bytecode.ValueType
     var effects: Core.Effects
+    var callbackParameterIndices: Set<Int>
 }
 
 private struct ShellEntryCall {
@@ -2025,12 +2026,19 @@ public struct Interpreter: Sendable {
                         from: erased.dynamicType,
                         to: targetType
                     )
+                    let owned = try converted.map {
+                        try materializeAnyCastResult(
+                            $0,
+                            targetType: targetType,
+                            budget: budget
+                        )
+                    }
                     try chargeAggregate(
-                        elementCount: converted == nil ? 0 : 1,
+                        elementCount: owned == nil ? 0 : 1,
                         budget: budget
                     )
                     try initialize(
-                        .optional(converted),
+                        .optional(owned),
                         register: result,
                         registers: &registers
                     )
@@ -2059,7 +2067,15 @@ public struct Interpreter: Sendable {
                             expected: targetType
                         )
                     }
-                    try initialize(converted, register: result, registers: &registers)
+                    try initialize(
+                        try materializeAnyCastResult(
+                            converted,
+                            targetType: targetType,
+                            budget: budget
+                        ),
+                        register: result,
+                        registers: &registers
+                    )
                 case let .checkedCastExistential(
                     result, source, acceptedTypes
                 ):
@@ -5413,10 +5429,12 @@ public struct Interpreter: Sendable {
                     let descriptor = try nativeCallDescriptor(importID)
                     let values = try arguments.map { try read($0, registers: registers) }
                     try chargeCallShape(values, budget: budget)
-                    guard values.count == descriptor.parameterTypes.count,
-                          zip(values, descriptor.parameterTypes).allSatisfy({
-                              $0.matches($1)
-                          })
+                    guard VM.NativeInvocationABI.argumentsAreCompatible(
+                        values,
+                        with: descriptor.parameterTypes,
+                        callbackParameterIndices:
+                            descriptor.callbackParameterIndices
+                    )
                     else {
                         throw VM.RuntimeTrap.nativeFailure("runtime argument check failed for import \(importID)")
                     }
@@ -6085,10 +6103,12 @@ public struct Interpreter: Sendable {
                     let descriptor = try nativeCallDescriptor(importID)
                     let values = try arguments.map { try read($0, registers: registers) }
                     try chargeCallShape(values, budget: budget)
-                    guard values.count == descriptor.parameterTypes.count,
-                          zip(values, descriptor.parameterTypes).allSatisfy({
-                              $0.matches($1)
-                          })
+                    guard VM.NativeInvocationABI.argumentsAreCompatible(
+                        values,
+                        with: descriptor.parameterTypes,
+                        callbackParameterIndices:
+                            descriptor.callbackParameterIndices
+                    )
                     else {
                         throw VM.RuntimeTrap.nativeFailure(
                             "runtime argument check failed for import \(importID)"
@@ -7291,6 +7311,20 @@ public struct Interpreter: Sendable {
         case .bool, .integer, .float, .string:
             value
         }
+    }
+
+    /// `Any` is reusable, while a native-typed register owns one explicit
+    /// TypeOps copy. Crossing that boundary must clone every native leaf
+    /// instead of aliasing the existential payload.
+    private func materializeAnyCastResult(
+        _ value: VM.Value,
+        targetType: Bytecode.DynamicType,
+        budget: VM.InvocationBudget
+    ) throws -> VM.Value {
+        guard targetType.storageType.requiresLinearOwnership else {
+            return value
+        }
+        return try copyCharging(value, budget: budget)
     }
 
     private func closureScopeIsReachable(
@@ -8767,7 +8801,10 @@ public struct Interpreter: Sendable {
                 parameterTypes: invoker.parameterTypes,
                 parameterConventions: nativeParameterConventions(invoker),
                 resultType: invoker.resultType,
-                effects: invoker.effects
+                effects: invoker.effects,
+                callbackParameterIndices: Set(
+                    invoker.contract.callbacks.map { Int($0.parameterIndex) }
+                )
             )
         case let (.none, .some(invoker)):
             return .init(
@@ -8777,7 +8814,10 @@ public struct Interpreter: Sendable {
                     count: invoker.parameterTypes.count
                 ),
                 resultType: invoker.resultType,
-                effects: invoker.effects
+                effects: invoker.effects,
+                callbackParameterIndices: Set(
+                    invoker.contract.callbacks.map { Int($0.parameterIndex) }
+                )
             )
         case (.some, .some):
             throw VM.RuntimeTrap.nativeImportDescriptorMismatch(id)

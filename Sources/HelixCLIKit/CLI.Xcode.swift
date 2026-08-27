@@ -1385,37 +1385,37 @@ private func performPrepareXcodeShell(
             invocationObserver: performance.subprocessObserver
         )
     }
-    let nativeAPICatalogs = try resolveXcodeNativeAPICatalogs(
-        context: context,
-        metadata: metadata,
-        importedModules: sourceImports.modules,
-        compilerArguments: capture.analysisJob.arguments,
-        compilerInputs: compilerInputs,
-        toolchain: toolchain,
-        cache: buildCache,
-        performance: performance
-    )
     var prepareInputHash: Core.Digest?
     var prepareIdentitySources: [CLI.XcodePrepareInput.Source]?
-    if context.profile.workflow == .hotPatch {
+    var restoredFrontendOutput: FrontendReceipt.Output?
+    var refreshedHubReservation: XcodeIntegration.HubReservationDocument?
+    let callingSurfacePolicy: FrontendReceipt.CallingSurfacePolicy =
+        context.profile.workflow == .liveReload
+            ? .managedDevelopmentModule
+            : .managedProductionModule
+    if compilerInputs.isComplete {
         let identity = try performance.measure("prepare.make_fast_path_identity") {
-            try makeHotPatchPrepareIdentity(
+            try makeXcodePrepareIdentity(
                 context: context,
                 capture: capture,
                 compilerInputs: compilerInputs,
                 metadata: metadata,
                 configuration: configuration,
                 toolchain: toolchain,
-                nativeAPICatalogs: nativeAPICatalogs.snapshots
+                callingSurfacePolicy: callingSurfacePolicy
             )
         }
         prepareIdentitySources = identity.sources
-        if compilerInputs.isComplete {
-            prepareInputHash = identity.inputHash
-            if let state = loadHotPatchPrepareState(
-                context: context,
-                expectedInputHash: identity.inputHash
-            ), hotPatchPrepareSourcesMatch(identity.sources) {
+        prepareInputHash = identity.inputHash
+        if let state = loadXcodePrepareState(
+            context: context,
+            expectedInputHash: identity.inputHash
+        ), hotPatchPrepareSourcesMatch(identity.sources) {
+            if state.requiresNativeAPICatalogRefresh {
+                performance.incrementCounter(
+                    "prepare.catalog_refresh_pending_count"
+                )
+            } else if context.profile.workflow == .hotPatch {
                 performance.incrementCounter("prepare.state_hit_count")
                 performance.setCounter(
                     "prepare.eligible_function_count",
@@ -1432,36 +1432,98 @@ private func performPrepareXcodeShell(
                         + "Functions: \(state.eligibleFunctionCount) eligible, "
                         + "\(state.rejectedFunctionCount) rejected\n"
                 )
+            } else {
+                let existing = try loadXcodeHubReservation(context)
+                let reserved = try await performance.measure(
+                    "prepare.reserve_hub"
+                ) {
+                    try await xcodeHubControlClient()
+                        .reserveAutomaticInvitation(
+                            reusing: existing.reservation
+                        )
+                }
+                let current = try XcodeIntegration.HubReservationDocument(
+                    reservation: reserved.reservation,
+                    spkiSHA256: reserved.spkiSHA256
+                )
+                if current == existing {
+                    performance.incrementCounter("prepare.state_hit_count")
+                    performance.incrementCounter(
+                        "prepare.hub_reservation_reused_count"
+                    )
+                    performance.setCounter(
+                        "prepare.eligible_function_count",
+                        value: UInt64(state.eligibleFunctionCount)
+                    )
+                    performance.setCounter(
+                        "prepare.rejected_function_count",
+                        value: UInt64(state.rejectedFunctionCount)
+                    )
+                    return .init(
+                        exitCode: 0,
+                        standardOutput:
+                            "Prepared \(context.profile.id) Helix Shell at "
+                            + "\(context.environment.shellOutputURL.path)\n"
+                            + "Functions: \(state.eligibleFunctionCount) eligible, "
+                            + "\(state.rejectedFunctionCount) rejected\n"
+                    )
+                }
+                restoredFrontendOutput = try? loadPreparedFrontendOutput(
+                    context: context,
+                    identitySources: identity.sources,
+                    toolchain: toolchain,
+                    importedModules: sourceImports.modules
+                )
+                refreshedHubReservation = current
+                performance.incrementCounter("prepare.state_refresh_count")
             }
-            performance.incrementCounter("prepare.state_miss_count")
-        } else {
-            performance.incrementCounter(
-                "prepare.compiler_inputs_incomplete_count"
-            )
         }
-    }
-    let receiptRequest = FrontendReceipt.Request(
-        metadata: metadata,
-        configuration: configuration,
-        sources: capture.frontendSources,
-        compilerURL: context.environment.compilerURL,
-        nativeImportCatalog: .empty,
-        nativeAPICatalogs: nativeAPICatalogs.snapshots,
-        callingSurfacePolicy: context.profile.workflow == .liveReload
-            ? .managedDevelopmentModule
-            : .managedProductionModule
-    )
-    let indexed = try performance.measure("prepare.frontend_receipt") {
-        try FrontendReceipt.CachedAdapter(cache: buildCache).generate(
-            receiptRequest,
-            compilerCapture: capture.recordBytes,
-            compilerArguments: capture.analysisJob.arguments,
-            workingDirectory: context.environment.sourceRootURL,
-            precomputedToolchain: toolchain,
-            precomputedCompilerInputs: compilerInputs
+        if restoredFrontendOutput == nil {
+            performance.incrementCounter("prepare.state_miss_count")
+        }
+    } else {
+        performance.incrementCounter(
+            "prepare.compiler_inputs_incomplete_count"
         )
     }
-    performance.merge(indexed.performance)
+    let nativeAPICatalogs: XcodeNativeAPICatalogResolution?
+    let indexed: FrontendReceipt.Output
+    if let restoredFrontendOutput {
+        nativeAPICatalogs = nil
+        indexed = restoredFrontendOutput
+    } else {
+        let resolved = try await resolveXcodeNativeAPICatalogs(
+            context: context,
+            metadata: metadata,
+            importedModules: sourceImports.modules,
+            compilerArguments: capture.analysisJob.arguments,
+            compilerInputs: compilerInputs,
+            toolchain: toolchain,
+            cache: buildCache,
+            performance: performance
+        )
+        nativeAPICatalogs = resolved
+        let receiptRequest = FrontendReceipt.Request(
+            metadata: metadata,
+            configuration: configuration,
+            sources: capture.frontendSources,
+            compilerURL: context.environment.compilerURL,
+            nativeImportCatalog: .empty,
+            nativeAPICatalogs: resolved.snapshots,
+            callingSurfacePolicy: callingSurfacePolicy
+        )
+        indexed = try performance.measure("prepare.frontend_receipt") {
+            try FrontendReceipt.CachedAdapter(cache: buildCache).generate(
+                receiptRequest,
+                compilerCapture: capture.recordBytes,
+                compilerArguments: capture.analysisJob.arguments,
+                workingDirectory: context.environment.sourceRootURL,
+                precomputedToolchain: toolchain,
+                precomputedCompilerInputs: compilerInputs
+            )
+        }
+        performance.merge(indexed.performance)
+    }
     if prepareInputHash != nil {
         var confirmedCompilerInputs = BuildCache.CompilerInputs.capture(
             arguments: capture.analysisJob.arguments,
@@ -1495,13 +1557,20 @@ private func performPrepareXcodeShell(
     let hubReservation: XcodeIntegration.HubReservationDocument?
     let hubBinding: ShellBuild.HubBinding?
     if context.profile.workflow == .liveReload {
-        let reserved = try await performance.measure("prepare.reserve_hub") {
-            try await xcodeHubControlClient().reserveAutomaticInvitation()
+        let document: XcodeIntegration.HubReservationDocument
+        if let refreshedHubReservation {
+            document = refreshedHubReservation
+        } else {
+            let reserved = try await performance.measure("prepare.reserve_hub") {
+                try await xcodeHubControlClient().reserveAutomaticInvitation(
+                    reusing: nil
+                )
+            }
+            document = try XcodeIntegration.HubReservationDocument(
+                reservation: reserved.reservation,
+                spkiSHA256: reserved.spkiSHA256
+            )
         }
-        let document = try XcodeIntegration.HubReservationDocument(
-            reservation: reserved.reservation,
-            spkiSHA256: reserved.spkiSHA256
-        )
         hubReservation = document
         hubBinding = try .init(
             reservation: document.reservation,
@@ -1605,7 +1674,9 @@ private func performPrepareXcodeShell(
                 )
             },
             eligibleFunctionCount: materialized.report.eligibleFunctionCount,
-            rejectedFunctionCount: materialized.report.rejectedFunctionCount
+            rejectedFunctionCount: materialized.report.rejectedFunctionCount,
+            requiresNativeAPICatalogRefresh:
+                nativeAPICatalogs?.prewarmRequests.isEmpty == false
         )
         try performance.measure("prepare.publish_state") {
             try files.write(
@@ -1632,6 +1703,7 @@ private func performPrepareXcodeShell(
     )
     var catalogPrewarmStatus = ""
     if context.profile.workflow == .liveReload,
+       let nativeAPICatalogs,
        !nativeAPICatalogs.prewarmRequests.isEmpty {
         do {
             try scheduleNativeAPICatalogPrewarm(

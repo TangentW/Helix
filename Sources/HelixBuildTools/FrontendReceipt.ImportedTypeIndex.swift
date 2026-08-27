@@ -14,6 +14,9 @@ struct ImportedTypeIndex: Sendable {
             var names = Set(
                 [type.canonicalName, type.swiftType] + type.aliases
             )
+            names = names.filter {
+                !FrontendReceipt.ValueTypeParser.isBuiltinValueSpelling($0)
+            }
             if let runtimeName = type.objectiveCRuntimeName {
                 names.insert(runtimeName)
                 names.insert("__C.\(runtimeName)")
@@ -41,7 +44,10 @@ struct ImportedTypeIndex: Sendable {
             ) {
                 var prefix = token
                 while true {
-                    indices.formUnion(indicesByName[prefix] ?? [])
+                    if let matches = indicesByName[prefix], !matches.isEmpty {
+                        indices.formUnion(matches)
+                        break
+                    }
                     guard let separator = prefix.lastIndex(of: ".") else {
                         break
                     }

@@ -145,6 +145,29 @@ public actor Authority {
         return reservation
     }
 
+    /// Reuses an exact unactivated reservation while it remains authoritative.
+    /// Activated, consumed, expired, or foreign values produce a fresh code;
+    /// callers never infer reservation state from timestamps alone.
+    public func reserve(
+        kind: Pairing.Kind,
+        reusing existing: Pairing.Reservation?,
+        now: Date = Date()
+    ) throws -> Pairing.Reservation {
+        purge(now: now)
+        if let existing {
+            try existing.validate()
+            let maximumAge = reservationLifetime(for: existing.kind)
+            if existing.kind == kind,
+               existing.reservedAt <= now,
+               now.timeIntervalSince(existing.reservedAt) <= maximumAge,
+               reservations[existing.invitationID] == existing,
+               invitationByCode[existing.code] == existing.invitationID {
+                return existing
+            }
+        }
+        return try reserve(kind: kind, now: now)
+    }
+
     /// Registers a reservation created by another same-user Helix process.
     public func register(
         _ reservation: Pairing.Reservation,

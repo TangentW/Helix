@@ -84,7 +84,7 @@ extension CLI.Application {
         toolchain: ReleaseCompiler.ToolchainIdentity,
         cache: BuildCache.Store,
         performance: BuildPerformance.Recorder
-    ) throws -> XcodeNativeAPICatalogResolution {
+    ) async throws -> XcodeNativeAPICatalogResolution {
         let sdk = SwiftFrontend.Driver.SDKIdentity(
             name: context.environment.sdkName,
             path: context.environment.sdkRootURL.standardizedFileURL.path,
@@ -120,27 +120,48 @@ extension CLI.Application {
             unresolvedModules.formUnion(plan.unresolvedModules)
             let pending = plan.requests.filter {
                 !processedModules.contains($0.identity.moduleName)
+            }.sorted {
+                $0.identity.moduleName < $1.identity.moduleName
             }
             guard !pending.isEmpty else { break }
             var discoveredModules = Set<String>()
-            for request in pending {
-                processedModules.insert(request.identity.moduleName)
-                let output: NativeAPICatalog.BuildOutput?
-                if context.profile.workflow == .liveReload {
-                    output = try performance.measure(
-                        "prepare.catalog_read"
-                    ) {
-                        try builder.cached(request)
-                    }
-                    if output == nil { prewarmRequests.append(request) }
-                } else {
-                    output = try performance.measure(
-                        "prepare.catalog_build"
-                    ) {
-                        try builder.build(request)
+            let isLiveReload = context.profile.workflow == .liveReload
+            let parallelism = isLiveReload ? 4 : 2
+            var resolved: [(NativeAPICatalog.BuildRequest,
+                            NativeAPICatalog.BuildOutput?)] = []
+            for start in stride(from: 0, to: pending.count, by: parallelism) {
+                let end = min(start + parallelism, pending.count)
+                let batch = Array(pending[start..<end])
+                let outputs = try await performance.measure(
+                    isLiveReload ? "prepare.catalog_read" : "prepare.catalog_build"
+                ) {
+                    try await withThrowingTaskGroup(
+                        of: (Int, NativeAPICatalog.BuildOutput?).self
+                    ) { group in
+                        for (offset, request) in batch.enumerated() {
+                            group.addTask {
+                                let output = if isLiveReload {
+                                    try builder.cached(request)
+                                } else {
+                                    try builder.build(request)
+                                }
+                                return (offset, output)
+                            }
+                        }
+                        var values: [(Int, NativeAPICatalog.BuildOutput?)] = []
+                        for try await value in group {
+                            values.append(value)
+                        }
+                        return values.sorted { $0.0 < $1.0 }.map(\.1)
                     }
                 }
+                resolved.append(contentsOf: zip(batch, outputs))
+            }
+            for (request, output) in resolved {
+                processedModules.insert(request.identity.moduleName)
+                if isLiveReload, output == nil { prewarmRequests.append(request) }
                 guard let output else { continue }
+                performance.merge(output.performance)
                 snapshots.append(output.snapshot)
                 discoveredModules.formUnion(
                     output.snapshot.referencedModules

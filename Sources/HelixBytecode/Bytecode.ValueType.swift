@@ -1,4 +1,37 @@
+import HelixCore
+
 extension Bytecode.ValueType {
+    /// Every native TypeID nested anywhere in this logical value shape.
+    /// Keeping this traversal beside the schema prevents capability planning,
+    /// verification, and build receipts from disagreeing on recursive types.
+    public var referencedNativeTypeIDs: Set<Core.TypeID> {
+        switch self {
+        case let .native(id): [id]
+        case let .array(element), let .set(element),
+             let .address(element), let .mutableCell(element),
+             let .nonOwningReference(_, element),
+             let .arrayState(_, element), let .optional(element):
+            element.referencedNativeTypeIDs
+        case let .dictionary(key, value),
+             let .dictionaryState(key, value):
+            key.referencedNativeTypeIDs.union(value.referencedNativeTypeIDs)
+        case let .closure(signature):
+            signature.parameters.reduce(
+                signature.result.referencedNativeTypeIDs
+            ) { $0.union($1.referencedNativeTypeIDs) }
+                .union(
+                    signature.thrownType?.referencedNativeTypeIDs ?? []
+                )
+        case let .tuple(elements):
+            elements.reduce(into: Set<Core.TypeID>()) {
+                $0.formUnion($1.referencedNativeTypeIDs)
+            }
+        case .void, .never, .bool, .integer, .float, .string, .any,
+             .local, .error:
+            []
+        }
+    }
+
     /// The element shape exposed by the managed Collection representations.
     /// Dictionary iteration carries one `(key, value)` tuple, matching Swift's
     /// `Dictionary.Element`; compiler-only adapters are represented as Arrays.

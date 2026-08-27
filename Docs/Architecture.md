@@ -79,7 +79,10 @@ Both workflows depend on stable, build-specific identities:
 - A managed-development Build Receipt keeps baseline-used native bindings separate
   from dormant, data-only Catalog candidates. An authenticated first use assigns
   a deterministic session-local compact ID after the linked prefix without
-  changing the Shell interface hash. Every generation and escaping callback
+  changing the Shell interface hash. Native types reachable through casts or
+  metatypes are promoted independently of calls. Reconnects preserve the exact
+  Key-to-ID mapping and published TypeID inventory because active bytecode
+  already contains those compact IDs. Every generation and escaping callback
   pins one immutable capability snapshot; later saves cannot expand it in
   place.
 - Supported Objective-C imports share one descriptor-driven Runtime invoker

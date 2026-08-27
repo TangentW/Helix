@@ -17,6 +17,7 @@ struct DevelopmentPayload {
         #expect(try decoded.encoded() == bytes)
         #expect(decoded.manifest.schemaVersion == 1)
         #expect(decoded.manifest.nativeImports.map(\.key) == [fixture.key])
+        #expect(decoded.manifest.nativeTypes == [fixture.nativeType])
     }
 
     @Test("Every framed region is length- and hash-bound")
@@ -108,6 +109,21 @@ struct DevelopmentPayload {
         #expect(throws: DevProtocol.Error.self) {
             _ = try invalidIdentity.encoded()
         }
+
+        var invalidType = fixture.nativeType
+        invalidType.exportSymbol = "wrong_type_export"
+        var invalidTypeArtifact = fixture.artifact
+        invalidTypeArtifact.manifest.nativeTypes = [invalidType]
+        #expect(throws: DevProtocol.Error.self) {
+            _ = try invalidTypeArtifact.encoded()
+        }
+
+        var invalidObjectiveCType = fixture.nativeType
+        invalidObjectiveCType.binding = .objectiveCReference
+        invalidObjectiveCType.objectiveCRuntimeName = "UIView"
+        #expect(throws: DevProtocol.Error.self) {
+            try invalidObjectiveCType.validate(imageCount: 1)
+        }
     }
 
     private func payloadOffset(_ encoded: Data) throws -> Int {
@@ -130,6 +146,7 @@ private struct PayloadFixture {
     let image = Data("signed-adapter-image".utf8)
     let key: Core.NativeCall.Key
     let nativeImport: DevProtocol.DevelopmentPayload.NativeImport
+    let nativeType: DevProtocol.DevelopmentPayload.NativeType
     let imageDescriptor: DevProtocol.DevelopmentPayload.Image
     let artifact: DevProtocol.DevelopmentPayload.Artifact
 
@@ -159,6 +176,18 @@ private struct PayloadFixture {
             imageIndex: 0,
             exportSymbol: "hlx_swift_adapter_body_v1_\(key.rawValue.hex)"
         )
+        let typeID = Core.TypeID(rawValue: .sha256("Fixture.NativeValue"))
+        nativeType = .init(
+            id: typeID,
+            canonicalName: "Fixture.NativeValue",
+            kind: .value,
+            layoutFingerprint: .sha256("Fixture.NativeValue.Layout"),
+            isCopyable: true,
+            estimatedSize: 8,
+            binding: .swiftAdapter,
+            imageIndex: 0,
+            exportSymbol: "hlx_native_type_ops_v1_\(typeID.rawValue.hex)"
+        )
         imageDescriptor = .init(
             installName: "@rpath/HLXDevAdapter-\(shellHash.hex).dylib",
             uuid: UUID(uuidString: "776E2F49-25A0-49AB-904A-31C5A7643CA1")!,
@@ -172,6 +201,7 @@ private struct PayloadFixture {
             targetTriple: "arm64-apple-ios17.0-simulator",
             bytecode: bytecode,
             nativeImports: [nativeImport],
+            nativeTypes: [nativeType],
             imageDescriptors: [imageDescriptor],
             images: [image]
         )

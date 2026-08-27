@@ -12,6 +12,7 @@ public enum Namespace: String, Codable, Hashable, Sendable {
     case nativeAPICatalog = "native_api_catalog"
     case symbolGraph = "symbol_graph"
     case managedProbe = "managed_probe"
+    case managedProbeBatch = "managed_probe_batch"
     case adapterPack = "adapter_pack"
     case adapterObject = "adapter_object"
     case developmentAdapter = "development_adapter"

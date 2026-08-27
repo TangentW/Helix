@@ -130,7 +130,8 @@ extension Runtime.ObjectiveCInvoker {
         case .object:
             return supportsObject(
                 logicalType: resultType,
-                nullable: result.isNullable
+                nullable: result.isNullable,
+                allowsSwiftAnyErasure: false
             ) && [.direct, .directOwned, .directUnowned, .autoreleased]
                 .contains(signature.resultConvention)
         case .boolean:
@@ -181,7 +182,8 @@ extension Runtime.ObjectiveCInvoker {
         case .object:
             return supportsObject(
                 logicalType: logicalType,
-                nullable: parameter.type.isNullable
+                nullable: parameter.type.isNullable,
+                allowsSwiftAnyErasure: true
             )
         case .block:
             guard let shape = logicalType.directClosureShape else {
@@ -212,15 +214,19 @@ extension Runtime.ObjectiveCInvoker {
 
     private static func supportsObject(
         logicalType: Bytecode.ValueType,
-        nullable: Bool
+        nullable: Bool,
+        allowsSwiftAnyErasure: Bool
     ) -> Bool {
         switch logicalType {
         case .string, .error, .native:
             return !nullable
+        case .any:
+            return allowsSwiftAnyErasure && !nullable
         case let .optional(wrapped):
             return nullable && supportsObject(
                 logicalType: wrapped,
-                nullable: false
+                nullable: false,
+                allowsSwiftAnyErasure: allowsSwiftAnyErasure
             )
         default:
             return false

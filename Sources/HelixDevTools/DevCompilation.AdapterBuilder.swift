@@ -14,6 +14,7 @@ public struct AdapterImage: Sendable {
     public var descriptor: MachO.Descriptor
     public var installName: String
     public var keys: [Core.NativeCall.Key]
+    public var typeIDs: [Core.TypeID]
     public var cacheSource: BuildCache.Source
 
     public init(
@@ -21,12 +22,14 @@ public struct AdapterImage: Sendable {
         descriptor: MachO.Descriptor,
         installName: String,
         keys: [Core.NativeCall.Key],
+        typeIDs: [Core.TypeID] = [],
         cacheSource: BuildCache.Source
     ) {
         self.bytes = bytes
         self.descriptor = descriptor
         self.installName = installName
         self.keys = keys.sorted()
+        self.typeIDs = typeIDs.sorted { $0.rawValue < $1.rawValue }
         self.cacheSource = cacheSource
     }
 }
@@ -37,13 +40,17 @@ public struct AdapterBuildRequest: Sendable {
     public var outputDirectory: URL
     public var records: [InterfaceArchive.NativeImportRecord]
     public var bindings: [BridgeGeneration.NativeImportBinding]
+    public var nativeTypeRecords: [InterfaceArchive.TypeRecord]
+    public var nativeTypeBindings: [BridgeGeneration.NativeTypeBinding]
 
     public init(
         manifest: DevBuildManifest.Document,
         compilerURL: URL,
         outputDirectory: URL,
         records: [InterfaceArchive.NativeImportRecord],
-        bindings: [BridgeGeneration.NativeImportBinding]
+        bindings: [BridgeGeneration.NativeImportBinding],
+        nativeTypeRecords: [InterfaceArchive.TypeRecord] = [],
+        nativeTypeBindings: [BridgeGeneration.NativeTypeBinding] = []
     ) {
         self.manifest = manifest
         self.compilerURL = compilerURL
@@ -53,6 +60,12 @@ public struct AdapterBuildRequest: Sendable {
                 < ($1.id ?? .init(rawValue: UInt32.max))
         }
         self.bindings = bindings.sorted { $0.id < $1.id }
+        self.nativeTypeRecords = nativeTypeRecords.sorted {
+            $0.id.rawValue < $1.id.rawValue
+        }
+        self.nativeTypeBindings = nativeTypeBindings.sorted {
+            $0.id.rawValue < $1.id.rawValue
+        }
     }
 }
 
@@ -76,8 +89,10 @@ public struct AdapterBuilder<Runner: ProcessExecution.Running>: Sendable {
               request.compilerURL.path.hasPrefix("/"),
               request.outputDirectory.isFileURL,
               request.outputDirectory.path.hasPrefix("/"),
-              !request.records.isEmpty,
+              !request.records.isEmpty || !request.nativeTypeRecords.isEmpty,
               request.records.count == request.bindings.count,
+              request.nativeTypeRecords.count
+                == request.nativeTypeBindings.count,
               Set(request.records.map(\.key)).count == request.records.count,
               Set(request.bindings.map(\.key)).count == request.bindings.count,
               Set(request.bindings.map(\.id)).count == request.bindings.count,
@@ -88,6 +103,18 @@ public struct AdapterBuilder<Runner: ProcessExecution.Running>: Sendable {
               }),
               request.bindings.allSatisfy({
                   $0.strategy == .generatedSwiftAdapter
+              }),
+              Set(request.nativeTypeRecords.map(\.id)).count
+                == request.nativeTypeRecords.count,
+              Set(request.nativeTypeBindings.map(\.id)).count
+                == request.nativeTypeBindings.count,
+              request.nativeTypeRecords.allSatisfy({
+                  $0.isEmittedToDevice
+                      && $0.isCopyable
+                      && $0.objectiveCRuntimeName == nil
+              }),
+              request.nativeTypeBindings.allSatisfy({
+                  $0.strategy == .factory && $0.generated != nil
               })
         else {
             throw DevCompilation.NativeCapabilityError.invalidAdapterRequest
@@ -104,12 +131,29 @@ public struct AdapterBuilder<Runner: ProcessExecution.Running>: Sendable {
         else {
             throw DevCompilation.NativeCapabilityError.invalidAdapterRequest
         }
+        let typeBindingsByID = Dictionary(
+            uniqueKeysWithValues: request.nativeTypeBindings.map {
+                ($0.id, $0)
+            }
+        )
+        guard request.nativeTypeRecords.allSatisfy({ record in
+            guard let binding = typeBindingsByID[record.id] else {
+                return false
+            }
+            return binding.canonicalName == record.canonicalName
+                && binding.layoutFingerprint == record.layoutFingerprint
+                && binding.requiresMainActor == record.requiresMainActor
+        }) else {
+            throw DevCompilation.NativeCapabilityError.invalidAdapterRequest
+        }
 
         let sourceFiles = try BridgeGeneration.Generator()
             .generateDevelopmentAdapterFiles(
                 applicationModuleName: request.manifest.moduleName,
                 bindings: request.bindings,
-                records: request.records
+                records: request.records,
+                nativeTypeBindings: request.nativeTypeBindings,
+                nativeTypeRecords: request.nativeTypeRecords
             )
         let key = try cacheKey(request: request, sourceFiles: sourceFiles)
         let installName = "@rpath/HLXDevAdapter-\(key.hex).dylib"
@@ -152,6 +196,7 @@ public struct AdapterBuilder<Runner: ProcessExecution.Running>: Sendable {
             descriptor: descriptor,
             installName: installName,
             keys: request.records.map(\.key),
+            typeIDs: request.nativeTypeRecords.map(\.id),
             cacheSource: value.source
         )
     }
@@ -189,6 +234,15 @@ public struct AdapterBuilder<Runner: ProcessExecution.Running>: Sendable {
             hasher.append(try Core.CanonicalJSON.encode(record.parameterTypes))
             hasher.append(try Core.CanonicalJSON.encode(record.resultType))
             hasher.append(try Core.CanonicalJSON.encode(record.contract))
+        }
+        hasher.append(UInt64(request.nativeTypeRecords.count))
+        for record in request.nativeTypeRecords {
+            hasher.append(record.id.rawValue)
+            hasher.append(record.canonicalName)
+            hasher.append(record.kind.rawValue)
+            hasher.append(record.layoutFingerprint)
+            hasher.append(UInt8(record.requiresMainActor ? 1 : 0))
+            hasher.append(record.estimatedSize)
         }
         return hasher.finalize()
     }

@@ -130,7 +130,7 @@ Imported Optional property 在比较或复制时还会产生 address-form SIL。
 
 数量上限与去重后的 artifact 字节预算会把这些执行中 snapshot 一并计算。如果所有可淘汰项都被固定，新 generation 会以 transaction 方式失败，旧 generation 保持活动，不会为了接收新代码而破坏执行中的调用。lease 释放后，下一次 Registry 操作会压缩旧 snapshot。独立的全进程 generation ID 高水位保证已压缩 ID 不能复用。开发 generation 不进入生产补丁存储；重启 App 后回到 Dev Shell baseline。
 
-每个 HLBC generation 都会固定一份不可变原生能力 snapshot，其中包含已链接 baseline 和本 session 已发布的开发候选。escaping 原生 callback lease 会继续持有同一份 snapshot，因此后续保存不能改变该 callback 能调用什么。开发 Adapter image 不能安全卸载，其数量与映射字节会和 Dynamic Replacement generation 共用全进程原生 image 预算。失败 image 不会发布；若 loader 状态无法证明干净，App 会标记 native state uncertain，并在重启前拒绝后续带 image 的 payload。重连 identity 会报告已发布开发 Key 与已映射 image inventory，Hub 可以复用现有 session 状态。
+每个 HLBC generation 都会固定一份不可变原生能力 snapshot，其中包含已链接 baseline 和本 session 已发布的开发候选。escaping 原生 callback lease 会继续持有同一份 snapshot，因此后续保存不能改变该 callback 能调用什么。开发 Adapter image 不能安全卸载，其数量与映射字节会和 Dynamic Replacement generation 共用全进程原生 image 预算。失败 image 不会发布；若 loader 状态无法证明干净，App 会标记 native state uncertain，并在重启前拒绝后续带 image 的 payload。重连 identity 会报告精确的 `NativeCallKey` 到 `NativeImportID` 映射、独立发布的开发 `TypeID` 清单和已映射 image 资源总量；Hub 因而可以保留活动 HLBC 已引用的紧凑 ID，并复用现有 session 状态。
 
 两次保存可能在 Hub 编译同一个首次使用的 Swift Adapter 时重叠。如果较早事务先完成发布，App 会把后一份 Descriptor 完全相同的 session import 当作幂等重放，不会再次映射或重复计费其中已经多余的 image；只要 ID、Key、Descriptor、ABI、contract 或 binding 有任何变化，整个事务仍会被拒绝。一份 payload 同时包含已发布 import 与真正的新 import 时，只会加载新 import 实际需要的 image，再激活新 generation。
 

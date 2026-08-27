@@ -101,8 +101,12 @@ public struct Snapshot: Hashable, Sendable {
     public var pendingGenerationID: DevProtocol.GenerationID?
     /// Current backend selection for every function with an active override.
     public var activeFunctionRoutes: [DevProtocol.ActiveFunctionRoute]
-    /// NativeCall keys published by successful development HLBC transactions.
-    public var activeDevelopmentNativeCallKeys: [Core.NativeCall.Key]
+    /// Native capabilities published by successful development HLBC
+    /// transactions, including compact IDs that activated bytecode still uses.
+    public var activeDevelopmentNativeImports: [
+        DevProtocol.ActiveDevelopmentNativeImport
+    ]
+    public var activeDevelopmentNativeTypeIDs: [Core.TypeID]
     /// Swift Adapter images mapped for development HLBC, including orphaned
     /// images from transactions rejected after mapping.
     public var loadedDevelopmentAdapterCount: Int
@@ -170,6 +174,12 @@ public actor Controller {
     private var developmentAsyncNativeInvokers: [
         Core.NativeImportID: any VM.AsyncNativeInvoker
     ] = [:]
+    private var developmentTypes: [
+        Core.TypeID: DevProtocol.DevelopmentPayload.NativeType
+    ] = [:]
+    private var developmentTypeOperations: [
+        Core.TypeID: VM.NativeTypeOperations
+    ] = [:]
     private let initialNativeImageCount: Int
     private let initialNativeImageBytes: Int
     private var nativeStateUncertain = false
@@ -220,7 +230,8 @@ public actor Controller {
                 ($0.functionKey, $0.backend)
             }
         )
-        guard identity.activeDevelopmentNativeCallKeys.isEmpty,
+        guard identity.activeDevelopmentNativeImports.isEmpty,
+              identity.activeDevelopmentNativeTypeIDs.isEmpty,
               identity.loadedDevelopmentAdapterCount == 0,
               identity.loadedDevelopmentAdapterBytes == 0
         else {
@@ -553,8 +564,10 @@ public actor Controller {
             hasPendingTransfer: pending != nil,
             pendingGenerationID: pending?.offer.generationID,
             activeFunctionRoutes: activeRoutes(),
-            activeDevelopmentNativeCallKeys:
-                developmentImports.values.map(\.key).sorted(),
+            activeDevelopmentNativeImports: activeDevelopmentNativeImports(),
+            activeDevelopmentNativeTypeIDs: developmentTypes.keys.sorted {
+                $0.rawValue < $1.rawValue
+            },
             loadedDevelopmentAdapterCount:
                 loadedDevelopmentAdapters.count,
             loadedDevelopmentAdapterBytes:
@@ -575,8 +588,10 @@ public actor Controller {
         current.highestAppliedSourceRevision = highestAppliedRevision
         current.activeGenerationID = activeGenerationID
         current.activeFunctionRoutes = activeRoutes()
-        current.activeDevelopmentNativeCallKeys = developmentImports.values
-            .map(\.key).sorted()
+        current.activeDevelopmentNativeImports = activeDevelopmentNativeImports()
+        current.activeDevelopmentNativeTypeIDs = developmentTypes.keys.sorted {
+            $0.rawValue < $1.rawValue
+        }
         current.loadedDevelopmentAdapterCount = UInt32(
             loadedDevelopmentAdapters.count
         )
@@ -589,6 +604,16 @@ public actor Controller {
             totalMappedNativeImageCount >= limits.nativeImageSoftWarningCount
         current.nativeStateUncertain = nativeStateUncertain
         return current
+    }
+
+    private func activeDevelopmentNativeImports()
+        -> [DevProtocol.ActiveDevelopmentNativeImport]
+    {
+        developmentImports.values.map {
+            .init(id: $0.id, key: $0.key)
+        }.sorted { lhs, rhs in
+            lhs.id == rhs.id ? lhs.key < rhs.key : lhs.id < rhs.id
+        }
     }
 
     /// Closes and deletes a pending transfer without changing active code.
@@ -691,9 +716,59 @@ public actor Controller {
             candidateImports[nativeImport.id] = normalized(nativeImport)
             newImports.append(nativeImport)
         }
+        let baselineTypeNames = Set(shell.types.values.map(\.canonicalName))
+        var candidateTypes = developmentTypes
+        var newTypes: [DevProtocol.DevelopmentPayload.NativeType] = []
+        for nativeType in artifact.manifest.nativeTypes {
+            guard shell.types[nativeType.id] == nil,
+                  !baselineTypeNames.contains(nativeType.canonicalName)
+            else {
+                throw DevProtocol.Error.invalidArtifact(
+                    "development native type collides with the linked Shell"
+                )
+            }
+            if let existing = candidateTypes[nativeType.id] {
+                guard sessionEquivalent(existing, nativeType) else {
+                    throw DevProtocol.Error.invalidArtifact(
+                        "development native type changed after session publication"
+                    )
+                }
+                continue
+            }
+            guard !candidateTypes.values.contains(where: {
+                $0.canonicalName == nativeType.canonicalName
+            }) else {
+                throw DevProtocol.Error.invalidArtifact(
+                    "development native type name collides with another TypeID"
+                )
+            }
+            switch nativeType.binding {
+            case .swiftAdapter:
+                guard nativeType.imageIndex != nil,
+                      nativeType.exportSymbol != nil
+                else {
+                    throw DevProtocol.Error.invalidArtifact(
+                        "a new Swift native type has no Adapter image"
+                    )
+                }
+            case .objectiveCReference:
+                guard nativeType.imageIndex == nil,
+                      nativeType.exportSymbol == nil
+                else {
+                    throw DevProtocol.Error.invalidArtifact(
+                        "a generic Objective-C native type references an Adapter image"
+                    )
+                }
+            }
+            candidateTypes[nativeType.id] = normalized(nativeType)
+            newTypes.append(nativeType)
+        }
         var effectiveCapabilities = shell.capabilities
         if !candidateImports.isEmpty {
             effectiveCapabilities.insert(.nativeImportsV1)
+        }
+        if !candidateTypes.isEmpty {
+            effectiveCapabilities.insert(.nativeTypesV1)
         }
         let effectiveShell = try Verification.ShellInterface(
             interfaceHash: shell.interfaceHash,
@@ -702,12 +777,16 @@ public actor Controller {
             entries: Array(shell.entries.values),
             imports: Array(shell.imports.values)
                 + candidateImports.values.map(resolvedImport),
-            types: Array(shell.types.values),
+            types: Array(shell.types.values)
+                + candidateTypes.values.map(resolvedType),
             frozenValueTypes: Array(shell.frozenValueTypes.values)
         )
         var developmentPolicy = runtimePolicy
         if !candidateImports.isEmpty {
             developmentPolicy.acceptedCapabilities.insert(.nativeImportsV1)
+        }
+        if !candidateTypes.isEmpty {
+            developmentPolicy.acceptedCapabilities.insert(.nativeTypesV1)
         }
         developmentPolicy.allowedNativeCalls.formUnion(
             candidateImports.values.map(\.key)
@@ -732,6 +811,7 @@ public actor Controller {
 
         var candidateNativeInvokers = developmentNativeInvokers
         var candidateAsyncInvokers = developmentAsyncNativeInvokers
+        var candidateTypeOperations = developmentTypeOperations
         for nativeImport in newImports {
             switch nativeImport.binding {
             case .objectiveCInvoker:
@@ -769,9 +849,23 @@ public actor Controller {
                 break
             }
         }
+        for nativeType in newTypes
+        where nativeType.binding == .objectiveCReference {
+            let operations = try Runtime.ObjectiveCTypeOperations.make(
+                shellType: resolvedType(nativeType)
+            )
+            guard candidateTypeOperations.updateValue(
+                operations,
+                forKey: nativeType.id
+            ) == nil else {
+                throw DevProtocol.Error.invalidArtifact(
+                    "development Objective-C TypeID is duplicated"
+                )
+            }
+        }
         let imageIndexesToLoad = Set(newImports.compactMap {
             $0.imageIndex.map(Int.init)
-        })
+        }).union(newTypes.compactMap { $0.imageIndex.map(Int.init) })
         if !imageIndexesToLoad.isEmpty {
             guard !nativeStateUncertain else {
                 throw DevProtocol.Diagnostic(
@@ -795,10 +889,14 @@ public actor Controller {
             let imageImports = newImports.filter {
                 $0.imageIndex.map(Int.init) == index
             }
+            let imageTypes = newTypes.filter {
+                $0.imageIndex.map(Int.init) == index
+            }
             let loaded = try developmentAdapterLoader.load(
                 bytes: artifact.images[index],
                 descriptor: artifact.manifest.images[index],
                 imports: imageImports,
+                nativeTypes: imageTypes,
                 identity: identity,
                 cacheDirectory: cacheDirectory.appendingPathComponent(
                     "Adapters",
@@ -828,6 +926,16 @@ public actor Controller {
                     )
                 }
             }
+            for operations in loaded.nativeTypeOperations {
+                guard candidateTypeOperations.updateValue(
+                    operations,
+                    forKey: operations.id
+                ) == nil else {
+                    throw DevProtocol.Error.invalidArtifact(
+                        "development Adapter returned a duplicate TypeID"
+                    )
+                }
+            }
         }
         for nativeImport in newImports {
             if nativeImport.descriptor.effects.isAsync {
@@ -848,9 +956,19 @@ public actor Controller {
                 }
             }
         }
+        for nativeType in newTypes {
+            guard let operations = candidateTypeOperations[nativeType.id],
+                  typeOperationsMatch(operations, nativeType)
+            else {
+                throw DevProtocol.Error.invalidArtifact(
+                    "development Adapter TypeOps do not match their descriptor"
+                )
+            }
+        }
         let nativeCapabilities = try runtime.baselineNativeCapabilities.appending(
             nativeInvokers: Array(candidateNativeInvokers.values),
-            asyncNativeInvokers: Array(candidateAsyncInvokers.values)
+            asyncNativeInvokers: Array(candidateAsyncInvokers.values),
+            nativeTypeOperations: Array(candidateTypeOperations.values)
         )
         let parent = registry.activeLease()?.generation.id
         let generation = try Runtime.Generation(
@@ -869,6 +987,8 @@ public actor Controller {
         developmentImports = candidateImports
         developmentNativeInvokers = candidateNativeInvokers
         developmentAsyncNativeInvokers = candidateAsyncInvokers
+        developmentTypes = candidateTypes
+        developmentTypeOperations = candidateTypeOperations
     }
 
     private func normalized(
@@ -880,9 +1000,25 @@ public actor Controller {
         return value
     }
 
+    private func normalized(
+        _ nativeType: DevProtocol.DevelopmentPayload.NativeType
+    ) -> DevProtocol.DevelopmentPayload.NativeType {
+        var value = nativeType
+        value.imageIndex = nil
+        value.exportSymbol = nil
+        return value
+    }
+
     private func sessionEquivalent(
         _ lhs: DevProtocol.DevelopmentPayload.NativeImport,
         _ rhs: DevProtocol.DevelopmentPayload.NativeImport
+    ) -> Bool {
+        normalized(lhs) == normalized(rhs)
+    }
+
+    private func sessionEquivalent(
+        _ lhs: DevProtocol.DevelopmentPayload.NativeType,
+        _ rhs: DevProtocol.DevelopmentPayload.NativeType
     ) -> Bool {
         normalized(lhs) == normalized(rhs)
     }
@@ -899,6 +1035,44 @@ public actor Controller {
             contract: nativeImport.contract,
             capability: nativeImport.capability
         )
+    }
+
+    private func resolvedType(
+        _ nativeType: DevProtocol.DevelopmentPayload.NativeType
+    ) -> Verification.ResolvedNativeType {
+        let kind: Verification.NativeTypeKind = switch nativeType.kind {
+        case .value: .value
+        case .reference: .reference
+        case .enumeration: .enumeration
+        }
+        return .init(
+            id: nativeType.id,
+            canonicalName: nativeType.canonicalName,
+            kind: kind,
+            layoutFingerprint: nativeType.layoutFingerprint,
+            objectiveCRuntimeName: nativeType.objectiveCRuntimeName,
+            isCopyable: nativeType.isCopyable,
+            requiresMainActor: nativeType.requiresMainActor,
+            estimatedSize: nativeType.estimatedSize
+        )
+    }
+
+    private func typeOperationsMatch(
+        _ operations: VM.NativeTypeOperations,
+        _ nativeType: DevProtocol.DevelopmentPayload.NativeType
+    ) -> Bool {
+        let kind: VM.NativeTypeKind = switch nativeType.kind {
+        case .value: .value
+        case .reference: .reference
+        case .enumeration: .enumeration
+        }
+        return operations.id == nativeType.id
+            && operations.canonicalName == nativeType.canonicalName
+            && operations.kind == kind
+            && operations.layoutFingerprint == nativeType.layoutFingerprint
+            && operations.isCopyable == nativeType.isCopyable
+            && operations.requiresMainActor == nativeType.requiresMainActor
+            && operations.estimatedSize == nativeType.estimatedSize
     }
 
     private func invokerMatches(

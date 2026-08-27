@@ -241,6 +241,16 @@ extension Runtime.ObjectiveCInvoker {
             )
         case let .native(native):
             return try catalog.referencedObject(in: native)
+        case .any:
+            guard expected == .any else {
+                throw VM.RuntimeTrap.nativeFailure(
+                    "VM Any value is not authorized for this Objective-C object slot"
+                )
+            }
+            return try Runtime.BridgeValueCodec.decodeAny(
+                value,
+                nativeTypeCatalog: catalog
+            ) as AnyObject
         case let .string(string):
             return string as NSString
         case let .error(error):

@@ -1,3 +1,4 @@
+import Foundation
 import HelixBytecode
 import HelixCore
 import HelixVerifier
@@ -7,6 +8,26 @@ import Testing
 extension VMTests {
 @Suite("HLVM Any execution")
 struct AnyExecution {
+    private struct NativeSnapshot: Hashable, Sendable {
+        let value: Int
+    }
+
+    private enum NativeStatus: Equatable, Sendable {
+        case ready
+    }
+
+    private final class CloneProbe: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage = 0
+
+        var count: Int { lock.withLock { storage } }
+
+        func clone(_ value: NativeSnapshot) -> NativeSnapshot {
+            lock.withLock { storage += 1 }
+            return value
+        }
+    }
+
     @Test("Erasure records the static concrete type and preserves its value")
     func erasesScalarValue() throws {
         let int = try integer(42)
@@ -26,6 +47,167 @@ struct AnyExecution {
                 .any(.init(dynamicType: .integer(.int), payload: int))
             )
         )
+    }
+
+    @Test("Copyable native values preserve their identity through Any")
+    func nativeValueRoundTrip() throws {
+        let typeID = Core.TypeID(rawValue: .sha256("VMAny.NativeSnapshot"))
+        let layout = Core.Digest.sha256("VMAny.NativeSnapshot.Layout")
+        let operations = VM.NativeTypeOperations.opaqueValue(
+            id: typeID,
+            canonicalName: "Fixture.NativeSnapshot",
+            layoutFingerprint: layout,
+            estimatedSize: 8,
+            clone: { (value: NativeSnapshot) in value }
+        )
+        let catalog = try VM.NativeTypeCatalog([operations])
+        let boxed = try catalog.box(NativeSnapshot(value: 42), as: typeID)
+        let resolvedType = Verification.ResolvedNativeType(
+            id: typeID,
+            canonicalName: "Fixture.NativeSnapshot",
+            kind: .value,
+            layoutFingerprint: layout,
+            isCopyable: true,
+            estimatedSize: 8
+        )
+
+        let erase = erasureFunction(sourceType: .native(typeID))
+        let eraseImage = try makeVerified(
+            function: erase,
+            parameterTypes: [.native(typeID)],
+            resultType: .any,
+            nativeTypes: [resolvedType]
+        )
+        let erased = VM.Value.any(
+            .init(dynamicType: .native(typeID), payload: .native(boxed))
+        )
+        #expect(
+            VM.Interpreter(nativeTypeCatalog: catalog).invoke(
+                function: erase.id,
+                image: eraseImage,
+                arguments: [.native(boxed)]
+            ) == .returned(erased)
+        )
+
+        let roundTrip = nativeAnyRoundTripFunction(typeID: typeID)
+        let roundTripImage = try makeVerified(
+            function: roundTrip,
+            parameterTypes: [.native(typeID)],
+            resultType: .native(typeID),
+            nativeTypes: [resolvedType]
+        )
+        #expect(
+            VM.Interpreter(nativeTypeCatalog: catalog).invoke(
+                function: roundTrip.id,
+                image: roundTripImage,
+                arguments: [.native(boxed)]
+            ) == .returned(.native(boxed))
+        )
+    }
+
+    @Test("Opaque native enums preserve their enumeration descriptor")
+    func opaqueNativeEnumeration() throws {
+        let typeID = Core.TypeID(rawValue: .sha256("VMAny.NativeStatus"))
+        let layout = Core.Digest.sha256("VMAny.NativeStatus.Layout")
+        let operations = VM.NativeTypeOperations.opaqueEnumeration(
+            id: typeID,
+            canonicalName: "Fixture.NativeStatus",
+            layoutFingerprint: layout,
+            clone: { (value: NativeStatus) in value }
+        )
+        let catalog = try VM.NativeTypeCatalog([operations])
+        let boxed = try catalog.box(NativeStatus.ready, as: typeID)
+
+        #expect(operations.kind == .enumeration)
+        #expect(try catalog.copy(boxed) == boxed)
+        #expect(boxed.value(as: NativeStatus.self) == .ready)
+    }
+
+    @Test("Development native type catalogs append exact descriptors only")
+    func appendsNativeTypeCatalogTransactionally() throws {
+        let firstID = Core.TypeID(rawValue: .sha256("VMAny.First"))
+        let secondID = Core.TypeID(rawValue: .sha256("VMAny.Second"))
+        let firstLayout = Core.Digest.sha256("VMAny.First.Layout")
+        let first = VM.NativeTypeOperations.opaqueValue(
+            id: firstID,
+            canonicalName: "Fixture.First",
+            layoutFingerprint: firstLayout,
+            estimatedSize: 8,
+            clone: { (value: NativeSnapshot) in value }
+        )
+        let replay = VM.NativeTypeOperations.opaqueValue(
+            id: firstID,
+            canonicalName: "Fixture.First",
+            layoutFingerprint: firstLayout,
+            estimatedSize: 8,
+            clone: { (value: NativeSnapshot) in value }
+        )
+        let second = VM.NativeTypeOperations.opaqueValue(
+            id: secondID,
+            canonicalName: "Fixture.Second",
+            layoutFingerprint: .sha256("VMAny.Second.Layout"),
+            estimatedSize: 8,
+            clone: { (value: NativeSnapshot) in value }
+        )
+        let catalog = try VM.NativeTypeCatalog([first])
+        let extended = try catalog.appending([replay, second])
+
+        #expect(extended[firstID] != nil)
+        #expect(extended[secondID] != nil)
+        let mismatched = VM.NativeTypeOperations.opaqueValue(
+            id: firstID,
+            canonicalName: "Fixture.First",
+            layoutFingerprint: .sha256("VMAny.First.ChangedLayout"),
+            estimatedSize: 8,
+            clone: { (value: NativeSnapshot) in value }
+        )
+        #expect(throws: VM.RuntimeTrap.self) {
+            _ = try catalog.appending([mismatched])
+        }
+        #expect(catalog[secondID] == nil)
+    }
+
+    @Test("Casting reusable Any storage materializes a native TypeOps copy")
+    func nativeCastCopiesExistentialPayload() throws {
+        let typeID = Core.TypeID(rawValue: .sha256("VMAny.CloneSnapshot"))
+        let layout = Core.Digest.sha256("VMAny.CloneSnapshot.Layout")
+        let probe = CloneProbe()
+        let operations = VM.NativeTypeOperations.opaqueValue(
+            id: typeID,
+            canonicalName: "Fixture.CloneSnapshot",
+            layoutFingerprint: layout,
+            estimatedSize: 8,
+            clone: probe.clone
+        )
+        let catalog = try VM.NativeTypeCatalog([operations])
+        let boxed = try catalog.box(NativeSnapshot(value: 42), as: typeID)
+        let resolvedType = Verification.ResolvedNativeType(
+            id: typeID,
+            canonicalName: "Fixture.CloneSnapshot",
+            kind: .value,
+            layoutFingerprint: layout,
+            isCopyable: true,
+            estimatedSize: 8
+        )
+        let function = castFunction(target: .native(typeID), checked: false)
+        let image = try makeVerified(
+            function: function,
+            parameterTypes: [.any],
+            resultType: .native(typeID),
+            nativeTypes: [resolvedType]
+        )
+        let erased = VM.Value.any(
+            .init(dynamicType: .native(typeID), payload: .native(boxed))
+        )
+
+        #expect(
+            VM.Interpreter(nativeTypeCatalog: catalog).invoke(
+                function: function.id,
+                image: image,
+                arguments: [erased]
+            ) == .returned(.native(boxed))
+        )
+        #expect(probe.count == 1)
     }
 
     @Test("Checked casts and force casts preserve scalar values")
@@ -663,6 +845,47 @@ struct AnyExecution {
         )
     }
 
+    private func nativeAnyRoundTripFunction(
+        typeID: Core.TypeID
+    ) -> Bytecode.Function {
+        .init(
+            id: .init(rawValue: 0),
+            name: "nativeAnyRoundTrip",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .native(typeID),
+            registerTypes: [
+                .native(typeID),
+                .any,
+                .any,
+                .native(typeID),
+            ],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .eraseToAny(
+                            result: .init(rawValue: 1),
+                            value: .init(rawValue: 0),
+                            dynamicType: .native(typeID)
+                        ),
+                        .copyValue(
+                            result: .init(rawValue: 2),
+                            source: .init(rawValue: 1)
+                        ),
+                        .forceCastAny(
+                            result: .init(rawValue: 3),
+                            value: .init(rawValue: 2),
+                            targetType: .native(typeID)
+                        ),
+                        .returnValue(.init(rawValue: 3)),
+                    ]
+                ),
+            ]
+        )
+    }
+
     private func integer(_ value: Int64) throws -> VM.Value {
         .integer(try .init(signed: value, bitWidth: 64, isSigned: true))
     }
@@ -673,7 +896,8 @@ struct AnyExecution {
         resultType: Bytecode.ValueType,
         limits: Core.ResourceLimits = .init(
             maxWallTimeMainThreadMilliseconds: 1_000
-        )
+        ),
+        nativeTypes: [Verification.ResolvedNativeType] = []
     ) throws -> Verification.Image {
         let shellHash = Core.Digest.sha256("vm-any-shell")
         let compatibility = Core.Compatibility(
@@ -698,9 +922,12 @@ struct AnyExecution {
             loweredSignature: signature,
             role: .function
         )
-        let capabilities: Set<Core.Capability> = [
+        var capabilities: Set<Core.Capability> = [
             .baselineV1, .stringsV1, .collectionsV1, .anyValuesV1,
         ]
+        if !nativeTypes.isEmpty {
+            capabilities.insert(.nativeTypesV1)
+        }
         let module = Bytecode.Module(
             name: "VMAnyFixture",
             shellInterfaceHash: shellHash,
@@ -729,7 +956,8 @@ struct AnyExecution {
                     resultType: resultType,
                     effects: function.effects
                 ),
-            ]
+            ],
+            types: nativeTypes
         )
         return try Verification.Engine().verify(
             bytes: Bytecode.Encoder.encode(module),

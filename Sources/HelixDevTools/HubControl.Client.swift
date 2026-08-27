@@ -7,7 +7,9 @@ import HelixDevProtocol
 extension HubControl {
 /// Minimal client contract consumed by build orchestration.
 public protocol ClientProtocol: Sendable {
-    func reserveAutomaticInvitation() async throws -> (
+    func reserveAutomaticInvitation(
+        reusing existing: Pairing.Reservation?
+    ) async throws -> (
         reservation: Pairing.Reservation,
         spkiSHA256: Core.Digest
     )
@@ -43,13 +45,15 @@ public struct Client: HubControl.ClientProtocol, Sendable {
         )
     }
 
-    public func reserveAutomaticInvitation() async throws -> (
+    public func reserveAutomaticInvitation(
+        reusing existing: Pairing.Reservation? = nil
+    ) async throws -> (
         reservation: Pairing.Reservation,
         spkiSHA256: Core.Digest
     ) {
         let rendezvous = try rendezvousStore.load()
         let response = try await send(
-            .reserveAutomaticInvitation,
+            .reserveAutomaticInvitation(reusing: existing),
             rendezvous: rendezvous
         )
         guard case let .automaticInvitationReserved(reservation) = response else {
@@ -184,5 +188,14 @@ public struct Client: HubControl.ClientProtocol, Sendable {
         }
     }
 }
+}
+
+extension HubControl.ClientProtocol {
+    public func reserveAutomaticInvitation() async throws -> (
+        reservation: Pairing.Reservation,
+        spkiSHA256: Core.Digest
+    ) {
+        try await reserveAutomaticInvitation(reusing: nil)
+    }
 }
 #endif

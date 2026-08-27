@@ -40,6 +40,7 @@ extension FrontendReceipt.ManagedNativeSurface {
         var moduleName: String
         var preciseIdentifier: String
         var kindIdentifier: String
+        var hasInhabitedValue: Bool
         var swiftPath: String
         var runtimeName: String?
         var genericParameters: [String]
@@ -74,6 +75,7 @@ extension FrontendReceipt.ManagedNativeSurface {
         var memberName: String
         var argumentLabels: [String]
         var parameterTypes: [String]
+        var resultType: String
         var sourceFileLogicalID: String
         var importedModules: [String]
         var requiresMainActor: Bool
@@ -82,6 +84,7 @@ extension FrontendReceipt.ManagedNativeSurface {
 
     private struct SymbolGraphCacheKey: Codable, Sendable {
         var schemaVersion: UInt16 = 1
+        var symbolGraphPipelineHash: Core.Digest
         var compilerFingerprint: String
         var compilerInputHash: Core.Digest
         var moduleName: String
@@ -102,6 +105,7 @@ extension FrontendReceipt.ManagedNativeSurface {
         var memberName: String
         var argumentLabels: [String]
         var parameterTypes: [String]
+        var resultType: String
         var importedModules: [String]
         var requiresMainActor: Bool
         var mayThrow: Bool
@@ -115,6 +119,7 @@ extension FrontendReceipt.ManagedNativeSurface {
             memberName = candidate.memberName
             argumentLabels = candidate.argumentLabels
             parameterTypes = candidate.parameterTypes
+            resultType = candidate.resultType
             importedModules = candidate.importedModules.sorted()
             requiresMainActor = candidate.requiresMainActor
             mayThrow = candidate.mayThrow
@@ -170,7 +175,7 @@ extension FrontendReceipt.ManagedNativeSurface {
 
     private struct ProbeCacheKey: Codable, Sendable {
         var schemaVersion: UInt16 = 1
-        var transformPipelineHash: Core.Digest
+        var compilerProbePipelineHash: Core.Digest
         var compilerFingerprint: String
         var compilerInputHash: Core.Digest
         var invocation: InterfaceArchive.FrontendInvocation
@@ -186,9 +191,31 @@ extension FrontendReceipt.ManagedNativeSurface {
         var operations: [FrontendReceipt.Adapter.ImportedOperation]
     }
 
+    private struct ProbeBatchCacheKey: Codable, Sendable {
+        var schemaVersion: UInt16 = 1
+        var compilerProbePipelineHash: Core.Digest
+        var compilerFingerprint: String
+        var compilerInputHash: Core.Digest
+        var invocation: InterfaceArchive.FrontendInvocation
+        var minimumOS: Core.SemanticVersion
+        var candidates: [ProbeCandidate]
+        var importedTypeBoundaryHash: Core.Digest
+    }
+
+    private struct ProbeBatchCachePayload: Codable, Sendable {
+        var schemaVersion: UInt16 = 1
+        var candidates: [ProbeCandidate]
+        var results: [ProbeCachePayload]
+    }
+
     private struct DecodedProbePayload: Sendable {
         var types: [FrontendReceipt.Adapter.ImportedNativeType]
         var operations: [FrontendReceipt.Adapter.ImportedOperation]
+    }
+
+    private struct DecodedProbeBatch: Sendable {
+        var result: ProbeResult
+        var rejectionCount: UInt64
     }
 
     private struct MeasuredType: Sendable {
@@ -220,6 +247,10 @@ extension FrontendReceipt.ManagedNativeSurface {
                     .union(rhs.cacheableCandidates)
             )
         }
+    }
+
+    private enum UncacheableProbeBatch: Swift.Error {
+        case result(ProbeResult)
     }
 
     private struct ProbedSurface: Sendable {
@@ -305,11 +336,17 @@ extension FrontendReceipt.ManagedNativeSurface {
         var metrics = resolution.metrics
         var enrichedTypes = resolution.importedTypes
         var candidates: [Candidate] = []
+        var uninhabitedCanonicalNames = Set<String>()
         for index in importedTypes.indices.sorted(by: {
             importedTypes[$0].canonicalName < importedTypes[$1].canonicalName
         }) {
             guard let surface = resolution.ownerSurfacesByIndex[index] else {
                 continue
+            }
+            if !surface.hasInhabitedValue {
+                uninhabitedCanonicalNames.insert(
+                    enrichedTypes[index].canonicalName
+                )
             }
             candidates += makeCandidates(
                 surface: surface,
@@ -321,6 +358,23 @@ extension FrontendReceipt.ManagedNativeSurface {
             operationTypes: enrichedTypes
         )
         candidates = Array(Set(candidates)).sorted(by: candidateOrdering)
+        let boundaryTypeIndex = FrontendReceipt.ImportedTypeIndex(
+            types: enrichedTypes
+        )
+        let nominatedCount = candidates.count
+        candidates = candidates.filter {
+            !crossesUninhabitedBoundary(
+                $0,
+                typeIndex: boundaryTypeIndex,
+                uninhabitedCanonicalNames: uninhabitedCanonicalNames
+            )
+        }
+        metrics.rejectedSingletonCount += UInt64(
+            nominatedCount - candidates.count
+        )
+        enrichedTypes.removeAll {
+            uninhabitedCanonicalNames.contains($0.canonicalName)
+        }
         guard candidates.count <= 4_096 else {
             throw FrontendReceipt.Error.frontendFailed(
                 "managed native surface exceeds the 4096-operation audit bound"
@@ -349,8 +403,10 @@ extension FrontendReceipt.ManagedNativeSurface {
         )
         return Expansion(
             importedTypes: enrichedTypes,
-            operations: try FrontendReceipt.Adapter()
-                .mergeImportedOperations(probedSurface.operations),
+            operations: try canonicalizedOperations(
+                probedSurface.operations,
+                importedTypes: enrichedTypes
+            ),
             modulesByDeclarationUSR: resolution.modulesByDeclarationUSR,
             metrics: metrics
         )
@@ -401,11 +457,15 @@ extension FrontendReceipt.ManagedNativeSurface {
                 sourceFileLogicalID: sourceFileLogicalID
             ).map { (surface, $0) }
         }
-        var importedTypes = try FrontendReceipt.Adapter()
+        let probeImportedTypes = try FrontendReceipt.Adapter()
             .mergeImportedNativeTypes(
                 discoveredTypes: [],
                 operationTypes: typedSurfaces.map(\.1)
             )
+        let uninhabitedCanonicalNames = Set(typedSurfaces.compactMap {
+            surface, importedType in
+            surface.hasInhabitedValue ? nil : importedType.canonicalName
+        })
         var candidates = typedSurfaces.flatMap { surface, importedType in
             makeCandidates(surface: surface, importedType: importedType)
         }
@@ -415,41 +475,62 @@ extension FrontendReceipt.ManagedNativeSurface {
             sourceFileLogicalID: sourceFileLogicalID
         )
         candidates = Array(Set(candidates)).sorted(by: candidateOrdering)
+        let boundaryTypeIndex = FrontendReceipt.ImportedTypeIndex(
+            types: probeImportedTypes
+        )
+        let nominatedCount = candidates.count
+        candidates = candidates.filter {
+            !crossesUninhabitedBoundary(
+                $0,
+                typeIndex: boundaryTypeIndex,
+                uninhabitedCanonicalNames: uninhabitedCanonicalNames
+            )
+        }
+        metrics.rejectedSingletonCount += UInt64(
+            nominatedCount - candidates.count
+        )
         guard candidates.count <= 250_000 else {
             throw FrontendReceipt.Error.frontendFailed(
                 "native API Catalog exceeds the 250000-operation bound"
             )
         }
         metrics.candidateCount = UInt64(candidates.count)
-        let probedSurface = try probe(
+        let probedSurface = try probeCatalog(
             candidates,
-            importedTypes: importedTypes,
+            importedTypes: probeImportedTypes,
             minimumOS: minimumOS,
             frontend: frontend,
             invocation: invocation,
-            // The enclosing whole-Catalog cache already owns this exact
-            // module identity. Per-candidate filesystem lookups would add one
-            // lock and manifest read for every public API without enabling
-            // reuse across a changed module identity.
-            cache: nil,
-            compilerFingerprint: nil,
-            compilerInputHash: nil,
+            cache: cache,
+            compilerFingerprint: compilerFingerprint,
+            compilerInputHash: moduleInputHash,
             metrics: &metrics
         )
         let signatureTypes = enrichSignatureTypes(
             probedSurface.types,
             ownerSurfacesByModule: [moduleName: surfaces]
         )
-        importedTypes = try FrontendReceipt.Adapter().mergeImportedNativeTypes(
-            discoveredTypes: importedTypes,
+        let importedTypes = try FrontendReceipt.Adapter().mergeImportedNativeTypes(
+            discoveredTypes: probeImportedTypes.filter {
+                !uninhabitedCanonicalNames.contains($0.canonicalName)
+            },
             operationTypes: signatureTypes
-        )
-        let operations = try FrontendReceipt.Adapter().mergeImportedOperations(
+        ).map { type in
+            var type = type
+            // Module ownership is temporary authority while measurement
+            // reconciles weaker probe observations. The persisted projection
+            // is module-relative; CatalogSurface restores ownership when a
+            // consumer binds the snapshot.
+            type.nativeModuleName = nil
+            return type
+        }
+        let operations = try canonicalizedOperations(
             probedSurface.operations.map { operation in
                 var dormant = operation
                 dormant.isEmittedToDevice = false
                 return dormant
-            }
+            },
+            importedTypes: importedTypes
         )
         var modulesByDeclarationUSR: [String: String] = [:]
         for operation in operations {
@@ -468,6 +549,20 @@ extension FrontendReceipt.ManagedNativeSurface {
             modulesByDeclarationUSR: modulesByDeclarationUSR,
             metrics: metrics
         )
+    }
+
+    /// Probe batches are independent cache units. Apply aliases again after
+    /// their native type evidence has been merged so an operation measured in
+    /// one batch can use an identity proven by another batch in the module.
+    static func canonicalizedOperations(
+        _ operations: [FrontendReceipt.Adapter.ImportedOperation],
+        importedTypes: [FrontendReceipt.Adapter.ImportedNativeType]
+    ) throws -> [FrontendReceipt.Adapter.ImportedOperation] {
+        let adapter = FrontendReceipt.Adapter()
+        let aliases = try adapter.makeImportedSwiftTypeAliases(importedTypes)
+        return try adapter.mergeImportedOperations(operations.map {
+            adapter.applyingSwiftTypeAliases($0, aliases: aliases)
+        })
     }
 
     /// Resolves only the declaring modules needed by source-observed foreign
@@ -632,6 +727,8 @@ extension FrontendReceipt.ManagedNativeSurface {
         let key = try BuildCache.key(
             domain: "HLX.BuildCache.SymbolGraph.v1",
             value: SymbolGraphCacheKey(
+                symbolGraphPipelineHash:
+                    NativeAPICatalog.Pipeline.symbolGraphPipelineHash,
                 compilerFingerprint: compilerFingerprint,
                 compilerInputHash: compilerInputHash,
                 moduleName: moduleName,
@@ -743,6 +840,15 @@ extension FrontendReceipt.ManagedNativeSurface {
             else { continue }
             membersByOwner[owner, default: []].append(symbol)
         }
+        let enumCaseIdentifiers = Set(graph.symbols.compactMap { symbol in
+            symbol.kind.identifier == "swift.enum.case"
+                ? symbol.identifier.precise : nil
+        })
+        let inhabitedEnums = Set(graph.relationships.compactMap { relationship in
+            relationship.kind == "memberOf"
+                && enumCaseIdentifiers.contains(relationship.source)
+                ? relationship.target : nil
+        })
         return owners.keys.sorted().compactMap { precise -> OwnerSurface? in
             guard let owner = owners[precise] else { return nil }
             var genericParameters: [String] = []
@@ -757,6 +863,8 @@ extension FrontendReceipt.ManagedNativeSurface {
                 moduleName: graph.module.name,
                 preciseIdentifier: precise,
                 kindIdentifier: owner.kind.identifier,
+                hasInhabitedValue: owner.kind.identifier != "swift.enum"
+                    || inhabitedEnums.contains(precise),
                 swiftPath: owner.pathComponents.joined(separator: "."),
                 runtimeName: clangRuntimeName(precise),
                 genericParameters: genericParameters,
@@ -783,7 +891,10 @@ extension FrontendReceipt.ManagedNativeSurface {
         case "swift.class":
             representation = .reference
             kind = .reference
-        case "swift.enum", "swift.struct":
+        case "swift.enum":
+            representation = .opaqueValue
+            kind = .enumeration
+        case "swift.struct":
             representation = .opaqueValue
             kind = .value
         case "swift.typealias":
@@ -795,8 +906,13 @@ extension FrontendReceipt.ManagedNativeSurface {
             return nil
         }
         let qualified = "\(surface.moduleName).\(surface.swiftPath)"
-        let isClangImported = surface.preciseIdentifier.hasPrefix("c:")
-        let canonical = isClangImported ? surface.swiftPath : qualified
+        // Objective-C classes share one process-wide runtime identity. Clang
+        // value types do not: Swift can import equally named structs or enums
+        // from different modules and disambiguate them with `Module.Type`.
+        // Preserve that module boundary in TypeID derivation while retaining
+        // the source spelling as a lookup alias.
+        let canonical = surface.preciseIdentifier.hasPrefix("c:objc(cs)")
+            ? surface.swiftPath : qualified
         let runtimeAliases = surface.runtimeName.map {
             [$0, "__C.\($0)"]
         } ?? []
@@ -810,6 +926,7 @@ extension FrontendReceipt.ManagedNativeSurface {
             representation: representation,
             sourceFileLogicalID: sourceFileLogicalID,
             importedModules: [surface.moduleName],
+            nativeModuleName: surface.moduleName,
             objectiveCModuleName: surface.runtimeName == nil
                 ? nil : surface.moduleName,
             objectiveCRuntimeName: representation == .reference
@@ -834,11 +951,14 @@ extension FrontendReceipt.ManagedNativeSurface {
                   }),
                   let signature = callableSignature(symbol),
                   isProbeIdentifier(signature.baseName),
-                  signature.parameterTypes.allSatisfy(
+                  (signature.parameterTypes + [signature.resultType]).allSatisfy(
                       FrontendReceipt.SwiftTypeSpelling.isGeneratedType
                   )
             else { return nil }
             let actor = requiresMainActor(symbol)
+            let importedModules = Array(Set(
+                [graph.module.name] + referencedSwiftModules(in: symbol)
+            )).sorted()
             return Candidate(
                 preciseIdentifier: symbol.identifier.precise,
                 moduleName: graph.module.name,
@@ -850,8 +970,12 @@ extension FrontendReceipt.ManagedNativeSurface {
                 parameterTypes: signature.parameterTypes.map {
                     inheritedCallbackType($0, requiresMainActor: actor)
                 },
+                resultType: inheritedCallbackType(
+                    signature.resultType,
+                    requiresMainActor: actor
+                ),
                 sourceFileLogicalID: sourceFileLogicalID,
-                importedModules: [graph.module.name],
+                importedModules: importedModules,
                 requiresMainActor: actor,
                 mayThrow: signature.mayThrow
             )
@@ -939,8 +1063,11 @@ extension FrontendReceipt.ManagedNativeSurface {
         if let runtimeName = surface.runtimeName,
            normalizedTypeName(result.canonicalName, moduleName: nil) == runtimeName,
            runtimeName != surface.swiftPath {
-            result.canonicalName = surface.swiftPath
-            result.swiftType = surface.swiftPath
+            let canonical = surface.preciseIdentifier.hasPrefix("c:objc(cs)")
+                ? surface.swiftPath
+                : "\(surface.moduleName).\(surface.swiftPath)"
+            result.canonicalName = canonical
+            result.swiftType = canonical
         }
         return result
     }
@@ -1007,6 +1134,7 @@ extension FrontendReceipt.ManagedNativeSurface {
                 memberName: "init",
                 argumentLabels: [],
                 parameterTypes: [],
+                resultType: specialization.probeType,
                 sourceFileLogicalID: importedType.sourceFileLogicalID,
                 importedModules: importedType.importedModules,
                 requiresMainActor: surface.requiresMainActor,
@@ -1028,11 +1156,15 @@ extension FrontendReceipt.ManagedNativeSurface {
         let requiresActor = !isNonisolated && (
             surface.requiresMainActor || requiresMainActor(member)
         )
+        let importedModules = Array(Set(
+            importedType.importedModules + referencedSwiftModules(in: member)
+        )).sorted()
         func candidate(
             dispatch: NativeImportDiscovery.Dispatch,
             memberName: String,
             labels: [String] = [],
             parameterTypes: [String] = [],
+            resultType: String,
             mayThrow: Bool = false
         ) -> Candidate {
             Candidate(
@@ -1044,8 +1176,9 @@ extension FrontendReceipt.ManagedNativeSurface {
                 memberName: memberName,
                 argumentLabels: labels,
                 parameterTypes: parameterTypes,
+                resultType: resultType,
                 sourceFileLogicalID: importedType.sourceFileLogicalID,
-                importedModules: importedType.importedModules,
+                importedModules: importedModules,
                 requiresMainActor: requiresActor,
                 mayThrow: mayThrow
             )
@@ -1077,7 +1210,8 @@ extension FrontendReceipt.ManagedNativeSurface {
             let isStatic = member.kind.identifier == "swift.type.property"
             var values = [candidate(
                 dispatch: isStatic ? .staticGetter : .instanceGetter,
-                memberName: memberName
+                memberName: memberName,
+                resultType: isolatedType
             )]
             if member.declarationFragments.contains(where: {
                 $0.kind == "keyword" && $0.spelling == "set"
@@ -1093,7 +1227,8 @@ extension FrontendReceipt.ManagedNativeSurface {
                     dispatch: setter,
                     memberName: memberName,
                     labels: ["_"],
-                    parameterTypes: [isolatedType]
+                    parameterTypes: [isolatedType],
+                    resultType: "Swift.Void"
                 ))
             }
             return values
@@ -1118,6 +1253,18 @@ extension FrontendReceipt.ManagedNativeSurface {
             guard parameterTypes.allSatisfy(
                 FrontendReceipt.SwiftTypeSpelling.isGeneratedType
             ) else { return [] }
+            let resultType = FrontendReceipt.SwiftTypeSpelling
+                .replacingNominalAliases(
+                    in: signature.resultType,
+                    aliases: specialization.substitutions
+                )
+            let isolatedResultType = inheritedCallbackType(
+                resultType,
+                requiresMainActor: requiresActor
+            )
+            guard FrontendReceipt.SwiftTypeSpelling.isGeneratedType(
+                isolatedResultType
+            ) else { return [] }
             let dispatch: NativeImportDiscovery.Dispatch = switch member.kind.identifier {
             case "swift.init": .initializer
             case "swift.type.method": .staticMethod
@@ -1128,6 +1275,8 @@ extension FrontendReceipt.ManagedNativeSurface {
                 memberName: dispatch == .initializer ? "init" : signature.baseName,
                 labels: signature.argumentLabels,
                 parameterTypes: parameterTypes,
+                resultType: dispatch == .initializer
+                    ? specialization.probeType : isolatedResultType,
                 mayThrow: signature.mayThrow
             )]
         default:
@@ -1155,6 +1304,7 @@ extension FrontendReceipt.ManagedNativeSurface {
         var baseName: String
         var argumentLabels: [String]
         var parameterTypes: [String]
+        var resultType: String
         var mayThrow: Bool
     }
 
@@ -1199,11 +1349,21 @@ extension FrontendReceipt.ManagedNativeSurface {
             baseName: baseName,
             argumentLabels: labels,
             parameterTypes: parameterTypes,
+            resultType: functionResultType(symbol),
             mayThrow: symbol.declarationFragments.contains(where: {
                 $0.kind == "keyword"
                     && ($0.spelling == "throws" || $0.spelling == "rethrows")
             })
         )
+    }
+
+    private static func functionResultType(
+        _ symbol: SwiftFrontend.SymbolGraph.Symbol
+    ) -> String {
+        let value = symbol.functionSignature?.returns?
+            .map(\.spelling).joined()
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty || value == "Void" ? "Swift.Void" : value
     }
 
     private static func parameterType(
@@ -1249,14 +1409,24 @@ extension FrontendReceipt.ManagedNativeSurface {
             fragments[$0].kind == "externalParam"
         }
         guard starts.count == count else { return nil }
-        return starts.enumerated().map { offset, start in
+        var result: [[String]] = []
+        result.reserveCapacity(starts.count)
+        for (offset, start) in starts.enumerated() {
             let end = offset + 1 < starts.count
                 ? starts[offset + 1] : fragments.endIndex
-            return fragments[start..<end].compactMap {
+            let declaration = fragments[start..<end]
+            // Native invokers currently exchange immutable BridgeValue slots;
+            // they cannot commit Swift `inout` writeback to a VM address. Do
+            // not mis-probe such declarations as ordinary value parameters.
+            guard !declaration.contains(where: {
+                $0.kind == "keyword" && $0.spelling == "inout"
+            }) else { return nil }
+            result.append(declaration.compactMap {
                 $0.kind == "attribute"
                     ? normalizedAttribute($0.spelling) : nil
-            }
+            })
         }
+        return result
     }
 
     private static func normalizedAttribute(_ raw: String) -> String? {
@@ -1274,6 +1444,192 @@ extension FrontendReceipt.ManagedNativeSurface {
         let type = remainder[..<end]
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return type.isEmpty ? nil : type
+    }
+
+    /// Catalog construction can fail after frontend measurement while its
+    /// projection is being validated. Checkpoint bounded groups so that a
+    /// retry reuses successful and deterministic-rejection measurements
+    /// without creating one filesystem entry for every public declaration.
+    private static func probeCatalog(
+        _ candidates: [Candidate],
+        importedTypes: [FrontendReceipt.Adapter.ImportedNativeType],
+        minimumOS: Core.SemanticVersion,
+        frontend: SwiftFrontend.Driver,
+        invocation: InterfaceArchive.FrontendInvocation,
+        cache: BuildCache.Store?,
+        compilerFingerprint: String?,
+        compilerInputHash: Core.Digest?,
+        metrics: inout Metrics
+    ) throws -> ProbedSurface {
+        guard let cache, let compilerFingerprint, let compilerInputHash else {
+            let measured = try probeUncached(
+                candidates,
+                importedTypes: importedTypes,
+                frontend: frontend,
+                invocation: invocation,
+                metrics: &metrics
+            )
+            return .init(
+                types: measured.types.map(\.type),
+                operations: measured.operations.map(\.operation)
+            )
+        }
+
+        let cacheTypes = Array(Set(importedTypes.map(ProbeNativeType.init)))
+            .sorted(by: probeTypeOrdering)
+        let importedTypeBoundaryHash = try BuildCache.key(
+            domain: "HLX.BuildCache.ManagedProbeTypes.v1",
+            value: cacheTypes
+        )
+        let batches = stride(from: 0, to: candidates.count, by: 256).map {
+            start in
+            Array(candidates[start..<min(start + 256, candidates.count)])
+        }
+        guard !batches.isEmpty else { return .init(types: [], operations: []) }
+
+        let measured: ProbeResult
+        if batches.count == 1 {
+            measured = try probeCatalogBatch(
+                batches[0],
+                importedTypes: importedTypes,
+                minimumOS: minimumOS,
+                frontend: frontend,
+                invocation: invocation,
+                cache: cache,
+                compilerFingerprint: compilerFingerprint,
+                compilerInputHash: compilerInputHash,
+                importedTypeBoundaryHash: importedTypeBoundaryHash,
+                metrics: &metrics
+            )
+        } else {
+            let work = ProbeWorkQueue(count: batches.count)
+            DispatchQueue.concurrentPerform(iterations: min(4, batches.count)) { _ in
+                while let index = work.claim() {
+                    autoreleasepool {
+                        var localMetrics = Metrics()
+                        do {
+                            work.publish(.init(
+                                result: try probeCatalogBatch(
+                                    batches[index],
+                                    importedTypes: importedTypes,
+                                    minimumOS: minimumOS,
+                                    frontend: frontend,
+                                    invocation: invocation,
+                                    cache: cache,
+                                    compilerFingerprint: compilerFingerprint,
+                                    compilerInputHash: compilerInputHash,
+                                    importedTypeBoundaryHash:
+                                        importedTypeBoundaryHash,
+                                    metrics: &localMetrics
+                                ),
+                                error: nil,
+                                metrics: localMetrics
+                            ), at: index)
+                        } catch {
+                            work.publish(.init(
+                                result: nil,
+                                error: error,
+                                metrics: localMetrics
+                            ), at: index)
+                        }
+                    }
+                }
+            }
+            var combined = ProbeResult.empty
+            for index in batches.indices {
+                let outcome = work.outcome(at: index)
+                mergeAllProbeMetrics(outcome.metrics, into: &metrics)
+                if let error = outcome.error { throw error }
+                guard let result = outcome.result else {
+                    throw FrontendReceipt.Error.frontendFailed(
+                        "managed native Catalog probe batch produced no result"
+                    )
+                }
+                combined = combined + result
+            }
+            measured = combined
+        }
+        return .init(
+            types: measured.types.map(\.type),
+            operations: measured.operations.map(\.operation)
+        )
+    }
+
+    private static func probeCatalogBatch(
+        _ candidates: [Candidate],
+        importedTypes: [FrontendReceipt.Adapter.ImportedNativeType],
+        minimumOS: Core.SemanticVersion,
+        frontend: SwiftFrontend.Driver,
+        invocation: InterfaceArchive.FrontendInvocation,
+        cache: BuildCache.Store,
+        compilerFingerprint: String,
+        compilerInputHash: Core.Digest,
+        importedTypeBoundaryHash: Core.Digest,
+        metrics: inout Metrics
+    ) throws -> ProbeResult {
+        let candidateIdentities = candidates.map(ProbeCandidate.init)
+        let key = try BuildCache.key(
+            domain: "HLX.BuildCache.ManagedProbeBatch.v1",
+            value: ProbeBatchCacheKey(
+                compilerProbePipelineHash:
+                    NativeAPICatalog.Pipeline.compilerProbePipelineHash,
+                compilerFingerprint: compilerFingerprint,
+                compilerInputHash: compilerInputHash,
+                invocation: invocation,
+                minimumOS: minimumOS,
+                candidates: candidateIdentities,
+                importedTypeBoundaryHash: importedTypeBoundaryHash
+            )
+        )
+        var decoded: DecodedProbeBatch?
+        var generatedMetrics = Metrics()
+        do {
+            let value = try cache.value(
+                namespace: .managedProbeBatch,
+                key: key,
+                maximumBytes: 128 * 1_024 * 1_024,
+                validate: {
+                    decoded = try decodeProbeBatchPayload(
+                        $0,
+                        candidates: candidates
+                    )
+                }
+            ) {
+                let measured = try probeBatch(
+                    candidates,
+                    importedTypes: importedTypes,
+                    frontend: frontend,
+                    invocation: invocation,
+                    metrics: &generatedMetrics
+                )
+                guard measured.cacheableCandidates == Set(candidates) else {
+                    throw UncacheableProbeBatch.result(measured)
+                }
+                return try Core.CanonicalJSON.encode(ProbeBatchCachePayload(
+                    candidates: candidateIdentities,
+                    results: try candidates.map {
+                        try probeCachePayload(candidate: $0, measured: measured)
+                    }
+                ))
+            }
+            guard let decoded else {
+                throw FrontendReceipt.Error.frontendFailed(
+                    "managed native Catalog probe cache was not validated"
+                )
+            }
+            if value.source == .hit {
+                metrics.probeCacheHitCount += UInt64(candidates.count)
+                metrics.cachedRejectionCount += decoded.rejectionCount
+            } else {
+                metrics.probeCacheMissCount += UInt64(candidates.count)
+                mergeProbeMetrics(generatedMetrics, into: &metrics)
+            }
+            return decoded.result
+        } catch UncacheableProbeBatch.result(let measured) {
+            metrics.probeCacheMissCount += UInt64(candidates.count)
+            mergeProbeMetrics(generatedMetrics, into: &metrics)
+            return measured
+        }
     }
 
     private static func probe(
@@ -1339,8 +1695,8 @@ extension FrontendReceipt.ManagedNativeSurface {
                         "managed native probe cache was not validated"
                     )
                 }
-                let cachedOperations = validatedPayload.operations.map {
-                    restoring($0, for: candidate)
+                let cachedOperations = try validatedPayload.operations.map {
+                    try restoring($0, for: candidate)
                 }
                 metrics.probeCacheHitCount += 1
                 if cachedOperations.isEmpty {
@@ -1368,20 +1724,10 @@ extension FrontendReceipt.ManagedNativeSurface {
             guard measured.cacheableCandidates.contains(miss.candidate) else {
                 continue
             }
-            let candidateOperations = measured.operations.filter {
-                $0.candidate == miss.candidate
-            }.map {
-                normalizingForCache($0.operation, candidate: miss.candidate)
-            }
-            let candidateTypes = Array(Set(measured.types.compactMap {
-                $0.candidate == miss.candidate
-                    ? ProbeNativeType($0.type) : nil
-            })).sorted(by: probeTypeOrdering)
             let encoded = try Core.CanonicalJSON.encode(
-                ProbeCachePayload(
-                    candidate: ProbeCandidate(miss.candidate),
-                    types: candidateTypes,
-                    operations: candidateOperations
+                try probeCachePayload(
+                    candidate: miss.candidate,
+                    measured: measured
                 )
             )
             var validatedPayload: DecodedProbePayload?
@@ -1402,11 +1748,21 @@ extension FrontendReceipt.ManagedNativeSurface {
                 )
             }
             types += validatedPayload.types
-            operations += validatedPayload.operations.map {
-                restoring($0, for: miss.candidate)
+            operations += try validatedPayload.operations.map {
+                try restoring($0, for: miss.candidate)
             }
         }
         return .init(types: types, operations: operations)
+    }
+
+    private static func mergeAllProbeMetrics(
+        _ source: Metrics,
+        into destination: inout Metrics
+    ) {
+        destination.probeCacheHitCount += source.probeCacheHitCount
+        destination.probeCacheMissCount += source.probeCacheMissCount
+        destination.cachedRejectionCount += source.cachedRejectionCount
+        mergeProbeMetrics(source, into: &destination)
     }
 
     private static func probeUncached(
@@ -1497,7 +1853,8 @@ extension FrontendReceipt.ManagedNativeSurface {
         try BuildCache.key(
             domain: "HLX.BuildCache.ManagedProbe.v1",
             value: ProbeCacheKey(
-                transformPipelineHash: ShellBuild.transformPipelineHash,
+                compilerProbePipelineHash:
+                    NativeAPICatalog.Pipeline.compilerProbePipelineHash,
                 compilerFingerprint: compilerFingerprint,
                 compilerInputHash: compilerInputHash,
                 invocation: invocation,
@@ -1508,11 +1865,81 @@ extension FrontendReceipt.ManagedNativeSurface {
         )
     }
 
+    private static func probeCachePayload(
+        candidate: Candidate,
+        measured: ProbeResult
+    ) throws -> ProbeCachePayload {
+        let operations = try FrontendReceipt.Adapter().mergeImportedOperations(
+            measured.operations.compactMap {
+                $0.candidate == candidate
+                    ? normalizingForCache($0.operation, candidate: candidate)
+                    : nil
+            }
+        )
+        let types = Array(Set(measured.types.compactMap {
+            $0.candidate == candidate ? ProbeNativeType($0.type) : nil
+        })).sorted(by: probeTypeOrdering)
+        return .init(
+            candidate: ProbeCandidate(candidate),
+            types: types,
+            operations: operations
+        )
+    }
+
+    private static func decodeProbeBatchPayload(
+        _ data: Data,
+        candidates: [Candidate]
+    ) throws -> DecodedProbeBatch {
+        let payload = try JSONDecoder().decode(
+            ProbeBatchCachePayload.self,
+            from: data
+        )
+        guard payload.schemaVersion == 1,
+              candidates.count <= 256,
+              payload.candidates == candidates.map(ProbeCandidate.init),
+              payload.results.count == candidates.count,
+              try Core.CanonicalJSON.encode(payload) == data
+        else {
+            throw FrontendReceipt.Error.frontendFailed(
+                "managed native Catalog probe cache payload is invalid"
+            )
+        }
+        var result = ProbeResult.empty
+        var rejectionCount: UInt64 = 0
+        for (candidate, cached) in zip(candidates, payload.results) {
+            let decoded = try decodeProbePayload(cached, candidate: candidate)
+            if decoded.operations.isEmpty { rejectionCount += 1 }
+            result.types += decoded.types.map {
+                MeasuredType(candidate: candidate, type: $0)
+            }
+            result.operations += try decoded.operations.map {
+                MeasuredOperation(
+                    candidate: candidate,
+                    operation: try restoring($0, for: candidate)
+                )
+            }
+        }
+        result.cacheableCandidates = Set(candidates)
+        return .init(result: result, rejectionCount: rejectionCount)
+    }
+
     private static func decodeProbePayload(
         _ data: Data,
         candidate: Candidate
     ) throws -> DecodedProbePayload {
         let payload = try JSONDecoder().decode(ProbeCachePayload.self, from: data)
+        guard try Core.CanonicalJSON.encode(payload) == data else {
+            throw FrontendReceipt.Error.frontendFailed(
+                "managed native probe cache payload has noncanonical encoding"
+            )
+        }
+        return try decodeProbePayload(payload, candidate: candidate)
+    }
+
+    private static func decodeProbePayload(
+        _ payload: ProbeCachePayload,
+        candidate: Candidate
+    ) throws -> DecodedProbePayload {
         var invalidFacts: [String] = []
         if payload.schemaVersion != 1 { invalidFacts.append("schema") }
         if payload.candidate != ProbeCandidate(candidate) {
@@ -1534,7 +1961,11 @@ extension FrontendReceipt.ManagedNativeSurface {
         }
         if payload.operations.count > 4 { invalidFacts.append("operation count") }
         for value in payload.operations {
-            if !operation(value, matches: candidate) {
+            if !operation(
+                value,
+                matches: candidate,
+                probeTypes: payload.types
+            ) {
                 invalidFacts.append(
                     "operation \(value.ownerType).\(value.baseName)"
                         + " dispatch=\(value.dispatch.rawValue)"
@@ -1560,9 +1991,6 @@ extension FrontendReceipt.ManagedNativeSurface {
             if !value.witnessFunctions.isEmpty {
                 invalidFacts.append("witness functions")
             }
-        }
-        if try Core.CanonicalJSON.encode(payload) != data {
-            invalidFacts.append("canonical encoding")
         }
         guard invalidFacts.isEmpty else {
             throw FrontendReceipt.Error.frontendFailed(
@@ -1628,7 +2056,8 @@ extension FrontendReceipt.ManagedNativeSurface {
 
     private static func operation(
         _ operation: FrontendReceipt.Adapter.ImportedOperation,
-        matches candidate: Candidate
+        matches candidate: Candidate,
+        probeTypes: [ProbeNativeType]
     ) -> Bool {
         let expectedParameterCount = candidate.parameterTypes.count
             + (isInstanceDispatch(candidate.dispatch) ? 1 : 0)
@@ -1636,15 +2065,34 @@ extension FrontendReceipt.ManagedNativeSurface {
         if candidate.preciseIdentifier.hasSuffix(
             "#zero-argument-construction"
         ) {
-            declarationMatches = operation.ownerType == candidate.ownerType
-                && operation.dispatch == .initializer
-                && operation.argumentLabels.isEmpty
+            let nominalUSR = String(candidate.preciseIdentifier.dropLast(
+                "#zero-argument-construction".count
+            ))
+            declarationMatches = operation.declarationUSR != nil
+                && (operation.declarationUSR?.hasPrefix(nominalUSR) == true
+                    || probeTypes.contains { type in
+                        probeType(type, recognizes: operation.ownerType)
+                            && probeType(
+                                type,
+                                recognizes: operation.resultSwiftType
+                            )
+                            && [
+                                candidate.ownerType,
+                                candidate.probeOwnerType,
+                                candidate.resultType,
+                            ].contains { probeType(type, recognizes: $0) }
+                    })
         } else if operation.objectiveC != nil {
             // Inherited methods are invoked through the candidate receiver but
             // belong to the compiler-resolved declaring type. Their exact USR,
             // not receiver spelling equality, authenticates the cached fact.
             declarationMatches = operation.declarationUSR
                 == candidate.preciseIdentifier
+                || synthesizedObjectiveCInitializer(
+                    operation,
+                    matches: candidate,
+                    probeTypes: probeTypes
+                )
         } else {
             // Swift protocol extensions and imported newtype wrappers may
             // resolve a candidate member to a different generic declaration
@@ -1671,14 +2119,171 @@ extension FrontendReceipt.ManagedNativeSurface {
             && operation.mayThrow == candidate.mayThrow
     }
 
+    private static func synthesizedObjectiveCInitializer(
+        _ operation: FrontendReceipt.Adapter.ImportedOperation,
+        matches candidate: Candidate,
+        probeTypes: [ProbeNativeType]
+    ) -> Bool {
+        guard candidate.preciseIdentifier.contains("::SYNTHESIZED::"),
+              candidate.dispatch == .initializer,
+              candidate.memberName == "init",
+              candidate.argumentLabels.isEmpty,
+              let evidence = operation.objectiveC,
+              evidence.methodFamily == .initializer,
+              evidence.selector == "init",
+              evidence.selectorIsExact,
+              let dispatchClass = evidence.dispatchClassName
+        else { return false }
+        let receiverNames = [
+            candidate.ownerType,
+            candidate.probeOwnerType,
+            operation.ownerType,
+            operation.resultSwiftType,
+        ]
+        return receiverNames.contains {
+            normalizedTypeName($0, moduleName: candidate.moduleName)
+                .split(separator: ".").last.map(String.init) == dispatchClass
+        } && probeTypes.contains { type in
+            receiverNames.contains { probeType(type, recognizes: $0) }
+                && probeType(type, recognizes: dispatchClass)
+        }
+    }
+
+    private static func probeType(
+        _ type: ProbeNativeType,
+        recognizes spelling: String
+    ) -> Bool {
+        var names = Set([type.canonicalName, type.swiftType] + type.aliases)
+        if let runtimeName = type.objectiveCRuntimeName {
+            names.insert(runtimeName)
+            names.insert("__C.\(runtimeName)")
+        }
+        let relativeNames = names
+        for module in type.importedModules {
+            for name in relativeNames where !name.hasPrefix(module + ".") {
+                names.insert(module + "." + name)
+            }
+        }
+        return names.contains(spelling)
+    }
+
     private static func restoring(
         _ operation: FrontendReceipt.Adapter.ImportedOperation,
         for candidate: Candidate
-    ) -> FrontendReceipt.Adapter.ImportedOperation {
-        var result = operation
+    ) throws -> FrontendReceipt.Adapter.ImportedOperation {
+        guard var result = applyingCandidateLogicalSignature(
+            operation,
+            candidate: candidate
+        ) else {
+            throw FrontendReceipt.Error.frontendFailed(
+                "managed native probe result has no complete logical signature for "
+                    + "\(candidate.moduleName).\(candidate.ownerType)."
+                    + candidate.memberName
+            )
+        }
         result.sourceFileLogicalID = candidate.sourceFileLogicalID
         result.importedModules = candidate.importedModules
         return result
+    }
+
+    /// Symbol Graph parameters describe the source-facing Swift API, while the
+    /// measured operation supplies exact SIL/Objective-C physical evidence.
+    /// Preserve compiler-measured closure attributes, but never promote a
+    /// bridged physical nominal such as NSString into the logical signature.
+    private static func applyingCandidateLogicalSignature(
+        _ operation: FrontendReceipt.Adapter.ImportedOperation,
+        candidate: Candidate
+    ) -> FrontendReceipt.Adapter.ImportedOperation? {
+        // Clang-imported C typedefs frequently surface as source aliases for a
+        // scalar ABI (for example CFTimeInterval/Double). The exact compiler
+        // and Clang evidence is the callable logical boundary Helix supports;
+        // replacing it with an opaque Symbol Graph alias would discard a valid
+        // generic C invocation.
+        guard operation.c == nil else { return operation }
+        let receiverCount = isInstanceDispatch(candidate.dispatch) ? 1 : 0
+        guard operation.parameterSwiftTypes.count
+                == candidate.parameterTypes.count + receiverCount
+        else { return nil }
+        var result = operation
+        var parameters = candidate.parameterTypes.indices.map { index in
+            let logical = candidate.parameterTypes[index]
+            let measured = operation.parameterSwiftTypes[index]
+            if let invocation = operation.invocationParameterSwiftTypes,
+               invocation.indices.contains(index),
+               invocation[index] != measured {
+                // A prior compiler/foreign-boundary pass deliberately erased
+                // the logical ABI while retaining the narrower type used by
+                // generated Swift. Symbol Graph syntax must not undo that
+                // invocation adapter (for example protocol -> AnyObject).
+                return measured
+            }
+            return FrontendReceipt.FunctionTypeSpelling.callbackBoundary(
+                in: measured
+            )
+                == nil ? sourceFacingType(
+                    logical: logical,
+                    measured: measured,
+                    moduleName: candidate.moduleName
+                ) : measured
+        }
+        if receiverCount == 1, let receiver = operation.parameterSwiftTypes.last {
+            parameters.append(receiver)
+        }
+        result.parameterSwiftTypes = parameters
+        if let invocation = operation.invocationParameterSwiftTypes {
+            result.invocationParameterSwiftTypes = invocation == parameters
+                ? nil : invocation
+        }
+        if candidate.dispatch != .instanceValueSetter,
+           FrontendReceipt.FunctionTypeSpelling.callbackBoundary(
+               in: operation.resultSwiftType
+           ) == nil {
+            result.resultSwiftType = sourceFacingType(
+                logical: candidate.resultType,
+                measured: operation.resultSwiftType,
+                moduleName: candidate.moduleName
+            )
+        }
+        return result
+    }
+
+    static func sourceFacingType(
+        logical: String,
+        measured: String,
+        moduleName: String
+    ) -> String {
+        let canonicalLogical = FrontendReceipt.SwiftTypeSpelling
+            .catalogAuthorityMatchIdentity(logical)
+        let canonicalMeasured = FrontendReceipt.SwiftTypeSpelling
+            .canonicalABIIdentity(measured)
+        func moduleRelativeIdentity(_ value: String) -> String {
+            let prefix = moduleName + "."
+            let aliases = Dictionary(uniqueKeysWithValues: Set(
+                FrontendReceipt.SwiftTypeSpelling.nominalTokens(in: value)
+                    .filter { $0.hasPrefix(prefix) }
+            ).map { token in
+                (token, String(token.dropFirst(prefix.count)))
+            })
+            return FrontendReceipt.SwiftTypeSpelling.replacingNominalAliases(
+                in: value,
+                aliases: aliases
+            )
+        }
+        if moduleRelativeIdentity(canonicalLogical)
+            == moduleRelativeIdentity(canonicalMeasured) {
+            return canonicalMeasured
+        }
+        if FrontendReceipt.ValueTypeParser.parse(
+            canonicalLogical,
+            allowVoid: true
+        ) == nil,
+           FrontendReceipt.ValueTypeParser.parse(
+               canonicalMeasured,
+               allowVoid: true
+           ) != nil {
+            return canonicalMeasured
+        }
+        return canonicalLogical
     }
 
     private static func probeBatch(
@@ -1703,14 +2308,36 @@ extension FrontendReceipt.ManagedNativeSurface {
             }
             metrics.failedProbeCount += 1
             guard candidates.count > 1 else {
+                let candidate = candidates[0]
+                let escapingParameters = escapingProbeParameterIndices(
+                    status: status,
+                    diagnostics: diagnostics,
+                    candidate: candidate
+                )
+                if !escapingParameters.isEmpty {
+                    return try probeSingleton(
+                        candidate,
+                        forcingEscaping: escapingParameters,
+                        importedTypes: importedTypes,
+                        frontend: frontend,
+                        invocation: invocation,
+                        metrics: &metrics
+                    )
+                }
                 metrics.rejectedSingletonCount += 1
+                guard isDeterministicProbeRejection(
+                    status: status,
+                    diagnostics: diagnostics
+                ) else {
+                    // A transient compiler/toolchain failure is not evidence
+                    // that this API is unsupported. Propagate it so the
+                    // module Catalog cannot publish and cache a silent hole.
+                    throw error
+                }
                 return .init(
                     types: [],
                     operations: [],
-                    cacheableCandidates: isDeterministicProbeRejection(
-                        status: status,
-                        diagnostics: diagnostics
-                    ) ? Set(candidates) : []
+                    cacheableCandidates: Set(candidates)
                 )
             }
             let middle = candidates.count / 2
@@ -1730,11 +2357,58 @@ extension FrontendReceipt.ManagedNativeSurface {
         }
     }
 
+    private static func probeSingleton(
+        _ candidate: Candidate,
+        forcingEscaping initialParameters: Set<Int>,
+        importedTypes: [FrontendReceipt.Adapter.ImportedNativeType],
+        frontend: SwiftFrontend.Driver,
+        invocation: InterfaceArchive.FrontendInvocation,
+        metrics: inout Metrics
+    ) throws -> ProbeResult {
+        var escapingParameters = initialParameters
+        while true {
+            do {
+                return try measure(
+                    [candidate],
+                    importedTypes: importedTypes,
+                    frontend: frontend,
+                    invocation: invocation,
+                    forcedEscapingParameters: [0: escapingParameters],
+                    metrics: &metrics
+                )
+            } catch let error as SwiftFrontend.Error {
+                guard case let .compilationFailed(status, diagnostics) = error
+                else { throw error }
+                metrics.failedProbeCount += 1
+                let discovered = escapingProbeParameterIndices(
+                    status: status,
+                    diagnostics: diagnostics,
+                    candidate: candidate
+                )
+                if !discovered.isSubset(of: escapingParameters) {
+                    escapingParameters.formUnion(discovered)
+                    continue
+                }
+                metrics.rejectedSingletonCount += 1
+                guard isDeterministicProbeRejection(
+                    status: status,
+                    diagnostics: diagnostics
+                ) else { throw error }
+                return .init(
+                    types: [],
+                    operations: [],
+                    cacheableCandidates: [candidate]
+                )
+            }
+        }
+    }
+
     private static func measure(
         _ candidates: [Candidate],
         importedTypes: [FrontendReceipt.Adapter.ImportedNativeType],
         frontend: SwiftFrontend.Driver,
         invocation: InterfaceArchive.FrontendInvocation,
+        forcedEscapingParameters: [Int: Set<Int>] = [:],
         metrics: inout Metrics
     ) throws -> ProbeResult {
         metrics.probeAttemptCount += 1
@@ -1748,19 +2422,44 @@ extension FrontendReceipt.ManagedNativeSurface {
         )
         defer { try? FileManager.default.removeItem(at: directory) }
 
+        let storageURL = directory.appendingPathComponent(
+            "ManagedNativeStorage.swift"
+        )
+        let storageSource = renderStorageSource(candidates)
+        let storageContents = Data(storageSource.utf8)
         let sourceURL = directory.appendingPathComponent("ManagedNativeSurface.swift")
-        let source = renderSource(candidates)
+        let source = renderSource(
+            candidates,
+            forcedEscapingParameters: forcedEscapingParameters
+        )
         let contents = Data(source.utf8)
-        metrics.generatedProbeSourceBytes += UInt64(contents.count)
-        guard contents.count <= 8 * 1_024 * 1_024 else {
+        metrics.generatedProbeSourceBytes += UInt64(
+            storageContents.count + contents.count
+        )
+        guard storageContents.count + contents.count <= 8 * 1_024 * 1_024 else {
             throw FrontendReceipt.Error.frontendFailed(
                 "managed native probe source exceeds 8 MiB"
             )
         }
+        try storageContents.write(to: storageURL, options: .atomic)
         try contents.write(to: sourceURL, options: .atomic)
+
+        var storageInvocation = invocation
+        storageInvocation.semanticArguments.removeAll {
+            $0 == "-warnings-as-errors" || $0 == "-suppress-warnings"
+        }
+        _ = try frontend.typecheckDiagnostics(
+            sourceFiles: [storageURL],
+            invocation: storageInvocation
+        )
+
+        var probeInvocation = invocation
+        probeInvocation.semanticArguments.removeAll {
+            $0 == "-warnings-as-errors"
+        }
         let astOutput = try frontend.emitTypedAST(
             sourceFiles: [sourceURL],
-            invocation: invocation
+            invocation: probeInvocation
         )
         let documents = try FrontendReceipt.TypedAST.parseDocuments(astOutput)
         let demangled = try FrontendReceipt.Demangler(
@@ -1769,7 +2468,7 @@ extension FrontendReceipt.ManagedNativeSurface {
         ).demangle(FrontendReceipt.TypedAST.mangledTypes(in: documents))
         let canonicalSIL = try frontend.emitCanonicalSIL(
             sourceFiles: [sourceURL],
-            invocation: invocation
+            invocation: probeInvocation
         )
         let silFile = try CanonicalSIL.File(text: canonicalSIL)
         let state = FrontendReceipt.Adapter.SourceState(
@@ -1887,38 +2586,73 @@ extension FrontendReceipt.ManagedNativeSurface {
                     measured.objectiveC = evidence
                 }
             }
+            if !FrontendReceipt.SwiftTypeSpelling.isGeneratedType(
+                measured.ownerType
+            ) {
+                // Imported protocol-extension witnesses can be printed as a
+                // compiler diagnostic placeholder such as "related decl"
+                // rather than a legal Swift type. The exact declaration USR
+                // and the successfully typechecked concrete probe receiver
+                // together are sufficient to restore only that unusable
+                // spelling; valid generic declaring owners stay untouched.
+                guard measured.declarationUSR == candidate.preciseIdentifier,
+                      FrontendReceipt.SwiftTypeSpelling.isGeneratedType(
+                          candidate.ownerType
+                      )
+                else { return nil }
+                measured.ownerType = candidate.ownerType
+            }
             // The compiler-resolved declaration owner is authoritative. A
             // probe may be invoked through a subclass or type alias while the
             // member is declared by a generic superclass; replacing that
             // owner with the probe receiver would manufacture a different
-            // logical ABI for the same SIL symbol.
-            measured.parameterSwiftTypes = operation.parameterSwiftTypes.map {
+            // logical ABI for the same SIL symbol. Compiler-proven nominal
+            // aliases still describe that same owner identity and must use
+            // the generated Swift spelling shared by parameters and results.
+            measured.ownerType = FrontendReceipt.SwiftTypeSpelling
+                .replacingNominalAliases(
+                    in: measured.ownerType,
+                    aliases: swiftAliases
+                )
+            guard let logical = applyingCandidateLogicalSignature(
+                measured,
+                candidate: candidate
+            ) else { return nil }
+            measured = logical
+            measured.parameterSwiftTypes = measured.parameterSwiftTypes.map {
                 FrontendReceipt.SwiftTypeSpelling.replacingNominalAliases(
                     in: $0,
                     aliases: swiftAliases
                 )
             }
-            measured.invocationParameterSwiftTypes = operation
+            measured.invocationParameterSwiftTypes = measured
                 .invocationParameterSwiftTypes?.map {
                     FrontendReceipt.SwiftTypeSpelling.replacingNominalAliases(
                         in: $0,
                         aliases: swiftAliases
                     )
                 }
-            for index in candidate.parameterTypes.indices
-            where measured.parameterSwiftTypes.indices.contains(index) {
-                let formal = FrontendReceipt.SwiftTypeSpelling
-                    .replacingNominalAliases(
-                        in: candidate.parameterTypes[index],
-                        aliases: swiftAliases
+            if isSetterDispatch(candidate.dispatch),
+               measured.parameterSwiftTypes.first.flatMap({
+                   FrontendReceipt.FunctionTypeSpelling.callbackBoundary(in: $0)
+               }) != nil {
+                guard let storedParameters = FrontendReceipt
+                    .FunctionTypeSpelling.applyingAuthoritativeLifetimes(
+                        [0: .escaping],
+                        to: measured.parameterSwiftTypes
                     )
-                if let boundary = FrontendReceipt.FunctionTypeSpelling
-                    .callbackBoundary(in: formal) {
-                    measured.parameterSwiftTypes[index] = boundary.declaredSpelling
-                    if measured.invocationParameterSwiftTypes != nil {
-                        measured.invocationParameterSwiftTypes?[index] =
-                            boundary.declaredSpelling
-                    }
+                else { return nil }
+                measured.parameterSwiftTypes = storedParameters
+                if let invocationParameters = measured
+                    .invocationParameterSwiftTypes {
+                    guard let storedInvocationParameters = FrontendReceipt
+                        .FunctionTypeSpelling.applyingAuthoritativeLifetimes(
+                            [0: .escaping],
+                            to: invocationParameters
+                        )
+                    else { return nil }
+                    measured.invocationParameterSwiftTypes =
+                        storedInvocationParameters
                 }
             }
             if candidate.requiresMainActor {
@@ -1938,7 +2672,7 @@ extension FrontendReceipt.ManagedNativeSurface {
             }
             measured.resultSwiftType = FrontendReceipt.SwiftTypeSpelling
                 .replacingNominalAliases(
-                    in: operation.resultSwiftType,
+                    in: measured.resultSwiftType,
                     aliases: swiftAliases
                 )
             let parameters = measured.parameterSwiftTypes.compactMap {
@@ -1996,49 +2730,147 @@ extension FrontendReceipt.ManagedNativeSurface {
     ) -> Bool {
         guard status == 1 else { return false }
         let stableSemanticFragments = [
+            "a c function pointer can only be formed",
             "ambiguous use of",
             "cannot assign to property",
             "cannot call value of non-function type",
+            "cannot be constructed because it has no accessible initializers",
             "cannot convert return expression",
             "cannot convert value",
             "cannot infer contextual base",
             "cannot invoke initializer",
+            "cannot reference class method",
+            "cannot reference instance method",
             "extra argument",
             "generic parameter ",
             "get-only property",
             "has no member",
+            "has been replaced by",
+            "has been renamed to",
             "inaccessible due to",
             "incorrect argument label",
             "instance member ",
             "is unavailable",
+            "is only available in",
             "missing argument",
             "no exact matches in call",
+            "reference to generic type",
             "requires that",
             "static member ",
             "type of expression is ambiguous",
+            "will never be executed",
         ]
-        let errors = diagnostics.split(whereSeparator: \.isNewline).compactMap {
-            line -> String? in
-            let value = line.lowercased()
-            guard let marker = value.range(of: "error:") else { return nil }
-            return String(value[marker.upperBound...])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        }
+        let errors = compilerErrorMessages(diagnostics)
         return !errors.isEmpty && errors.allSatisfy { error in
-            stableSemanticFragments.contains { error.contains($0) }
+            let unresolvedContextualName = (
+                error.hasPrefix("cannot find '")
+                    || error.hasPrefix("cannot find type '")
+            ) && error.contains("' in scope")
+            return unresolvedContextualName
+                || stableSemanticFragments.contains { error.contains($0) }
         }
     }
 
-    private static func renderSource(_ candidates: [Candidate]) -> String {
-        let imports = Set(candidates.map(\.moduleName)).sorted().map { "import \($0)" }
+    private static func compilerErrorMessages(_ diagnostics: String) -> [String] {
+        diagnostics.split(whereSeparator: \.isNewline).compactMap {
+            line -> String? in
+            let value = line.lowercased().trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            let message: Substring
+            if value.hasPrefix("error:") {
+                message = value.dropFirst("error:".count)
+            } else if value.hasPrefix("fatal error:") {
+                message = value.dropFirst("fatal error:".count)
+            } else if value.hasPrefix("llvm error:") {
+                message = value.dropFirst("llvm error:".count)
+            } else if let marker = value.range(of: ": error:") {
+                message = value[marker.upperBound...]
+            } else {
+                return nil
+            }
+            return String(message).trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+        }
+    }
+
+    private static func escapingProbeParameterIndices(
+        status: Int32,
+        diagnostics: String,
+        candidate: Candidate
+    ) -> Set<Int> {
+        guard status == 1 else { return [] }
+        let parameterMarker = "non-escaping parameter 'argument"
+        return Set(compilerErrorMessages(diagnostics).compactMap { error in
+            guard let marker = error.range(of: parameterMarker),
+                  error.contains("@escaping")
+                    || error.contains("may allow it to escape")
+                    || error.hasPrefix("escaping closure captures")
+            else { return nil }
+            let suffix = error[marker.upperBound...]
+            guard let quote = suffix.firstIndex(of: "'"),
+                  let index = Int(suffix[..<quote]),
+                  candidate.parameterTypes.indices.contains(index)
+            else { return nil }
+            return index
+        })
+    }
+
+    private static func renderSource(
+        _ candidates: [Candidate],
+        forcedEscapingParameters: [Int: Set<Int>] = [:]
+    ) -> String {
+        let imports = Set(candidates.flatMap {
+            [$0.moduleName] + $0.importedModules
+        }).sorted().map { "import \($0)" }
         let declarations = candidates.enumerated().flatMap { index, candidate in
-            [renderProbe(index: index, candidate: candidate)]
-                + propertySelectorProbe(index: index, candidate: candidate)
+            [renderProbe(
+                index: index,
+                candidate: candidate,
+                forcedEscapingParameters: forcedEscapingParameters[index] ?? []
+            )] + propertySelectorProbe(index: index, candidate: candidate)
         }
-        return (imports + [""] + declarations + [""]).joined(separator: "\n")
+        return (imports + [""] + declarations + [""])
+            .joined(separator: "\n")
     }
 
-    private static func renderProbe(index: Int, candidate: Candidate) -> String {
+    private static func renderStorageSource(_ candidates: [Candidate]) -> String {
+        let imports = Set(candidates.flatMap {
+            [$0.moduleName] + $0.importedModules
+        }).sorted().map { "import \($0)" }
+        let helpers = """
+        private func helixManagedNativeRequiresStorable<T>(_: T.Type) {}
+        """
+        let declarations = candidates.enumerated().map { index, candidate in
+            renderStorageProbe(index: index, candidate: candidate)
+        }
+        return (imports + ["", helpers, ""] + declarations + [""])
+            .joined(separator: "\n")
+    }
+
+    private static func renderStorageProbe(
+        index: Int,
+        candidate: Candidate
+    ) -> String {
+        let owner = escapedNominalType(candidate.probeOwnerType)
+        let boundaryTypes = (isInstanceDispatch(candidate.dispatch)
+            ? [owner] : []) + candidate.parameterTypes + [candidate.resultType]
+        let checks = Set(boundaryTypes.map(storableProbeType)).sorted().flatMap {
+            type in
+            [
+                "    helixManagedNativeRequiresStorable((\(type)).self)",
+            ]
+        }.joined(separator: "\n")
+        return "private func helixManagedNativeStorageProbe\(index)() {\n"
+            + "\(checks)\n}"
+    }
+
+    private static func renderProbe(
+        index: Int,
+        candidate: Candidate,
+        forcedEscapingParameters: Set<Int> = []
+    ) -> String {
         let isolation = candidate.requiresMainActor ? "@MainActor " : ""
         let throwing = candidate.mayThrow ? " throws" : ""
         let tryPrefix = candidate.mayThrow ? "try " : ""
@@ -2048,8 +2880,12 @@ extension FrontendReceipt.ManagedNativeSurface {
         if isInstanceDispatch(candidate.dispatch) {
             parameters.append("_ receiver: \(owner)")
         }
-        parameters += candidate.parameterTypes.enumerated().map {
-            "_ argument\($0.offset): \($0.element)"
+        parameters += candidate.parameterTypes.enumerated().map { item in
+            let type = probeParameterType(
+                item.element,
+                forceEscaping: forcedEscapingParameters.contains(item.offset)
+            )
+            return "_ argument\(item.offset): \(type)"
         }
         let arguments = zip(
             candidate.argumentLabels,
@@ -2081,9 +2917,50 @@ extension FrontendReceipt.ManagedNativeSurface {
         }
         let mutableReceiver = candidate.dispatch == .instanceValueSetter
             ? "\n    var mutableReceiver = receiver" : ""
+        let callStatement = storableProbeType(candidate.resultType) == "Swift.Void"
+            ? "\(tryPrefix)\(call)" : "_ = \(tryPrefix)\(call)"
         return "\(isolation)private func helixManagedNativeProbe\(index)("
             + "\(parameters.joined(separator: ", ")))\(throwing) {"
-            + "\(mutableReceiver)\n    _ = \(tryPrefix)\(call)\n}"
+            + "\(mutableReceiver)\n"
+            + "    \(callStatement)\n}"
+    }
+
+    static func storableProbeType(_ raw: String) -> String {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        for prefix in ["@autoclosure ", "borrowing ", "consuming ", "isolated "]
+        where value.hasPrefix(prefix) {
+            value.removeFirst(prefix.count)
+            value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if value == "()" || value == "Void" { return "Swift.Void" }
+        if value.hasSuffix("!") {
+            value = String(value.dropLast()) + "?"
+        }
+        guard let callback = FrontendReceipt.FunctionTypeSpelling
+            .callbackBoundary(in: value)
+        else { return value }
+        return callback.isOptional
+            ? "Swift.Optional<\(callback.function.generatedSpelling)>"
+            : callback.function.generatedSpelling
+    }
+
+    private static func probeParameterType(
+        _ raw: String,
+        forceEscaping: Bool
+    ) -> String {
+        guard var callback = FrontendReceipt.FunctionTypeSpelling
+            .callbackBoundary(in: raw),
+              !callback.isOptional
+        else {
+            return forceEscaping ? "@escaping \(raw)" : raw
+        }
+        // An escaping value may be passed to either an escaping or a
+        // nonescaping parameter. This lets the call compile without guessing
+        // the SDK declaration's lifetime from an incomplete Symbol Graph;
+        // the callee's canonical SIL parameter remains authoritative and is
+        // recorded by ImportedOperations.
+        callback.function.attributes.isEscaping = true
+        return callback.declaredSpelling
     }
 
     private static func propertySelectorProbe(
@@ -2124,6 +3001,33 @@ extension FrontendReceipt.ManagedNativeSurface {
         }
     }
 
+    private static func isSetterDispatch(
+        _ dispatch: NativeImportDiscovery.Dispatch
+    ) -> Bool {
+        switch dispatch {
+        case .staticSetter, .instanceSetter, .instanceValueSetter:
+            true
+        case .globalFunction, .initializer, .staticMethod, .instanceMethod,
+             .staticGetter, .instanceGetter, .nativeUpcast, .anyObjectBridge:
+            false
+        }
+    }
+
+    private static func crossesUninhabitedBoundary(
+        _ candidate: Candidate,
+        typeIndex: FrontendReceipt.ImportedTypeIndex,
+        uninhabitedCanonicalNames: Set<String>
+    ) -> Bool {
+        guard !uninhabitedCanonicalNames.isEmpty else { return false }
+        var spellings = candidate.parameterTypes + [candidate.resultType]
+        if isInstanceDispatch(candidate.dispatch) {
+            spellings += [candidate.ownerType, candidate.probeOwnerType]
+        }
+        return typeIndex.matching(spellings: spellings).contains {
+            uninhabitedCanonicalNames.contains($0.canonicalName)
+        }
+    }
+
     /// Keeps a candidate cache entry independent of the probe batch that
     /// happened to contain it. Only native types named by that candidate's
     /// callable signature are persisted with the operation.
@@ -2132,15 +3036,19 @@ extension FrontendReceipt.ManagedNativeSurface {
         operation: FrontendReceipt.Adapter.ImportedOperation,
         candidate: Candidate
     ) -> [FrontendReceipt.Adapter.ImportedNativeType] {
-        let spellings = [
-            operation.ownerType,
+        var spellings = [
             operation.resultSwiftType,
-            candidate.ownerType,
-            candidate.probeOwnerType,
         ] + operation.parameterSwiftTypes
             + (operation.invocationParameterSwiftTypes ?? [])
             + (operation.physicalParameterSwiftTypes ?? [])
             + candidate.parameterTypes
+        if isInstanceDispatch(candidate.dispatch) {
+            spellings += [
+                operation.ownerType,
+                candidate.ownerType,
+                candidate.probeOwnerType,
+            ]
+        }
         return index.matching(spellings: spellings).map { original in
             var type = original
             type.sourceFileLogicalID = candidate.sourceFileLogicalID
@@ -2166,7 +3074,8 @@ extension FrontendReceipt.ManagedNativeSurface {
             for name in Set(
                 [type.canonicalName, type.swiftType, "__C.\(type.canonicalName)"]
                     + type.aliases
-            ) {
+            ) where !FrontendReceipt.ValueTypeParser
+                .isBuiltinValueSpelling(name) {
                 result[name] = placeholder
             }
         }
@@ -2300,6 +3209,36 @@ extension FrontendReceipt.ManagedNativeSurface {
         symbol.declarationFragments.contains {
             $0.preciseIdentifier == "s:ScM" && $0.spelling == "MainActor"
         }
+    }
+
+    private static func referencedSwiftModules(
+        in symbol: SwiftFrontend.SymbolGraph.Symbol
+    ) -> [String] {
+        Array(Set(symbol.declarationFragments.compactMap {
+            $0.preciseIdentifier.flatMap(swiftModuleName)
+        })).sorted()
+    }
+
+    static func swiftModuleName(inPreciseIdentifier precise: String) -> String? {
+        guard precise.hasPrefix("s:") else { return nil }
+        let suffix = precise.utf8.dropFirst(2)
+        let lengthBytes = suffix.prefix { byte in
+            byte >= Character("0").asciiValue!
+                && byte <= Character("9").asciiValue!
+        }
+        guard !lengthBytes.isEmpty,
+              lengthBytes.count <= 3,
+              let length = Int(String(decoding: lengthBytes, as: UTF8.self)),
+              length > 0,
+              length <= 128
+        else { return nil }
+        let nameBytes = suffix.dropFirst(lengthBytes.count).prefix(length)
+        guard nameBytes.count == length else { return nil }
+        let name = String(decoding: nameBytes, as: UTF8.self)
+        guard isProbeIdentifier(name),
+              !["Builtin", "Swift", "_Concurrency"].contains(name)
+        else { return nil }
+        return name
     }
 
     private static func isAvailable(

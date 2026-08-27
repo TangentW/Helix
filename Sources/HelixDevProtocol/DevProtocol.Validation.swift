@@ -89,21 +89,35 @@ extension DevProtocol.SessionIdentity {
                 "active function routes require an active generation"
             )
         }
-        guard activeDevelopmentNativeCallKeys.count <= 65_536,
-              Set(activeDevelopmentNativeCallKeys).count
-                == activeDevelopmentNativeCallKeys.count,
-              activeDevelopmentNativeCallKeys
-                == activeDevelopmentNativeCallKeys.sorted(),
-              activeDevelopmentNativeCallKeys.isEmpty
+        guard activeDevelopmentNativeImports.count <= 65_536,
+              Set(activeDevelopmentNativeImports.map(\.id)).count
+                == activeDevelopmentNativeImports.count,
+              Set(activeDevelopmentNativeImports.map(\.key)).count
+                == activeDevelopmentNativeImports.count,
+              activeDevelopmentNativeImports
+                == activeDevelopmentNativeImports.sorted(by: { lhs, rhs in
+                    lhs.id == rhs.id ? lhs.key < rhs.key : lhs.id < rhs.id
+                }),
+              activeDevelopmentNativeTypeIDs.count <= 65_536,
+              Set(activeDevelopmentNativeTypeIDs).count
+                == activeDevelopmentNativeTypeIDs.count,
+              activeDevelopmentNativeTypeIDs
+                == activeDevelopmentNativeTypeIDs.sorted(by: {
+                    $0.rawValue < $1.rawValue
+                }),
+              (activeDevelopmentNativeImports.isEmpty
+                    && activeDevelopmentNativeTypeIDs.isEmpty)
                 || supportedBackends.contains(.hlbc)
         else {
             throw DevProtocol.Error.malformedMessage(
-                "development NativeCall keys are duplicated, unordered, oversized, or HLBC is disabled"
+                "development native inventory is duplicated, unordered, oversized, or HLBC is disabled"
             )
         }
-        if !activeDevelopmentNativeCallKeys.isEmpty, activeGenerationID == nil {
+        if (!activeDevelopmentNativeImports.isEmpty
+                || !activeDevelopmentNativeTypeIDs.isEmpty),
+           activeGenerationID == nil {
             throw DevProtocol.Error.malformedMessage(
-                "development NativeCall keys require an active generation"
+                "development native inventory requires an active generation"
             )
         }
         if (loadedDevelopmentAdapterCount == 0)

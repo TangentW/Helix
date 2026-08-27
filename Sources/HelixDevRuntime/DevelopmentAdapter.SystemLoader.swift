@@ -21,6 +21,7 @@ public final class LoadedImage: @unchecked Sendable {
     public let descriptor: MachO.Descriptor
     public let nativeInvokers: [any VM.NativeInvoker]
     public let asyncNativeInvokers: [any VM.AsyncNativeInvoker]
+    public let nativeTypeOperations: [VM.NativeTypeOperations]
     let handle: UnsafeMutableRawPointer?
 
     public init(
@@ -29,6 +30,7 @@ public final class LoadedImage: @unchecked Sendable {
         descriptor: MachO.Descriptor,
         nativeInvokers: [any VM.NativeInvoker],
         asyncNativeInvokers: [any VM.AsyncNativeInvoker] = [],
+        nativeTypeOperations: [VM.NativeTypeOperations] = [],
         handle: UnsafeMutableRawPointer? = nil
     ) {
         self.fileURL = fileURL
@@ -36,6 +38,7 @@ public final class LoadedImage: @unchecked Sendable {
         self.descriptor = descriptor
         self.nativeInvokers = nativeInvokers
         self.asyncNativeInvokers = asyncNativeInvokers
+        self.nativeTypeOperations = nativeTypeOperations
         self.handle = handle
     }
 
@@ -76,6 +79,7 @@ public protocol Loading: Sendable {
         bytes: Data,
         descriptor: DevProtocol.DevelopmentPayload.Image,
         imports: [DevProtocol.DevelopmentPayload.NativeImport],
+        nativeTypes: [DevProtocol.DevelopmentPayload.NativeType],
         identity: DevProtocol.SessionIdentity,
         cacheDirectory: URL
     ) throws -> DevelopmentAdapter.LoadedImage
@@ -92,20 +96,26 @@ public struct SystemLoader: DevelopmentAdapter.Loading {
         bytes: Data,
         descriptor expected: DevProtocol.DevelopmentPayload.Image,
         imports: [DevProtocol.DevelopmentPayload.NativeImport],
+        nativeTypes: [DevProtocol.DevelopmentPayload.NativeType],
         identity: DevProtocol.SessionIdentity,
         cacheDirectory: URL
     ) throws -> DevelopmentAdapter.LoadedImage {
-        guard !imports.isEmpty,
+        guard !imports.isEmpty || !nativeTypes.isEmpty,
               imports.allSatisfy({
                   $0.binding == .swiftAdapter
                       && $0.exportSymbol != nil
                       && $0.descriptor.target.backend == .swiftAdapter
               }),
+              nativeTypes.allSatisfy({
+                  $0.binding == .swiftAdapter
+                      && $0.exportSymbol != nil
+                      && $0.objectiveCRuntimeName == nil
+              }),
               UInt64(bytes.count) == expected.byteLength,
               Core.Digest.sha256(bytes) == expected.sha256
         else {
             throw DevelopmentAdapter.Error.invalidImage(
-                "manifest, imports, length, or hash is inconsistent"
+                "manifest, native capabilities, length, or hash is inconsistent"
             )
         }
         let descriptor: MachO.Descriptor
@@ -147,6 +157,10 @@ public struct SystemLoader: DevelopmentAdapter.Loading {
         }
         typealias Factory = @convention(c) () -> UnsafeMutableRawPointer?
         let factories: [(DevProtocol.DevelopmentPayload.NativeImport, Factory)]
+        let typeFactories: [(
+            DevProtocol.DevelopmentPayload.NativeType,
+            Factory
+        )]
         do {
             factories = try imports.map { nativeImport in
                 guard let name = nativeImport.exportSymbol,
@@ -158,13 +172,26 @@ public struct SystemLoader: DevelopmentAdapter.Loading {
                 }
                 return (nativeImport, unsafeBitCast(symbol, to: Factory.self))
             }
+            typeFactories = try nativeTypes.map { nativeType in
+                guard let name = nativeType.exportSymbol,
+                      let symbol = dlsym(handle, name)
+                else {
+                    throw DevelopmentAdapter.Error.invalidImage(
+                        "required TypeOps export is missing for \(nativeType.id)"
+                    )
+                }
+                return (nativeType, unsafeBitCast(symbol, to: Factory.self))
+            }
         } catch {
             dlclose(handle)
             try? FileManager.default.removeItem(at: fileURL)
             throw error
         }
         let retainedBodies = factories.map { ($0.0, $0.1()) }
-        guard retainedBodies.allSatisfy({ $0.1 != nil }) else {
+        let retainedTypeBodies = typeFactories.map { ($0.0, $0.1()) }
+        guard retainedBodies.allSatisfy({ $0.1 != nil }),
+              retainedTypeBodies.allSatisfy({ $0.1 != nil })
+        else {
             for (nativeImport, pointer) in retainedBodies {
                 guard let pointer else { continue }
                 if nativeImport.descriptor.effects.isAsync {
@@ -174,6 +201,11 @@ public struct SystemLoader: DevelopmentAdapter.Loading {
                     _ = Unmanaged<Runtime.NativeAdapterBody>
                         .fromOpaque(pointer).takeRetainedValue()
                 }
+            }
+            for (_, pointer) in retainedTypeBodies {
+                guard let pointer else { continue }
+                _ = Unmanaged<Runtime.NativeTypeOperationsBody>
+                    .fromOpaque(pointer).takeRetainedValue()
             }
             dlclose(handle)
             try? FileManager.default.removeItem(at: fileURL)
@@ -209,12 +241,38 @@ public struct SystemLoader: DevelopmentAdapter.Loading {
                 ))
             }
         }
+        let nativeTypeOperations = try retainedTypeBodies.map {
+            nativeType, pointer -> VM.NativeTypeOperations in
+            let operations = try Runtime.NativeTypeOperationsBody
+                .takeRetained(pointer).operations
+            let expectedKind: VM.NativeTypeKind = switch nativeType.kind {
+            case .value: .value
+            case .reference: .reference
+            case .enumeration: .enumeration
+            }
+            guard operations.id == nativeType.id,
+                  operations.canonicalName == nativeType.canonicalName,
+                  operations.kind == expectedKind,
+                  operations.layoutFingerprint
+                    == nativeType.layoutFingerprint,
+                  operations.isCopyable == nativeType.isCopyable,
+                  operations.requiresMainActor
+                    == nativeType.requiresMainActor,
+                  operations.estimatedSize == nativeType.estimatedSize
+            else {
+                throw DevelopmentAdapter.Error.stateUncertain(
+                    "exported TypeOps disagree with \(nativeType.canonicalName)"
+                )
+            }
+            return operations
+        }
         return .init(
             fileURL: fileURL,
             byteCount: bytes.count,
             descriptor: descriptor,
             nativeInvokers: nativeInvokers,
             asyncNativeInvokers: asyncInvokers,
+            nativeTypeOperations: nativeTypeOperations,
             handle: handle
         )
         #else

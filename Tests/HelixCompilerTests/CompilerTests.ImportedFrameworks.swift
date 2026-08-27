@@ -135,6 +135,9 @@ struct ImportedFrameworks {
     @Test("Objective-C bridge values preserve their logical type across branch merges")
     func lowersBridgedStringBranchMerge() throws {
         let labelType = Core.TypeID(rawValue: .sha256("UIKit.UILabel"))
+        let stringObjectType = Core.TypeID(
+            rawValue: .sha256("Foundation.NSString")
+        )
         let physicalType = "@convention(objc_method) "
             + "(Optional<NSString>, UILabel) -> ()"
         let symbol = CanonicalSIL.NativeBridgeSymbols.foreignCall(
@@ -152,8 +155,14 @@ struct ImportedFrameworks {
         ])
         let environment = try CanonicalSIL.TypeEnvironment.empty
             .includingNativeTypes(
-                ["UILabel": labelType],
-                kinds: [labelType: .reference]
+                [
+                    "UILabel": labelType,
+                    "NSString": stringObjectType,
+                ],
+                kinds: [
+                    labelType: .reference,
+                    stringObjectType: .reference,
+                ]
             )
         let function = CanonicalSIL.Function(
             mangledName: "$s7Fixture6updateyySo7UILabelC_SbSStF",
@@ -179,6 +188,29 @@ struct ImportedFrameworks {
               return %11
             """
         )
+
+        let representation = try CanonicalSIL.ForeignRepresentation.Plan
+            .analyze(
+                body: function.body,
+                function: function,
+                directCalls: calls
+            )
+        #expect(
+            CanonicalSIL.ForeignRepresentation.ObjectiveCBridgeIntrinsic(
+                mangledName:
+                    "$sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF",
+                loweredType: "@convention(method) (@guaranteed String) "
+                    + "-> @owned NSString"
+            ) == .stringToObjectiveC
+        )
+        #expect(calls.hasBinding(for: symbol))
+        for token in ["%6", "%7", "%8"] {
+            #expect(
+                representation.logicalType(for: token)
+                    == .optional(.string)
+            )
+        }
+        #expect(representation.logicalType(for: "%5") == .string)
 
         let lowered = try CanonicalSIL.Lowerer(
             typeEnvironment: environment
@@ -277,6 +309,220 @@ struct ImportedFrameworks {
                 directCalls: calls
             )
         }
+    }
+
+    @Test("Optional.none accepts an exact compiler-proven native alias")
+    func lowersNativeAliasOptionalNone() throws {
+        let centerType = Core.TypeID(
+            rawValue: .sha256("Foundation.NotificationCenter")
+        )
+        let nameType = Core.TypeID(
+            rawValue: .sha256("Foundation.Notification.Name")
+        )
+        let physicalType = "@convention(objc_method) "
+            + "(Optional<NSNotification.Name>, NotificationCenter) -> ()"
+        let symbol = CanonicalSIL.NativeBridgeSymbols.foreignCall(
+            reference: "#NotificationCenter.observe!foreign",
+            loweredType: physicalType
+        )
+        let requirement = try importRequirement(id: 42)
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: symbol,
+                parameterTypes: [
+                    .optional(.native(nameType)),
+                    .native(centerType),
+                ],
+                resultType: .void,
+                target: .nativeImport(requirement)
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                [
+                    "Foundation.Notification.Name": nameType,
+                    "NotificationCenter": centerType,
+                ],
+                aliases: ["NSNotification.Name": [nameType]],
+                kinds: [
+                    nameType: .enumeration,
+                    centerType: .reference,
+                ]
+            )
+        #expect(
+            try environment.resolve("NSNotification.Name")
+                == .native(nameType)
+        )
+        #expect(
+            try environment.resolve("Optional<NSNotification.Name>")
+                == .optional(.native(nameType))
+        )
+        let function = CanonicalSIL.Function(
+            mangledName: "$s7Fixture7observeyySo18NSNotificationCenterCF",
+            loweredType: "@convention(thin) (@guaranteed NotificationCenter) -> ()",
+            body: """
+            bb0(%0 : @guaranteed $NotificationCenter):
+              %1 = enum $Optional<NSNotification.Name>, #Optional.none!enumelt
+              %2 = objc_method %0, #NotificationCenter.observe!foreign : (NotificationCenter) -> (NSNotification.Name?) -> (), $\(physicalType)
+              %3 = apply %2(%1, %0) : $\(physicalType)
+              release_value %1
+              %4 = tuple ()
+              return %4
+            """
+        )
+
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            function,
+            displayName: "Fixture.observe",
+            directCalls: calls
+        )
+        #expect(lowered.blocks.flatMap(\.instructions).contains {
+            guard case let .nativeApply(_, id, _) = $0 else { return false }
+            return id == requirement.id
+        })
+
+        var forged = function
+        forged.body = function.body.replacingOccurrences(
+            of: "%1 = enum $Optional<NSNotification.Name>, "
+                + "#Optional.none!enumelt",
+            with: "%1 = enum $Optional<NSNotification.OtherName>, "
+                + "#Optional.none!enumelt"
+        )
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            try CanonicalSIL.Lowerer(typeEnvironment: environment).lower(
+                forged,
+                displayName: "Fixture.forgedObserve",
+                directCalls: calls
+            )
+        }
+    }
+
+    @Test("Foundation collection bridges preserve Dictionary and Set NativeImport ABIs")
+    func lowersFoundationCollectionBridges() throws {
+        let consumerType = Core.TypeID(
+            rawValue: .sha256("Fixture.CollectionConsumer")
+        )
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                ["CollectionConsumer": consumerType],
+                kinds: [consumerType: .reference]
+            )
+        let dictionaryType = Bytecode.ValueType.dictionary(
+            key: .string,
+            value: .integer(bitWidth: 64, signed: true)
+        )
+        let setterPhysical = "@convention(objc_method) "
+            + "(NSDictionary, CollectionConsumer) -> ()"
+        let getterPhysical = "@convention(objc_method) "
+            + "(CollectionConsumer) -> @autoreleased Optional<NSDictionary>"
+        let setterRequirement = try importRequirement(id: 42)
+        let getterRequirement = try importRequirement(id: 43)
+        let setterSymbol = CanonicalSIL.NativeBridgeSymbols.foreignCall(
+            reference: "#CollectionConsumer.values!setter.foreign",
+            loweredType: setterPhysical
+        )
+        let getterSymbol = CanonicalSIL.NativeBridgeSymbols.foreignCall(
+            reference: "#CollectionConsumer.values!getter.foreign",
+            loweredType: getterPhysical
+        )
+        let dictionaryCalls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: setterSymbol,
+                parameterTypes: [dictionaryType, .native(consumerType)],
+                resultType: .void,
+                target: .nativeImport(setterRequirement)
+            ),
+            .init(
+                mangledName: getterSymbol,
+                parameterTypes: [.native(consumerType)],
+                resultType: dictionaryType,
+                target: .nativeImport(getterRequirement)
+            ),
+        ])
+        let dictionaryFunction = CanonicalSIL.Function(
+            mangledName: "$s7Fixture15roundTripValuesySDySSSiGAA18CollectionConsumerC_AEtF",
+            loweredType: "@convention(thin) (@guaranteed CollectionConsumer, "
+                + "@guaranteed Dictionary<String, Int>) "
+                + "-> @owned Dictionary<String, Int>",
+            body: """
+            bb0(%0 : @guaranteed $CollectionConsumer, %1 : @guaranteed $Dictionary<String, Int>):
+              %2 = function_ref @$sSD10FoundationE19_bridgeToObjectiveCSo12NSDictionaryCyF : $@convention(method) <τ_0_0, τ_0_1 where τ_0_0 : Hashable> (@guaranteed Dictionary<τ_0_0, τ_0_1>) -> @owned NSDictionary
+              %3 = apply %2<String, Int>(%1) : $@convention(method) <τ_0_0, τ_0_1 where τ_0_0 : Hashable> (@guaranteed Dictionary<τ_0_0, τ_0_1>) -> @owned NSDictionary
+              %4 = objc_method %0, #CollectionConsumer.values!setter.foreign : (CollectionConsumer) -> ([String : Int]) -> (), $\(setterPhysical)
+              %5 = apply %4(%3, %0) : $\(setterPhysical)
+              release_value %3
+              %6 = objc_method %0, #CollectionConsumer.values!getter.foreign : (CollectionConsumer) -> () -> [String : Int], $\(getterPhysical)
+              %7 = apply %6(%0) : $\(getterPhysical)
+              %8 = function_ref @$sSD10FoundationE36_unconditionallyBridgeFromObjectiveCySDyxq_GSo12NSDictionaryCSgFZ : $@convention(method) <τ_0_0, τ_0_1 where τ_0_0 : Hashable> (@guaranteed Optional<NSDictionary>, @thin Dictionary<τ_0_0, τ_0_1>.Type) -> @owned Dictionary<τ_0_0, τ_0_1>
+              %9 = metatype $@thin Dictionary<String, Int>.Type
+              %10 = apply %8<String, Int>(%7, %9) : $@convention(method) <τ_0_0, τ_0_1 where τ_0_0 : Hashable> (@guaranteed Optional<NSDictionary>, @thin Dictionary<τ_0_0, τ_0_1>.Type) -> @owned Dictionary<τ_0_0, τ_0_1>
+              release_value %7
+              return %10
+            """
+        )
+        let loweredDictionary = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            dictionaryFunction,
+            displayName: "Fixture.roundTripValues",
+            directCalls: dictionaryCalls
+        )
+        #expect(
+            loweredDictionary.registerTypes.contains(dictionaryType)
+        )
+        #expect(Set(loweredDictionary.blocks.flatMap(\.instructions).compactMap {
+            instruction -> Core.NativeImportID? in
+            guard case let .nativeApply(_, id, _) = instruction else {
+                return nil
+            }
+            return id
+        }) == [setterRequirement.id, getterRequirement.id])
+
+        let setType = Bytecode.ValueType.set(.string)
+        let setPhysical = "@convention(objc_method) "
+            + "(CollectionConsumer) -> @autoreleased Optional<NSSet>"
+        let setRequirement = try importRequirement(id: 44)
+        let setSymbol = CanonicalSIL.NativeBridgeSymbols.foreignCall(
+            reference: "#CollectionConsumer.names!getter.foreign",
+            loweredType: setPhysical
+        )
+        let setCalls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: setSymbol,
+                parameterTypes: [.native(consumerType)],
+                resultType: setType,
+                target: .nativeImport(setRequirement)
+            ),
+        ])
+        let setFunction = CanonicalSIL.Function(
+            mangledName: "$s7Fixture5namesyShySSGAA18CollectionConsumerCF",
+            loweredType: "@convention(thin) (@guaranteed CollectionConsumer) "
+                + "-> @owned Set<String>",
+            body: """
+            bb0(%0 : @guaranteed $CollectionConsumer):
+              %1 = objc_method %0, #CollectionConsumer.names!getter.foreign : (CollectionConsumer) -> () -> Set<String>, $\(setPhysical)
+              %2 = apply %1(%0) : $\(setPhysical)
+              %3 = function_ref @$sSh10FoundationE36_unconditionallyBridgeFromObjectiveCyShyxGSo5NSSetCSgFZ : $@convention(method) <τ_0_0 where τ_0_0 : Hashable> (@guaranteed Optional<NSSet>, @thin Set<τ_0_0>.Type) -> @owned Set<τ_0_0>
+              %4 = metatype $@thin Set<String>.Type
+              %5 = apply %3<String>(%2, %4) : $@convention(method) <τ_0_0 where τ_0_0 : Hashable> (@guaranteed Optional<NSSet>, @thin Set<τ_0_0>.Type) -> @owned Set<τ_0_0>
+              release_value %2
+              return %5
+            """
+        )
+        let loweredSet = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            setFunction,
+            displayName: "Fixture.names",
+            directCalls: setCalls
+        )
+        #expect(loweredSet.registerTypes.contains(setType))
+        #expect(loweredSet.blocks.flatMap(\.instructions).contains {
+            guard case let .nativeApply(_, id, _) = $0 else { return false }
+            return id == setRequirement.id
+        })
     }
 
     @Test("Foundation native-value bridges preserve the frozen Swift overlay ABI")
@@ -1461,6 +1707,182 @@ struct ImportedFrameworks {
             return result != nil && id == requirement.id
                 && arguments.count == 1
         })
+    }
+
+    @Test("Objective-C Any glue remains logical at a NativeImport boundary")
+    func erasesOptionalAnyObjectGlueAtNativeBoundary() throws {
+        let objectType = Core.TypeID(rawValue: .sha256("Swift.AnyObject"))
+        let centerType = Core.TypeID(
+            rawValue: .sha256("Foundation.NotificationCenter")
+        )
+        let labelType = Core.TypeID(rawValue: .sha256("UIKit.UILabel"))
+        let bridgeRequirement = try importRequirement(
+            id: 51,
+            kind: .staticMethod
+        )
+        let callRequirement = try importRequirement(id: 52)
+        let physicalCall = "@convention(objc_method) "
+            + "(Optional<AnyObject>, NotificationCenter) -> ()"
+        let callSymbol = CanonicalSIL.NativeBridgeSymbols.foreignCall(
+            reference: "#NotificationCenter.consume!foreign",
+            loweredType: physicalCall
+        )
+        let calls = try CanonicalSIL.DirectCallTable([
+            .init(
+                mangledName: CanonicalSIL.NativeBridgeSymbols.anyObjectBridge(
+                    to: objectType
+                ),
+                parameterTypes: [.any],
+                parameterConventions: [.owned],
+                resultType: .native(objectType),
+                target: .nativeImport(bridgeRequirement)
+            ),
+            .init(
+                mangledName: callSymbol,
+                parameterTypes: [.optional(.any), .native(centerType)],
+                resultType: .void,
+                target: .nativeImport(callRequirement)
+            ),
+        ])
+        let environment = try CanonicalSIL.TypeEnvironment.empty
+            .includingNativeTypes(
+                [
+                    "Swift.AnyObject": objectType,
+                    "NotificationCenter": centerType,
+                    "UILabel": labelType,
+                ],
+                kinds: [
+                    objectType: .reference,
+                    centerType: .reference,
+                    labelType: .reference,
+                ]
+            )
+        let opened = "@opened(\"FIXTURE-OPTIONAL-ANY\", Any) Self"
+        let lowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            .init(
+                mangledName: "$s7Fixture7consumeyyF",
+                loweredType: "@convention(thin) "
+                    + "(@guaranteed NotificationCenter) -> ()",
+                body: """
+                bb0(%0 : @guaranteed $NotificationCenter):
+                  %1 = alloc_stack $Optional<Any>
+                  inject_enum_addr %1, #Optional.none!enumelt
+                  switch_enum_addr %1, case #Optional.some!enumelt: bb1, case #Optional.none!enumelt: bb2
+                bb1:
+                  %2 = unchecked_take_enum_data_addr %1, #Optional.some!enumelt
+                  %3 = open_existential_addr immutable_access %2 to $*\(opened)
+                  %4 = alloc_stack $\(opened)
+                  copy_addr %3 to [init] %4
+                  %5 = function_ref @\(CanonicalSIL.AnyObjectBridge.silMangledName) : $@convention(thin) <T> (@in_guaranteed T) -> @owned AnyObject
+                  %6 = apply %5<\(opened)>(%4) : $@convention(thin) <T> (@in_guaranteed T) -> @owned AnyObject
+                  %7 = enum $Optional<AnyObject>, #Optional.some!enumelt, %6
+                  destroy_addr %4
+                  dealloc_stack %4
+                  destroy_addr %2
+                  br bb3(%7)
+                bb2:
+                  %8 = enum $Optional<AnyObject>, #Optional.none!enumelt
+                  br bb3(%8)
+                bb3(%9 : $Optional<AnyObject>):
+                  dealloc_stack %1
+                  %10 = objc_method %0, #NotificationCenter.consume!foreign : (NotificationCenter) -> (Any?) -> (), $\(physicalCall)
+                  %11 = apply %10(%9, %0) : $\(physicalCall)
+                  release_value %9
+                  %12 = tuple ()
+                  return %12
+                """
+            ),
+            displayName: "Fixture.consume",
+            directCalls: calls
+        )
+        let merged = try #require(
+            lowered.blocks.first { $0.id.rawValue == 3 }
+        )
+        let parameter = try #require(merged.parameters.first)
+        #expect(
+            lowered.registerTypes[Int(parameter.rawValue)] == .optional(.any)
+        )
+        let imports = lowered.blocks.flatMap(\.instructions).compactMap {
+            instruction -> Core.NativeImportID? in
+            guard case let .nativeApply(_, id, _) = instruction else {
+                return nil
+            }
+            return id
+        }
+        #expect(imports == [callRequirement.id])
+
+        let stringBridgeType = "@convention(method) (@guaranteed String) "
+            + "-> @owned NSString"
+        let stringLowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            .init(
+                mangledName: "$s7Fixture13consumeStringyyF",
+                loweredType: "@convention(thin) "
+                    + "(@guaranteed NotificationCenter, @guaranteed String) -> ()",
+                body: """
+                bb0(%0 : @guaranteed $NotificationCenter, %1 : @guaranteed $String):
+                  %2 = function_ref @$sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF : $\(stringBridgeType)
+                  %3 = apply %2(%1) : $\(stringBridgeType)
+                  %4 = init_existential_ref %3 : $NSString : $NSString, $AnyObject
+                  %5 = enum $Optional<AnyObject>, #Optional.some!enumelt, %4
+                  %6 = objc_method %0, #NotificationCenter.consume!foreign : (NotificationCenter) -> (Any?) -> (), $\(physicalCall)
+                  %7 = apply %6(%5, %0) : $\(physicalCall)
+                  release_value %5
+                  %8 = tuple ()
+                  return %8
+                """
+            ),
+            displayName: "Fixture.consumeString",
+            directCalls: calls
+        )
+        let stringImports = stringLowered.blocks.flatMap(\.instructions)
+            .compactMap { instruction -> Core.NativeImportID? in
+                guard case let .nativeApply(_, id, _) = instruction else {
+                    return nil
+                }
+                return id
+            }
+        #expect(stringImports == [callRequirement.id])
+
+        let nativeLowered = try CanonicalSIL.Lowerer(
+            typeEnvironment: environment
+        ).lower(
+            .init(
+                mangledName: "$s7Fixture13consumeLabelyyF",
+                loweredType: "@convention(thin) "
+                    + "(@guaranteed NotificationCenter, @guaranteed UILabel) -> ()",
+                body: """
+                bb0(%0 : @guaranteed $NotificationCenter, %1 : @guaranteed $UILabel):
+                  strong_retain %1
+                  %2 = init_existential_ref %1 : $UILabel : $UILabel, $AnyObject
+                  %3 = enum $Optional<AnyObject>, #Optional.some!enumelt, %2
+                  %4 = objc_method %0, #NotificationCenter.consume!foreign : (NotificationCenter) -> (Any?) -> (), $\(physicalCall)
+                  %5 = apply %4(%3, %0) : $\(physicalCall)
+                  release_value %3
+                  %6 = tuple ()
+                  return %6
+                """
+            ),
+            displayName: "Fixture.consumeLabel",
+            directCalls: calls
+        )
+        let nativeInstructions = nativeLowered.blocks.flatMap(\.instructions)
+        #expect(nativeInstructions.contains { instruction in
+            guard case let .eraseToAny(_, _, dynamicType) = instruction else {
+                return false
+            }
+            return dynamicType == .native(labelType)
+        })
+        #expect(nativeInstructions.compactMap { instruction
+            -> Core.NativeImportID? in
+            guard case let .nativeApply(_, id, _) = instruction else {
+                return nil
+            }
+            return id
+        } == [callRequirement.id])
     }
 
     @Test("Optional.some materializes one owner for a borrowed linear payload")

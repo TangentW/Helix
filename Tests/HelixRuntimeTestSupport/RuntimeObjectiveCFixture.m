@@ -187,6 +187,10 @@ HelixRuntimeTestObject *HelixRuntimeTestMakeIncompatibleEchoObject(void) {
     _invocationCount += 1;
 }
 
+- (id)identityObject:(id)object {
+    return object;
+}
+
 - (float)scaleFloat:(float)value {
     return value * 2.0f;
 }

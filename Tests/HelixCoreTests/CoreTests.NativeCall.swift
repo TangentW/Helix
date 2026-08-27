@@ -5,6 +5,14 @@ import Testing
 extension CoreTests {
 @Suite("Stable native call descriptors")
 struct NativeCall {
+    @Test("Void spelling is compared semantically")
+    func recognizesVoidSpellings() {
+        #expect(Core.NativeCall.isVoid("Swift.Void"))
+        #expect(Core.NativeCall.isVoid("Void"))
+        #expect(Core.NativeCall.isVoid("()"))
+        #expect(!Core.NativeCall.isVoid("(Swift.Int, Swift.Int)"))
+    }
+
     @Test("Equivalent Swift spelling produces one project-independent key")
     func canonicalIdentity() throws {
         let effects = Core.Effects(requiresMainActor: true)
@@ -580,6 +588,86 @@ struct NativeCall {
         }
     }
 
+    @Test("Objective-C selectors may contain unnamed argument pieces")
+    func validatesObjectiveCUnnamedSelectorPieces() throws {
+        let contract = Core.NativeImportContract.bounded(
+            kind: .initializer,
+            domain: .application,
+            access: .read,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: false
+        )
+        let float = Core.NativeCall.ABIType(
+            kind: .floatingPoint,
+            canonicalName: "Swift.Float",
+            size: 4,
+            alignment: 4,
+            encoding: "f"
+        )
+        let physicalParameters = (0..<4).map { index in
+            Core.NativeCall.ABIParameter(
+                type: float,
+                source: .argument(UInt16(index))
+            )
+        }
+        let result = Core.NativeCall.ABIType(
+            kind: .object,
+            canonicalName: "CAMediaTimingFunction",
+            encoding: "@"
+        )
+        let descriptor = try Core.NativeCall.Descriptor.objectiveCMessage(
+            module: "QuartzCore",
+            owner: "CAMediaTimingFunction",
+            member: "init(controlPoints:_:_:_:)",
+            selector: "initWithControlPoints::::",
+            dispatch: .initializer,
+            receiverArgumentIndex: nil,
+            signature: .init(
+                parameters: Array(repeating: "Swift.Float", count: 4),
+                result: "QuartzCore.CAMediaTimingFunction"
+            ),
+            effects: .init(mayAllocate: true),
+            contract: contract,
+            physicalSignature: .init(
+                callingConvention: .objectiveC,
+                parameters: physicalParameters,
+                result: result,
+                resultConvention: .directOwned
+            ),
+            metadata: .init(
+                runtimeClassName: "CAMediaTimingFunction",
+                dispatchClassName: "CAMediaTimingFunction",
+                methodFamily: .initializer
+            )
+        )
+        try descriptor.validate(contract: contract)
+
+        #expect(throws: Core.NativeCall.DescriptorError.self) {
+            try Core.NativeCall.Descriptor.objectiveCMessage(
+                module: "QuartzCore",
+                owner: "CAMediaTimingFunction",
+                member: "invalid(_:_:_:_:)",
+                selector: ":invalid:::",
+                dispatch: .static,
+                receiverArgumentIndex: nil,
+                signature: descriptor.loweredSignature,
+                effects: descriptor.effects,
+                contract: Core.NativeImportContract.bounded(
+                    kind: .staticMethod,
+                    domain: .application,
+                    access: .read,
+                    maximumDurationMicroseconds: 500,
+                    allowsMainThread: false
+                ),
+                physicalSignature: descriptor.physicalSignature,
+                metadata: .init(
+                    runtimeClassName: "CAMediaTimingFunction",
+                    dispatchClassName: "CAMediaTimingFunction"
+                )
+            )
+        }
+    }
+
     @Test("Objective-C ownership families cannot be hidden by a false convention")
     func validatesObjectiveCMethodFamilies() throws {
         let contract = Core.NativeImportContract.bounded(
@@ -700,6 +788,12 @@ struct NativeCall {
         #expect(decoded == descriptor)
         #expect(try Core.NativeCall.Key.derive(descriptor: decoded)
             == Core.NativeCall.Key.derive(descriptor: descriptor))
+        var expectedHasher = Core.StableHasher(domain: "HLX.NativeCall.v1")
+        expectedHasher.append(bytes)
+        #expect(
+            try Core.NativeCall.Key.derive(descriptor: descriptor).rawValue
+                == expectedHasher.finalize()
+        )
     }
 
     @Test("C descriptors require a direct compiler-proven physical ABI")

@@ -76,8 +76,13 @@ public struct ObjectiveCInvoker: VM.NativeInvoker {
                 constructionFailure ?? "Objective-C descriptor metadata is missing"
             )
         }
-        guard arguments.count == parameterTypes.count,
-              zip(arguments, parameterTypes).allSatisfy({ $0.0.matches($0.1) })
+        guard VM.NativeInvocationABI.argumentsAreCompatible(
+            arguments,
+            with: parameterTypes,
+            callbackParameterIndices: Set(
+                contract.callbacks.map { Int($0.parameterIndex) }
+            )
+        )
         else {
             throw VM.RuntimeTrap.nativeFailure(
                 "Objective-C invocation arguments disagree with verified types"

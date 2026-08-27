@@ -385,8 +385,11 @@ public struct Archive: Codable, Hashable, Sendable {
             frozenValueTypes: frozenValueTypes,
             bridgeRegistrationCount: bridgeRegistrationCount
         ).normalized()
-        archive.shellInterfaceHash = try archive.computeShellInterfaceHash()
-        try archive.validate()
+        let computedShellInterfaceHash = try archive.computeShellInterfaceHash()
+        archive.shellInterfaceHash = computedShellInterfaceHash
+        try archive.validate(
+            computedShellInterfaceHash: computedShellInterfaceHash
+        )
         return archive
     }
 
@@ -437,6 +440,12 @@ public struct Archive: Codable, Hashable, Sendable {
     }
 
     public func validate() throws {
+        try validate(computedShellInterfaceHash: nil)
+    }
+
+    private func validate(
+        computedShellInterfaceHash: Core.Digest?
+    ) throws {
         guard schemaVersion == Self.currentSchemaVersion else {
             throw InterfaceArchive.Error.unsupportedSchema(schemaVersion)
         }
@@ -470,7 +479,9 @@ public struct Archive: Codable, Hashable, Sendable {
             throw InterfaceArchive.Error.invalidArchive("capabilities are not unique")
         }
         try validateFrozenValueTypes()
-        guard shellInterfaceHash.constantTimeEquals(try computeShellInterfaceHash()) else {
+        let expectedShellInterfaceHash = try computedShellInterfaceHash
+            ?? computeShellInterfaceHash()
+        guard shellInterfaceHash.constantTimeEquals(expectedShellInterfaceHash) else {
             throw InterfaceArchive.Error.interfaceHashMismatch
         }
         guard Set(sources.map(\.logicalPath)).count == sources.count,
@@ -574,76 +585,104 @@ public struct Archive: Codable, Hashable, Sendable {
             guard let first = variants.first else { continue }
             var baseContract = first.contract
             baseContract.callbacks = []
-            var parameterTypeByPhysicalIndex: [UInt16: Bytecode.ValueType] = [:]
-            var defaultByPhysicalIndex: [
-                UInt16: InterfaceArchive.NativeImportDefaultArgument
-            ] = [:]
-            var projections = Set<[UInt16]>()
-            var callbackLifetimeByPhysicalIndex: [
-                UInt16: Core.NativeImportCallbackLifetime
-            ] = [:]
+            var accepted: [InterfaceArchive.NativeImportRecord] = []
             for variant in variants {
                 var variantBaseContract = variant.contract
                 variantBaseContract.callbacks = []
-                guard variant.parameterProjection.physicalParameterCount
+                guard variant.parameterProjection.isValid(
+                        logicalParameterCount: variant.parameterTypes.count
+                      ),
+                      variant.parameterProjection.physicalParameterCount
                         == first.parameterProjection.physicalParameterCount,
-                      variant.resultType == first.resultType,
                       variant.effects == first.effects,
                       variantBaseContract == baseContract,
                       variant.capability == first.capability,
                       variant.isEmittedToDevice == first.isEmittedToDevice,
-                      variant.abiAdapter == first.abiAdapter,
-                      projections.insert(
-                          variant.parameterProjection.logicalParameterIndices
-                      ).inserted
+                      variant.abiAdapter == first.abiAdapter
                 else {
                     throw InterfaceArchive.Error.invalidArchive(
                         "native import symbol \(symbol) has inconsistent physical variants"
                     )
                 }
-                for (physicalIndex, type) in zip(
-                    variant.parameterProjection.logicalParameterIndices,
-                    variant.parameterTypes
-                ) {
-                    if let existing = parameterTypeByPhysicalIndex[physicalIndex],
-                       existing != type {
+                for existing in accepted {
+                    let projection = variant.parameterProjection
+                        .logicalParameterIndices
+                    let existingProjection = existing.parameterProjection
+                        .logicalParameterIndices
+                    if projection == existingProjection {
+                        // Swift generic and protocol-extension implementations
+                        // keep one SIL symbol and projection while the concrete
+                        // apply substitution changes the logical value ABI.
+                        // The compiler selects these variants from the
+                        // specialized function type, so duplicate logical
+                        // signatures remain forbidden.
+                        guard variant.parameterProjection
+                                == existing.parameterProjection,
+                              variant.contract.callbacks
+                                == existing.contract.callbacks,
+                              variant.parameterTypes != existing.parameterTypes
+                                || variant.resultType != existing.resultType
+                        else {
+                            throw InterfaceArchive.Error.invalidArchive(
+                                "native import symbol \(symbol) has duplicate logical variants"
+                            )
+                        }
+                        continue
+                    }
+                    guard variant.resultType == existing.resultType else {
+                        throw InterfaceArchive.Error.invalidArchive(
+                            "native import symbol \(symbol) has inconsistent physical variants"
+                        )
+                    }
+                    let types = Dictionary(uniqueKeysWithValues: zip(
+                        projection,
+                        variant.parameterTypes
+                    ))
+                    let existingTypes = Dictionary(uniqueKeysWithValues: zip(
+                        existingProjection,
+                        existing.parameterTypes
+                    ))
+                    for index in Set(types.keys).intersection(existingTypes.keys)
+                    where types[index] != existingTypes[index] {
                         throw InterfaceArchive.Error.invalidArchive(
                             "native import symbol \(symbol) changes a physical parameter type"
                         )
                     }
-                    parameterTypeByPhysicalIndex[physicalIndex] = type
-                }
-                for defaultArgument in variant.parameterProjection.defaultArguments {
-                    let index = defaultArgument.physicalParameterIndex
-                    if let existing = defaultByPhysicalIndex[index],
-                       existing != defaultArgument {
+                    let defaults = Dictionary(uniqueKeysWithValues:
+                        variant.parameterProjection.defaultArguments.map {
+                            ($0.physicalParameterIndex, $0)
+                        }
+                    )
+                    let existingDefaults = Dictionary(uniqueKeysWithValues:
+                        existing.parameterProjection.defaultArguments.map {
+                            ($0.physicalParameterIndex, $0)
+                        }
+                    )
+                    for index in Set(defaults.keys).intersection(
+                        existingDefaults.keys
+                    ) where defaults[index] != existingDefaults[index] {
                         throw InterfaceArchive.Error.invalidArchive(
                             "native import symbol \(symbol) changes default-argument provenance"
                         )
                     }
-                    defaultByPhysicalIndex[index] = defaultArgument
-                }
-                for callback in variant.contract.callbacks {
-                    let logicalIndex = Int(callback.parameterIndex)
-                    guard variant.parameterProjection.logicalParameterIndices.indices
-                        .contains(logicalIndex)
-                    else {
-                        throw InterfaceArchive.Error.invalidArchive(
-                            "native import symbol \(symbol) has an invalid callback projection"
+                    let callbacks = try Self.callbackLifetimesByPhysicalIndex(
+                        variant,
+                        symbol: symbol
+                    )
+                    let existingCallbacks = try Self
+                        .callbackLifetimesByPhysicalIndex(
+                            existing,
+                            symbol: symbol
                         )
-                    }
-                    let physicalIndex = variant.parameterProjection
-                        .logicalParameterIndices[logicalIndex]
-                    if let existing = callbackLifetimeByPhysicalIndex[
-                        physicalIndex
-                    ], existing != callback.lifetime {
+                    for index in Set(callbacks.keys).intersection(
+                        existingCallbacks.keys
+                    ) where callbacks[index] != existingCallbacks[index] {
                         throw InterfaceArchive.Error.invalidArchive(
                             "native import symbol \(symbol) changes a physical callback lifetime"
                         )
                     }
-                    callbackLifetimeByPhysicalIndex[physicalIndex] =
-                        callback.lifetime
                 }
+                accepted.append(variant)
             }
         }
         for item in nativeImports {
@@ -1069,6 +1108,34 @@ public struct Archive: Codable, Hashable, Sendable {
                 )
             }.sorted { $0.definition.key < $1.definition.key }
         )
+    }
+
+    private static func callbackLifetimesByPhysicalIndex(
+        _ record: InterfaceArchive.NativeImportRecord,
+        symbol: String
+    ) throws -> [UInt16: Core.NativeImportCallbackLifetime] {
+        var result: [UInt16: Core.NativeImportCallbackLifetime] = [:]
+        for callback in record.contract.callbacks {
+            let logicalIndex = Int(callback.parameterIndex)
+            guard record.parameterProjection.logicalParameterIndices.indices
+                    .contains(logicalIndex)
+            else {
+                throw InterfaceArchive.Error.invalidArchive(
+                    "native import symbol \(symbol) has an invalid callback projection"
+                )
+            }
+            let physicalIndex = record.parameterProjection
+                .logicalParameterIndices[logicalIndex]
+            guard result.updateValue(
+                callback.lifetime,
+                forKey: physicalIndex
+            ) == nil else {
+                throw InterfaceArchive.Error.invalidArchive(
+                    "native import symbol \(symbol) has a duplicate physical callback"
+                )
+            }
+        }
+        return result
     }
 
     private static func isSafeLogicalPath(_ path: String) -> Bool {

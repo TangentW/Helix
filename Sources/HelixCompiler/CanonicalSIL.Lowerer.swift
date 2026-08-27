@@ -8,120 +8,8 @@ public struct Lowerer: Sendable {
     private let typeEnvironment: CanonicalSIL.TypeEnvironment
     private let sourceFile: CanonicalSIL.File?
 
-    /// Swift emits these Foundation bridges around imported Objective-C APIs.
-    /// HLBC calls a generated, Swift-typed NativeImport instead, so lowering
-    /// preserves the Swift value while validating the exact compiler bridge.
-    private enum ObjectiveCBridgeIntrinsic: Equatable {
-        case stringToObjectiveC
-        case stringFromObjectiveC
-        case arrayToObjectiveC
-        case arrayFromObjectiveC
-        case nativeValueToObjectiveC
-
-        init?(mangledName: String, loweredType: String) {
-            switch mangledName {
-            case "$sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF":
-                self = .stringToObjectiveC
-            case "$sSS10FoundationE36_unconditionallyBridgeFromObjectiveCySSSo8NSStringCSgFZ":
-                self = .stringFromObjectiveC
-            case "$sSa10FoundationE19_bridgeToObjectiveCSo7NSArrayCyF":
-                self = .arrayToObjectiveC
-            case "$sSa10FoundationE36_unconditionallyBridgeFromObjectiveCySayxGSo7NSArrayCSgFZ":
-                self = .arrayFromObjectiveC
-            default:
-                guard mangledName.hasPrefix("$s10Foundation"),
-                      mangledName.contains("19_bridgeToObjectiveC")
-                else { return nil }
-                self = .nativeValueToObjectiveC
-            }
-            guard accepts(loweredType: loweredType) else { return nil }
-        }
-
-        func accepts(loweredType: String) -> Bool {
-            let normalized = loweredType
-                .replacingOccurrences(of: "Swift.", with: "")
-                .filter { !$0.isWhitespace }
-            return switch self {
-            case .stringToObjectiveC:
-                normalized
-                    == "@convention(method)(@guaranteedString)->@ownedNSString"
-            case .stringFromObjectiveC:
-                normalized
-                    == "@convention(method)(@guaranteedOptional<NSString>,@thinString.Type)->@ownedString"
-            case .arrayToObjectiveC:
-                normalized.hasPrefix("@convention(method)<τ_0_0>")
-                    && normalized.hasSuffix("(@guaranteedArray<τ_0_0>)->@ownedNSArray")
-            case .arrayFromObjectiveC:
-                normalized.hasPrefix("@convention(method)<τ_0_0>")
-                    && normalized.hasSuffix(
-                        "(@guaranteedOptional<NSArray>,@thinArray<τ_0_0>.Type)->@ownedArray<τ_0_0>"
-                    )
-            case .nativeValueToObjectiveC:
-                Self.acceptsNativeValueToObjectiveC(normalized)
-            }
-        }
-
-        private static func acceptsNativeValueToObjectiveC(
-            _ normalized: String
-        ) -> Bool {
-            guard normalized.utf8.count <= 8_192 else { return false }
-            let convention = "@convention(method)"
-            let ownershipPrefixes = [
-                "(@in_guaranteed", "(@guaranteed",
-            ]
-            guard let ownership = ownershipPrefixes.compactMap({ prefix in
-                normalized.range(of: prefix).map { (prefix, $0) }
-            }).min(by: { $0.1.lowerBound < $1.1.lowerBound })
-            else { return false }
-            let functionPrefix = normalized[..<ownership.1.lowerBound]
-            guard functionPrefix == convention
-                    || functionPrefix.hasPrefix(convention + "<")
-                        && functionPrefix.hasSuffix(">")
-                        && hasBalancedAngles(
-                            functionPrefix.dropFirst(convention.count)
-                        )
-            else { return false }
-            let separator = ")->@owned"
-            guard let separatorRange = normalized.range(
-                of: separator,
-                options: .backwards
-            ),
-                  separatorRange.upperBound < normalized.endIndex
-            else { return false }
-            let sourceStart = ownership.1.upperBound
-            let source = normalized[sourceStart..<separatorRange.lowerBound]
-            let target = normalized[separatorRange.upperBound...]
-            return isNominalTypeSpelling(source)
-                && isNominalTypeSpelling(target)
-        }
-
-        private static func isNominalTypeSpelling(
-            _ value: Substring
-        ) -> Bool {
-            !value.isEmpty
-                && hasBalancedAngles(value)
-                && value.allSatisfy {
-                    $0 == "_" || $0 == "." || $0 == "," || $0 == ":"
-                        || $0 == "&" || $0 == "?" || $0 == "<" || $0 == ">"
-                        || $0.isLetter || $0.isNumber
-                }
-        }
-
-        private static func hasBalancedAngles(
-            _ value: Substring
-        ) -> Bool {
-            var depth = 0
-            for character in value {
-                if character == "<" {
-                    depth += 1
-                } else if character == ">" {
-                    depth -= 1
-                    if depth < 0 { return false }
-                }
-            }
-            return depth == 0
-        }
-    }
+    private typealias ObjectiveCBridgeIntrinsic =
+        CanonicalSIL.ForeignRepresentation.ObjectiveCBridgeIntrinsic
 
     private struct PendingArrayLiteral {
         var elementType: Bytecode.ValueType
@@ -640,6 +528,7 @@ public struct Lowerer: Sendable {
         var storageInitializationPlan: CanonicalSIL.StorageInitialization.Plan
         var existentialInitializationPlan: CanonicalSIL.ExistentialInitialization.Plan
         var nsErrorBridges: CanonicalSIL.NSErrorBridgePlan
+        var foreignRepresentationPlan: CanonicalSIL.ForeignRepresentation.Plan
     }
 
     public init(typeEnvironment: CanonicalSIL.TypeEnvironment = .empty) {
@@ -756,6 +645,12 @@ public struct Lowerer: Sendable {
             function: function,
             directCalls: directCalls
         )
+        let foreignRepresentationPlan = try CanonicalSIL
+            .ForeignRepresentation.Plan.analyze(
+                body: normalizedBody,
+                function: function,
+                directCalls: directCalls
+            )
         return .init(
             signature: signature,
             hostedMethodContext: hostedMethodContext,
@@ -764,7 +659,8 @@ public struct Lowerer: Sendable {
             normalizedBody: normalizedBody,
             storageInitializationPlan: storageInitializationPlan,
             existentialInitializationPlan: existentialInitializationPlan,
-            nsErrorBridges: nsErrorBridges
+            nsErrorBridges: nsErrorBridges,
+            foreignRepresentationPlan: foreignRepresentationPlan
         )
     }
 
@@ -792,6 +688,7 @@ public struct Lowerer: Sendable {
         let mutableCapturePointees =
             storageInitializationPlan.mutableCapturePointees
         let nsErrorBridges = preparation.nsErrorBridges
+        let foreignRepresentationPlan = preparation.foreignRepresentationPlan
         let rawLines = normalizedBody.split(
             separator: "\n",
             omittingEmptySubsequences: false
@@ -917,6 +814,7 @@ public struct Lowerer: Sendable {
         var observedBranchParameterTypes: [
             Bytecode.BlockID: [Bytecode.ValueType]
         ] = [:]
+        var foreignRepresentationBridgedBlocks = Set<Bytecode.BlockID>()
         var declaredBlockIDs = Set<Bytecode.BlockID>()
         for rawLine in rawLines {
             let instruction = CanonicalSIL.DebugMetadata.strippingMetadata(
@@ -940,8 +838,7 @@ public struct Lowerer: Sendable {
                 guard let parameter = match(
                     component,
                     pattern: #"^%[0-9]+\s*:\s*(.+)$"#
-                ), let type = try? parseType(parameter[0])
-                else {
+                ) else {
                     // Metatypes and other compiler-only block parameters are
                     // interpreted by the authoritative block parser. This
                     // optional prepass exists only to normalize provable
@@ -949,7 +846,30 @@ public struct Lowerer: Sendable {
                     hasOnlyStorableParameters = false
                     break
                 }
-                parameterTypes.append(ValueRepresentation.storable(type))
+                let valueToken = component.split(
+                    separator: ":",
+                    maxSplits: 1
+                )[0].trimmingCharacters(in: .whitespaces)
+                if let logicalType = foreignRepresentationPlan.logicalType(
+                    for: valueToken
+                ) {
+                    guard isSupportedObjectiveCBridgeSpelling(
+                        parameter[0],
+                        to: logicalType,
+                        allowingForeignABIRepresentation: true
+                    ) else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "foreign representation plan does not match block parameter \(valueToken)"
+                        )
+                    }
+                    parameterTypes.append(logicalType)
+                    foreignRepresentationBridgedBlocks.insert(id)
+                } else if let type = try? parseType(parameter[0]) {
+                    parameterTypes.append(ValueRepresentation.storable(type))
+                } else {
+                    hasOnlyStorableParameters = false
+                    break
+                }
             }
             if hasOnlyStorableParameters {
                 declaredBlockParameterTypes[id] = parameterTypes
@@ -1463,6 +1383,13 @@ public struct Lowerer: Sendable {
             expectedType: Bytecode.ValueType? = nil,
             line: Int
         ) throws -> Bytecode.Register {
+            if let expectedType,
+               let contextualNone = try materializeContextualOptionalNone(
+                   token,
+                   as: expectedType
+               ) {
+                return contextualNone
+            }
             var value = try resolveStorableValue(
                 token,
                 line: line
@@ -3102,6 +3029,46 @@ public struct Lowerer: Sendable {
             try materializeZeroSizedValue(type: ValueRepresentation.unit)
         }
 
+        /// Optional.none has no payload whose representation can disagree.
+        /// Swift may nevertheless print a concrete physical wrapper before a
+        /// source-level `nil` reaches a more general logical boundary. Create
+        /// a new contextual value instead of mutating the old register type;
+        /// copies and their ownership instructions must retain one exact type.
+        func materializeContextualOptionalNone(
+            _ token: String,
+            as expectedType: Bytecode.ValueType
+        ) throws -> Bytecode.Register? {
+            guard inlineOptionalNoneValues.contains(token),
+                  let source = values[token],
+                  case .optional = registerTypes[Int(source.rawValue)],
+                  case .optional = expectedType,
+                  registerTypes[Int(source.rawValue)] != expectedType
+            else { return nil }
+            let actualType = registerTypes[Int(source.rawValue)]
+            let isCompatibleDeferredBlock: Bool
+            if case .optional(.never) = actualType,
+               case let .optional(expectedWrapped) = expectedType,
+               let physicalBlock = deferredNativeBlockNoneTypes[token] {
+                isCompatibleDeferredBlock = isSupportedBlockBridgeSpelling(
+                    physicalBlock,
+                    to: expectedWrapped
+                )
+            } else {
+                isCompatibleDeferredBlock = false
+            }
+            guard isCompatibleDeferredBlock else { return nil }
+            let result = try allocate(type: expectedType)
+            appendInstruction(.makeOptionalNone(result: result))
+            while let retained = takePendingRetainedValue(for: token) {
+                appendInstruction(.destroyValue(retained))
+            }
+            releaseCompilerTemporariesAfterLastUse(
+                [token],
+                after: currentSILLineIndex
+            )
+            return result
+        }
+
         func materializeZeroSizedValue(
             type: Bytecode.ValueType
         ) throws -> Bytecode.Register {
@@ -3203,27 +3170,16 @@ public struct Lowerer: Sendable {
                         line: line
                     )
                 }
-                if actualType != expectedType,
-                   inlineOptionalNoneValues.contains(token),
-                   case .optional(.never) = actualType,
-                   case let .optional(expectedWrapped) = expectedType,
-                   let physicalBlock = deferredNativeBlockNoneTypes[token],
-                   isSupportedBlockBridgeSpelling(
-                       physicalBlock,
-                       to: expectedWrapped
-                   ) {
-                    // A deferred Clang block has no standalone VM type, while
-                    // Optional.none has no payload. Rebind only that explicit
-                    // placeholder; a concrete Optional<T>.none must still
-                    // agree with the callee's frozen type.
-                    registerTypes[registerIndex] = expectedType
-                    return value
-                }
                 guard actualType == expectedType else {
+                    let instruction = rawLines.indices.contains(line - 1)
+                        ? rawLines[line - 1].trimmingCharacters(
+                            in: .whitespacesAndNewlines
+                        )
+                        : "unknown"
                     throw CanonicalSIL.LoweringError.malformedSIL(
                         "stored value \(token) in \(displayName) at SIL line \(line) has type "
                             + "\(actualType), expected "
-                            + "\(expectedType)"
+                            + "\(expectedType); instruction: \(instruction)"
                     )
                 }
             }
@@ -3272,13 +3228,15 @@ public struct Lowerer: Sendable {
             _ arguments: [Bytecode.Register],
             binding: CanonicalSIL.DirectCallBinding
         ) -> Bool {
-            guard arguments.count == binding.parameterTypes.count else {
-                return false
-            }
-            return zip(arguments, binding.parameterTypes).allSatisfy {
-                argument, expected in
-                registerTypes[Int(argument.rawValue)] == expected
-            }
+            Bytecode.NativeCallbackABI.argumentsAreCompatible(
+                actual: arguments.map {
+                    registerTypes[Int($0.rawValue)]
+                },
+                boundary: binding.parameterTypes,
+                callbackParameterIndices: nativeCallbackParameterIndices(
+                    for: binding
+                )
+            )
         }
 
         func prepareDirectCallArguments(
@@ -3334,17 +3292,39 @@ public struct Lowerer: Sendable {
                         )
                     }
                     if boundaryConvention == .owned {
-                        value = try prepareOwnedValue(
-                            token,
-                            expectedType: logicalType,
-                            line: line
-                        )
-                    } else {
                         let source = try resolveStorableValue(
                             token,
                             line: line
                         )
-                        if registerTypes[Int(source.rawValue)] == logicalType {
+                        let actual = registerTypes[Int(source.rawValue)]
+                        value = if Bytecode.NativeCallbackABI
+                            .isMainActorRestriction(
+                                actual,
+                                of: logicalType
+                            ) {
+                            try prepareOwnedValue(token, line: line)
+                        } else {
+                            try prepareOwnedValue(
+                                token,
+                                expectedType: logicalType,
+                                line: line
+                            )
+                        }
+                    } else {
+                        let contextualNone = try
+                            materializeContextualOptionalNone(
+                                token,
+                                as: logicalType
+                            )
+                        let source = try contextualNone
+                            ?? resolveStorableValue(token, line: line)
+                        let actual = registerTypes[Int(source.rawValue)]
+                        if actual == logicalType
+                            || Bytecode.NativeCallbackABI
+                                .isMainActorRestriction(
+                                    actual,
+                                    of: logicalType
+                                ) {
                             value = source
                         } else {
                             value = try copyRestrictingClosure(
@@ -3355,9 +3335,19 @@ public struct Lowerer: Sendable {
                             )
                             temporaryOwners.append(value)
                         }
+                        if contextualNone != nil,
+                           requiresManagedOwnership(actual) {
+                            temporaryOwners.append(source)
+                        }
                     }
                     let actual = registerTypes[Int(value.rawValue)]
-                    guard actual == logicalType else {
+                    guard actual == logicalType
+                            || Bytecode.NativeCallbackABI
+                                .isMainActorRestriction(
+                                    actual,
+                                    of: logicalType
+                                )
+                    else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
                             "NativeImport callback argument does not match its callable ABI"
                         )
@@ -3472,10 +3462,13 @@ public struct Lowerer: Sendable {
                             line: line
                         )
                     } else {
-                        let source = try resolveStorableValue(
-                            token,
-                            line: line
-                        )
+                        let contextualNone = try
+                            materializeContextualOptionalNone(
+                                token,
+                                as: logicalType
+                            )
+                        let source = try contextualNone
+                            ?? resolveStorableValue(token, line: line)
                         if registerTypes[Int(source.rawValue)] == logicalType {
                             value = source
                         } else {
@@ -3486,6 +3479,12 @@ public struct Lowerer: Sendable {
                                 line: line
                             )
                             temporaryOwners.append(value)
+                        }
+                        if contextualNone != nil,
+                           requiresManagedOwnership(
+                               registerTypes[Int(source.rawValue)]
+                           ) {
+                            temporaryOwners.append(source)
                         }
                     }
                 }
@@ -3669,24 +3668,35 @@ public struct Lowerer: Sendable {
                     mangledName: symbol
                 )
             }
-            let physicalSpellings = try physicalValueParameterSpellings(
-                in: loweredType
-            )
-            let variants: [ResolvedFunctionReference] = try bindings.map { binding in
+            let physicalSpellings = try physicalValueParameterSpellings(in: loweredType)
+            func resolve(
+                _ binding: CanonicalSIL.DirectCallBinding
+            ) throws -> ResolvedFunctionReference {
                 let bridge: (
                     parameters: [Bytecode.ValueType],
                     result: Bytecode.ValueType
                 )? = bridgesPhysicalTypes
                     ? (binding.parameterTypes, binding.resultType) : nil
-                let callee = try parseFunctionType(
-                    loweredType,
-                    bridgingTo: bridge,
-                    parameterProjection: binding.parameterProjection,
-                    abiAdapter: binding.abiAdapter,
-                    preservingClosureOwnership:
-                        preservesPhysicalClosureOwnership(for: binding),
-                    allowingForeignABIRepresentation: usesObjectiveCBridge
-                )
+                let callee = try {
+                    do {
+                        return try parseFunctionType(
+                            loweredType,
+                            bridgingTo: bridge,
+                            parameterProjection: binding.parameterProjection,
+                            abiAdapter: binding.abiAdapter,
+                            preservingClosureOwnership:
+                                preservesPhysicalClosureOwnership(for: binding),
+                            allowingForeignABIRepresentation:
+                                usesObjectiveCBridge
+                        )
+                    } catch let error as CanonicalSIL.LoweringError {
+                        throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                            line: line,
+                            mangledName: symbol,
+                            detail: error.description
+                        )
+                    }
+                }()
                 guard callee.parameters == binding.parameterTypes,
                       acceptsPhysicalConventions(
                           callee.parameterConventions,
@@ -3720,6 +3730,23 @@ public struct Lowerer: Sendable {
                     erasedMetatypes: callee.erasedMetatypes,
                     usesObjectiveCBridge: usesObjectiveCBridge
                 )
+            }
+            if bindings.count == 1, let binding = bindings.first {
+                return .init(variants: [try resolve(binding)])
+            }
+            let variants = bindings.compactMap { binding in
+                try? resolve(binding)
+            }
+            guard !variants.isEmpty else {
+                guard let first = bindings.first else {
+                    throw CanonicalSIL.LoweringError.unboundCallee(
+                        line: line,
+                        mangledName: symbol
+                    )
+                }
+                // Re-run one candidate to preserve its precise type diagnostic
+                // when no frozen logical specialization matches.
+                return .init(variants: [try resolve(first)])
             }
             return .init(variants: variants)
         }
@@ -5681,6 +5708,38 @@ public struct Lowerer: Sendable {
                     detail: error.description
                 )
             }
+            let nativeBindings = deferred.bindings.filter { binding in
+                guard binding.genericSpecialization == nil,
+                      case .nativeImport = binding.target
+                else { return false }
+                return true
+            }
+            if nativeBindings.count == deferred.bindings.count {
+                let concreteLoweredType: String
+                do {
+                    concreteLoweredType = try CanonicalSIL.GenericFunction
+                        .substituteLoweredType(
+                            deferred.loweredType,
+                            arguments: rawArguments
+                        )
+                } catch let error as CanonicalSIL.GenericFunction
+                    .SpecializationError {
+                    throw CanonicalSIL.LoweringError.callSignatureMismatch(
+                        line: line,
+                        mangledName: deferred.symbol,
+                        detail: error.description
+                    )
+                }
+                let references = try resolveFunctionReferenceSet(
+                    bindings: nativeBindings,
+                    loweredType: concreteLoweredType,
+                    bridgesPhysicalTypes: true,
+                    usesObjectiveCBridge: false,
+                    symbol: deferred.symbol,
+                    line: line
+                )
+                return (references, concreteLoweredType)
+            }
             let matching = deferred.bindings.filter {
                 $0.genericSpecialization?.arguments == arguments
             }
@@ -6544,7 +6603,6 @@ public struct Lowerer: Sendable {
             }
             observedBranchParameterTypes[target] = types
         }
-
         func appendSyntheticBlock(
             id: Bytecode.BlockID,
             parameters: [Bytecode.Register] = [],
@@ -20180,6 +20238,18 @@ public struct Lowerer: Sendable {
                         specializations[0]
                     )
                 }
+                if foreignRepresentationPlan.logicalType(
+                    for: resultToken
+                ) == .any {
+                    let erased = try eraseSwiftValueToAny(
+                        source: source,
+                        dynamicType: dynamicType,
+                        context: "Swift AnyObject bridge"
+                    )
+                    values[resultToken] = erased
+                    objectiveCBridgeDynamicTypes[erased] = dynamicType
+                    return
+                }
                 try lowerSwiftValueAnyObjectBridge(
                     resultToken: resultToken,
                     source: source,
@@ -22152,54 +22222,87 @@ public struct Lowerer: Sendable {
                 return
             }
 
-            if intrinsic == .arrayToObjectiveC || intrinsic == .arrayFromObjectiveC {
+            if let collectionKind = intrinsic.collectionKind {
                 guard !genericArguments.isEmpty else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Objective-C Array bridge has no concrete element type"
+                        "Objective-C collection bridge has no concrete value type"
                     )
                 }
-                let element = try parseType(genericArguments)
+                let substitutions: [String]
+                do {
+                    substitutions = try CanonicalSIL.GenericFunction.arguments(
+                        in: genericArguments
+                    )
+                } catch {
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "Objective-C collection bridge has malformed specializations"
+                    )
+                }
+                let collectionType: Bytecode.ValueType
+                switch collectionKind {
+                case .array:
+                    guard substitutions.count == 1 else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Objective-C Array bridge has an invalid specialization"
+                        )
+                    }
+                    collectionType = .array(try parseType(substitutions[0]))
+                case .dictionary:
+                    guard substitutions.count == 2 else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Objective-C Dictionary bridge has an invalid specialization"
+                        )
+                    }
+                    collectionType = .dictionary(
+                        key: try parseType(substitutions[0]),
+                        value: try parseType(substitutions[1])
+                    )
+                case .set:
+                    guard substitutions.count == 1 else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Objective-C Set bridge has an invalid specialization"
+                        )
+                    }
+                    collectionType = .set(try parseType(substitutions[0]))
+                }
                 let source: Bytecode.Register
-                switch intrinsic {
-                case .arrayToObjectiveC:
+                if intrinsic.isCollectionBridgeFromObjectiveC {
+                    guard arguments.count == 2,
+                          collectionMetatype(
+                            arguments[1],
+                            matches: collectionType
+                          ),
+                          let value = values[arguments[0]]
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "Objective-C-to-collection bridge has unsupported arguments"
+                        )
+                    }
+                    source = value
+                } else {
                     guard arguments.count == 1,
                           let value = values[arguments[0]]
                     else {
                         throw CanonicalSIL.LoweringError.malformedSIL(
-                            "Array-to-Objective-C bridge has unsupported arguments"
+                            "collection-to-Objective-C bridge has unsupported arguments"
                         )
                     }
                     source = value
-                case .arrayFromObjectiveC:
-                    guard arguments.count == 2,
-                          arrayMetatypeValues[arguments[1]] == element,
-                          let value = values[arguments[0]]
-                    else {
-                        throw CanonicalSIL.LoweringError.malformedSIL(
-                            "Objective-C-to-Array bridge has unsupported arguments"
-                        )
-                    }
-                    source = value
-                case .stringToObjectiveC, .stringFromObjectiveC,
-                     .nativeValueToObjectiveC:
-                    preconditionFailure("not an Array bridge")
                 }
-                guard registerTypes[Int(source.rawValue)] == .array(element) else {
+                guard registerTypes[Int(source.rawValue)] == collectionType else {
                     throw CanonicalSIL.LoweringError.malformedSIL(
-                        "Objective-C Array bridge payload has the wrong Swift element type"
+                        "Objective-C collection bridge payload has the wrong Swift type"
                     )
                 }
-                let result = try allocate(type: .array(element))
+                let result = try allocate(type: collectionType)
                 values[resultToken] = result
                 appendInstruction(.copyValue(result: result, source: source))
-                if let elementDynamicType = try? parseDynamicAnyType(
-                    genericArguments
+                if let dynamicType = try? dynamicCollectionType(
+                    collectionKind,
+                    substitutions: substitutions
                 ) {
-                    let dynamicType = Bytecode.DynamicType.array(
-                        elementDynamicType
-                    )
-                    if dynamicType.isSwiftBridgeMaterializableV1,
-                       dynamicType.storageType == .array(element) {
+                    if dynamicType.isNativeBridgeMaterializableV1,
+                       dynamicType.storageType == collectionType {
                         objectiveCBridgeDynamicTypes[result] = dynamicType
                     }
                 }
@@ -22244,6 +22347,8 @@ public struct Lowerer: Sendable {
                     )
                 }
             case .arrayToObjectiveC, .arrayFromObjectiveC,
+                 .dictionaryToObjectiveC, .dictionaryFromObjectiveC,
+                 .setToObjectiveC, .setFromObjectiveC,
                  .nativeValueToObjectiveC:
                 preconditionFailure("handled before String bridge lowering")
             }
@@ -22258,14 +22363,47 @@ public struct Lowerer: Sendable {
             objectiveCBridgeDynamicTypes[result] = .string
         }
 
-        func lowerSwiftValueAnyObjectBridge(
-            resultToken: String,
+        func collectionMetatype(
+            _ token: String,
+            matches type: Bytecode.ValueType
+        ) -> Bool {
+            switch type {
+            case let .array(element):
+                arrayMetatypeValues[token] == element
+            case let .dictionary(key, value):
+                dictionaryMetatypeValues[token].map {
+                    $0.0 == key && $0.1 == value
+                } == true
+            case let .set(element):
+                setMetatypeValues[token] == element
+            default:
+                false
+            }
+        }
+
+        func dynamicCollectionType(
+            _ kind: ObjectiveCBridgeIntrinsic.CollectionKind,
+            substitutions: [String]
+        ) throws -> Bytecode.DynamicType {
+            switch kind {
+            case .array:
+                return .array(try parseDynamicAnyType(substitutions[0]))
+            case .dictionary:
+                return .dictionary(
+                    key: try parseDynamicAnyType(substitutions[0]),
+                    value: try parseDynamicAnyType(substitutions[1])
+                )
+            case .set:
+                return .set(try parseDynamicAnyType(substitutions[0]))
+            }
+        }
+
+        func eraseSwiftValueToAny(
             source: Bytecode.Register,
             dynamicType: Bytecode.DynamicType,
             context: String
-        ) throws {
-            guard !resultToken.isEmpty,
-                  dynamicType.isSwiftBridgeMaterializableV1,
+        ) throws -> Bytecode.Register {
+            guard dynamicType.isNativeBridgeMaterializableV1,
                   dynamicType.storageType == registerTypes[Int(source.rawValue)]
             else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
@@ -22285,6 +22423,25 @@ public struct Lowerer: Sendable {
                     )
                 )
             }
+            return erased
+        }
+
+        func lowerSwiftValueAnyObjectBridge(
+            resultToken: String,
+            source: Bytecode.Register,
+            dynamicType: Bytecode.DynamicType,
+            context: String
+        ) throws {
+            guard !resultToken.isEmpty else {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "\(context) has no result"
+                )
+            }
+            let erased = try eraseSwiftValueToAny(
+                source: source,
+                dynamicType: dynamicType,
+                context: context
+            )
             guard case let .native(targetType) = try parseType("Swift.AnyObject")
             else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
@@ -22735,6 +22892,10 @@ public struct Lowerer: Sendable {
             let observedParameterTypes = parsedBlockID.flatMap {
                 observedBranchParameterTypes[$0]
             }
+            let plannedParameterTypes = parsedBlockID.flatMap { blockID in
+                foreignRepresentationBridgedBlocks.contains(blockID)
+                    ? declaredBlockParameterTypes[blockID] : nil
+            }
             if let optionalPayloadParameterTypes,
                let observedParameterTypes,
                optionalPayloadParameterTypes != observedParameterTypes {
@@ -22742,7 +22903,15 @@ public struct Lowerer: Sendable {
                     "Optional payload and branch edges disagree on block parameter types"
                 )
             }
+            if let plannedParameterTypes,
+               let observedParameterTypes,
+               plannedParameterTypes != observedParameterTypes {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "foreign representation and branch edges disagree on block parameter types"
+                )
+            }
             let bridgedBlockParameterTypes = optionalPayloadParameterTypes
+                ?? plannedParameterTypes
                 ?? observedParameterTypes
             if let block = try parseBlockHeader(
                 line,
@@ -22753,6 +22922,9 @@ public struct Lowerer: Sendable {
                     ? signature.erasedMetatypes
                     : [],
                 bridgedParameterTypes: bridgedBlockParameterTypes,
+                allowingForeignABIRepresentation: parsedBlockID.map {
+                    foreignRepresentationBridgedBlocks.contains($0)
+                } == true,
                 indirectResultTypes: entryBlock == nil
                     ? signature.indirectResultTypes : [],
                 indirectErrorType: entryBlock == nil
@@ -25421,7 +25593,25 @@ public struct Lowerer: Sendable {
             ) {
                 let borrowedSource = try resolve(cast[1], line: sourceLine)
                 let sourceValueType = registerTypes[Int(borrowedSource.rawValue)]
+                let preservesLogicalAny = foreignRepresentationPlan
+                    .logicalType(for: cast[0]) == .any
                 if case let .native(sourceType) = sourceValueType {
+                    if preservesLogicalAny {
+                        let source = try materializeOwnedValue(
+                            at: cast[1],
+                            line: sourceLine
+                        )
+                        let erased = try eraseSwiftValueToAny(
+                            source: source,
+                            dynamicType: .native(sourceType),
+                            context: "native reference AnyObject erasure"
+                        )
+                        values[cast[0]] = erased
+                        objectiveCBridgeDynamicTypes[erased] = .native(
+                            sourceType
+                        )
+                        continue
+                    }
                     guard case let .native(targetType) = try parseType("Swift.AnyObject"),
                           sourceType != targetType
                     else {
@@ -25487,6 +25677,16 @@ public struct Lowerer: Sendable {
                     at: cast[1],
                     line: sourceLine
                 )
+                if preservesLogicalAny {
+                    let erased = try eraseSwiftValueToAny(
+                        source: source,
+                        dynamicType: dynamicType,
+                        context: "Swift value AnyObject erasure"
+                    )
+                    values[cast[0]] = erased
+                    objectiveCBridgeDynamicTypes[erased] = dynamicType
+                    continue
+                }
                 try lowerSwiftValueAnyObjectBridge(
                     resultToken: cast[0],
                     source: source,
@@ -25947,19 +26147,35 @@ public struct Lowerer: Sendable {
                     )
                     continue
                 }
+                // Built-in semantic lowerings may deliberately finish in a
+                // fixed NativeImport (for example generic `T` text rendering
+                // through an `Any` boundary). They must see the concrete SIL
+                // specialization before the general Catalog-backed generic
+                // resolver tries to compare `T` with that fixed boundary.
+                if !hasImageBody,
+                   let intrinsic = SwiftCoreIntrinsic(
+                       mangledName: reference[1]
+                   ) {
+                    swiftCoreReferences[reference[0]] = intrinsic
+                    continue
+                }
                 let genericImageBindings = boundCalls.filter {
                     $0.genericSpecialization != nil
                 }
+                let genericNativeBindings = boundCalls.filter { binding in
+                    guard binding.genericSpecialization == nil,
+                          case .nativeImport = binding.target
+                    else { return false }
+                    return true
+                }
                 if CanonicalSIL.GenericFunction.isGeneric(
                     loweredType: reference[2]
-                ), !genericImageBindings.isEmpty {
-                    guard genericImageBindings.count == boundCalls.count,
-                          genericImageBindings.allSatisfy({ binding in
-                              guard binding.genericSpecialization != nil,
-                                    case .function = binding.target
-                              else { return false }
-                              return true
-                          })
+                ), !boundCalls.isEmpty {
+                    let hasOnlyImageSpecializations =
+                        genericImageBindings.count == boundCalls.count
+                    let hasOnlyNativeVariants =
+                        genericNativeBindings.count == boundCalls.count
+                    guard hasOnlyImageSpecializations || hasOnlyNativeVariants
                     else {
                         throw CanonicalSIL.LoweringError.unboundCallee(
                             line: sourceLine,
@@ -25969,15 +26185,9 @@ public struct Lowerer: Sendable {
                     deferredGenericFunctionReferences[reference[0]] = .init(
                         symbol: reference[1],
                         loweredType: reference[2],
-                        bindings: genericImageBindings
+                        bindings: hasOnlyNativeVariants
+                            ? genericNativeBindings : genericImageBindings
                     )
-                    continue
-                }
-                if !hasImageBody,
-                   let intrinsic = SwiftCoreIntrinsic(
-                       mangledName: reference[1]
-                   ) {
-                    swiftCoreReferences[reference[0]] = intrinsic
                     continue
                 }
                 if let intrinsic = ObjectiveCBridgeIntrinsic(
@@ -26984,11 +27194,11 @@ public struct Lowerer: Sendable {
                 }
                 let references: ResolvedFunctionReferenceSet
                 let appliedLoweredType: String
-                let usesGenericImageSpecialization: Bool
+                let usesDeferredGenericReference: Bool
                 if let resolved = functionReferences[call[0]] {
                     references = resolved
                     appliedLoweredType = call[3]
-                    usesGenericImageSpecialization = false
+                    usesDeferredGenericReference = false
                 } else if let deferred = deferredGenericFunctionReferences[
                     call[0]
                 ] {
@@ -27000,7 +27210,7 @@ public struct Lowerer: Sendable {
                     )
                     references = resolved.references
                     appliedLoweredType = resolved.concreteLoweredType
-                    usesGenericImageSpecialization = true
+                    usesDeferredGenericReference = true
                 } else if let deferred = deferredForeignReferences[call[0]] {
                     references = try resolveDeferredForeignReference(
                         deferred,
@@ -27008,7 +27218,7 @@ public struct Lowerer: Sendable {
                         line: sourceLine
                     )
                     appliedLoweredType = call[3]
-                    usesGenericImageSpecialization = false
+                    usesDeferredGenericReference = false
                 } else {
                     throw CanonicalSIL.LoweringError.unsupportedInstruction(
                         line: sourceLine,
@@ -27095,7 +27305,7 @@ public struct Lowerer: Sendable {
                           appliedType.effects,
                           authoritative: binding.effects
                       ),
-                      usesGenericImageSpecialization
+                      usesDeferredGenericReference
                         ? !call[1].isEmpty : call[1].isEmpty
                 else {
                     throw CanonicalSIL.LoweringError.callSignatureMismatch(
@@ -28445,7 +28655,28 @@ public struct Lowerer: Sendable {
                 let payload: Bytecode.Register
                 let source: Bytecode.Register
                 let wrapped: Bytecode.ValueType
-                if voidValues.contains(optional[2]) {
+                if let logicalType = foreignRepresentationPlan.logicalType(
+                    for: optional[0]
+                ) {
+                    guard case let .optional(logicalWrapped) = logicalType,
+                          (try? parsePhysicalType(
+                              "Optional<\(optional[1])>",
+                              bridgedTo: logicalType,
+                              allowingForeignABIRepresentation: true
+                          )) == logicalType
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "foreign Optional.some representation does not match its logical type"
+                        )
+                    }
+                    wrapped = logicalWrapped
+                    source = try resolve(optional[2], line: sourceLine)
+                    payload = try prepareOwnedValue(
+                        optional[2],
+                        expectedType: wrapped,
+                        line: sourceLine
+                    )
+                } else if voidValues.contains(optional[2]) {
                     wrapped = try parseStoredType(optional[1])
                     payload = try resolveStorableValue(
                         optional[2],
@@ -28510,7 +28741,29 @@ public struct Lowerer: Sendable {
             ) {
                 let resolvedWrapped: Bytecode.ValueType
                 var deferredNativeBlock: String?
-                if let resolved = try? parseType(optional[1]) {
+                if let logicalType = foreignRepresentationPlan.logicalType(
+                    for: optional[0]
+                ) {
+                    let physicalSpelling = "Optional<\(optional[1])>"
+                    let exactPhysicalType = (try? parseType(
+                        physicalSpelling
+                    )).map(ValueRepresentation.storable)
+                    guard case let .optional(logicalWrapped) = logicalType,
+                          exactPhysicalType == logicalType
+                            || isSupportedObjectiveCBridgeSpelling(
+                                physicalSpelling,
+                                to: logicalType,
+                                allowingForeignABIRepresentation: true
+                            )
+                    else {
+                        throw CanonicalSIL.LoweringError.malformedSIL(
+                            "foreign Optional.none representation "
+                                + "\(physicalSpelling) does not match logical "
+                                + "type \(logicalType)"
+                        )
+                    }
+                    resolvedWrapped = logicalWrapped
+                } else if let resolved = try? parseType(optional[1]) {
                     resolvedWrapped = resolved
                 } else if isSupportedObjectiveCBridgeSpelling(
                     optional[1],
@@ -32180,6 +32433,17 @@ public struct Lowerer: Sendable {
                 break
             }
         }
+        func matchesObjectiveCObject(_ names: Set<String>) -> Bool {
+            if names.contains(spelling) { return true }
+            for prefix in ["Optional<", "Swift.Optional<"]
+            where spelling.hasPrefix(prefix) && spelling.hasSuffix(">") {
+                let body = String(
+                    spelling.dropFirst(prefix.count).dropLast()
+                )
+                if names.contains(body) { return true }
+            }
+            return false
+        }
         switch expected {
         case .any:
             return allowingForeignABIRepresentation
@@ -32190,37 +32454,24 @@ public struct Lowerer: Sendable {
                 to: expected
             )
         case .string:
-            let names = ["NSString", "Foundation.NSString", "__C.NSString"]
-            if names.contains(spelling) { return true }
-            for prefix in ["Optional<", "Swift.Optional<"]
-            where spelling.hasPrefix(prefix) && spelling.hasSuffix(">") {
-                return names.contains(
-                    String(spelling.dropFirst(prefix.count).dropLast())
-                )
-            }
-            return false
+            return matchesObjectiveCObject([
+                "NSString", "Foundation.NSString", "__C.NSString",
+            ])
         case .array:
-            if ["NSArray", "Foundation.NSArray", "__C.NSArray"]
-                .contains(spelling) {
-                return true
-            }
-            for prefix in ["Optional<", "Swift.Optional<"]
-            where spelling.hasPrefix(prefix) && spelling.hasSuffix(">") {
-                let body = String(spelling.dropFirst(prefix.count).dropLast())
-                return ["NSArray", "Foundation.NSArray", "__C.NSArray"]
-                    .contains(body)
-            }
-            return false
+            return matchesObjectiveCObject([
+                "NSArray", "Foundation.NSArray", "__C.NSArray",
+            ])
         case .dictionary:
             return allowingForeignABIRepresentation
-                && [
+                && matchesObjectiveCObject([
                     "NSDictionary", "Foundation.NSDictionary",
                     "__C.NSDictionary",
-                ].contains(spelling)
+                ])
         case .set:
             return allowingForeignABIRepresentation
-                && ["NSSet", "Foundation.NSSet", "__C.NSSet"]
-                    .contains(spelling)
+                && matchesObjectiveCObject([
+                    "NSSet", "Foundation.NSSet", "__C.NSSet",
+                ])
         case let .native(typeID):
             return (
                 allowingForeignABIRepresentation
@@ -32784,6 +33035,7 @@ public struct Lowerer: Sendable {
         entryParameterTypes: [Bytecode.ValueType]?,
         erasedMetatypes: [ErasedMetatype],
         bridgedParameterTypes: [Bytecode.ValueType]?,
+        allowingForeignABIRepresentation: Bool,
         indirectResultTypes: [Bytecode.ValueType],
         indirectErrorType: Bytecode.ValueType?,
         suppressedParameterType: Bytecode.ValueType?,
@@ -32887,7 +33139,9 @@ public struct Lowerer: Sendable {
                 if let bridgedParameterTypes {
                     physicalType = try parsePhysicalType(
                         value[1],
-                        bridgedTo: bridgedParameterTypes[logicalPhysicalIndex]
+                        bridgedTo: bridgedParameterTypes[logicalPhysicalIndex],
+                        allowingForeignABIRepresentation:
+                            allowingForeignABIRepresentation
                     )
                 } else {
                     let parsed = try parseType(value[1])

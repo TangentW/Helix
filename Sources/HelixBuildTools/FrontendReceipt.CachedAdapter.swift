@@ -27,8 +27,8 @@ public struct CachedAdapter: Sendable {
     }
 
     private struct CatalogIdentity: Codable, Sendable {
-        var document: NativeAPICatalog.Document
-        var compilerProjectionSHA256: Core.Digest
+        var moduleName: String
+        var artifactIdentity: Core.Digest
     }
 
     private struct Payload: Codable, Sendable {
@@ -116,9 +116,8 @@ public struct CachedAdapter: Sendable {
         let key = try performance.measure("frontend_cache.make_key") {
             let catalogIdentities = try request.nativeAPICatalogs.map {
                 CatalogIdentity(
-                    document: $0.document,
-                    compilerProjectionSHA256:
-                        try $0.compilerProjectionDigest()
+                    moduleName: $0.document.identity.moduleName,
+                    artifactIdentity: try $0.cacheIdentity()
                 )
             }
             return try BuildCache.key(

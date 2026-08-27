@@ -7,7 +7,7 @@ import Testing
 extension VMTests {
 @Suite("Native callback lifetime")
 struct NativeCallback {
-    @Test("Native callbacks require an exact canonical callable signature")
+    @Test("Native callbacks admit only exact or stricter MainActor signatures")
     func callbackRequiresCanonicalSignature() throws {
         let box = InvocationBox()
         let expected = closure().signature
@@ -81,16 +81,15 @@ struct NativeCallback {
             callbackHost: host(box: box),
             isMainThread: false
         )
-        #expect(throws: VM.RuntimeTrap.self) {
-            try mismatchContext.makeCallback(
-                parameterIndex: 0,
-                from: .closure(.init(
-                    functionID: .init(rawValue: 7),
-                    signature: actorMismatch,
-                    captures: []
-                ))
-            )
-        }
+        let restricted = try mismatchContext.makeCallback(
+            parameterIndex: 0,
+            from: .closure(.init(
+                functionID: .init(rawValue: 7),
+                signature: actorMismatch,
+                captures: []
+            ))
+        )
+        #expect(restricted.signature == actorMismatch)
         try mismatchContext.finish(requireCooperation: true)
     }
 

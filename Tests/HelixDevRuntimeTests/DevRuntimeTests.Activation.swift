@@ -164,8 +164,8 @@ struct ActivationController {
         #expect(firstResult.codeStatus == .codeActive)
         #expect(adapter.loadCount == 1)
         #expect(
-            await controller.snapshot().activeDevelopmentNativeCallKeys
-                == [firstImport.key]
+            await controller.snapshot().activeDevelopmentNativeImports
+                == [.init(id: firstImport.id, key: firstImport.key)]
         )
 
         let input = try VM.Integer(signed: 19, bitWidth: 64, isSigned: true)
@@ -224,7 +224,9 @@ struct ActivationController {
         #expect(rejected.codeStatus == .rejected)
         #expect(runtime.registry.snapshot().activeGenerationID == .init(rawValue: 3))
         let snapshot = await controller.snapshot()
-        #expect(snapshot.activeDevelopmentNativeCallKeys == [firstImport.key])
+        #expect(snapshot.activeDevelopmentNativeImports == [
+            .init(id: firstImport.id, key: firstImport.key),
+        ])
         #expect(snapshot.loadedDevelopmentAdapterCount == 2)
         #expect(snapshot.nativeImageSoftLimitReached)
         #expect(
@@ -257,10 +259,118 @@ struct ActivationController {
         #expect(adapter.loadCount == 3)
         #expect(runtime.registry.snapshot().activeGenerationID == .init(rawValue: 3))
         let reconnect = await controller.currentSessionIdentity()
-        #expect(reconnect.activeDevelopmentNativeCallKeys == [firstImport.key])
+        #expect(reconnect.activeDevelopmentNativeImports == [
+            .init(id: firstImport.id, key: firstImport.key),
+        ])
         #expect(reconnect.loadedDevelopmentAdapterCount == 2)
         #expect(reconnect.nativeImageSoftLimitReached)
         #expect(reconnect.nativeStateUncertain)
+    }
+
+    @Test("Development native TypeOps publish atomically and survive reconnect inventory")
+    func activatesDevelopmentNativeTypesAtomically() async throws {
+        let fixture = try DevRuntimeFixture()
+        let directory = try temporaryRuntimeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let runtime = try fixture.makeRuntime()
+        let adapter = FakeDevelopmentAdapterLoader()
+        let controller = try DevActivation.Controller(
+            identity: fixture.identity,
+            shell: fixture.shell,
+            runtimePolicy: .init(),
+            runtime: runtime,
+            cacheDirectory: directory,
+            developmentAdapterLoader: adapter
+        )
+        let objectiveCID = Core.TypeID(rawValue: .sha256(
+            "DevRuntime.Foundation.NSObject"
+        ))
+        let objectiveCType = DevProtocol.DevelopmentPayload.NativeType(
+            id: objectiveCID,
+            canonicalName: "Foundation.NSObject",
+            kind: .reference,
+            layoutFingerprint: .sha256("Foundation.NSObject.Layout"),
+            objectiveCRuntimeName: "NSObject",
+            isCopyable: true,
+            estimatedSize: 8,
+            binding: .objectiveCReference
+        )
+        let objectiveCResult = await DevRuntimeTests.transfer(
+            try fixture.nativeTypePayload(
+                nativeType: objectiveCType,
+                includesAdapterImage: false
+            ),
+            revision: 1,
+            generation: 1,
+            fixture: fixture,
+            controller: controller
+        )
+        #expect(objectiveCResult.codeStatus == .codeActive)
+        #expect(adapter.loadCount == 0)
+
+        let swiftID = Core.TypeID(rawValue: .sha256(
+            "DevRuntime.Fixture.NativeSnapshot"
+        ))
+        let swiftType = DevProtocol.DevelopmentPayload.NativeType(
+            id: swiftID,
+            canonicalName: "Fixture.NativeSnapshot",
+            kind: .value,
+            layoutFingerprint: .sha256("Fixture.NativeSnapshot.Layout"),
+            isCopyable: true,
+            estimatedSize: 8,
+            binding: .swiftAdapter,
+            imageIndex: 0,
+            exportSymbol: "hlx_native_type_ops_v1_\(swiftID.rawValue.hex)"
+        )
+        let swiftPayload = try fixture.nativeTypePayload(
+            nativeType: swiftType,
+            includesAdapterImage: true
+        )
+        let swiftResult = await DevRuntimeTests.transfer(
+            swiftPayload,
+            revision: 2,
+            generation: 2,
+            fixture: fixture,
+            controller: controller
+        )
+        #expect(swiftResult.codeStatus == .codeActive)
+        #expect(adapter.loadCount == 1)
+        #expect(await controller.snapshot().activeDevelopmentNativeTypeIDs == [
+            objectiveCID, swiftID,
+        ].sorted { $0.rawValue < $1.rawValue })
+
+        let replay = await DevRuntimeTests.transfer(
+            swiftPayload,
+            revision: 3,
+            generation: 3,
+            fixture: fixture,
+            controller: controller
+        )
+        #expect(replay.codeStatus == .codeActive)
+        #expect(adapter.loadCount == 1)
+
+        var changedType = swiftType
+        changedType.layoutFingerprint = .sha256(
+            "Fixture.NativeSnapshot.ChangedLayout"
+        )
+        changedType.imageIndex = nil
+        changedType.exportSymbol = nil
+        let rejected = await DevRuntimeTests.transfer(
+            try fixture.nativeTypePayload(
+                nativeType: changedType,
+                includesAdapterImage: false
+            ),
+            revision: 4,
+            generation: 4,
+            fixture: fixture,
+            controller: controller
+        )
+        #expect(rejected.codeStatus == .rejected)
+        #expect(runtime.registry.snapshot().activeGenerationID == .init(rawValue: 3))
+        let reconnect = await controller.currentSessionIdentity()
+        #expect(reconnect.activeDevelopmentNativeTypeIDs == [
+            objectiveCID, swiftID,
+        ].sorted { $0.rawValue < $1.rawValue })
     }
 
     @Test("HLBC identity failures retain their actionable diagnostic")
@@ -790,6 +900,7 @@ private final class FakeDevelopmentAdapterLoader:
         bytes: Data,
         descriptor: DevProtocol.DevelopmentPayload.Image,
         imports: [DevProtocol.DevelopmentPayload.NativeImport],
+        nativeTypes: [DevProtocol.DevelopmentPayload.NativeType],
         identity: DevProtocol.SessionIdentity,
         cacheDirectory: URL
     ) throws -> DevelopmentAdapter.LoadedImage {
@@ -831,6 +942,17 @@ private final class FakeDevelopmentAdapterLoader:
         case .iOSSimulator: .iOSSimulator
         case .macOS: .macOS
         }
+        let typeOperations: [VM.NativeTypeOperations] = mode.0 ? []
+            : nativeTypes.map { nativeType in
+                VM.NativeTypeOperations.opaqueValue(
+                    id: nativeType.id,
+                    canonicalName: nativeType.canonicalName,
+                    layoutFingerprint: nativeType.layoutFingerprint,
+                    requiresMainActor: nativeType.requiresMainActor,
+                    estimatedSize: nativeType.estimatedSize,
+                    clone: { (value: FakeDevelopmentNativeValue) in value }
+                )
+            }
         return .init(
             fileURL: cacheDirectory.appendingPathComponent("FakeAdapter.dylib"),
             byteCount: bytes.count,
@@ -842,7 +964,8 @@ private final class FakeDevelopmentAdapterLoader:
                 platform: platform,
                 codeSignature: .init(dataOffset: 1, dataSize: 1)
             ),
-            nativeInvokers: invokers
+            nativeInvokers: invokers,
+            nativeTypeOperations: typeOperations
         )
     }
 
@@ -853,6 +976,10 @@ private final class FakeDevelopmentAdapterLoader:
             "unexpected C invoker in Swift Adapter test"
         )
     }
+}
+
+private struct FakeDevelopmentNativeValue: Sendable {
+    var rawValue: Int
 }
 
 private struct DevRuntimeFixture {
@@ -1126,6 +1253,36 @@ private struct DevRuntimeFixture {
             targetTriple: "arm64-apple-ios17.0-simulator",
             bytecode: encodedBytecode,
             nativeImports: [transactionImport],
+            imageDescriptors: includesAdapterImage ? [descriptor] : [],
+            images: includesAdapterImage ? [image] : []
+        ).encoded()
+    }
+
+    func nativeTypePayload(
+        nativeType: DevProtocol.DevelopmentPayload.NativeType,
+        includesAdapterImage: Bool
+    ) throws -> Data {
+        let base = try DevProtocol.DevelopmentPayload.Artifact.decode(bytecode)
+        let image = Data("fake-type-adapter-\(nativeType.id)".utf8)
+        let imageIdentity = Core.Digest.sha256(image)
+        let descriptor = DevProtocol.DevelopmentPayload.Image(
+            installName: "@rpath/HLXDevAdapter-\(imageIdentity.hex).dylib",
+            uuid: UUID(),
+            byteLength: UInt64(image.count),
+            sha256: imageIdentity
+        )
+        var transactionType = nativeType
+        transactionType.imageIndex = includesAdapterImage ? 0 : nil
+        transactionType.exportSymbol = includesAdapterImage
+            ? "hlx_native_type_ops_v1_\(nativeType.id.rawValue.hex)"
+            : nil
+        return try DevProtocol.DevelopmentPayload.Artifact(
+            shellInterfaceHash: shellHash,
+            compilerFingerprint: compatibility.compilerFingerprint,
+            sdkBuild: "22A",
+            targetTriple: "arm64-apple-ios17.0-simulator",
+            bytecode: base.bytecode,
+            nativeTypes: [transactionType],
             imageDescriptors: includesAdapterImage ? [descriptor] : [],
             images: includesAdapterImage ? [image] : []
         ).encoded()

@@ -13,11 +13,6 @@ struct XcodePrepareInput: Codable, Sendable {
         var contentHash: Core.Digest
     }
 
-    struct NativeAPICatalogIdentity: Codable, Sendable {
-        var document: NativeAPICatalog.Document
-        var compilerProjectionSHA256: Core.Digest
-    }
-
     var schemaVersion: UInt16 = 1
     var profileID: String
     var featureID: String
@@ -27,7 +22,8 @@ struct XcodePrepareInput: Codable, Sendable {
     var metadata: InterfaceArchive.ReleaseMetadata
     var configuration: PatchConfiguration.Document
     var nativeImportCatalog: NativeImportCatalog.Document
-    var nativeAPICatalogs: [NativeAPICatalogIdentity]
+    var nativeAPICatalogRulesVersion: UInt16
+    var nativeAPICatalogPipelineIdentity: Core.Digest
     var callingSurfacePolicy: FrontendReceipt.CallingSurfacePolicy
     var sources: [Source]
 }
@@ -96,14 +92,14 @@ func hotPatchPrepareSourcesMatch(
     }
 }
 
-func makeHotPatchPrepareIdentity(
+func makeXcodePrepareIdentity(
     context: XcodeIntegration.BuildContext,
     capture: XcodeFeatureCapture,
     compilerInputs: BuildCache.CompilerInputs.Snapshot,
     metadata: InterfaceArchive.ReleaseMetadata,
     configuration: PatchConfiguration.Document,
     toolchain: ReleaseCompiler.ToolchainIdentity,
-    nativeAPICatalogs: [NativeAPICatalog.Snapshot]
+    callingSurfacePolicy: FrontendReceipt.CallingSurfacePolicy
 ) throws -> (
     inputHash: Core.Digest,
     sources: [CLI.XcodePrepareInput.Source]
@@ -123,12 +119,6 @@ func makeHotPatchPrepareIdentity(
             contentHash: .sha256(data)
         )
     }
-    let catalogIdentities = try nativeAPICatalogs.map {
-        CLI.XcodePrepareInput.NativeAPICatalogIdentity(
-            document: $0.document,
-            compilerProjectionSHA256: try $0.compilerProjectionDigest()
-        )
-    }
     let input = CLI.XcodePrepareInput(
         profileID: context.profile.id,
         featureID: context.feature.id,
@@ -138,8 +128,11 @@ func makeHotPatchPrepareIdentity(
         metadata: metadata,
         configuration: configuration,
         nativeImportCatalog: .empty,
-        nativeAPICatalogs: catalogIdentities,
-        callingSurfacePolicy: .managedProductionModule,
+        nativeAPICatalogRulesVersion:
+            NativeAPICatalog.Identity.currentRulesVersion,
+        nativeAPICatalogPipelineIdentity:
+            NativeAPICatalog.currentPipelineIdentity,
+        callingSurfacePolicy: callingSurfacePolicy,
         sources: sources
     )
     return (
@@ -201,7 +194,7 @@ func bridgeObjectMatches(
         && Core.Digest.sha256(data) == expected.contentHash
 }
 
-func loadHotPatchPrepareState(
+func loadXcodePrepareState(
     context: XcodeIntegration.BuildContext,
     expectedInputHash: Core.Digest
 ) -> XcodeIntegration.PrepareState? {
@@ -211,7 +204,7 @@ func loadHotPatchPrepareState(
     guard let data = try? readRegularFile(
         url,
         maximumBytes: XcodeIntegration.PrepareStateCodec.maximumDocumentBytes,
-        label: "Hot Patch Prepare state"
+        label: "Xcode Prepare state"
     ), let state = try? XcodeIntegration.PrepareStateCodec.decode(data),
        state.inputHash == expectedInputHash,
        preparedShellMatches(
@@ -220,6 +213,58 @@ func loadHotPatchPrepareState(
        )
     else { return nil }
     return state
+}
+
+func loadPreparedFrontendOutput(
+    context: XcodeIntegration.BuildContext,
+    identitySources: [CLI.XcodePrepareInput.Source],
+    toolchain: ReleaseCompiler.ToolchainIdentity,
+    importedModules: [String]
+) throws -> FrontendReceipt.Output {
+    let receiptData = try readRegularFile(
+        context.environment.shellOutputURL.appendingPathComponent(
+            "ShellBuildReceipt.json"
+        ),
+        maximumBytes: ShellBuildReceipt.Codec.maximumDocumentBytes,
+        label: "cached Shell Build Receipt"
+    )
+    let receipt = try ShellBuildReceipt.Codec.decode(receiptData)
+    let expectedSources = identitySources.map {
+        ShellBuildReceipt.Source(
+            logicalPath: $0.logicalPath,
+            contentHash: $0.contentHash
+        )
+    }
+    guard receipt.sources == expectedSources,
+          receipt.compatibility.compilerFingerprint == toolchain.fingerprint
+    else {
+        throw CLI.Error.input(
+            "cached Prepare receipt disagrees with current compiler inputs"
+        )
+    }
+    let diagnosticsData = try readRegularFile(
+        context.environment.shellOutputURL.appendingPathComponent(
+            "FrontendDiagnostics.json"
+        ),
+        maximumBytes: 32 * 1_024 * 1_024,
+        label: "cached frontend diagnostics"
+    )
+    let diagnostics = try JSONDecoder().decode(
+        [Core.Diagnostic].self,
+        from: diagnosticsData
+    )
+    guard diagnostics.count <= 1_000_000,
+          try Core.CanonicalJSON.encode(diagnostics) == diagnosticsData
+    else {
+        throw CLI.Error.input("cached frontend diagnostics are invalid")
+    }
+    return .init(
+        receipt: receipt,
+        diagnostics: diagnostics,
+        toolchain: toolchain,
+        importedModules: Array(Set(importedModules)).sorted(),
+        performance: .init()
+    )
 }
 
 func preparedShellMatches(

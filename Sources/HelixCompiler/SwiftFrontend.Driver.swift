@@ -8,6 +8,7 @@ extension SwiftFrontend {
 public enum InvocationKind: String, Codable, Hashable, Sendable {
     case typedAST = "typed_ast"
     case canonicalSIL = "canonical_sil"
+    case typecheck
     case symbolGraph = "symbol_graph"
     case sdkPath = "sdk_path"
     case sdkBuild = "sdk_build"
@@ -169,6 +170,48 @@ public struct Driver: Sendable {
             )
         }
         return output.standardOutput
+    }
+
+    /// Typechecks sources and returns diagnostics emitted by a successful
+    /// compilation. This keeps warnings observable for callers that enforce a
+    /// narrow semantic invariant without turning unrelated project warnings
+    /// into compilation failures.
+    public func typecheckDiagnostics(
+        sourceFiles: [URL],
+        invocation: InterfaceArchive.FrontendInvocation
+    ) throws -> String {
+        try invocation.validate()
+        let normalizedSources = sourceFiles.map(\.standardizedFileURL)
+        guard !normalizedSources.isEmpty,
+              Set(normalizedSources).count == normalizedSources.count
+        else {
+            throw SwiftFrontend.Error.compilationFailed(
+                status: -1,
+                diagnostics: "typecheck requires unique, nonempty sources"
+            )
+        }
+        let sdk = try sdkIdentity(name: invocation.sdkName)
+        guard sdk.buildVersion == invocation.sdkBuild else {
+            throw SwiftFrontend.Error.sdkBuildMismatch(
+                expected: invocation.sdkBuild,
+                actual: sdk.buildVersion
+            )
+        }
+        let arguments = [
+            "-frontend", "-typecheck",
+            "-module-name", invocation.moduleName,
+            "-target", invocation.targetTriple,
+            "-sdk", sdk.path,
+        ] + (try directFrontendArguments(invocation.semanticArguments))
+            + normalizedSources.map(\.path)
+        let output = try run(arguments: arguments)
+        guard output.terminationStatus == 0 else {
+            throw SwiftFrontend.Error.compilationFailed(
+                status: output.terminationStatus,
+                diagnostics: output.standardError
+            )
+        }
+        return output.standardError
     }
 
     /// Emits one JSON typed-AST document per primary source while preserving
@@ -447,6 +490,7 @@ public struct Driver: Sendable {
         }
         if arguments.contains("-dump-ast") { return .typedAST }
         if arguments.contains("-emit-sil") { return .canonicalSIL }
+        if arguments.contains("-typecheck") { return .typecheck }
         if arguments.contains("--show-sdk-path") { return .sdkPath }
         if arguments.contains("--show-sdk-build-version") { return .sdkBuild }
         if arguments.contains("-print-target-info") { return .targetInfo }

@@ -787,7 +787,7 @@ struct Application {
         #expect(livePerformance.workflow == .liveReload)
         #expect(livePerformance.outcome == .success)
         #expect(livePerformance.trace.counters.contains {
-            $0.name == "managed_native.probe_attempt_count"
+            $0.name == "prepare.catalog_hit_module_count" && $0.value > 0
         })
         #expect(livePerformance.trace.subprocesses.contains {
             $0.kind == .canonicalSIL && $0.invocationCount >= 2
@@ -864,15 +864,67 @@ struct Application {
             )
         )
         #expect(repeatedLivePerformance.trace.counters.contains {
-            $0.name == "frontend_cache.module_hit_count" && $0.value == 1
+            $0.name == "prepare.state_hit_count" && $0.value == 1
+        })
+        #expect(repeatedLivePerformance.trace.counters.contains {
+            $0.name == "prepare.hub_reservation_reused_count" && $0.value == 1
         })
         #expect(!repeatedLivePerformance.trace.subprocesses.contains {
             $0.kind == .typedAST || $0.kind == .canonicalSIL
                 || $0.kind == .symbolGraph
         })
+        #expect(!repeatedLivePerformance.trace.stages.contains {
+            $0.name == "prepare.frontend_receipt"
+                || $0.name == "prepare.catalog_read"
+                || $0.name == "prepare.catalog_build"
+        })
         #expect(repeatedLivePerformance.trace.stages.contains {
             $0.name == "prepare.reserve_hub"
         })
+
+        let liveStateURL = buildDirectory.appendingPathComponent(
+            "HelixGenerated/live/PrepareState.json"
+        )
+        var pendingState = try XcodeIntegration.PrepareStateCodec.decode(
+            Data(contentsOf: liveStateURL)
+        )
+        pendingState.requiresNativeAPICatalogRefresh = true
+        try XcodeIntegration.PrepareStateCodec.encode(pendingState).write(
+            to: liveStateURL
+        )
+        let refreshedLive = await CLI.Application(
+            currentDirectoryURL: directory,
+            environment: liveEnvironment,
+            hubControlClient: StubHubControlClient()
+        ).runAsync([
+            "xcode", "phase",
+            "--plan", generatedPlanURL.path,
+            "--profile", "live",
+            "--phase", "prepare",
+        ])
+        #expect(
+            refreshedLive.exitCode == 0,
+            Comment(rawValue: refreshedLive.standardError)
+        )
+        let refreshedLivePerformance = try buildPerformanceReport(
+            at: buildDirectory.appendingPathComponent(
+                "HelixGenerated/live/BuildPerformance.prepare.json"
+            )
+        )
+        #expect(refreshedLivePerformance.trace.counters.contains {
+            $0.name == "prepare.catalog_refresh_pending_count"
+                && $0.value == 1
+        })
+        #expect(refreshedLivePerformance.trace.counters.contains {
+            $0.name == "prepare.state_miss_count" && $0.value == 1
+        })
+        #expect(refreshedLivePerformance.trace.stages.contains {
+            $0.name == "prepare.catalog_read"
+        })
+        let refreshedState = try XcodeIntegration.PrepareStateCodec.decode(
+            Data(contentsOf: liveStateURL)
+        )
+        #expect(!refreshedState.requiresNativeAPICatalogRefresh)
     }
 
     @Test("Live Catalog prewarm publishes one private canonical job")
@@ -1235,11 +1287,16 @@ struct Application {
 }
 
 private struct StubHubControlClient: HubControl.ClientProtocol {
-    func reserveAutomaticInvitation() async throws -> (
+    func reserveAutomaticInvitation(
+        reusing existing: Pairing.Reservation?
+    ) async throws -> (
         reservation: Pairing.Reservation,
         spkiSHA256: Core.Digest
     ) {
-        (
+        if let existing {
+            return (existing, .sha256("stub Hub Host Identity"))
+        }
+        return (
             .init(
                 invitationID: .init(
                     rawValue: UUID(

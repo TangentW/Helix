@@ -17,14 +17,32 @@ public struct Key: Core.DigestIdentity, Comparable {
         descriptor: Core.NativeCall.Descriptor
     ) throws -> Self {
         let canonical = try descriptor.canonicalized()
+        return try deriveCanonical(canonical)
+    }
+
+    fileprivate static func deriveCanonical(
+        _ descriptor: Core.NativeCall.Descriptor
+    ) throws -> Self {
         var hasher = Core.StableHasher(domain: "HLX.NativeCall.v1")
-        hasher.append(try Core.CanonicalJSON.encode(canonical))
+        // `descriptor` is already canonical and is a keyed JSON object. Avoid
+        // reparsing every encoder-produced object through JSONSerialization;
+        // large SDK Catalog validation derives thousands of these keys.
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        hasher.append(try encoder.encode(descriptor))
         return Self(rawValue: hasher.finalize())
     }
 
     public static func < (lhs: Self, rhs: Self) -> Bool {
         lhs.rawValue < rhs.rawValue
     }
+}
+
+/// Semantic check shared by validators that consume compiler-generated Swift
+/// spellings. Swift accepts all three forms as the same empty tuple type.
+public static func isVoid(_ type: String) -> Bool {
+    let compact = type.filter { !$0.isWhitespace }
+    return compact == "Swift.Void" || compact == "Void" || compact == "()"
 }
 
 public enum Backend: String, Codable, Hashable, Sendable, CaseIterable {
@@ -844,6 +862,22 @@ public struct Descriptor: Codable, Hashable, Sendable {
         return canonical
     }
 
+    /// Validates, canonicalizes, and derives identity in one normalization
+    /// pass. Catalog boundaries use this to avoid repeating Unicode and type-
+    /// grammar work for every entry in a large SDK module.
+    public func validatedIdentity(
+        contract: Core.NativeImportContract
+    ) throws -> (
+        descriptor: Self,
+        key: Core.NativeCall.Key
+    ) {
+        let descriptor = try validated(contract: contract)
+        return (
+            descriptor,
+            try Core.NativeCall.Key.deriveCanonical(descriptor)
+        )
+    }
+
     public func validate(contract: Core.NativeImportContract) throws {
         guard try validated(contract: contract) == self else {
             throw Core.NativeCall.DescriptorError.invalid(
@@ -1059,37 +1093,63 @@ public struct Descriptor: Codable, Hashable, Sendable {
                 )
             }
         case .objectiveCMessage:
-            guard target.dispatch != .global,
-                  let objectiveC,
-                  physicalTypes.allSatisfy({ $0.kind != .bridgeValue }),
-                  physicalTypes.allSatisfy({
-                      $0.kind == .void || $0.encoding != nil
-                  }),
-                  physicalTypes.allSatisfy(Self.objectiveCEncodingMatchesKind),
-                  physicalTypes.allSatisfy(
-                    Self.objectiveCPhysicalNameIsRuntimeResolvable
-                  ),
-                  Self.isObjectiveCSelector(target.entryPoint),
-                  target.entryPoint.filter({ $0 == ":" }).count
-                    == physicalSignature.parameters.count,
-                  objectiveC.lexicalSuperclassName == nil
-                    || target.dispatch == .instance,
-                  (target.dispatch == .instance)
-                    == (objectiveC.dispatchClassName == nil),
-                  objectiveC.property.map({ property in
-                      target.dispatch != .initializer
-                          && target.entryPoint.filter({ $0 == ":" }).count
-                              == (property.accessor == .setter ? 1 : 0)
-                          && (property.accessor == .getter
-                              || objectiveC.methodFamily == .none)
-                  }) ?? true,
-                  Self.objectiveCMethodFamilyIsValid(
-                      objectiveC.methodFamily,
-                      target: target,
-                      result: physicalSignature.result,
-                      resultConvention: physicalSignature.resultConvention
-                  )
-            else {
+            var failures: [String] = []
+            if target.dispatch == .global {
+                failures.append("global dispatch")
+            }
+            if objectiveC == nil {
+                failures.append("missing Objective-C evidence")
+            }
+            if physicalTypes.contains(where: { $0.kind == .bridgeValue }) {
+                failures.append("BridgeValue physical slot")
+            }
+            if physicalTypes.contains(where: {
+                $0.kind != .void && $0.encoding == nil
+            }) {
+                failures.append("missing type encoding")
+            }
+            if !physicalTypes.allSatisfy(Self.objectiveCEncodingMatchesKind) {
+                failures.append("type encoding/kind mismatch")
+            }
+            if !physicalTypes.allSatisfy(
+                Self.objectiveCPhysicalNameIsRuntimeResolvable
+            ) {
+                failures.append("non-runtime object spelling")
+            }
+            if !Self.isObjectiveCSelector(target.entryPoint) {
+                failures.append("invalid selector")
+            }
+            let selectorArity = target.entryPoint.filter { $0 == ":" }.count
+            if selectorArity != physicalSignature.parameters.count {
+                failures.append("selector/argument arity mismatch")
+            }
+            if let objectiveC {
+                if objectiveC.lexicalSuperclassName != nil,
+                   target.dispatch != .instance {
+                    failures.append("invalid lexical super dispatch")
+                }
+                if (target.dispatch == .instance)
+                    != (objectiveC.dispatchClassName == nil) {
+                    failures.append("dispatch class mismatch")
+                }
+                if let property = objectiveC.property,
+                   target.dispatch == .initializer
+                    || selectorArity
+                        != (property.accessor == .setter ? 1 : 0)
+                    || property.accessor != .getter
+                        && objectiveC.methodFamily != .none {
+                    failures.append("property accessor mismatch")
+                }
+                if !Self.objectiveCMethodFamilyIsValid(
+                    objectiveC.methodFamily,
+                    target: target,
+                    result: physicalSignature.result,
+                    resultConvention: physicalSignature.resultConvention
+                ) {
+                    failures.append("method family mismatch")
+                }
+            }
+            guard failures.isEmpty else {
                 throw Core.NativeCall.DescriptorError.invalid(
                     "Objective-C call \(target.canonicalCallee) ["
                         + "\(target.entryPoint)] requires a consistent encoded native ABI "
@@ -1097,7 +1157,8 @@ public struct Descriptor: Codable, Hashable, Sendable {
                         + "\(objectiveC?.methodFamily.rawValue ?? "missing"), result: "
                         + "\(physicalSignature.result.kind.rawValue)/"
                         + "\(physicalSignature.resultConvention.rawValue), arguments: "
-                        + "\(physicalSignature.parameters.count))"
+                        + "\(physicalSignature.parameters.count); failed: "
+                        + failures.joined(separator: ", ") + ")"
                 )
             }
         case .cFunction:
@@ -1156,10 +1217,18 @@ private extension Core.NativeCall.Descriptor {
             return isSwiftIdentifier(Substring(value))
         }
         guard value.last == ":" else { return false }
-        return value.dropLast().split(
+        let components = value.dropLast().split(
             separator: ":",
             omittingEmptySubsequences: false
-        ).allSatisfy(isSwiftIdentifier)
+        )
+        guard let first = components.first, isSwiftIdentifier(first) else {
+            return false
+        }
+        // Objective-C permits unnamed selector pieces after the first one,
+        // for example `initWithControlPoints::::` in QuartzCore.
+        return components.dropFirst().allSatisfy {
+            $0.isEmpty || isSwiftIdentifier($0)
+        }
     }
 
     static func isCSymbol(_ value: String) -> Bool {
@@ -1645,22 +1714,24 @@ private extension Core.NativeCall.Descriptor {
         }
         var output = ""
         var pendingSpace = false
-        let punctuation = CharacterSet(charactersIn: "<>()[]{}.,:?!&=")
-        let scalars = Array(trimmed.unicodeScalars)
-        var index = 0
-        while index < scalars.count {
-            let scalar = scalars[index]
-            if CharacterSet.whitespacesAndNewlines.contains(scalar) {
+        var previousScalar: Unicode.Scalar?
+        var index = trimmed.unicodeScalars.startIndex
+        while index < trimmed.unicodeScalars.endIndex {
+            let scalar = trimmed.unicodeScalars[index]
+            if scalar.properties.isWhitespace {
                 pendingSpace = true
-                index += 1
+                index = trimmed.unicodeScalars.index(after: index)
                 continue
             }
-            let isPunctuation = punctuation.contains(scalar)
-                || scalar == "-" && index + 1 < scalars.count
-                    && scalars[index + 1] == ">"
-                || scalar == ">" && index > 0 && scalars[index - 1] == "-"
-            let previousIsPunctuation = output.unicodeScalars.last.map {
-                punctuation.contains($0) || $0 == "-" || $0 == ">"
+            let nextIndex = trimmed.unicodeScalars.index(after: index)
+            let nextScalar = nextIndex < trimmed.unicodeScalars.endIndex
+                ? trimmed.unicodeScalars[nextIndex] : nil
+            let isPunctuation = Self.isSwiftTypePunctuation(scalar)
+                || scalar.value == 0x2D && nextScalar?.value == 0x3E
+                || scalar.value == 0x3E && previousScalar?.value == 0x2D
+            let previousIsPunctuation = previousScalar.map {
+                Self.isSwiftTypePunctuation($0)
+                    || $0.value == 0x2D || $0.value == 0x3E
             } ?? false
             if pendingSpace, !output.isEmpty, !isPunctuation,
                !previousIsPunctuation {
@@ -1668,9 +1739,22 @@ private extension Core.NativeCall.Descriptor {
             }
             output.unicodeScalars.append(scalar)
             pendingSpace = false
-            index += 1
+            previousScalar = scalar
+            index = nextIndex
         }
         return output
+    }
+
+    private static func isSwiftTypePunctuation(
+        _ scalar: Unicode.Scalar
+    ) -> Bool {
+        switch scalar.value {
+        case 0x21, 0x26, 0x28, 0x29, 0x2C, 0x2E, 0x3A,
+             0x3C, 0x3D, 0x3E, 0x3F, 0x5B, 0x5D, 0x7B, 0x7D:
+            true
+        default:
+            false
+        }
     }
 
     static func hasSingleGroupingParentheses(_ value: String) -> Bool {
@@ -1729,14 +1813,23 @@ private extension Core.NativeCall.Descriptor {
     }
 
     static func hasBalancedTypeDelimiters(_ value: String) -> Bool {
-        var stack: [Character] = []
-        let pairs: [Character: Character] = [")": "(", "]": "[", "}": "{", ">": "<"]
-        var previous: Character?
-        for character in value {
-            if let opening = pairs[character], character != ">" || previous != "-" {
+        var stack: [UInt32] = []
+        stack.reserveCapacity(8)
+        var previous: UInt32?
+        for scalar in value.unicodeScalars {
+            let character = scalar.value
+            let opening: UInt32? = switch character {
+            case 0x29: 0x28
+            case 0x3E where previous != 0x2D: 0x3C
+            case 0x5D: 0x5B
+            case 0x7D: 0x7B
+            default: nil
+            }
+            if let opening {
                 guard stack.last == opening else { return false }
                 stack.removeLast()
-            } else if ["(", "[", "{", "<"].contains(character) {
+            } else if character == 0x28 || character == 0x3C
+                        || character == 0x5B || character == 0x7B {
                 stack.append(character)
             }
             previous = character

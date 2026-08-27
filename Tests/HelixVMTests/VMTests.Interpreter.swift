@@ -1354,6 +1354,22 @@ struct Interpreter {
         #expect(!rejectedBudget.sideEffectsCommitted)
     }
 
+    @Test("NativeImport validation preserves the contextual type of Optional.none")
+    func invokesNativeCatalogWithOptionalNone() throws {
+        let fixture = try makeOptionalEchoImage()
+        let importID = Core.NativeImportID(rawValue: 0)
+        let key = try #require(fixture.shell.imports[importID]?.key)
+        let catalog = try VM.NativeCatalog([OptionalEchoInvoker(key: key)])
+
+        #expect(
+            VM.Interpreter(nativeCatalog: catalog).invoke(
+                entry: .init(rawValue: 0),
+                image: fixture,
+                arguments: [.optional(nil)]
+            ) == .returned(.optional(nil))
+        )
+    }
+
     @Test("A NativeImport function value dispatches through closure_apply")
     func invokesNativeImportClosure() throws {
         let fixture = try makeNativeIncrementImage(throughClosure: true)
@@ -7182,6 +7198,22 @@ struct Interpreter {
         }
     }
 
+    private struct OptionalEchoInvoker: VM.NativeInvoker {
+        let id = Core.NativeImportID(rawValue: 0)
+        let key: Core.NativeCall.Key
+        let parameterTypes: [Bytecode.ValueType] = [.optional(.string)]
+        let resultType: Bytecode.ValueType = .optional(.string)
+        let effects = Core.Effects()
+        let contract = vmPureImportContract
+
+        func invoke(
+            arguments: [VM.Value],
+            context: VM.NativeInvocationContext
+        ) -> VM.NativeInvocationResult {
+            .returned(arguments[0])
+        }
+    }
+
     private struct CallableFactoryInvoker: VM.NativeInvoker {
         static let signature = Bytecode.ClosureSignature(
             parameters: [.int64],
@@ -7471,6 +7503,76 @@ struct Interpreter {
                 acceptedCapabilities: capabilities,
                 allowedNativeCalls: [importKey]
             )
+        )
+    }
+
+    private func makeOptionalEchoImage() throws -> Verification.Image {
+        let optionalString = Bytecode.ValueType.optional(.string)
+        let signature = Core.LoweredSignature(
+            parameters: ["Swift.Optional<Swift.String>"],
+            result: "Swift.Optional<Swift.String>"
+        )
+        let callDescriptor = try Core.NativeCall.Descriptor.swiftAdapter(
+            canonicalCallee: "Fixture.echo(_:)",
+            signature: signature,
+            effects: .init(),
+            contract: vmPureImportContract
+        )
+        let importKey = try Core.NativeCall.Key.derive(
+            descriptor: callDescriptor
+        )
+        let importID = Core.NativeImportID(rawValue: 0)
+        let requirement = Bytecode.ImportRequirement(
+            id: importID,
+            key: importKey,
+            descriptor: callDescriptor,
+            contract: vmPureImportContract
+        )
+        let descriptor = Verification.ResolvedNativeImport(
+            id: importID,
+            key: importKey,
+            descriptor: callDescriptor,
+            parameterTypes: [optionalString],
+            resultType: optionalString,
+            contract: vmPureImportContract
+        )
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "optionalEcho",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: optionalString,
+            registerTypes: [optionalString, optionalString],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .nativeApply(
+                            result: .init(rawValue: 1),
+                            importID: importID,
+                            arguments: [.init(rawValue: 0)]
+                        ),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ]
+        )
+        let capabilities: Set<Core.Capability> = [
+            .baselineV1, .nativeImportsV1, .stringsV1,
+        ]
+        return try makeVerified(
+            function: function,
+            capabilities: capabilities,
+            imports: [requirement],
+            shellImports: [descriptor],
+            policy: .init(
+                acceptedCapabilities: capabilities,
+                allowedNativeCalls: [importKey]
+            ),
+            signature: signature,
+            parameterTypes: [optionalString],
+            resultType: optionalString
         )
     }
 

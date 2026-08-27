@@ -2602,6 +2602,8 @@ public struct Engine: Verification.ImageVerifying {
             case .any, .bool, .integer, .floatingPoint, .string, .character,
                  .substring:
                 true
+            case let .native(id):
+                shell.types[id]?.isCopyable == true
             case let .local(key):
                 localTypes[key] != nil
             case let .optional(wrapped), let .array(wrapped),
@@ -2939,6 +2941,7 @@ public struct Engine: Verification.ImageVerifying {
             }
             guard type(result) == .any,
                   dynamicType.isAnyPayloadOrExistentialV1,
+                  isKnownDynamicType(dynamicType),
                   dynamicType.storageType == type(value)
             else {
                 throw fail(
@@ -2952,6 +2955,7 @@ public struct Engine: Verification.ImageVerifying {
             guard type(value) == .any,
                   case let .optional(target) = type(result),
                   targetType.isAnyCastTargetV1,
+                  isKnownDynamicType(targetType),
                   targetType.storageType == target
             else {
                 throw fail(
@@ -2964,6 +2968,7 @@ public struct Engine: Verification.ImageVerifying {
             }
             guard type(value) == .any,
                   targetType.isAnyCastTargetV1,
+                  isKnownDynamicType(targetType),
                   targetType.storageType == type(result)
             else {
                 throw fail(
@@ -4505,7 +4510,12 @@ public struct Engine: Verification.ImageVerifying {
                 resultType: descriptor.resultType,
                 function: function,
                 block: block,
-                offset: offset
+                offset: offset,
+                nativeCallbackParameterIndices: Set(
+                    descriptor.contract.callbacks.map {
+                        Int($0.parameterIndex)
+                    }
+                )
             )
         case let .makeClosure(result, target, captures, _):
             guard capabilities.contains(.closureValuesV1) else {
@@ -4842,7 +4852,12 @@ public struct Engine: Verification.ImageVerifying {
                 block: block,
                 offset: offset,
                 blocks: blocks,
-                capabilities: capabilities
+                capabilities: capabilities,
+                nativeCallbackParameterIndices: Set(
+                    descriptor.contract.callbacks.map {
+                        Int($0.parameterIndex)
+                    }
+                )
             )
         case let .returnValue(value):
             if function.resultType == .void {
@@ -5205,7 +5220,8 @@ public struct Engine: Verification.ImageVerifying {
         block: Bytecode.Block,
         offset: Int,
         blocks: [Bytecode.BlockID: Bytecode.Block],
-        capabilities: Set<Core.Capability>
+        capabilities: Set<Core.Capability>,
+        nativeCallbackParameterIndices: Set<Int> = []
     ) throws {
         let fail: (String) -> Verification.Error = {
             .invalidInstruction(function: function.id, block: block.id, offset: offset, reason: $0)
@@ -5216,10 +5232,11 @@ public struct Engine: Verification.ImageVerifying {
         guard arguments.count == parameterTypes.count else {
             throw fail("try_apply argument count mismatch")
         }
-        for (argument, expected) in zip(arguments, parameterTypes)
-        where function.type(of: argument) != expected {
-            throw fail("try_apply argument type mismatch")
-        }
+        guard Bytecode.NativeCallbackABI.argumentsAreCompatible(
+            actual: arguments.compactMap { function.type(of: $0) },
+            boundary: parameterTypes,
+            callbackParameterIndices: nativeCallbackParameterIndices
+        ) else { throw fail("try_apply argument type mismatch") }
         guard let normal = blocks[normalTarget] else {
             throw fail("unknown try_apply normal target \(normalTarget)")
         }
@@ -5295,16 +5312,18 @@ public struct Engine: Verification.ImageVerifying {
         resultType: Bytecode.ValueType,
         function: Bytecode.Function,
         block: Bytecode.Block,
-        offset: Int
+        offset: Int,
+        nativeCallbackParameterIndices: Set<Int> = []
     ) throws {
         let fail: (String) -> Verification.Error = {
             .invalidInstruction(function: function.id, block: block.id, offset: offset, reason: $0)
         }
         guard arguments.count == parameterTypes.count else { throw fail("call argument count mismatch") }
-        for (argument, expected) in zip(arguments, parameterTypes)
-        where function.type(of: argument) != expected {
-            throw fail("call argument type mismatch")
-        }
+        guard Bytecode.NativeCallbackABI.argumentsAreCompatible(
+            actual: arguments.compactMap { function.type(of: $0) },
+            boundary: parameterTypes,
+            callbackParameterIndices: nativeCallbackParameterIndices
+        ) else { throw fail("call argument type mismatch") }
         if resultType == .void {
             guard result == nil else { throw fail("Void call must not define a result") }
         } else {
@@ -5413,8 +5432,20 @@ public struct Engine: Verification.ImageVerifying {
                     where function.type(of: result)?.requiresLinearOwnership == true {
                         live.insert(result)
                     }
+                case let .eraseToAny(_, value, _):
+                    if function.type(of: value)?.requiresLinearOwnership == true,
+                       live.remove(value) == nil {
+                        throw fail(
+                            "erase_to_any consumes a non-live owned value"
+                        )
+                    }
+                case let .checkedCastAny(result, _, _),
+                     let .forceCastAny(result, _, _):
+                    if function.type(of: result)?.requiresLinearOwnership
+                        == true {
+                        live.insert(result)
+                    }
                 case .makeStruct, .structExtract, .makeEnum, .makeError, .castError,
-                     .eraseToAny, .checkedCastAny, .forceCastAny,
                      .checkedCastExistential, .forceCastExistential,
                      .stackAddress,
                      .projectAggregateAddress, .projectMutableCell, .allocateObject,

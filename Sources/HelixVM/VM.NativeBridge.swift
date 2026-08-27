@@ -156,7 +156,10 @@ public struct NativeInvocationContext: Sendable {
                     .directClosureShape,
                   case let .closure(closure) = value,
                   closure.isNativeCallbackTarget,
-                  closure.signature == expectedShape.signature,
+                  (closure.signature == expectedShape.signature
+                    || closure.signature.isMainActorRestriction(
+                        of: expectedShape.signature
+                    )),
                   closure.signature.isNativeBridgeCallback
             else {
                 throw VM.RuntimeTrap.nativeFailure(

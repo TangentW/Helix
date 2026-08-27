@@ -801,6 +801,75 @@ struct Archive {
         try archive.validate()
     }
 
+    @Test("One generic SIL symbol may carry distinct concrete Catalog ABIs")
+    func genericNativeImportVariants() throws {
+        var archive = try fixture()
+        let symbol = "$s7Fixture10ProbeValuePAAE7payloadSivg"
+        let names = ["Fixture.First", "Fixture.Second"]
+        let typeIDs = names.map {
+            Core.TypeID.derive(
+                namespace: archive.metadata.shellNamespaceID,
+                canonicalType: $0
+            )
+        }
+        let contract = Core.NativeImportContract.bounded(
+            kind: .instanceGetter,
+            domain: .application,
+            access: .read,
+            maximumDurationMicroseconds: 500,
+            allowsMainThread: true
+        )
+        archive.capabilities += [.nativeImportsV1, .nativeTypesV1]
+        archive.nativeTypes = zip(names, typeIDs).map { name, typeID in
+            .init(
+                id: typeID,
+                canonicalName: name,
+                kind: .value,
+                layoutFingerprint: .sha256("\(name).opaque.v1"),
+                isCopyable: true,
+                isEmittedToDevice: true,
+                estimatedSize: 8
+            )
+        }.sorted { $0.id.rawValue < $1.id.rawValue }
+        archive.nativeImports = try zip(names, typeIDs).enumerated().map {
+            index, pair in
+            let (name, typeID) = pair
+            let descriptor = try Core.NativeCall.Descriptor.swiftAdapter(
+                canonicalCallee: "\(name).payload.get",
+                signature: .init(
+                    parameters: [name],
+                    result: "Swift.Int"
+                ),
+                effects: .init(),
+                contract: contract,
+                receiverArgumentIndex: 0
+            )
+            return .init(
+                id: .init(rawValue: UInt32(index)),
+                key: try Core.NativeCall.Key.derive(descriptor: descriptor),
+                descriptor: descriptor,
+                silMangledNames: [symbol],
+                parameterTypes: [.native(typeID)],
+                resultType: .int64,
+                contract: contract,
+                isEmittedToDevice: true
+            )
+        }
+        archive.shellInterfaceHash = try archive.computeShellInterfaceHash()
+
+        try archive.validate()
+
+        var duplicate = archive
+        duplicate.nativeImports[1].parameterTypes = duplicate
+            .nativeImports[0].parameterTypes
+        duplicate.nativeImports[1].resultType = duplicate
+            .nativeImports[0].resultType
+        duplicate.shellInterfaceHash = try duplicate.computeShellInterfaceHash()
+        #expect(throws: InterfaceArchive.Error.self) {
+            try duplicate.validate()
+        }
+    }
+
     @Test("A nonisolated native declaration may use a MainActor nominal type")
     func nonisolatedNativeImportWithMainActorNominal() throws {
         var archive = try fixture()

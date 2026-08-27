@@ -95,6 +95,87 @@ extension NativeImportDiscovery {
     struct Candidate: Hashable, Sendable {
         var record: InterfaceArchive.NativeImportRecord
         var generatedBinding: NativeImportDiscovery.GeneratedBinding
+
+        func shellBuildBinding(
+            catalogModuleName: String? = nil
+        ) throws -> ShellBuildReceipt.NativeImportBinding {
+            var generated = generatedBinding
+            if record.descriptor.target.backend == .swiftAdapter,
+               generated.nativeModuleName == nil,
+               let catalogModuleName {
+                guard record.descriptor.target.module == catalogModuleName else {
+                    throw FrontendReceipt.Error.invalidRequest(
+                        "Swift Adapter Catalog authority disagrees with its call target"
+                    )
+                }
+                // A module Catalog is stronger authority than a standalone
+                // consumer USR. Overlay declarations can omit their Swift
+                // module from the symbol while still being safely reusable.
+                generated.nativeModuleName = catalogModuleName
+                generated.importedModules = Array(Set(
+                    generated.importedModules + [catalogModuleName]
+                )).sorted()
+            }
+            let dispatch: ShellBuildReceipt.GeneratedNativeImport.Dispatch =
+                switch generated.dispatch {
+                case .globalFunction: .globalFunction
+                case .initializer: .initializer
+                case .staticMethod: .staticMethod
+                case .nativeUpcast: .nativeUpcast
+                case .anyObjectBridge: .anyObjectBridge
+                case .staticGetter: .staticGetter
+                case .staticSetter: .staticSetter
+                case .instanceMethod: .instanceMethod
+                case .instanceGetter: .instanceGetter
+                case .instanceSetter: .instanceSetter
+                case .instanceValueSetter: .instanceValueSetter
+                }
+            switch record.descriptor.target.backend {
+            case .objectiveCMessage:
+                return .init(key: record.key, strategy: .objectiveCInvoker)
+            case .cFunction:
+                guard let function = generated.cFunction else {
+                    throw FrontendReceipt.Error.invalidRequest(
+                        "C NativeImport candidate has no compiler-proven physical binding"
+                    )
+                }
+                return .init(
+                    key: record.key,
+                    strategy: .cInvoker,
+                    importedModules: [function.moduleName],
+                    cFunction: .init(
+                        moduleName: function.moduleName,
+                        swiftName: function.swiftName,
+                        parameterSwiftTypes: function.parameterSwiftTypes,
+                        resultSwiftType: function.resultSwiftType
+                    )
+                )
+            case .swiftAdapter:
+                return .init(
+                    key: record.key,
+                    strategy: .generatedSwiftAdapter,
+                    importedModules: generated.importedModules,
+                    generated: .init(
+                        declarationMangledName:
+                            generated.declarationMangledName,
+                        sourceFileLogicalID: generated.sourceFileLogicalID,
+                        dispatch: dispatch,
+                        ownerType: generated.ownerType,
+                        baseName: generated.baseName,
+                        argumentLabels: generated.argumentLabels,
+                        parameterSwiftTypes: generated.parameterSwiftTypes,
+                        invocationParameterSwiftTypes:
+                            generated.invocationParameterSwiftTypes,
+                        resultSwiftType: generated.resultSwiftType,
+                        nativeModuleName: generated.nativeModuleName
+                    )
+                )
+            case .builtin:
+                throw FrontendReceipt.Error.invalidRequest(
+                    "compiler discovery cannot publish builtin NativeImports"
+                )
+            }
+        }
     }
 
     struct Result: Sendable {
@@ -169,7 +250,11 @@ extension NativeImportDiscovery {
                 )
                 let effects = declaration.catalogEntry?.descriptor.effects
                     ?? inferredEffects
+                let authoritativeBackend = declaration.catalogEntry?
+                    .descriptor.target.backend
                 let objectiveCPhysical: Core.NativeCall.PhysicalSignature? = if
+                    authoritativeBackend == nil
+                        || authoritativeBackend == .objectiveCMessage,
                     !effects.isAsync,
                     let evidence = declaration.objectiveC {
                     FrontendReceipt.ObjectiveCABI.physicalSignature(
@@ -183,6 +268,8 @@ extension NativeImportDiscovery {
                     nil
                 }
                 let cPhysical: Core.NativeCall.PhysicalSignature? = if
+                    authoritativeBackend == nil
+                        || authoritativeBackend == .cFunction,
                     !effects.isAsync,
                     !effects.mayThrow,
                     let evidence = declaration.c {
@@ -323,10 +410,18 @@ extension NativeImportDiscovery {
                           catalogEntry.descriptor == callDescriptor,
                           catalogEntry.contract == contract
                     else {
+                        let differences = catalogMismatchFields(
+                            entry: catalogEntry,
+                            key: key,
+                            descriptor: callDescriptor,
+                            contract: contract
+                        ).joined(separator: ", ")
                         throw FrontendReceipt.Error.invalidRequest(
                             "Native API Catalog entry "
                                 + "\(catalogEntry.descriptor.canonicalCallee) "
                                 + "cannot be reproduced by its generated binding"
+                                + (differences.isEmpty
+                                    ? "" : "; differing: \(differences)")
                         )
                     }
                 }
@@ -652,6 +747,51 @@ extension NativeImportDiscovery {
             case .read: .read
             case .readWrite: .readWrite
             }
+        }
+
+        private func catalogMismatchFields(
+            entry: NativeAPICatalog.Entry,
+            key: Core.NativeCall.Key,
+            descriptor: Core.NativeCall.Descriptor,
+            contract: Core.NativeImportContract
+        ) -> [String] {
+            var result: [String] = []
+            if entry.support.state != .supported { result.append("support") }
+            if entry.binding == nil { result.append("binding") }
+            if entry.key != key {
+                result.append("NativeCallKey expected \(entry.key), actual \(key)")
+            }
+            if entry.descriptor.target != descriptor.target {
+                result.append(
+                    "target expected \(entry.descriptor.target), actual "
+                        + "\(descriptor.target)"
+                )
+            }
+            if entry.descriptor.logicalSignature != descriptor.logicalSignature {
+                result.append("logical signature")
+            }
+            if entry.descriptor.physicalSignature != descriptor.physicalSignature {
+                result.append(
+                    "physical signature expected "
+                        + "\(entry.descriptor.physicalSignature), actual "
+                        + "\(descriptor.physicalSignature)"
+                )
+            }
+            if entry.descriptor.objectiveC != descriptor.objectiveC {
+                result.append(
+                    "Objective-C metadata expected "
+                        + "\(String(describing: entry.descriptor.objectiveC)), actual "
+                        + "\(String(describing: descriptor.objectiveC))"
+                )
+            }
+            if entry.descriptor.effects != descriptor.effects {
+                result.append("effects")
+            }
+            if entry.descriptor.availability != descriptor.availability {
+                result.append("availability")
+            }
+            if entry.contract != contract { result.append("contract") }
+            return result
         }
 
         private func supportsAsyncDispatch(

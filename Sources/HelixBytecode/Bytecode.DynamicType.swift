@@ -1,4 +1,5 @@
 import Foundation
+import HelixCore
 
 extension Bytecode {
 /// Source-level identity retained by a VM-owned `Any` value.
@@ -20,6 +21,7 @@ public indirect enum DynamicType: Codable, Hashable, Sendable,
     case string
     case character
     case substring
+    case native(Core.TypeID)
     case local(Bytecode.LocalTypeKey)
     case optional(Bytecode.DynamicType)
     case array(Bytecode.DynamicType)
@@ -46,6 +48,8 @@ public indirect enum DynamicType: Codable, Hashable, Sendable,
             .string
         case .substring:
             .array(.string)
+        case let .native(id):
+            .native(id)
         case let .local(key):
             .local(key)
         case let .optional(wrapped):
@@ -94,6 +98,34 @@ public indirect enum DynamicType: Codable, Hashable, Sendable,
         case let .dictionary(key, value):
             key.isSwiftBridgeMaterializableV1(depth: depth + 1)
                 && value.isSwiftBridgeMaterializableV1(depth: depth + 1)
+        case .native, .arraySlice, .local, .tuple:
+            false
+        }
+    }
+
+    /// Whether a generic native invoker can materialize this identity with
+    /// its authenticated native-type catalog. This includes reference native
+    /// values while retaining VM-defined key semantics for dictionaries and
+    /// sets.
+    public var isNativeBridgeMaterializableV1: Bool {
+        isNativeBridgeMaterializableV1(depth: 0)
+    }
+
+    private func isNativeBridgeMaterializableV1(depth: Int) -> Bool {
+        guard depth <= Self.maximumNestingDepthV1 else { return false }
+        return switch self {
+        case .any, .bool, .integer, .floatingPoint, .string, .character,
+             .substring, .native:
+            true
+        case let .optional(wrapped), let .array(wrapped):
+            wrapped.isNativeBridgeMaterializableV1(depth: depth + 1)
+        case let .dictionary(key, value):
+            key.hasVMDefinedHashableSemantics
+                && key.isNativeBridgeMaterializableV1(depth: depth + 1)
+                && value.isNativeBridgeMaterializableV1(depth: depth + 1)
+        case let .set(element):
+            element.hasVMDefinedHashableSemantics
+                && element.isNativeBridgeMaterializableV1(depth: depth + 1)
         case .arraySlice, .local, .tuple:
             false
         }
@@ -115,7 +147,7 @@ public indirect enum DynamicType: Codable, Hashable, Sendable,
         case let .dictionary(key, value):
             key.hasVMDefinedHashableSemantics(depth: depth + 1)
                 && value.hasVMDefinedHashableSemantics(depth: depth + 1)
-        case .any, .local, .tuple:
+        case .any, .native, .local, .tuple:
             false
         }
     }
@@ -129,6 +161,7 @@ public indirect enum DynamicType: Codable, Hashable, Sendable,
         case .string: "String"
         case .character: "Character"
         case .substring: "Substring"
+        case let .native(id): "native<\(id)>"
         case let .local(key): key.description
         case let .optional(wrapped): "Optional<\(wrapped)>"
         case let .array(element): "Array<\(element)>"
@@ -149,7 +182,7 @@ public indirect enum DynamicType: Codable, Hashable, Sendable,
         guard depth <= Self.maximumNestingDepthV1 else { return false }
         switch self {
         case .any, .bool, .integer, .floatingPoint, .string, .character,
-             .substring, .local:
+             .substring, .native, .local:
             return true
         case let .optional(wrapped), let .array(wrapped),
              let .arraySlice(wrapped):

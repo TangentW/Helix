@@ -37,6 +37,8 @@ func matchesDynamicType(
         return actual == expected
     case let (.object(object), .local(expected)):
         return object.typeKey == expected
+    case let (.native(value), .native(expected)):
+        return value.typeID == expected
     case let (.any(erased), .any):
         return erased.dynamicType.isAnyPayloadV1
             && erased.payload.matchesDynamicType(

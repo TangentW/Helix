@@ -61,14 +61,28 @@ enum Builtins {
     ) throws -> [InterfaceArchive.NativeImportRecord] {
         let builtins = try self.records()
         let merged = records + builtins
-        guard Set(merged.map(\.key)).count == merged.count,
-              Set(merged.map(\.canonicalCallee)).count == merged.count,
-              Set(records.flatMap(\.silMangledNames)).isDisjoint(
-                  with: Set(builtins.flatMap(\.silMangledNames))
-              )
-        else {
+        let conflicts = records.flatMap { record in
+            builtins.compactMap { builtin -> String? in
+                var fields: [String] = []
+                if record.key == builtin.key { fields.append("key") }
+                if record.canonicalCallee == builtin.canonicalCallee {
+                    fields.append("callee")
+                }
+                if !Set(record.silMangledNames).isDisjoint(
+                    with: builtin.silMangledNames
+                ) {
+                    fields.append("compiler symbol")
+                }
+                guard !fields.isEmpty else { return nil }
+                return "\(record.canonicalCallee) conflicts with "
+                    + "\(builtin.canonicalCallee) by "
+                    + fields.joined(separator: ", ")
+            }
+        }
+        guard conflicts.isEmpty else {
             throw FrontendReceipt.Error.invalidRequest(
-                "NativeImport Catalog conflicts with a Helix standard-library import"
+                "NativeImport Catalog conflicts with a Helix standard-library import: "
+                    + conflicts.prefix(8).joined(separator: "; ")
             )
         }
         return merged.sorted { $0.key.rawValue < $1.key.rawValue }

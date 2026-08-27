@@ -346,8 +346,12 @@ extension FrontendReceipt.Adapter {
         operationTypes: [ImportedNativeType]
     ) throws -> [ImportedNativeType] {
         let uses = try normalizeImportedNominalIdentities(
-            normalizeClangTypealiasIdentities(
-                discoveredTypes + operationTypes
+            normalizeExplicitAliasIdentities(
+                normalizeClangTypealiasIdentities(
+                    normalizeCatalogAliasIdentities(
+                        discoveredTypes + operationTypes
+                    )
+                )
             )
         )
         var result: [String: ImportedNativeType] = [:]
@@ -381,6 +385,21 @@ extension FrontendReceipt.Adapter {
                 )
             }
             if var existing = result[use.canonicalName] {
+                if isLogicalValueBridge(existing, for: use) {
+                    var exactReference = use
+                    exactReference.importedModules = Array(Set(
+                        existing.importedModules + use.importedModules
+                    )).sorted()
+                    result[use.canonicalName] = exactReference
+                    continue
+                }
+                if isLogicalValueBridge(use, for: existing) {
+                    existing.importedModules = Array(Set(
+                        existing.importedModules + use.importedModules
+                    )).sorted()
+                    result[use.canonicalName] = existing
+                    continue
+                }
                 if existing.swiftType != use.swiftType {
                     if existing.swiftType == use.canonicalName {
                         existing.aliases.append(existing.swiftType)
@@ -410,7 +429,14 @@ extension FrontendReceipt.Adapter {
                         "imported native type \(use.canonicalName) has conflicting "
                             + "representations: \(existing.kind.rawValue)/"
                             + "\(existing.representation.rawValue) versus "
-                            + "\(use.kind.rawValue)/\(use.representation.rawValue)"
+                            + "\(use.kind.rawValue)/\(use.representation.rawValue); "
+                            + "existing Swift=\(existing.swiftType), aliases="
+                            + "\(existing.aliases), runtime="
+                            + "\(existing.objectiveCRuntimeName ?? "none"), source="
+                            + "\(existing.sourceFileLogicalID); incoming Swift="
+                            + "\(use.swiftType), aliases=\(use.aliases), runtime="
+                            + "\(use.objectiveCRuntimeName ?? "none"), source="
+                            + "\(use.sourceFileLogicalID)"
                     )
                 } else {
                     try mergeImportedIsolation(into: &existing, from: use)
@@ -432,7 +458,10 @@ extension FrontendReceipt.Adapter {
                    let incomingRuntimeName = use.objectiveCRuntimeName,
                    existingRuntimeName != incomingRuntimeName {
                     throw FrontendReceipt.Error.invalidRequest(
-                        "imported native type \(use.canonicalName) has conflicting Objective-C runtime identities"
+                        "imported native type \(use.canonicalName) has conflicting "
+                            + "Objective-C runtime identities: \(existingRuntimeName) "
+                            + "from \(existing.sourceFileLogicalID) versus "
+                            + "\(incomingRuntimeName) from \(use.sourceFileLogicalID)"
                     )
                 }
                 existing.objectiveCRuntimeName = existing.objectiveCRuntimeName
@@ -454,7 +483,185 @@ extension FrontendReceipt.Adapter {
         return result.values.filter {
             !($0.representation == .opaqueValue
                 && preciseAliases.contains($0.canonicalName))
+        }.map { value in
+            var value = value
+            // Compiler bridges such as String/NSString and Double/CGFloat
+            // prove conversion, not nominal identity. Keeping the VM-owned
+            // side as a native alias would later rewrite every logical use to
+            // the physical bridge representation.
+            value.aliases.removeAll {
+                FrontendReceipt.ValueTypeParser.isBuiltinValueSpelling($0)
+            }
+            return value
         }.sorted { $0.canonicalName < $1.canonicalName }
+    }
+
+    /// A module Catalog sees a nominal in its declaring compiler context and
+    /// therefore normally publishes more aliases than a consumer AST. Let one
+    /// unique Catalog superset canonicalize the weaker source observation;
+    /// never infer identity from a short alias shared by multiple nominals.
+    private func normalizeCatalogAliasIdentities(
+        _ uses: [ImportedNativeType]
+    ) -> [ImportedNativeType] {
+        let authorities = uses.filter { $0.nativeModuleName != nil }
+        guard !authorities.isEmpty else { return uses }
+
+        func names(of type: ImportedNativeType) -> Set<String> {
+            Set([type.canonicalName, type.swiftType] + type.aliases)
+        }
+
+        func hasCompatibleValueRepresentation(
+            _ lhs: ImportedNativeType,
+            _ rhs: ImportedNativeType
+        ) -> Bool {
+            lhs.kind != .reference
+                && rhs.kind != .reference
+                && Set([
+                    lhs.representation,
+                    rhs.representation,
+                ]).isSubset(of: [.opaqueValue, .rawRepresentable])
+        }
+
+        func preservesObjectiveCRuntimeSpelling(
+            _ observedNames: Set<String>,
+            authority: ImportedNativeType
+        ) -> Bool {
+            guard let runtimeName = authority.objectiveCRuntimeName else {
+                return false
+            }
+            return observedNames.contains(runtimeName)
+                || observedNames.contains("__C.\(runtimeName)")
+                || authority.objectiveCModuleName.map {
+                    observedNames.contains("\($0).\(runtimeName)")
+                } == true
+        }
+
+        return uses.map { use in
+            guard use.nativeModuleName == nil else { return use }
+            let observedNames = names(of: use)
+            let candidates = authorities.filter { authority in
+                let hasMatchingRepresentation =
+                    (authority.kind == use.kind
+                        && authority.representation == use.representation
+                        || hasCompatibleValueRepresentation(
+                            authority,
+                            use
+                        ))
+                        && authority.objectiveCRuntimeName
+                            == use.objectiveCRuntimeName
+                let correctsWeakObjectiveCReference =
+                    use.kind == .value
+                        && use.representation == .opaqueValue
+                        && use.objectiveCRuntimeName == nil
+                        && authority.kind == .reference
+                        && authority.representation == .reference
+                        && authority.objectiveCRuntimeName != nil
+                        && preservesObjectiveCRuntimeSpelling(
+                            observedNames,
+                            authority: authority
+                        )
+                return (hasMatchingRepresentation
+                        || correctsWeakObjectiveCReference)
+                    && (use.objectiveCModuleName == nil
+                        || authority.objectiveCModuleName
+                            == use.objectiveCModuleName)
+                    && names(of: authority).isSuperset(of: observedNames)
+            }
+            guard candidates.count == 1, let authority = candidates.first
+            else { return use }
+            var normalized = use
+            normalized.canonicalName = authority.canonicalName
+            normalized.swiftType = authority.swiftType
+            normalized.aliases = Array(observedNames.union(names(of: authority)))
+                .sorted()
+            normalized.kind = authority.kind
+            if !hasCompatibleValueRepresentation(use, authority) {
+                normalized.representation = authority.representation
+            }
+            normalized.objectiveCModuleName = authority.objectiveCModuleName
+            normalized.objectiveCRuntimeName = authority.objectiveCRuntimeName
+            return normalized
+        }
+    }
+
+    /// Coalesces compiler spellings only when both records publish the exact
+    /// same complete alias universe and representation. This handles module-
+    /// qualified versus relative nested names without treating a shared short
+    /// alias as proof that otherwise distinct native types are identical.
+    private func normalizeExplicitAliasIdentities(
+        _ uses: [ImportedNativeType]
+    ) -> [ImportedNativeType] {
+        struct AliasIdentity: Hashable {
+            var names: [String]
+            var kind: InterfaceArchive.TypeKind
+            var representation: ImportedNativeType.Representation
+            var objectiveCModuleName: String?
+            var objectiveCRuntimeName: String?
+        }
+
+        let groups = Dictionary(grouping: uses) { use in
+            AliasIdentity(
+                names: Array(Set(
+                    [use.canonicalName, use.swiftType] + use.aliases
+                )).sorted(),
+                kind: use.kind,
+                representation: use.representation,
+                objectiveCModuleName: use.objectiveCModuleName,
+                objectiveCRuntimeName: use.objectiveCRuntimeName
+            )
+        }
+        var canonicalByIdentity: [AliasIdentity: String] = [:]
+        for (identity, values) in groups {
+            let canonicalNames = Set(values.map(\.canonicalName))
+            guard canonicalNames.count > 1 else { continue }
+            canonicalByIdentity[identity] = canonicalNames.min { lhs, rhs in
+                let left = (lhs.split(separator: ".").count, lhs.count, lhs)
+                let right = (rhs.split(separator: ".").count, rhs.count, rhs)
+                return left < right
+            }
+        }
+        return uses.map { use in
+            let identity = AliasIdentity(
+                names: Array(Set(
+                    [use.canonicalName, use.swiftType] + use.aliases
+                )).sorted(),
+                kind: use.kind,
+                representation: use.representation,
+                objectiveCModuleName: use.objectiveCModuleName,
+                objectiveCRuntimeName: use.objectiveCRuntimeName
+            )
+            guard let canonicalName = canonicalByIdentity[identity] else {
+                return use
+            }
+            var result = use
+            result.canonicalName = canonicalName
+            return result
+        }
+    }
+
+    /// Clang importer may expose a Swift value at the call site while SIL
+    /// carries the bridged Objective-C class (for example String/NSString).
+    /// That value-side record describes a conversion, not a second native
+    /// nominal. Exact runtime class evidence owns TypeOps and must not inherit
+    /// the logical Swift value spelling as an alias.
+    private func isLogicalValueBridge(
+        _ candidate: ImportedNativeType,
+        for exactReference: ImportedNativeType
+    ) -> Bool {
+        guard candidate.kind == .value,
+              candidate.representation == .opaqueValue,
+              candidate.objectiveCRuntimeName == nil,
+              exactReference.kind == .reference,
+              exactReference.representation == .reference,
+              exactReference.objectiveCRuntimeName
+                == exactReference.canonicalName
+        else { return false }
+        return ([candidate.swiftType] + candidate.aliases).contains {
+            FrontendReceipt.ValueTypeParser.parse(
+                $0,
+                allowVoid: false
+            ) != nil
+        }
     }
 
     private func mergeImportedIsolation(
@@ -576,6 +783,7 @@ extension FrontendReceipt.Adapter {
         _ uses: [ImportedNativeType]
     ) throws -> [ImportedNativeType] {
         let usesByCanonicalName = Dictionary(grouping: uses, by: \.canonicalName)
+        var overlayByRuntime: [String: String] = [:]
         var normalized = uses
         for runtimeName in usesByCanonicalName.keys.sorted() {
             guard let matchingUses = usesByCanonicalName[runtimeName] else {
@@ -589,6 +797,36 @@ extension FrontendReceipt.Adapter {
                 throw FrontendReceipt.Error.invalidRequest(
                     "imported nominal \(runtimeName) has ambiguous Swift overlay identities"
                 )
+            }
+            var overlayComponents = overlayName.split(separator: ".")
+            let moduleRoots = Set(matchingUses.flatMap(\.importedModules)
+                .compactMap { $0.split(separator: ".").first })
+            if let first = overlayComponents.first,
+               moduleRoots.contains(first) {
+                overlayComponents.removeFirst()
+            }
+            guard overlayComponents.count >= 2 else {
+                // A different top-level Swift spelling can be a contextual
+                // abstraction over several runtime classes. Flat Clang/Swift
+                // renames are handled by the explicit typealias pass above;
+                // this pass exists only for proven nested overlay spellings.
+                continue
+            }
+            overlayByRuntime[runtimeName] = overlayName
+        }
+        let runtimesByOverlay = Dictionary(
+            grouping: overlayByRuntime.map { ($0.key, $0.value) },
+            by: \.1
+        )
+        for runtimeName in overlayByRuntime.keys.sorted() {
+            guard let overlayName = overlayByRuntime[runtimeName],
+                  runtimesByOverlay[overlayName]?.count == 1
+            else {
+                // A Swift abstraction can be carried by several concrete
+                // Objective-C classes (for example DispatchObject by both an
+                // object and a queue). That is a contextual physical bridge,
+                // not a nominal alias, so keep every runtime identity exact.
+                continue
             }
             for index in normalized.indices
             where normalized[index].canonicalName == runtimeName {
@@ -751,30 +989,35 @@ extension FrontendReceipt.Adapter {
         importedTypes: [ImportedNativeType],
         sourceNominals: [SourceNominal]
     ) throws -> [String: Core.TypeID] {
-        var result = Dictionary(uniqueKeysWithValues: records.map {
-            ($0.canonicalName, $0.id)
+        let recordsByCanonicalName = Dictionary(uniqueKeysWithValues: records.map {
+            ($0.canonicalName, $0)
         })
+        var result = recordsByCanonicalName.mapValues(\.id)
         var inferredAliases: [String: Set<Core.TypeID>] = [:]
         let sourceTypeNames = Set(sourceNominals.map(\.canonicalName))
+        var nonSourceRecordsByLeafName: [String: [InterfaceArchive.TypeRecord]] = [:]
+        for record in records where !sourceTypeNames.contains(record.canonicalName) {
+            guard let leaf = record.canonicalName.split(separator: ".").last else {
+                continue
+            }
+            nonSourceRecordsByLeafName[String(leaf), default: []].append(record)
+        }
         for source in sourceNominals where source.kind == .reference {
-            guard let record = records.first(where: {
-                $0.canonicalName == source.canonicalName
-            }) else { continue }
+            guard let record = recordsByCanonicalName[source.canonicalName] else {
+                continue
+            }
             // Generated Swift is compiled inside the current module, where a
             // source class is spelled without the leading module component.
             inferredAliases[source.localTypeKey.rawValue, default: []]
                 .insert(record.id)
         }
         for imported in importedTypes {
-            let exactMatches = records.filter {
-                $0.canonicalName == imported.canonicalName
+            let matches: [InterfaceArchive.TypeRecord]
+            if let exact = recordsByCanonicalName[imported.canonicalName] {
+                matches = [exact]
+            } else {
+                matches = nonSourceRecordsByLeafName[imported.canonicalName] ?? []
             }
-            let qualifiedMatches = records.filter {
-                !sourceTypeNames.contains($0.canonicalName)
-                    && $0.canonicalName.split(separator: ".").last
-                        == Substring(imported.canonicalName)
-            }
-            let matches = exactMatches.isEmpty ? qualifiedMatches : exactMatches
             guard matches.count == 1, let record = matches.first else {
                 throw FrontendReceipt.Error.invalidRequest(
                     "imported type \(imported.canonicalName) has no unique TypeID"
@@ -784,7 +1027,9 @@ extension FrontendReceipt.Adapter {
                 imported.canonicalName,
                 imported.swiftType,
                 "__C.\(imported.canonicalName)",
-            ] + imported.aliases)
+            ] + imported.aliases).filter {
+                !FrontendReceipt.ValueTypeParser.isBuiltinValueSpelling($0)
+            }
             for alias in aliases {
                 inferredAliases[alias, default: []].insert(record.id)
             }
@@ -815,7 +1060,9 @@ extension FrontendReceipt.Adapter {
             let aliases = Set(
                 [imported.canonicalName, imported.swiftType,
                  "__C.\(imported.canonicalName)"] + imported.aliases
-            )
+            ).filter {
+                !FrontendReceipt.ValueTypeParser.isBuiltinValueSpelling($0)
+            }
             for alias in aliases {
                 candidates[alias, default: []].append(
                     .init(

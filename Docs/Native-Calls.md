@@ -359,14 +359,18 @@ caches it by compiler, Xcode/SDK, target, deployment, dependency graph,
 normalized compile/link inputs, generated source, descriptor, and contract.
 Objective-C and C candidates never enter this compiler path.
 
-The canonical `DevelopmentPayload` frames the HLBC, exact promoted imports,
-Adapter image descriptors, hashes, and image bytes into one authenticated
-transaction. The App rechecks compiler fingerprint, SDK build, target, Shell
-hash, descriptor/key identity, image architecture/platform/install name/UUID,
-code signature, dependency policy, and required exports. It builds a candidate
-baseline-plus-session native table, verifies HLBC against that table, and only
-then atomically activates a generation. A failure may leave an already mapped
-image charged to the process budget, but it never publishes the import or
+The canonical `DevelopmentPayload` frames the HLBC, exact promoted imports and
+native types, Adapter image descriptors, hashes, and image bytes into one
+authenticated transaction. A source edit can require a type without making a
+new call—for example through `is`, `as?`, or a metatype expression—so reachable
+TypeOps are promoted independently rather than inferred only from import
+signatures. The App rechecks compiler fingerprint, SDK build, target, Shell
+hash, descriptor/key identity, native-type identity and layout, image
+architecture/platform/install name/UUID, code signature, dependency policy,
+and required exports. It builds candidate baseline-plus-session import and
+TypeOps tables, verifies HLBC against those tables, and only then atomically
+activates a generation. A failure may leave an already mapped image charged to
+the process budget, but it never publishes the import or type and never
 replaces active code. Each generation and every escaping callback lease pin an
 immutable native-capability snapshot.
 
@@ -382,8 +386,12 @@ Simulator and macOS are the currently qualified on-demand Swift Adapter
 targets. Physical iOS rejects this path and asks for an App rebuild until its
 development signing/loading matrix is separately demonstrated. Raw HLBC is no
 longer accepted by this development transport: even an adapter-free generation
-uses the version-1 development envelope. Reconnect identity reports published
-development keys and mapped Adapter inventory so Hub can reuse the session
-Registry without recompiling an already active Adapter.
+uses the version-1 development envelope. Reconnect identity reports the exact
+published `NativeCallKey`-to-`NativeImportID` mapping, published development
+`TypeID` inventory, and mapped Adapter resource totals. Hub therefore preserves
+the compact IDs already embedded in active bytecode and reuses the session
+Registry without recompiling an already active Adapter. Duplicate keys, IDs,
+types, noncanonical ordering, or native inventory without an active HLBC
+generation are rejected at the protocol boundary.
 
 All product, protocol, catalog, archive, and bytecode versions remain 1.

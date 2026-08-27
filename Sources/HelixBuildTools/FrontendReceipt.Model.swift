@@ -12,9 +12,9 @@ public enum CallingSurfacePolicy: String, Codable, Hashable, Sendable {
     /// Uses the exact NativeImport scope resolved for this build. Xcode
     /// integration creates it automatically; headless callers may supply one.
     case configured
-    /// Expands one development feature module into exact catalog candidates.
-    /// Calls absent from the baseline stay dormant until a trusted session
-    /// requests the corresponding Adapter.
+    /// Uses cached module Catalogs plus calls observed in the current source.
+    /// A missing Catalog never triggers a whole-module scan on the foreground
+    /// build; Hub prewarms it while source-observed calls remain available.
     case managedDevelopmentModule
     /// Expands one Release feature module and publishes every qualified
     /// candidate as immutable production capability. No project allowlist is
@@ -75,6 +75,20 @@ public struct Output: Sendable {
     public var toolchain: ReleaseCompiler.ToolchainIdentity
     public var importedModules: [String]
     public var performance: BuildPerformance.Trace
+
+    public init(
+        receipt: ShellBuildReceipt.Document,
+        diagnostics: [Core.Diagnostic],
+        toolchain: ReleaseCompiler.ToolchainIdentity,
+        importedModules: [String],
+        performance: BuildPerformance.Trace
+    ) {
+        self.receipt = receipt
+        self.diagnostics = diagnostics
+        self.toolchain = toolchain
+        self.importedModules = importedModules
+        self.performance = performance
+    }
 }
 
 public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {

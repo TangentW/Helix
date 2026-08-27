@@ -14,12 +14,17 @@ struct SILFunctionResolver: Sendable {
     }
 
     let file: CanonicalSIL.File
+    private let functionsByMangledName: [String: CanonicalSIL.Function]
     private let functionsByDeclarationLocation: [
         DeclarationLocationKey: [CanonicalSIL.Function]
     ]
 
     init(file: CanonicalSIL.File) {
         self.file = file
+        functionsByMangledName = Dictionary(
+            grouping: file.functions,
+            by: \.mangledName
+        ).compactMapValues(\.first)
         functionsByDeclarationLocation = Dictionary(grouping: file.functions.compactMap {
             function -> (DeclarationLocationKey, CanonicalSIL.Function)? in
             guard let location = function.declarationLocation else { return nil }
@@ -43,7 +48,7 @@ struct SILFunctionResolver: Sendable {
             return nil
         }
         let astSymbol = "$s" + usr.dropFirst(2)
-        if let exact = file.function(mangledName: astSymbol) { return exact }
+        if let exact = functionsByMangledName[astSymbol] { return exact }
         guard let location = declarationLocation(
             for: item,
             source: source,
@@ -59,6 +64,32 @@ struct SILFunctionResolver: Sendable {
         guard matches.count <= 1 else {
             throw FrontendReceipt.Error.ambiguousSILFunction(
                 astSymbol,
+                matches.map(\.mangledName).sorted()
+            )
+        }
+        return matches.first
+    }
+
+    func function(
+        forClosure item: FrontendReceipt.TypedAST.Object,
+        source: FrontendReceipt.Adapter.SourceState
+    ) throws -> CanonicalSIL.Function? {
+        guard item["_kind"] as? String == "closure_expr",
+              let range = FrontendReceipt.Adapter().sourceRange(in: item),
+              let location = sourceLocation(
+                  atUTF8Offset: range.start,
+                  in: source
+              )
+        else { return nil }
+        let key = DeclarationLocationKey(
+            file: Self.canonicalPath(location.file),
+            line: location.line,
+            column: location.column
+        )
+        let matches = functionsByDeclarationLocation[key] ?? []
+        guard matches.count <= 1 else {
+            throw FrontendReceipt.Error.ambiguousSILFunction(
+                "closure@\(location.file):\(location.line):\(location.column)",
                 matches.map(\.mangledName).sorted()
             )
         }
@@ -98,17 +129,7 @@ struct SILFunctionResolver: Sendable {
         in source: FrontendReceipt.Adapter.SourceState
     ) -> Core.SourceLocation? {
         guard offset >= 0, offset <= source.contents.count else { return nil }
-        var line = 1
-        var column = 1
-        for byte in source.contents.prefix(offset) {
-            if byte == UInt8(ascii: "\n") {
-                line += 1
-                column = 1
-            } else {
-                column += 1
-            }
-        }
-        return .init(file: source.url.path, line: line, column: column)
+        return source.sourceLocation(atUTF8Offset: offset)
     }
 
     private static func canonicalPath(_ path: String) -> String {

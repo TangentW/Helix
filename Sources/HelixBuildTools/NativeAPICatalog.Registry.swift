@@ -12,6 +12,17 @@ public struct Registry: Sendable {
     private let keysByEntryPoint: [EntryPointIndex: [Core.NativeCall.Key]]
 
     public init(documents: [NativeAPICatalog.Document]) throws {
+        try self.init(documents: documents, validatesDocuments: true)
+    }
+
+    init(validatedDocuments documents: [NativeAPICatalog.Document]) throws {
+        try self.init(documents: documents, validatesDocuments: false)
+    }
+
+    private init(
+        documents: [NativeAPICatalog.Document],
+        validatesDocuments: Bool
+    ) throws {
         var entriesByKey: [
             Core.NativeCall.Key: NativeAPICatalog.Entry
         ] = [:]
@@ -21,7 +32,7 @@ public struct Registry: Sendable {
         for document in documents.sorted(by: {
             $0.identity.cacheKey < $1.identity.cacheKey
         }) {
-            try document.validate()
+            if validatesDocuments { try document.validate() }
             let identity = document.identity.cacheKey
             if let existing = documentByIdentity[identity] {
                 guard existing == document else {

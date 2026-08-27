@@ -166,8 +166,560 @@ struct NativeImportDiscoveryTests {
         )
     }
 
+    @Test("Exact Objective-C classes replace logical Swift bridge artifacts")
+    func resolvesLogicalValueBridgeArtifacts() throws {
+        let logicalBridge = FrontendReceipt.Adapter.ImportedNativeType(
+            canonicalName: "NSString",
+            swiftType: "NSString",
+            kind: .value,
+            aliases: ["Swift.String"],
+            representation: .opaqueValue,
+            sourceFileLogicalID: "HelixManagedNative/ManagedNativeSurface.swift",
+            importedModules: ["Foundation"],
+            requiresMainActor: false
+        )
+        let exactReference = FrontendReceipt.Adapter.ImportedNativeType(
+            canonicalName: "NSString",
+            swiftType: "NSString",
+            kind: .reference,
+            aliases: ["Foundation.NSString", "__C.NSString"],
+            representation: .reference,
+            sourceFileLogicalID: "NativeAPICatalog/Foundation.swift",
+            importedModules: ["Foundation"],
+            objectiveCModuleName: "Foundation",
+            objectiveCRuntimeName: "NSString",
+            requiresMainActor: false,
+            isolationEvidence: .importedDeclaration
+        )
+
+        for values in [
+            [logicalBridge, exactReference],
+            [exactReference, logicalBridge],
+        ] {
+            let merged = try FrontendReceipt.Adapter()
+                .mergeImportedNativeTypes(
+                    discoveredTypes: [],
+                    operationTypes: values
+                )
+            #expect(merged.count == 1)
+            let type = try #require(merged.first)
+            #expect(type.kind == .reference)
+            #expect(type.representation == .reference)
+            #expect(type.objectiveCRuntimeName == "NSString")
+            #expect(type.sourceFileLogicalID
+                == "NativeAPICatalog/Foundation.swift")
+            #expect(!type.aliases.contains("Swift.String"))
+        }
+
+        let bridgeOnly = try FrontendReceipt.Adapter()
+            .mergeImportedNativeTypes(
+                discoveredTypes: [],
+                operationTypes: [logicalBridge]
+            )
+        let physicalType = try #require(bridgeOnly.first)
+        #expect(physicalType.canonicalName == "NSString")
+        #expect(!physicalType.aliases.contains("Swift.String"))
+        #expect(try FrontendReceipt.Adapter()
+            .makeImportedSwiftTypeAliases(bridgeOnly)["Swift.String"] == nil)
+        #expect(FrontendReceipt.ImportedTypeIndex(types: bridgeOnly)
+            .matching(spellings: ["Swift.String"]).isEmpty)
+    }
+
+    @Test("Catalog runtime evidence corrects one weak Objective-C reference observation")
+    func correctsWeakObjectiveCReferenceObservation() throws {
+        let weakObservation = FrontendReceipt.Adapter.ImportedNativeType(
+            canonicalName: "NSString",
+            swiftType: "NSString",
+            kind: .value,
+            aliases: [],
+            representation: .opaqueValue,
+            sourceFileLogicalID: "HelixManagedNative/ManagedNativeSurface.swift",
+            importedModules: ["Foundation"],
+            requiresMainActor: false
+        )
+        let exactReference = FrontendReceipt.Adapter.ImportedNativeType(
+            canonicalName: "NSString",
+            swiftType: "NSString",
+            kind: .reference,
+            aliases: ["Foundation.NSString", "__C.NSString"],
+            representation: .reference,
+            sourceFileLogicalID: "NativeAPICatalog/Foundation.swift",
+            importedModules: ["Foundation"],
+            nativeModuleName: "Foundation",
+            objectiveCModuleName: "Foundation",
+            objectiveCRuntimeName: "NSString",
+            requiresMainActor: false,
+            isolationEvidence: .importedDeclaration
+        )
+
+        let merged = try FrontendReceipt.Adapter().mergeImportedNativeTypes(
+            discoveredTypes: [weakObservation],
+            operationTypes: [exactReference]
+        )
+
+        let result = try #require(merged.first)
+        #expect(merged.count == 1)
+        #expect(result.kind == .reference)
+        #expect(result.representation == .reference)
+        #expect(result.objectiveCModuleName == "Foundation")
+        #expect(result.objectiveCRuntimeName == "NSString")
+        #expect(result.nativeModuleName == "Foundation")
+        #expect(result.aliases == ["Foundation.NSString", "NSString", "__C.NSString"])
+    }
+
+    @Test("Ambiguous Catalog evidence cannot reclassify a weak native type")
+    func rejectsAmbiguousWeakObjectiveCReferenceObservation() {
+        let weakObservation = FrontendReceipt.Adapter.ImportedNativeType(
+            canonicalName: "NSString",
+            swiftType: "NSString",
+            kind: .value,
+            aliases: [],
+            representation: .opaqueValue,
+            sourceFileLogicalID: "HelixManagedNative/ManagedNativeSurface.swift",
+            importedModules: ["Foundation"],
+            requiresMainActor: false
+        )
+        func exactReference(
+            canonicalName: String,
+            moduleName: String,
+            runtimeName: String
+        ) -> FrontendReceipt.Adapter.ImportedNativeType {
+            .init(
+                canonicalName: canonicalName,
+                swiftType: canonicalName,
+                kind: .reference,
+                aliases: canonicalName == "NSString" ? [] : ["NSString"],
+                representation: .reference,
+                sourceFileLogicalID: "NativeAPICatalog/\(moduleName).swift",
+                importedModules: [moduleName],
+                nativeModuleName: moduleName,
+                objectiveCModuleName: moduleName,
+                objectiveCRuntimeName: runtimeName,
+                requiresMainActor: false,
+                isolationEvidence: .importedDeclaration
+            )
+        }
+
+        #expect(throws: FrontendReceipt.Error.self) {
+            try FrontendReceipt.Adapter().mergeImportedNativeTypes(
+                discoveredTypes: [weakObservation],
+                operationTypes: [
+                    exactReference(
+                        canonicalName: "NSString",
+                        moduleName: "Foundation",
+                        runtimeName: "NSString"
+                    ),
+                    exactReference(
+                        canonicalName: "AlternateNSString",
+                        moduleName: "AlternateFoundation",
+                        runtimeName: "NSString"
+                    ),
+                ]
+            )
+        }
+    }
+
+    @Test("One Swift abstraction does not alias several Objective-C runtime classes")
+    func preservesContextualObjectiveCRuntimeIdentities() throws {
+        func runtimeType(
+            _ runtimeName: String
+        ) -> FrontendReceipt.Adapter.ImportedNativeType {
+            .init(
+                canonicalName: runtimeName,
+                swiftType: "DispatchObject",
+                kind: .reference,
+                aliases: [runtimeName, "__C.\(runtimeName)", "DispatchObject"],
+                representation: .reference,
+                sourceFileLogicalID: "NativeAPICatalog/Dispatch.swift",
+                importedModules: ["Dispatch"],
+                objectiveCModuleName: "Dispatch",
+                objectiveCRuntimeName: runtimeName,
+                requiresMainActor: false,
+                isolationEvidence: .importedDeclaration
+            )
+        }
+
+        let merged = try FrontendReceipt.Adapter().mergeImportedNativeTypes(
+            discoveredTypes: [],
+            operationTypes: [
+                runtimeType("OS_dispatch_object"),
+                runtimeType("OS_dispatch_queue"),
+            ]
+        )
+
+        #expect(Set(merged.map(\.canonicalName)) == [
+            "OS_dispatch_object", "OS_dispatch_queue",
+        ])
+        #expect(Set(merged.compactMap(\.objectiveCRuntimeName)) == [
+            "OS_dispatch_object", "OS_dispatch_queue",
+        ])
+
+        let nested = try FrontendReceipt.Adapter().mergeImportedNativeTypes(
+            discoveredTypes: [],
+            operationTypes: [.init(
+                canonicalName: "NSNotificationName",
+                swiftType: "NSNotification.Name",
+                kind: .value,
+                aliases: [],
+                representation: .opaqueValue,
+                sourceFileLogicalID: "NativeAPICatalog/Foundation.swift",
+                importedModules: ["Foundation"],
+                requiresMainActor: false,
+                isolationEvidence: .importedDeclaration
+            )]
+        )
+        #expect(nested.map(\.canonicalName) == ["NSNotification.Name"])
+    }
+
+    @Test("Exact nested aliases share one imported native identity")
+    func mergesQualifiedNestedTypeAliases() throws {
+        func type(
+            canonicalName: String,
+            swiftType: String,
+            aliases: [String] = [
+                "UIButton.Configuration",
+                "UIKit.UIButton.Configuration",
+            ],
+            nativeModuleName: String? = nil,
+            kind: InterfaceArchive.TypeKind = .value,
+            representation: FrontendReceipt.Adapter.ImportedNativeType
+                .Representation = .opaqueValue
+        ) -> FrontendReceipt.Adapter.ImportedNativeType {
+            .init(
+                canonicalName: canonicalName,
+                swiftType: swiftType,
+                kind: kind,
+                aliases: aliases,
+                representation: representation,
+                sourceFileLogicalID: "NativeAPICatalog/UIKit.swift",
+                importedModules: ["UIKit"],
+                nativeModuleName: nativeModuleName,
+                requiresMainActor: false,
+                isolationEvidence: .importedDeclaration
+            )
+        }
+
+        let merged = try FrontendReceipt.Adapter().mergeImportedNativeTypes(
+            discoveredTypes: [],
+            operationTypes: [
+                type(
+                    canonicalName: "UIButton.Configuration",
+                    swiftType: "UIButton.Configuration",
+                    aliases: []
+                ),
+                type(
+                    canonicalName: "UIKit.UIButton.Configuration",
+                    swiftType: "UIKit.UIButton.Configuration",
+                    nativeModuleName: "UIKit"
+                ),
+            ]
+        )
+
+        let configuration = try #require(merged.first)
+        #expect(merged.count == 1)
+        #expect(configuration.canonicalName
+            == "UIKit.UIButton.Configuration")
+        #expect(configuration.swiftType == "UIKit.UIButton.Configuration")
+        #expect(Set(configuration.aliases).isSuperset(of: [
+            "UIButton.Configuration", "UIKit.UIButton.Configuration",
+        ]))
+        #expect(try FrontendReceipt.Adapter().mergeImportedNativeTypes(
+            discoveredTypes: [],
+            operationTypes: merged
+        ) == merged)
+
+        let refined = try FrontendReceipt.Adapter().mergeImportedNativeTypes(
+            discoveredTypes: [type(
+                canonicalName: "UIButton.Configuration",
+                swiftType: "UIButton.Configuration",
+                aliases: [],
+                representation: .rawRepresentable
+            )],
+            operationTypes: [type(
+                canonicalName: "UIKit.UIButton.Configuration",
+                swiftType: "UIKit.UIButton.Configuration",
+                nativeModuleName: "UIKit"
+            )]
+        )
+        let refinedConfiguration = try #require(refined.first)
+        #expect(refined.count == 1)
+        #expect(refinedConfiguration.canonicalName
+            == "UIKit.UIButton.Configuration")
+        #expect(refinedConfiguration.representation == .rawRepresentable)
+        #expect(refinedConfiguration.aliases.contains(
+            "UIButton.Configuration"
+        ))
+
+        let refinedEnum = try FrontendReceipt.Adapter()
+            .mergeImportedNativeTypes(
+                discoveredTypes: [type(
+                    canonicalName: "UIView.AnimationCurve",
+                    swiftType: "UIView.AnimationCurve",
+                    aliases: []
+                )],
+                operationTypes: [type(
+                    canonicalName: "UIKit.UIView.AnimationCurve",
+                    swiftType: "UIKit.UIView.AnimationCurve",
+                    aliases: [
+                        "UIKit.UIView.AnimationCurve",
+                        "UIView.AnimationCurve",
+                    ],
+                    nativeModuleName: "UIKit",
+                    kind: .enumeration
+                )]
+            )
+        let animationCurve = try #require(refinedEnum.first)
+        #expect(refinedEnum.count == 1)
+        #expect(animationCurve.canonicalName
+            == "UIKit.UIView.AnimationCurve")
+        #expect(animationCurve.kind == .enumeration)
+
+        let ambiguous = try FrontendReceipt.Adapter().mergeImportedNativeTypes(
+            discoveredTypes: [],
+            operationTypes: [
+                type(
+                    canonicalName: "Configuration",
+                    swiftType: "Configuration",
+                    aliases: []
+                ),
+                type(
+                    canonicalName: "UIKit.First.Configuration",
+                    swiftType: "UIKit.First.Configuration",
+                    aliases: ["Configuration", "First.Configuration"],
+                    nativeModuleName: "UIKit"
+                ),
+                type(
+                    canonicalName: "UIKit.Second.Configuration",
+                    swiftType: "UIKit.Second.Configuration",
+                    aliases: ["Configuration", "Second.Configuration"],
+                    nativeModuleName: "UIKit"
+                ),
+            ]
+        )
+        #expect(ambiguous.contains { $0.canonicalName == "Configuration" })
+        #expect(try FrontendReceipt.Adapter()
+            .makeImportedSwiftTypeAliases(ambiguous)["Configuration"]
+                == "Configuration")
+
+        let operation = FrontendReceipt.Adapter.ImportedOperation(
+            silReferences: ["$s_ui_button_configuration_filled"],
+            sourceFileLogicalID: "NativeAPICatalog/UIKit.swift",
+            importedModules: ["UIKit"],
+            dispatch: .staticMethod,
+            ownerType: "UIButton.Configuration",
+            baseName: "filled",
+            argumentLabels: [],
+            parameterSwiftTypes: [],
+            resultSwiftType: "UIButton.Configuration",
+            requiresMainActor: true,
+            declarationUSR:
+                "s:So8UIButtonC5UIKitE13ConfigurationV6filledAEyFZ",
+            isolationEvidence: .importedDeclaration,
+            isEmittedToDevice: false
+        )
+        let canonicalOperation = try #require(
+            FrontendReceipt.ManagedNativeSurface.canonicalizedOperations(
+                [operation],
+                importedTypes: merged
+            ).first
+        )
+        #expect(canonicalOperation.ownerType
+            == "UIKit.UIButton.Configuration")
+        #expect(canonicalOperation.resultSwiftType
+            == "UIKit.UIButton.Configuration")
+
+        func setter(parameterType: String, source: String)
+            -> FrontendReceipt.Adapter.ImportedOperation {
+            .init(
+                silReferences: [
+                    "$sSo8UIButtonC5UIKitE13configurationAbCE13ConfigurationVSgvs",
+                ],
+                sourceFileLogicalID: source,
+                importedModules: ["UIKit"],
+                dispatch: .instanceSetter,
+                ownerType: "UIButton",
+                baseName: "configuration",
+                argumentLabels: [],
+                parameterSwiftTypes: [parameterType, "UIButton"],
+                resultSwiftType: "Swift.Void",
+                requiresMainActor: true,
+                declarationUSR:
+                    "s:So8UIButtonC5UIKitE13configurationAbCE13ConfigurationVSgvp",
+                isolationEvidence: .importedDeclaration,
+                isEmittedToDevice: source != "NativeAPICatalog/UIKit.swift"
+            )
+        }
+        let aliases = try FrontendReceipt.Adapter()
+            .makeImportedSwiftTypeAliases(merged)
+        let mergedSetter = try FrontendReceipt.Adapter()
+            .mergingAuthoritativeImportedOperations(
+                source: [setter(
+                    parameterType: "UIKit.UIButton.Configuration?",
+                    source: "Sources/Screen.swift"
+                )],
+                authoritative: [setter(
+                    parameterType: "UIButton.Configuration?",
+                    source: "NativeAPICatalog/UIKit.swift"
+                )],
+                comparisonAliases: aliases
+            )
+        #expect(mergedSetter.count == 1)
+        #expect(mergedSetter.first?.parameterSwiftTypes == [
+            "UIButton.Configuration?", "UIButton",
+        ])
+        #expect(mergedSetter.first?.silReferences == [
+            "$sSo8UIButtonC5UIKitE13configurationAbCE13ConfigurationVSgvs",
+        ])
+
+        let fontUSR = "c:objc(cs)UIFont(cm)systemFontOfSize:weight:"
+        let fontSymbol = "$hlx_native_foreign_system_font"
+        let fontEvidence = FrontendReceipt.ObjectiveCABI.Evidence(
+            moduleName: "UIKit",
+            declarationUSR: fontUSR,
+            runtimeClassName: "UIFont",
+            dispatchClassName: "UIFont",
+            selector: "systemFontOfSize:weight:",
+            lexicalSuperclassName: nil,
+            methodFamily: .none,
+            property: nil,
+            parameters: [
+                .init(swiftABIType: "CGFloat", source: .argument(0)),
+                .init(swiftABIType: "UIFont.Weight", source: .argument(1)),
+            ],
+            resultSwiftABIType: "@autoreleased UIFont",
+            resultConvention: .autoreleased,
+            errorConvention: .none,
+            errorFailure: nil
+        )
+        func fontOperation(
+            sizeType: String,
+            source: String
+        ) -> FrontendReceipt.Adapter.ImportedOperation {
+            .init(
+                silReferences: [fontSymbol],
+                sourceFileLogicalID: source,
+                importedModules: ["UIKit"],
+                dispatch: .staticMethod,
+                ownerType: "UIFont",
+                baseName: "systemFont",
+                argumentLabels: ["ofSize", "weight"],
+                parameterSwiftTypes: [sizeType, "UIFont.Weight"],
+                physicalParameterSwiftTypes: [sizeType, "UIFont.Weight"],
+                parameterProjection: .identity(parameterCount: 2),
+                resultSwiftType: "UIFont",
+                requiresMainActor: true,
+                declarationUSR: fontUSR,
+                objectiveC: fontEvidence,
+                isolationEvidence: .importedDeclaration,
+                isEmittedToDevice: source != "NativeAPICatalog/UIKit.swift"
+            )
+        }
+        var catalogFont = fontOperation(
+            sizeType: "CGFloat",
+            source: "NativeAPICatalog/UIKit.swift"
+        )
+        catalogFont.catalogAuthorityKey = .init(rawValue: .sha256("font"))
+        let mergedFont = try FrontendReceipt.Adapter()
+            .mergingAuthoritativeImportedOperations(
+                source: [fontOperation(
+                    sizeType: "CoreFoundation.CGFloat",
+                    source: "Sources/Screen.swift"
+                )],
+                authoritative: [catalogFont]
+            )
+        #expect(mergedFont.count == 1)
+        #expect(mergedFont.first?.parameterSwiftTypes == [
+            "CGFloat", "UIFont.Weight",
+        ])
+
+        let titleUSR =
+            "s:So8UIButtonC5UIKitE13ConfigurationV5titleSSSgvp"
+        let titleSymbol =
+            "$sSo8UIButtonC5UIKitE13ConfigurationV5titleSSSgvs"
+        func titleOperation(
+            valueType: String,
+            ownerType: String = "UIKit.UIButton.Configuration",
+            source: String
+        ) -> FrontendReceipt.Adapter.ImportedOperation {
+            .init(
+                silReferences: [titleSymbol],
+                sourceFileLogicalID: source,
+                importedModules: ["UIKit"],
+                dispatch: .instanceValueSetter,
+                ownerType: ownerType,
+                baseName: "title",
+                argumentLabels: ["_"],
+                parameterSwiftTypes: [valueType, ownerType],
+                resultSwiftType: ownerType,
+                requiresMainActor: true,
+                declarationUSR: titleUSR,
+                isolationEvidence: .importedDeclaration,
+                isEmittedToDevice: source != "NativeAPICatalog/UIKit.swift"
+            )
+        }
+        var catalogTitle = titleOperation(
+            valueType: "Swift.String?",
+            source: "NativeAPICatalog/UIKit.swift"
+        )
+        catalogTitle.catalogAuthorityKey = .init(rawValue: .sha256("title"))
+        let mergedTitle = try FrontendReceipt.Adapter()
+            .mergingAuthoritativeImportedOperations(
+                source: [titleOperation(
+                    valueType: "Swift.Optional<NSString>",
+                    source: "Sources/Screen.swift"
+                )],
+                authoritative: [catalogTitle]
+            )
+        #expect(mergedTitle.count == 1)
+        #expect(mergedTitle.first?.parameterSwiftTypes == [
+            "Swift.String?", "UIKit.UIButton.Configuration",
+        ])
+
+        let unrelatedOwner = titleOperation(
+            valueType: "Swift.Optional<NSString>",
+            ownerType: "Feature.Configuration",
+            source: "Sources/Screen.swift"
+        )
+        #expect(try FrontendReceipt.Adapter()
+            .mergingAuthoritativeImportedOperations(
+                source: [unrelatedOwner],
+                authoritative: [catalogTitle]
+            ).count == 2)
+    }
+
     @Test("Generated Swift type syntax accepts nested collections and rejects code")
     func validatesGeneratedSwiftTypeSyntax() {
+        #expect(
+            FrontendReceipt.SwiftTypeSpelling.canonicalABIIdentity(
+                "@escaping @Swift.MainActor (Swift.Bool) -> Swift.Void"
+            ) == "@escaping @MainActor (Swift.Bool) -> Swift.Void"
+        )
+        #expect(
+            FrontendReceipt.SwiftTypeSpelling.canonicalABIIdentity(
+                "Swift.Optional<@Swift.MainActor (UIKit.UIView) -> Swift.Void>"
+            ) == "Swift.Optional<@MainActor (UIKit.UIView) -> Swift.Void>"
+        )
+        #expect(
+            FrontendReceipt.SwiftTypeSpelling.canonicalABIIdentity(
+                "@Feature.MainActor () -> Swift.Void"
+            ) == "@Feature.MainActor () -> Swift.Void"
+        )
+        let authorityIdentity = FrontendReceipt.SwiftTypeSpelling
+            .catalogAuthorityMatchIdentity
+        #expect(
+            authorityIdentity(
+                "Swift.Optional<@escaping @Swift.MainActor @Sendable "
+                    + "@convention(block) (Bool) -> Void>"
+            ) == authorityIdentity("((Swift.Bool) -> Swift.Void)?")
+        )
+        #expect(
+            authorityIdentity("@MainActor (UIKit.UIView) -> Swift.Void")
+                != authorityIdentity("@MainActor (UIKit.UIButton) -> Swift.Void")
+        )
+        #expect(
+            authorityIdentity("((Swift.Bool) -> Swift.Void)?")
+                != authorityIdentity("(Swift.Bool) -> Swift.Void")
+        )
         #expect(FrontendReceipt.SwiftTypeSpelling.isGeneratedType("()"))
         #expect(FrontendReceipt.SwiftTypeSpelling.isGeneratedType("Swift.Void"))
         #expect(FrontendReceipt.SwiftTypeSpelling.isGeneratedType("[Swift.String: [UIKit.UIView?]]"))
@@ -593,6 +1145,38 @@ struct NativeImportDiscoveryTests {
         ))
     }
 
+    @Test("Swift built-ins take precedence over native bridge aliases")
+    func preservesBuiltinValueTypesAcrossNativeAliases() {
+        let bridged = Core.TypeID(rawValue: .sha256("bridged-native"))
+        let nativeTypes = [
+            "Swift.String": bridged,
+            "Swift.Int": bridged,
+            "CoreGraphics.CGFloat": bridged,
+            "Fixture.Value": bridged,
+        ]
+
+        #expect(FrontendReceipt.ValueTypeParser.parse(
+            "Swift.String",
+            allowVoid: false,
+            nativeTypes: nativeTypes
+        ) == .string)
+        #expect(FrontendReceipt.ValueTypeParser.parse(
+            "Swift.Int",
+            allowVoid: false,
+            nativeTypes: nativeTypes
+        ) == .integer(bitWidth: 64, signed: true))
+        #expect(FrontendReceipt.ValueTypeParser.parse(
+            "CoreGraphics.CGFloat",
+            allowVoid: false,
+            nativeTypes: nativeTypes
+        ) == .float(bitWidth: 64))
+        #expect(FrontendReceipt.ValueTypeParser.parse(
+            "Fixture.Value",
+            allowVoid: false,
+            nativeTypes: nativeTypes
+        ) == .native(bridged))
+    }
+
     @Test("Swift type checking proves nested callable escaping authority")
     func provesNestedCallableEscapingAuthority() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -710,6 +1294,25 @@ struct NativeImportDiscoveryTests {
         #expect(declaration.invocationParameterSwiftTypes == [
             "any UIInteraction", "UIView",
         ])
+    }
+
+    @Test("Managed logical projection keeps representable compiler aliases")
+    func projectsManagedLogicalTypeAliases() {
+        #expect(FrontendReceipt.ManagedNativeSurface.sourceFacingType(
+            logical: "TimeInterval",
+            measured: "Swift.Double",
+            moduleName: "Foundation"
+        ) == "Swift.Double")
+        #expect(FrontendReceipt.ManagedNativeSurface.sourceFacingType(
+            logical: "Swift.String?",
+            measured: "Swift.Optional<NSString>",
+            moduleName: "Foundation"
+        ) == "Swift.Optional<Swift.String>")
+        #expect(FrontendReceipt.ManagedNativeSurface.sourceFacingType(
+            logical: "CGFloat",
+            measured: "CoreFoundation.CGFloat",
+            moduleName: "UIKit"
+        ) == "CGFloat")
     }
 
     @Test("Managed SDK probing preserves NSError-backed Swift throws")
@@ -878,16 +1481,187 @@ struct NativeImportDiscoveryTests {
             compilerInputHash: .sha256("overload-test-compiler-inputs")
         )
         let overloads = first.operations.filter {
-            $0.ownerType == "\(moduleName).Overloaded"
+            $0.ownerType == "Overloaded"
                 && $0.baseName == "transform"
                 && $0.argumentLabels == ["_"]
         }
-
         #expect(overloads.count == 2)
         #expect(Set(overloads.map(\.parameterSwiftTypes)) == Set([
             ["Swift.Int", "Overloaded"],
             ["Swift.String", "Overloaded"],
         ]))
+        #expect(reused.operations == first.operations)
+        #expect(reused.metrics.probeCacheHitCount == reused.metrics.candidateCount)
+        #expect(reused.metrics.probeAttemptCount == 0)
+    }
+
+    @Test("Managed probes normalize Clang runtime owners to Swift overlays")
+    func normalizesManagedSDKSwiftOverlayOwners() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-managed-dispatch-owner-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let frontend = SwiftFrontend.Driver(
+            compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc")
+        )
+        let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        let invocation = InterfaceArchive.FrontendInvocation(
+            moduleName: "ManagedDispatchOwnerConsumer",
+            targetTriple: "arm64-apple-ios15.0-simulator",
+            sdkName: sdk.name,
+            sdkBuild: sdk.buildVersion,
+            optimization: "-Onone",
+            semanticArguments: ["-parse-as-library"]
+        )
+        let queue = FrontendReceipt.Adapter.ImportedNativeType(
+            canonicalName: "DispatchQueue",
+            swiftType: "DispatchQueue",
+            kind: .reference,
+            aliases: [
+                "Dispatch.DispatchQueue", "OS_dispatch_queue",
+                "__C.OS_dispatch_queue",
+            ],
+            representation: .reference,
+            sourceFileLogicalID: "Sources/Fixture.swift",
+            importedModules: ["Dispatch"],
+            objectiveCModuleName: "Dispatch",
+            objectiveCRuntimeName: "OS_dispatch_queue",
+            requiresMainActor: false,
+            isolationEvidence: .importedDeclaration
+        )
+
+        let expansion = try FrontendReceipt.ManagedNativeSurface.expand(
+            importedTypes: [queue],
+            minimumOS: .init(15),
+            frontend: frontend,
+            invocation: invocation,
+            cache: try .init(rootURL: directory.appendingPathComponent("Cache")),
+            compilerFingerprint: "dispatch-owner-test-compiler",
+            compilerInputHash: .sha256("dispatch-owner-test-inputs")
+        )
+
+        let main = try #require(expansion.operations.first {
+            $0.baseName == "main" && $0.dispatch == .staticGetter
+        })
+        #expect(main.ownerType == "DispatchQueue")
+        #expect(main.resultSwiftType == "DispatchQueue")
+        #expect(!expansion.operations.contains {
+            $0.ownerType == "OS_dispatch_queue"
+        })
+    }
+
+    @Test("Managed probes recover SDK callback lifetimes hidden by typealiases")
+    func recoversManagedSDKTypealiasCallbackLifetimes() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-managed-callback-alias-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let frontend = SwiftFrontend.Driver(
+            compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc")
+        )
+        let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        let invocation = InterfaceArchive.FrontendInvocation(
+            moduleName: "ManagedUIKitCallbackAliasConsumer",
+            targetTriple: "arm64-apple-ios15.0-simulator",
+            sdkName: sdk.name,
+            sdkBuild: sdk.buildVersion,
+            optimization: "-Onone",
+            semanticArguments: ["-parse-as-library"]
+        )
+        let importedTypes: [FrontendReceipt.Adapter.ImportedNativeType] = [
+            .init(
+                canonicalName: "UIAccessibilityCustomRotor",
+                swiftType: "UIAccessibilityCustomRotor",
+                kind: .reference,
+                aliases: [
+                    "__C.UIAccessibilityCustomRotor",
+                    "UIKit.UIAccessibilityCustomRotor",
+                ],
+                representation: .reference,
+                sourceFileLogicalID: "Sources/Fixture.swift",
+                importedModules: ["UIKit"],
+                objectiveCModuleName: "UIKit",
+                objectiveCRuntimeName: "UIAccessibilityCustomRotor",
+                requiresMainActor: true,
+                isolationEvidence: .importedDeclaration
+            ),
+            .init(
+                canonicalName: "UIAccessibilityCustomRotorSearchPredicate",
+                swiftType: "UIAccessibilityCustomRotorSearchPredicate",
+                kind: .reference,
+                aliases: [
+                    "__C.UIAccessibilityCustomRotorSearchPredicate",
+                    "UIKit.UIAccessibilityCustomRotorSearchPredicate",
+                ],
+                representation: .reference,
+                sourceFileLogicalID: "Sources/Fixture.swift",
+                importedModules: ["UIKit"],
+                objectiveCModuleName: "UIKit",
+                objectiveCRuntimeName:
+                    "UIAccessibilityCustomRotorSearchPredicate",
+                requiresMainActor: true,
+                isolationEvidence: .importedDeclaration
+            ),
+            .init(
+                canonicalName: "UIAccessibilityCustomRotorItemResult",
+                swiftType: "UIAccessibilityCustomRotorItemResult",
+                kind: .reference,
+                aliases: [
+                    "__C.UIAccessibilityCustomRotorItemResult",
+                    "UIKit.UIAccessibilityCustomRotorItemResult",
+                ],
+                representation: .reference,
+                sourceFileLogicalID: "Sources/Fixture.swift",
+                importedModules: ["UIKit"],
+                objectiveCModuleName: "UIKit",
+                objectiveCRuntimeName: "UIAccessibilityCustomRotorItemResult",
+                requiresMainActor: true,
+                isolationEvidence: .importedDeclaration
+            ),
+        ]
+        let cache = try BuildCache.Store(
+            rootURL: directory.appendingPathComponent("Cache")
+        )
+
+        let first = try FrontendReceipt.ManagedNativeSurface.expand(
+            importedTypes: importedTypes,
+            minimumOS: .init(15),
+            frontend: frontend,
+            invocation: invocation,
+            cache: cache,
+            compilerFingerprint: "uikit-callback-alias-test-compiler",
+            compilerInputHash: .sha256("uikit-callback-alias-test-inputs")
+        )
+        let reused = try FrontendReceipt.ManagedNativeSurface.expand(
+            importedTypes: importedTypes,
+            minimumOS: .init(15),
+            frontend: frontend,
+            invocation: invocation,
+            cache: cache,
+            compilerFingerprint: "uikit-callback-alias-test-compiler",
+            compilerInputHash: .sha256("uikit-callback-alias-test-inputs")
+        )
+        let setter = try #require(first.operations.first {
+            $0.ownerType == "UIAccessibilityCustomRotor"
+                && $0.baseName == "itemSearchBlock"
+                && $0.dispatch == .instanceSetter
+        })
+        let spelling = try #require(setter.parameterSwiftTypes.first)
+        let callback = try #require(
+            FrontendReceipt.FunctionTypeSpelling.callbackBoundary(in: spelling)
+        )
+        #expect(callback.lifetime == .escaping)
+        #expect(callback.function.attributes.globalActor == "MainActor")
         #expect(reused.operations == first.operations)
         #expect(reused.metrics.probeCacheHitCount == reused.metrics.candidateCount)
         #expect(reused.metrics.probeAttemptCount == 0)
@@ -993,9 +1767,90 @@ struct NativeImportDiscoveryTests {
 
     @Test("Managed probe caching excludes transient compiler failures")
     func classifiesManagedProbeRejections() {
+        #expect(FrontendReceipt.ManagedNativeSurface.swiftModuleName(
+            inPreciseIdentifier: "s:22UniformTypeIdentifiers6UTTypeV"
+        ) == "UniformTypeIdentifiers")
+        #expect(FrontendReceipt.ManagedNativeSurface.swiftModuleName(
+            inPreciseIdentifier: "s:10Foundation3URLV"
+        ) == "Foundation")
+        #expect(FrontendReceipt.ManagedNativeSurface.swiftModuleName(
+            inPreciseIdentifier: "s:Si"
+        ) == nil)
+        #expect(FrontendReceipt.ManagedNativeSurface.swiftModuleName(
+            inPreciseIdentifier: "c:objc(cs)UIView"
+        ) == nil)
+        #expect(FrontendReceipt.ManagedNativeSurface.swiftModuleName(
+            inPreciseIdentifier: "s:999Malformed"
+        ) == nil)
         #expect(FrontendReceipt.ManagedNativeSurface.isDeterministicProbeRejection(
             status: 1,
             diagnostics: "fixture.swift:1:1: error: cannot convert value"
+        ))
+        #expect(FrontendReceipt.ManagedNativeSurface.isDeterministicProbeRejection(
+            status: 1,
+            diagnostics: "fixture.swift:1:1: error: will never be executed"
+        ))
+        #expect(FrontendReceipt.ManagedNativeSurface.isDeterministicProbeRejection(
+            status: 1,
+            diagnostics: """
+            fixture.swift:1:1: error: 'DispatchData.Deallocator' cannot be \
+            constructed because it has no accessible initializers
+            """
+        ))
+        #expect(FrontendReceipt.ManagedNativeSurface.isDeterministicProbeRejection(
+            status: 1,
+            diagnostics: """
+            fixture.swift:4:13: error: 'init(forClass:)' has been renamed to \
+            'init(for:)'
+            Header.h:31:1: note: 'init(forClass:)' was obsoleted in Swift 3
+            + (Thing *)makeWithURL:(URL *)url error:(Error **)error;
+            """
+        ))
+        #expect(FrontendReceipt.ManagedNativeSurface.isDeterministicProbeRejection(
+            status: 1,
+            diagnostics: """
+            error: cannot reference class method 'make()' as a property; \
+            remove 'getter:'
+            """
+        ))
+        #expect(FrontendReceipt.ManagedNativeSurface.isDeterministicProbeRejection(
+            status: 1,
+            diagnostics: """
+            error: cannot find 'Value' in scope
+            error: generic parameter 'T' could not be inferred
+            """
+        ))
+        #expect(FrontendReceipt.ManagedNativeSurface.isDeterministicProbeRejection(
+            status: 1,
+            diagnostics: """
+            error: a C function pointer can only be formed from a reference \
+            to a 'func' or a literal closure
+            """
+        ))
+        #expect(FrontendReceipt.ManagedNativeSurface.isDeterministicProbeRejection(
+            status: 1,
+            diagnostics: "error: 'init()' is only available in iOS 16 or newer"
+        ))
+        #expect(FrontendReceipt.ManagedNativeSurface.isDeterministicProbeRejection(
+            status: 1,
+            diagnostics: """
+            error: 'UIDeviceOrientationIsLandscape' has been replaced by \
+            property 'UIDeviceOrientation.isLandscape'
+            """
+        ))
+        #expect(FrontendReceipt.ManagedNativeSurface.isDeterministicProbeRejection(
+            status: 1,
+            diagnostics: """
+            error: reference to generic type 'Measurement' requires arguments \
+            in <...>
+            """
+        ))
+        #expect(!FrontendReceipt.ManagedNativeSurface.isDeterministicProbeRejection(
+            status: 1,
+            diagnostics: """
+            fixture.swift:1:1: error: cannot convert value
+            error: compiler crashed
+            """
         ))
         #expect(!FrontendReceipt.ManagedNativeSurface.isDeterministicProbeRejection(
             status: 9,
@@ -1017,6 +1872,45 @@ struct NativeImportDiscoveryTests {
             status: 1,
             diagnostics: "error: unable to load standard library"
         ))
+    }
+
+    @Test("Managed probes normalize declaration-only type conventions")
+    func normalizesManagedProbeStorageTypes() {
+        let normalized = FrontendReceipt.ManagedNativeSurface.storableProbeType
+        #expect(normalized("()") == "Swift.Void")
+        #expect(normalized("UIView!") == "UIView?")
+        #expect(normalized("borrowing Foundation.Data") == "Foundation.Data")
+        #expect(normalized("@autoclosure () -> Swift.Bool")
+            == "() -> Swift.Bool")
+        #expect(normalized("@escaping @MainActor (Swift.Bool) -> Swift.Void")
+            == "@MainActor (Swift.Bool) -> ()")
+        #expect(normalized("Swift.Optional<@Sendable () -> Swift.Void>")
+            == "Swift.Optional<@Sendable () -> ()>")
+    }
+
+    @Test("Imported type lookup selects the most specific nominal boundary")
+    func selectsMostSpecificImportedType() {
+        func imported(_ name: String) -> FrontendReceipt.Adapter.ImportedNativeType {
+            .init(
+                canonicalName: name,
+                swiftType: name,
+                kind: .value,
+                aliases: [],
+                representation: .opaqueValue,
+                sourceFileLogicalID: "NativeAPICatalog/Foundation.swift",
+                importedModules: ["Foundation"],
+                requiresMainActor: false
+            )
+        }
+        let namespace = imported("Foundation.AttributeScopes")
+        let leaf = imported(
+            "Foundation.AttributeScopes.FoundationAttributes.LinkAttribute"
+        )
+        let index = FrontendReceipt.ImportedTypeIndex(types: [namespace, leaf])
+
+        #expect(index.matching(spellings: [leaf.canonicalName]) == [leaf])
+        #expect(index.matching(spellings: [namespace.canonicalName + ".Type"])
+            == [namespace])
     }
 
     @Test("Managed SDK probing prefreezes native members used inside callbacks")
@@ -1056,7 +1950,7 @@ struct NativeImportDiscoveryTests {
                 && $0.dispatch == .instanceMethod
         })
         #expect(invalidation.parameterSwiftTypes == ["Timer"])
-        #expect(invalidation.resultSwiftType == "Swift.Void")
+        #expect(invalidation.resultSwiftType == "()")
     }
 
     @Test("Managed SDK probing admits only compiler-proven zero-argument construction")
@@ -1420,11 +2314,13 @@ struct NativeImportDiscoveryTests {
                 _ view: UIView,
                 controller: UIViewController,
                 cell: UICollectionViewCell,
+                interaction: any UIInteraction,
                 url: URL,
                 group: DispatchGroup,
                 operations: OperationQueue,
                 operation: Operation
             ) {
+                view.addInteraction(interaction)
                 consumeNotification { notification in
                     _ = notification.name
                 }
@@ -1540,6 +2436,7 @@ struct NativeImportDiscoveryTests {
                     return true
                 }
                 let predicate = NSPredicate(block: evaluatePredicate)
+                _ = predicate.evaluate(with: "value")
                 _ = predicate
                 let enumerationError: @MainActor (URL, any Error) -> Bool = {
                     failedURL, error in
@@ -1621,6 +2518,20 @@ struct NativeImportDiscoveryTests {
             $0.canonicalName == "NSNotification.Name"
         })
         #expect(notificationName.aliases.contains("NSNotificationName"))
+        let notificationNameGetter = try #require(surface.operations.first {
+            $0.baseName == "name"
+                && $0.dispatch == .instanceGetter
+                && $0.ownerType.contains("Notification")
+        })
+        #expect(notificationNameGetter.witnessFunctions.contains {
+            $0.contains("fU")
+        })
+        let nestedLayoutCall = try #require(surface.operations.first {
+            $0.baseName == "setNeedsLayout"
+        })
+        #expect(nestedLayoutCall.witnessFunctions.contains {
+            $0.contains("fU")
+        })
         let resourceKey = try #require(surface.types.first {
             $0.canonicalName == "NSURLResourceKey"
                 || $0.aliases.contains("NSURLResourceKey")
@@ -1698,6 +2609,21 @@ struct NativeImportDiscoveryTests {
         })
         let presentation = try #require(surface.operations.first {
             $0.baseName == "present"
+        })
+        let addInteraction = try #require(surface.operations.first {
+            $0.ownerType == "UIView"
+                && $0.baseName == "addInteraction"
+                && $0.argumentLabels == ["_"]
+        })
+        #expect(addInteraction.parameterSwiftTypes == [
+            "Swift.AnyObject", "UIView",
+        ])
+        #expect(addInteraction.invocationParameterSwiftTypes == [
+            "any UIInteraction", "UIView",
+        ])
+        #expect(addInteraction.objectiveC?.selector == "addInteraction:")
+        #expect(surface.types.contains {
+            $0.canonicalName == "Swift.AnyObject"
         })
         let actionInitializer = try #require(surface.operations.first {
             $0.baseName == "init"
@@ -1837,16 +2763,41 @@ struct NativeImportDiscoveryTests {
                 && $0.ownerType.contains("NSPredicate")
                 && $0.parameterSwiftTypes.contains { $0.contains("-> Swift.Bool") }
         })
+        let predicateEvaluation = try #require(surface.operations.first {
+            $0.baseName == "evaluate"
+                && $0.ownerType.contains("NSPredicate")
+        })
+        #expect(
+            FrontendReceipt.SwiftTypeSpelling.catalogAuthorityMatchIdentity(
+                predicateEvaluation.parameterSwiftTypes[0]
+            ) == "Swift.Optional<Swift.Any>"
+        )
+        #expect(!predicateEvaluation.parameterSwiftTypes[0].contains("AnyObject"))
         let enumeratorOperation = try #require(surface.operations.first {
             $0.baseName == "enumerator"
                 && $0.ownerType.contains("FileManager")
         })
+        #expect(enumeratorOperation.argumentLabels == [
+            "at", "includingPropertiesForKeys", "errorHandler",
+        ])
+        #expect(enumeratorOperation.parameterSwiftTypes == [
+            "Foundation.URL",
+            "[NSURLResourceKey]?",
+            "Swift.Optional<@Swift.MainActor (Foundation.URL, Swift.Error) -> Swift.Bool>",
+            "FileManager",
+        ])
+        #expect(enumeratorOperation.parameterProjection?
+            .physicalParameterCount == 5)
+        #expect(enumeratorOperation.parameterProjection?
+            .logicalParameterIndices == [0, 1, 3, 4])
+        #expect(enumeratorOperation.parameterProjection?
+            .defaultArguments.map(\.physicalParameterIndex) == [2])
         let resultOperations = try FrontendReceipt.Adapter()
             .makeImportedOperationDeclarations(
                 [
                     predicateOperation, enumeratorOperation,
                     configurationSetter, operationCompletionSetter,
-                    presentation, actionInitializer, alertInitializer,
+                    presentation, addInteraction, actionInitializer, alertInitializer,
                     contextualActionInitializer,
                 ],
                 moduleName: invocation.moduleName,
@@ -1911,6 +2862,15 @@ struct NativeImportDiscoveryTests {
         ])
         #expect(presentationDeclaration.parameterSwiftTypes[2]
             .contains("MainActor"))
+        let interactionDeclaration = try #require(resultOperations.first {
+            $0.baseName == "addInteraction"
+        })
+        #expect(interactionDeclaration.parameterSwiftTypes == [
+            "Swift.AnyObject", "UIView",
+        ])
+        #expect(interactionDeclaration.invocationParameterSwiftTypes == [
+            "any UIInteraction", "UIView",
+        ])
         let initializerCallbacks = resultOperations.filter {
             $0.baseName == "init" && !$0.callbacks.isEmpty
         }
@@ -2259,6 +3219,11 @@ struct NativeImportDiscoveryTests {
         )
         let generated = shell.bridge.sourceFiles.values.joined(separator: "\n")
         #expect(generated.contains("import Swift"))
+        #expect(
+            generated.contains(
+                "BridgeValueCodec.decodeAny(arguments[0], context: context)"
+            )
+        )
         #expect(generated.contains("argument0 as Swift.AnyObject"))
         try typeCheckGeneratedBridge(
             shell: shell,
@@ -2773,9 +3738,7 @@ struct NativeImportDiscoveryTests {
 
         var tampered = output.receipt
         tampered.nativeImportBindings[0].strategy = .factory
-        #expect(throws: ShellBuildReceipt.Error.invalid(
-            "native import candidates or bindings are duplicated, unordered, or empty"
-        )) {
+        #expect(throws: ShellBuildReceipt.Error.self) {
             try ShellBuild.Materializer().materialize(
                 receipt: tampered,
                 sourceRoot: directory
@@ -3316,7 +4279,7 @@ struct NativeImportDiscoveryTests {
         )
     }
 
-    @Test("Managed development captures UIKit and Foundation call surfaces end to end")
+    @Test("Catalog-backed managed development lowers framework calls end to end")
     func lowersImportedFrameworkOperations() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "helix-managed-uikit-reference-\(UUID().uuidString)",
@@ -3564,15 +4527,20 @@ struct NativeImportDiscoveryTests {
             transformPipelineHash: ShellBuild.transformPipelineHash,
             sourceBaselineHash: .sha256("computed by indexer")
         )
-        let output = try FrontendReceipt.Adapter().generate(
-            .init(
-                metadata: metadata,
-                configuration: configuration,
-                sources: [.init(logicalPath: "Sources/Screen.swift", url: sourceURL)],
-                compilerURL: compilerURL,
-                callingSurfacePolicy: .managedDevelopmentModule
-            )
+        let catalogs = try systemCatalogSnapshots(
+            modules: ["Dispatch", "Foundation", "QuartzCore", "UIKit"],
+            metadata: metadata,
+            compilerURL: compilerURL,
+            sdk: sdk
         )
+        let output = try FrontendReceipt.Adapter().generate(.init(
+            metadata: metadata,
+            configuration: configuration,
+            sources: [.init(logicalPath: "Sources/Screen.swift", url: sourceURL)],
+            compilerURL: compilerURL,
+            nativeAPICatalogs: catalogs,
+            callingSurfacePolicy: .managedDevelopmentModule
+        ))
         let labelType = try #require(output.receipt.nativeTypes.first {
             $0.canonicalName == "UILabel"
         })
@@ -3587,18 +4555,36 @@ struct NativeImportDiscoveryTests {
         #expect(labelBinding.operationsExpression == nil)
         #expect(labelBinding.generated == nil)
         let labelGetterBinding = try #require(output.receipt.nativeImportBindings.first {
-            $0.generated?.dispatch == .instanceGetter
+            $0.generated?.sourceFileLogicalID == "Sources/Screen.swift"
+                && $0.generated?.baseName == "label"
+                && $0.generated?.dispatch == .instanceGetter
         })
         #expect(labelGetterBinding.importedModules.contains("UIKit"))
         let resourceKeyType = try #require(output.receipt.nativeTypes.first {
-            $0.canonicalName == "URLResourceKey"
+            $0.canonicalName == "Foundation.URLResourceKey"
+                && $0.swiftTypeAliases.contains("URLResourceKey")
         })
         let resourceKeyBinding = try #require(
             output.receipt.nativeTypeBindings.first {
                 $0.canonicalName == resourceKeyType.canonicalName
             }
         )
-        #expect(resourceKeyBinding.generated?.swiftType == "URLResourceKey")
+        #expect(
+            resourceKeyBinding.generated?.swiftType
+                == "Foundation.URLResourceKey"
+        )
+        #expect(output.performance.stages.allSatisfy {
+            $0.name != "frontend.expand_managed_native_surface"
+        })
+        #expect(output.performance.subprocesses.allSatisfy {
+            $0.kind != .symbolGraph && $0.kind != .typecheck
+        })
+        #expect(output.performance.counters.first {
+            $0.name == "native_api_catalog.hit_module_count"
+        }?.value == 4)
+        #expect(output.performance.counters.first {
+            $0.name == "native_api_catalog.miss_module_count"
+        }?.value == 0)
 
         var missingTypeImport = output.receipt
         let labelTypeBindingIndex = try #require(
@@ -3629,7 +4615,9 @@ struct NativeImportDiscoveryTests {
         var missingGetterImport = output.receipt
         let labelGetterBindingIndex = try #require(
             missingGetterImport.nativeImportBindings.firstIndex {
-                $0.generated?.dispatch == .instanceGetter
+                $0.generated?.sourceFileLogicalID == "Sources/Screen.swift"
+                    && $0.generated?.baseName == "label"
+                    && $0.generated?.dispatch == .instanceGetter
             }
         )
         missingGetterImport.nativeImportBindings[labelGetterBindingIndex].importedModules = []
@@ -3654,40 +4642,25 @@ struct NativeImportDiscoveryTests {
             $0.canonicalCallee.contains("NSLayoutAnchor")
                 && $0.canonicalCallee.contains("constraint")
         }
-        let objectiveCConstraintImports = constraintImports.filter {
-            $0.descriptor.target.backend == .objectiveCMessage
-        }
-        let emittedObjectiveCConstraints = objectiveCConstraintImports.filter(
-            \.isEmittedToDevice
-        )
-        #expect(emittedObjectiveCConstraints.count == 2)
-        #expect(Set(emittedObjectiveCConstraints.map {
-            $0.descriptor.target.entryPoint
-        }) == ["constraintEqualToAnchor:"])
-        #expect(Set(objectiveCConstraintImports.map {
-            $0.descriptor.target.entryPoint
-        }).isSuperset(of: [
-            "constraintEqualToAnchor:",
-            "constraintEqualToAnchor:constant:",
-            "constraintGreaterThanOrEqualToAnchor:",
-            "constraintGreaterThanOrEqualToAnchor:constant:",
-            "constraintLessThanOrEqualToAnchor:",
-            "constraintLessThanOrEqualToAnchor:constant:",
-        ]))
-        #expect(Set(objectiveCConstraintImports.map {
-            $0.descriptor.target.module
-        }) == ["UIKit"])
-        #expect(Set(objectiveCConstraintImports.compactMap {
-            $0.descriptor.objectiveC?.runtimeClassName
-        }) == ["NSLayoutAnchor"])
-        let objectiveCConstraintKeys = Set(objectiveCConstraintImports.map(\.key))
-        #expect(output.receipt.nativeImportBindings.filter {
-            objectiveCConstraintKeys.contains($0.key)
-        }.allSatisfy {
-            $0.strategy == .objectiveCInvoker && $0.generated == nil
+        #expect(constraintImports.count == 2)
+        #expect(Set(constraintImports.map(\.canonicalCallee)).count == 2)
+        #expect(constraintImports.allSatisfy {
+            $0.descriptor.target.backend == .swiftAdapter
+                && $0.descriptor.objectiveC == nil
+                && $0.isEmittedToDevice
         })
-        #expect(!output.receipt.nativeImportBindings.contains {
-            $0.generated?.baseName == "constraint"
+        #expect(constraintImports.contains {
+            $0.canonicalCallee.contains("NSLayoutXAxisAnchor")
+        })
+        #expect(constraintImports.contains {
+            $0.canonicalCallee.contains("NSLayoutYAxisAnchor")
+        })
+        let constraintKeys = Set(constraintImports.map(\.key))
+        #expect(output.receipt.nativeImportBindings.filter {
+            constraintKeys.contains($0.key)
+        }.allSatisfy {
+            $0.strategy == .generatedSwiftAdapter
+                && $0.generated?.baseName == "constraint"
         })
         let mediaTime = try #require(
             output.receipt.nativeImportCandidates.first {
@@ -3804,10 +4777,23 @@ struct NativeImportDiscoveryTests {
             interaction.descriptor.physicalSignature.parameters.first?
                 .type.canonicalName == "any UIInteraction"
         )
+        let animationOptionTypes = output.receipt.nativeTypes.filter {
+            Set([$0.canonicalName] + $0.swiftTypeAliases).contains(
+                "UIView.AnimationOptions"
+            )
+        }
+        let animationOptions = try #require(animationOptionTypes.first)
+        #expect(animationOptionTypes.map(\.canonicalName) == [
+            "UIKit.UIView.AnimationOptions",
+        ])
+        #expect(animationOptions.canonicalName == "UIKit.UIView.AnimationOptions")
+        #expect(animationOptions.swiftTypeAliases.contains(
+            "UIView.AnimationOptions"
+        ))
 
         let typeBindings = output.receipt.nativeTypeBindings.compactMap(\.generated)
         #expect(typeBindings.contains {
-            $0.swiftType == "NSTextAlignment"
+            $0.swiftType == "UIKit.NSTextAlignment"
                 && $0.representation == .rawRepresentable
         })
         #expect(typeBindings.contains {
@@ -3818,10 +4804,16 @@ struct NativeImportDiscoveryTests {
             $0.swiftType.hasSuffix("Date")
                 && $0.representation == .opaqueValue
         })
-        #expect(typeBindings.contains {
-            $0.swiftType == "_NSRange"
-                && $0.representation == .opaqueValue
+        let rangeType = try #require(output.receipt.nativeTypes.first {
+            Set([$0.canonicalName] + $0.swiftTypeAliases)
+                .contains("_NSRange")
         })
+        let rangeBinding = try #require(
+            output.receipt.nativeTypeBindings.first {
+                $0.canonicalName == rangeType.canonicalName
+            }
+        )
+        #expect(rangeBinding.generated?.representation == .opaqueValue)
 
         let selected = try #require(output.receipt.declarations.first {
             $0.interface.baseName == "selectedLabel"
@@ -3869,8 +4861,8 @@ struct NativeImportDiscoveryTests {
             "private static func makeSynchronousNativeInvokers_0() throws"
         ))
         #expect(primaryBridge.contains(
-            "try VM.NativeCatalog(try makeObjectiveCNativeInvokers() "
-                + "+ try makeSynchronousNativeInvokers())"
+            "try VM.NativeCatalog((try makeObjectiveCNativeInvokers()) "
+                + "+ (try makeSynchronousNativeInvokers()))"
         ))
         let sessionTaskType = try #require(shell.archive.nativeTypes.first {
             Set([$0.canonicalName] + $0.swiftTypeAliases)
@@ -4042,8 +5034,8 @@ struct NativeImportDiscoveryTests {
         )
     }
 
-    @Test("Managed development keeps unused generic SDK overloads dormant")
-    func preservesDormantGenericSDKOverloads() throws {
+    @Test("A missing Catalog keeps only current generic SDK calls without foreground probes")
+    func keepsMissingCatalogSourceScoped() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "helix-managed-generic-overload-\(UUID().uuidString)",
             isDirectory: true
@@ -4122,20 +5114,25 @@ struct NativeImportDiscoveryTests {
             )
         )
         let imports = output.receipt.nativeImportCandidates
-        let dormant = imports.filter {
-            $0.descriptor.target.member == "constraint(equalTo:)"
-        }
-        #expect(dormant.count == 2)
-        #expect(dormant.allSatisfy {
-            !$0.isEmittedToDevice && $0.id == nil
-        })
         let baseline = imports.filter {
-            $0.descriptor.target.member == "constraint(equalTo:constant:)"
+            $0.canonicalCallee.contains(".constraint(equalTo:constant:).")
         }
         #expect(baseline.count == 2)
         #expect(baseline.allSatisfy {
             $0.isEmittedToDevice && $0.id != nil
         })
+        #expect(!imports.contains {
+            $0.canonicalCallee.contains(".constraint(equalTo:).")
+        })
+        #expect(output.performance.stages.allSatisfy {
+            $0.name != "frontend.expand_managed_native_surface"
+        })
+        #expect(output.performance.subprocesses.allSatisfy {
+            $0.kind != .symbolGraph && $0.kind != .typecheck
+        })
+        #expect(output.performance.counters.first {
+            $0.name == "native_api_catalog.miss_module_count"
+        }?.value == 1)
     }
 
     @Test("Managed native surface selects development SDK members and production fails closed")
@@ -4332,6 +5329,12 @@ struct NativeImportDiscoveryTests {
 
         var managedRequest = request
         managedRequest.callingSurfacePolicy = .managedDevelopmentModule
+        managedRequest.nativeAPICatalogs = try systemCatalogSnapshots(
+            modules: ["Foundation", "UIKit"],
+            metadata: metadata,
+            compilerURL: compilerURL,
+            sdk: sdk
+        )
         let managed = try FrontendReceipt.Adapter().generate(managedRequest)
         let managedNames = Set(
             managed.receipt.nativeImportCandidates.map(\.canonicalCallee)
@@ -5399,6 +6402,54 @@ struct NativeImportDiscoveryTests {
             hasTypedThrows: false,
             hasUnsupportedAttributes: false
         )
+    }
+
+    private static let systemCatalogCacheRoot = FileManager.default
+        .temporaryDirectory.appendingPathComponent(
+            "helix-native-import-system-catalogs-v1",
+            isDirectory: true
+        )
+
+    private func systemCatalogSnapshots(
+        modules: [String],
+        metadata: InterfaceArchive.ReleaseMetadata,
+        compilerURL: URL,
+        sdk: SwiftFrontend.Driver.SDKIdentity
+    ) throws -> [NativeAPICatalog.Snapshot] {
+        let toolchain = try ReleaseCompiler.Driver().toolchainIdentity(
+            compilerURL: compilerURL
+        )
+        let builder = NativeAPICatalog.Builder(cache: try .init(
+            rootURL: Self.systemCatalogCacheRoot
+        ))
+        return try modules.sorted().map { module in
+            let identity = NativeAPICatalog.Identity(
+                provenance: .systemSDK,
+                xcodeProductBuild: metadata.xcodeBuild,
+                sdkProductBuild: metadata.sdkBuild,
+                compilerFingerprint: toolchain.fingerprint,
+                targetTriple: metadata.targetTriple,
+                minimumDeployment: metadata.minimumOS,
+                swiftLanguageMode: "default",
+                moduleName: module,
+                moduleContentHash: .sha256(
+                    "HLX.Test.SystemCatalog.v1:\(sdk.buildVersion):\(module)"
+                ),
+                moduleSearchPathHash: .sha256(
+                    "HLX.Test.SystemCatalogSearch.v1:\(sdk.buildVersion)"
+                ),
+                dependencyGraphHash: .sha256(
+                    "HLX.Test.SystemCatalogDependencies.v1:\(sdk.buildVersion):\(module)"
+                )
+            )
+            return try builder.build(.init(
+                identity: identity,
+                frontendInvocation: metadata.frontendInvocation,
+                compilerURL: compilerURL,
+                precomputedToolchain: toolchain,
+                precomputedSDK: sdk
+            )).snapshot
+        }
     }
 
     private func makeMetadata(moduleName: String) -> InterfaceArchive.ReleaseMetadata {

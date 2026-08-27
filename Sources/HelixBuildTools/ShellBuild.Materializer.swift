@@ -10,7 +10,7 @@ public enum ShellBuild {
     /// native-call descriptor semantics change. This invalidates local build
     /// facts without changing a shipped protocol or schema version.
     public static let transformPipelineHash = Core.Digest.sha256(
-        "Helix.ShellBuild.DynamicSourceTransform.v1:declaration-groups:frozen-value-hooks:source-body-dispatch:async-original-thunks:native-call-descriptor-v1:objective-c-invoker:objective-c-lightweight-generic-erasure:c-invoker-main-actor-unqualified-reference:swift-adapter-pack-v1:development-native-candidate-emission:production-native-capability-manifest:indexed-source-baseline-metadata:objective-c-declaration-qualified-sil:property-declaration-identity:exact-module-imports:separate-hub-contract-object:module-native-api-catalog:bounded-parallel-native-probes:published-catalog-projection:catalog-authoritative-descriptor:measured-native-type-isolation"
+        "Helix.ShellBuild.DynamicSourceTransform.v1:declaration-groups:frozen-value-hooks:source-body-dispatch:async-original-thunks:native-call-descriptor-v1:objective-c-invoker:objective-c-lightweight-generic-erasure:c-invoker-main-actor-unqualified-reference:swift-adapter-pack-v1:development-native-candidate-emission:production-native-capability-manifest:indexed-source-baseline-metadata:objective-c-declaration-qualified-sil:property-declaration-identity:exact-module-imports:separate-hub-contract-object:module-native-api-catalog:bounded-parallel-native-probes:published-catalog-projection:catalog-authoritative-descriptor:catalog-source-projections:complete-catalog-probe-publication:measured-native-type-isolation:storable-and-inhabited-native-boundaries:managed-inout-boundary-filter:compiler-measured-callback-lifetimes:signature-module-imports:render-all-signature-imports:concrete-invalid-owner-recovery:synthesized-objective-c-initializers:objective-c-protocol-anyobject-surface:swift-overlay-extension-module-ownership:pre-catalog-source-alias-normalization:exact-alias-identity-fixed-point:canonical-declaration-owner-aliases:module-global-operation-aliases:catalog-comparison-aliases:catalog-authoritative-alias-supersets:catalog-enum-kind-and-value-refinement:opaque-native-enum-typeops:swift-any-objective-c-bridge:foundation-collection-foreign-representation:catalog-exact-declaration-matching"
     )
 }
 
@@ -787,7 +787,7 @@ public struct Materializer: Sendable {
         guard Set(emitted.map {
             key($0.canonicalName, $0.layoutFingerprint, $0.requiresMainActor)
         })
-                == Set(byKey.keys)
+                .isSubset(of: Set(byKey.keys))
         else {
             throw ShellBuild.Error.nativeTypeBindingMismatch
         }
@@ -799,36 +799,7 @@ public struct Materializer: Sendable {
             )] else {
                 throw ShellBuild.Error.nativeTypeBindingMismatch
             }
-            let strategy: BridgeGeneration.NativeTypeBinding.Strategy
-            switch binding.strategy {
-            case .factory: strategy = .factory
-            case .objectiveCReference: strategy = .objectiveCReference
-            }
-            return .init(
-                id: type.id,
-                canonicalName: type.canonicalName,
-                layoutFingerprint: type.layoutFingerprint,
-                requiresMainActor: type.requiresMainActor,
-                strategy: strategy,
-                operationsExpression: binding.operationsExpression,
-                importedModules: binding.importedModules,
-                generated: binding.generated.map {
-                    let representation: BridgeGeneration.GeneratedNativeType.Representation =
-                        switch $0.representation {
-                        case .reference: .reference
-                        case .rawRepresentable: .rawRepresentable
-                        case .opaqueValue: .opaqueValue
-                        case .objectiveCStructure: .objectiveCStructure
-                        }
-                    return BridgeGeneration.GeneratedNativeType(
-                        sourceFileLogicalID: $0.sourceFileLogicalID,
-                        swiftType: $0.swiftType,
-                        representation: representation,
-                        nativeABIEncoding: $0.nativeABIEncoding,
-                        nativeModuleName: $0.nativeModuleName
-                    )
-                }
-            )
+            return try binding.bridgeBinding(for: type)
         }
     }
 
@@ -939,7 +910,7 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
         case .nativeImportBindingMismatch:
             "emitted native imports and typed invoker bindings do not form the same set"
         case .nativeTypeBindingMismatch:
-            "emitted native types and typed operation bindings do not form the same set"
+            "an emitted native type has no typed operation binding"
         case let .invalidReloadIndex(reason): "generated Reload Index is invalid: \(reason)"
         case let .outputCollision(path): "two Shell build artifacts use \(path)"
         case .prelinkArchiveRequired: "Shell finalization requires a provisional pre-link HLXI"

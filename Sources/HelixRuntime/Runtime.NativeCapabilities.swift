@@ -24,14 +24,17 @@ public struct NativeCapabilities: Sendable {
 
     public func appending(
         nativeInvokers: [any VM.NativeInvoker] = [],
-        asyncNativeInvokers: [any VM.AsyncNativeInvoker] = []
+        asyncNativeInvokers: [any VM.AsyncNativeInvoker] = [],
+        nativeTypeOperations: [VM.NativeTypeOperations] = []
     ) throws -> Runtime.NativeCapabilities {
         try .init(
             nativeCatalog: nativeCatalog.appending(nativeInvokers),
             asyncNativeCatalog: asyncNativeCatalog.appending(
                 asyncNativeInvokers
             ),
-            nativeTypeCatalog: nativeTypeCatalog
+            nativeTypeCatalog: nativeTypeCatalog.appending(
+                nativeTypeOperations
+            )
         )
     }
 }

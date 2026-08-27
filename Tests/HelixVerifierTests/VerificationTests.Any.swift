@@ -17,6 +17,77 @@ struct AnyVerifier {
         #expect(image.module.capabilities.contains(.anyValuesV1))
     }
 
+    @Test("Native Any identities must name a frozen Shell type")
+    func validatesNativeDynamicTypesAgainstShell() throws {
+        let typeID = Core.TypeID(rawValue: .sha256("AnyVerifier.Native"))
+        let nativeType = Verification.ResolvedNativeType(
+            id: typeID,
+            canonicalName: "Fixture.Native",
+            kind: .reference,
+            layoutFingerprint: .sha256("AnyVerifier.Native.Layout"),
+            isCopyable: true,
+            estimatedSize: 8
+        )
+        let function = Bytecode.Function(
+            id: .init(rawValue: 0),
+            name: "eraseNative",
+            parameterRegisters: [.init(rawValue: 0)],
+            resultType: .any,
+            registerTypes: [.native(typeID), .any],
+            entryBlock: .init(rawValue: 0),
+            blocks: [
+                .init(
+                    id: .init(rawValue: 0),
+                    parameters: [.init(rawValue: 0)],
+                    instructions: [
+                        .eraseToAny(
+                            result: .init(rawValue: 1),
+                            value: .init(rawValue: 0),
+                            dynamicType: .native(typeID)
+                        ),
+                        .returnValue(.init(rawValue: 1)),
+                    ]
+                ),
+            ]
+        )
+        let capabilities: Set<Core.Capability> = [
+            .baselineV1, .anyValuesV1, .nativeTypesV1,
+        ]
+
+        _ = try verify(
+            function: function,
+            moduleCapabilities: capabilities,
+            shellCapabilities: capabilities,
+            policyCapabilities: capabilities,
+            parameterTypes: [.native(typeID)],
+            resultType: .any,
+            nativeTypes: [nativeType]
+        )
+        #expect(throws: Verification.Error.self) {
+            _ = try verify(
+                function: function,
+                moduleCapabilities: capabilities,
+                shellCapabilities: capabilities,
+                policyCapabilities: capabilities,
+                parameterTypes: [.native(typeID)],
+                resultType: .any
+            )
+        }
+        var noncopyable = nativeType
+        noncopyable.isCopyable = false
+        #expect(throws: Verification.Error.self) {
+            _ = try verify(
+                function: function,
+                moduleCapabilities: capabilities,
+                shellCapabilities: capabilities,
+                policyCapabilities: capabilities,
+                parameterTypes: [.native(typeID)],
+                resultType: .any,
+                nativeTypes: [noncopyable]
+            )
+        }
+    }
+
     @Test("An Any type cannot be smuggled without the Any capability")
     func rejectsMissingCapability() throws {
         let function = validFunction()
@@ -224,11 +295,14 @@ struct AnyVerifier {
         function: Bytecode.Function,
         moduleCapabilities: Set<Core.Capability>,
         shellCapabilities: Set<Core.Capability>,
-        policyCapabilities: Set<Core.Capability>
+        policyCapabilities: Set<Core.Capability>,
+        parameterTypes: [Bytecode.ValueType] = [.int64],
+        resultType: Bytecode.ValueType = .int64,
+        nativeTypes: [Verification.ResolvedNativeType] = []
     ) throws -> Verification.Image {
         let signature = Core.LoweredSignature(
-            parameters: ["Swift.Int"],
-            result: "Swift.Int"
+            parameters: parameterTypes.map(\.description),
+            result: resultType.description
         )
         let key = try functionKey(signature: signature)
         let shellHash = Core.Digest.sha256("any-verifier-shell")
@@ -254,12 +328,13 @@ struct AnyVerifier {
                 .init(
                     index: .init(rawValue: 0),
                     key: key,
-                    parameterTypes: [.int64],
+                    parameterTypes: parameterTypes,
                     parameterConventions: function.parameterConventions,
-                    resultType: .int64,
+                    resultType: resultType,
                     effects: function.effects
                 ),
-            ]
+            ],
+            types: nativeTypes
         )
         return try Verification.Engine().verify(
             bytes: Bytecode.Encoder.encode(module),

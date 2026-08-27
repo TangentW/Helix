@@ -164,6 +164,11 @@ struct Service {
         let first = try await client.reserveAutomaticInvitation()
         #expect(first.reservation.kind == .automaticXcode)
         #expect(first.spkiSHA256 == endpoint.spkiSHA256)
+        let reused = try await client.reserveAutomaticInvitation(
+            reusing: first.reservation
+        )
+        #expect(reused.reservation == first.reservation)
+        #expect(reused.spkiSHA256 == first.spkiSHA256)
 
         let context = try serviceContext()
         await #expect(throws: HubControl.Error.self) {
@@ -182,7 +187,10 @@ struct Service {
         #expect(invitation.shellIdentity == context.shellIdentity)
         #expect(await registry.context(shellID: context.shellIdentity.shellID) == context)
 
-        let second = try await client.reserveAutomaticInvitation()
+        let second = try await client.reserveAutomaticInvitation(
+            reusing: first.reservation
+        )
+        #expect(second.reservation != first.reservation)
         var rotated = context
         rotated.shellIdentity = .init(
             shellID: .init(rawValue: UUID()),
@@ -266,7 +274,7 @@ struct Service {
     func controlFraming() throws {
         let request = HubControl.Request(
             requestID: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!,
-            command: .reserveAutomaticInvitation,
+            command: .reserveAutomaticInvitation(reusing: nil),
             controlSecret: Data(repeating: 0x19, count: 32)
         )
         let codec = HubControl.FrameCodec()

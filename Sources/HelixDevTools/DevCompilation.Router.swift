@@ -155,8 +155,10 @@ public actor Router {
                 initiallyActiveFunctions: Set(routes.compactMap {
                     $0.value == .hlbc ? $0.key : nil
                 }),
-                initiallyActiveDevelopmentKeys:
-                    Set(identity.activeDevelopmentNativeCallKeys)
+                initiallyActiveDevelopmentImports:
+                    identity.activeDevelopmentNativeImports,
+                initiallyActiveDevelopmentTypeIDs:
+                    Set(identity.activeDevelopmentNativeTypeIDs)
             )
             compilers.append(.bytecode(builder, eligibleFunctionKeys: eligible))
         }

@@ -97,6 +97,99 @@ struct DevCompilationTests {
         #expect(await builder.activeFunctionKeys.isEmpty)
     }
 
+    @Test("A cold save discovers ordinary UIKit calls and native types without a Shell rebuild")
+    func discoversColdUIKitNativeSurface() async throws {
+        let fixture = try Fixture.make(
+            baseline: """
+            import UIKit
+
+            @inline(never)
+            public func transform(_ x: Int) -> Int { x + 1 }
+            """,
+            platform: .iOSSimulator
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let archive = try fixture.archive(nativeImports: [])
+        let receipt = try fixture.receipt(archive: archive, bindings: [])
+        let cache = try BuildCache.Store(
+            rootURL: fixture.directory.appendingPathComponent(
+                "BuildCache",
+                isDirectory: true
+            )
+        )
+        let builder = DevCompilation.BytecodeBuilder(
+            archive: archive,
+            manifest: fixture.manifest,
+            receipt: receipt,
+            adapterOutputDirectory: fixture.directory.appendingPathComponent(
+                "Adapters",
+                isDirectory: true
+            ),
+            adapterCache: cache,
+            adapterBuild: { request in
+                let bytes = Data("cold-uikit-adapter".utf8)
+                var identity = Core.StableHasher(
+                    domain: "HLX.Test.ColdUIKitAdapter.v1"
+                )
+                request.records.forEach { identity.append($0.key.rawValue) }
+                request.nativeTypeRecords.forEach {
+                    identity.append($0.id.rawValue)
+                }
+                let installName = "@rpath/HLXDevAdapter-"
+                    + identity.finalize().hex + ".dylib"
+                return .init(
+                    bytes: bytes,
+                    descriptor: .init(
+                        architecture: .arm64,
+                        fileType: 6,
+                        uuid: UUID(),
+                        installName: installName,
+                        platform: .iOSSimulator,
+                        codeSignature: .init(dataOffset: 1, dataSize: 1)
+                    ),
+                    installName: installName,
+                    keys: request.records.map(\.key),
+                    typeIDs: request.nativeTypeRecords.map(\.id),
+                    cacheSource: .bypassed
+                )
+            }
+        )
+        try fixture.write(
+            """
+            import UIKit
+
+            @inline(never)
+            public func transform(_ x: Int) -> Int {
+                let view = UIView()
+                view.backgroundColor = .black
+                view.tag = x
+                return view.tag
+            }
+            """
+        )
+
+        let outcome = try await builder.build(
+            fixture.request(revision: 1, generation: 1)
+        )
+        let patch = try #require(outcome.patch)
+        let payload = try DevProtocol.DevelopmentPayload.Artifact.decode(
+            patch.payload
+        )
+
+        #expect(patch.backend == .hlbc)
+        #expect(!payload.manifest.nativeImports.isEmpty)
+        #expect(payload.manifest.nativeImports.allSatisfy {
+            $0.binding == .objectiveCInvoker || $0.binding == .swiftAdapter
+        })
+        #expect(payload.manifest.nativeTypes.contains {
+            $0.canonicalName == "UIKit.UIView"
+                || $0.objectiveCRuntimeName == "UIView"
+        })
+        #expect(payload.manifest.nativeTypes.allSatisfy {
+            $0.binding == .objectiveCReference || $0.binding == .swiftAdapter
+        })
+    }
+
     @Test("A save may add an image-local helper without rebuilding the Dev Shell")
     func compilesNewPatchLocalFunction() async throws {
         let fixture = try Fixture.make()
@@ -401,6 +494,145 @@ struct DevCompilationTests {
         }
     }
 
+    @Test("Development native plans preserve reconnect IDs and promote dependent types")
+    func preservesReconnectNativeInventory() throws {
+        let fixture = try Fixture.make()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let typeName = "UIKit.UIView"
+        let typeID = Core.TypeID.derive(
+            namespace: fixture.archive.metadata.shellNamespaceID,
+            canonicalType: typeName
+        )
+        let nativeType = InterfaceArchive.TypeRecord(
+            id: typeID,
+            canonicalName: typeName,
+            swiftTypeAliases: ["UIKit.UIView"],
+            kind: .reference,
+            layoutFingerprint: .sha256("UIKit.UIView.Layout"),
+            objectiveCRuntimeName: "UIView",
+            isCopyable: true,
+            isEmittedToDevice: false,
+            estimatedSize: 8
+        )
+        let dormant = try fixture.nativeImport(
+            name: "dormantView",
+            id: nil,
+            isEmittedToDevice: false,
+            resultType: .native(typeID),
+            resultSwiftType: "UIKit.UIView"
+        )
+        let dormantArchive = try fixture.archive(
+            nativeImports: [dormant],
+            nativeTypes: [nativeType]
+        )
+        let typeBinding = ShellBuildReceipt.NativeTypeBinding(
+            canonicalName: typeName,
+            layoutFingerprint: nativeType.layoutFingerprint,
+            strategy: .objectiveCReference,
+            importedModules: ["UIKit"]
+        )
+        let dormantReceipt = try fixture.receipt(
+            archive: dormantArchive,
+            bindings: [
+                .init(
+                    key: dormant.key,
+                    strategy: .factory,
+                    factoryReference: "FixtureNativeImportFactory.make"
+                ),
+            ],
+            typeBindings: [typeBinding]
+        )
+        let promotedPlan = try DevCompilation.NativeCapabilityPlan(
+            archive: dormantArchive,
+            receipt: dormantReceipt
+        )
+        #expect(promotedPlan.developmentTypes.map(\.id) == [typeID])
+        #expect(promotedPlan.developmentTypes.allSatisfy {
+            $0.isEmittedToDevice
+        })
+        #expect(
+            try promotedPlan.typeBinding(
+                for: promotedPlan.typeRecord(for: typeID)
+            ) == typeBinding
+        )
+
+        let typeOnlyArchive = try fixture.archive(
+            nativeImports: [],
+            nativeTypes: [nativeType]
+        )
+        let typeOnlyReceipt = try fixture.receipt(
+            archive: typeOnlyArchive,
+            bindings: []
+        )
+        var discoveredType = nativeType
+        discoveredType.isEmittedToDevice = true
+        let discoveredTypeArchive = try fixture.archive(
+            nativeImports: [],
+            nativeTypes: [discoveredType]
+        )
+        let discoveredTypeReceipt = try fixture.receipt(
+            archive: discoveredTypeArchive,
+            bindings: [],
+            typeBindings: [typeBinding]
+        )
+        var typeOnlyPlan = try DevCompilation.NativeCapabilityPlan(
+            archive: typeOnlyArchive,
+            receipt: typeOnlyReceipt
+        )
+        #expect(try typeOnlyPlan.incorporate(discoveredTypeReceipt))
+        #expect(typeOnlyPlan.developmentImports.isEmpty)
+        #expect(typeOnlyPlan.developmentTypes.map(\.id) == [typeID])
+
+        let baseArchive = try fixture.archive(nativeImports: [])
+        let baseReceipt = try fixture.receipt(
+            archive: baseArchive,
+            bindings: []
+        )
+        let first = try fixture.nativeImport(
+            name: "firstColdCall",
+            id: .init(rawValue: 0),
+            isEmittedToDevice: true
+        )
+        let second = try fixture.nativeImport(
+            name: "secondColdCall",
+            id: .init(rawValue: 1),
+            isEmittedToDevice: true
+        )
+        let discoveredArchive = try fixture.archive(
+            nativeImports: [first, second]
+        )
+        let discoveredReceipt = try fixture.receipt(
+            archive: discoveredArchive,
+            bindings: [first, second].map {
+                .init(
+                    key: $0.key,
+                    strategy: .factory,
+                    factoryReference: "FixtureNativeImportFactory.make"
+                )
+            }
+        )
+        let reconnectID = Core.NativeImportID(rawValue: 7)
+        var reconnectPlan = try DevCompilation.NativeCapabilityPlan(
+            archive: baseArchive,
+            receipt: baseReceipt,
+            activeDevelopmentImports: [
+                .init(id: reconnectID, key: first.key),
+            ]
+        )
+        #expect(reconnectPlan.allKeys.contains(first.key))
+        #expect(try reconnectPlan.incorporate(discoveredReceipt))
+        #expect(
+            reconnectPlan.developmentImports.first(where: {
+                $0.key == first.key
+            })?.id == reconnectID
+        )
+        #expect(
+            reconnectPlan.developmentImports.first(where: {
+                $0.key == second.key
+            })?.id == .init(rawValue: 8)
+        )
+    }
+
     @Test("Development Adapter inputs fail closed before compilation")
     func rejectsUnsafeDevelopmentAdapterInputs() throws {
         let fixture = try Fixture.make()
@@ -481,6 +713,64 @@ struct DevCompilationTests {
             ))
         }
         #expect(!FileManager.default.fileExists(atPath: output.path))
+    }
+
+    @Test("Development Adapter generation exports native TypeOps through the shared ABI")
+    func generatesDevelopmentNativeTypeOperations() throws {
+        let fixture = try Fixture.make()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let canonicalName = "\(fixture.manifest.moduleName).NativeBox"
+        let id = Core.TypeID.derive(
+            namespace: fixture.archive.metadata.shellNamespaceID,
+            canonicalType: canonicalName
+        )
+        let layout = Core.Digest.sha256("NativeBox.Layout")
+        let record = InterfaceArchive.TypeRecord(
+            id: id,
+            canonicalName: canonicalName,
+            swiftTypeAliases: ["NativeBox"],
+            kind: .reference,
+            layoutFingerprint: layout,
+            isCopyable: true,
+            isEmittedToDevice: true,
+            estimatedSize: 8
+        )
+        let binding = BridgeGeneration.NativeTypeBinding(
+            id: id,
+            canonicalName: canonicalName,
+            layoutFingerprint: layout,
+            strategy: .factory,
+            operationsExpression: BridgeGeneration.GeneratedNativeType
+                .bindingExpression(
+                    sourceFileLogicalID: "Patch.swift",
+                    id: id,
+                    canonicalName: canonicalName,
+                    layoutFingerprint: layout,
+                    requiresMainActor: false,
+                    estimatedSize: 8
+                ),
+            generated: .init(
+                sourceFileLogicalID: "Patch.swift",
+                swiftType: "NativeBox",
+                representation: .reference
+            )
+        )
+        let files = try BridgeGeneration.Generator()
+            .generateDevelopmentAdapterFiles(
+                applicationModuleName: fixture.manifest.moduleName,
+                bindings: [],
+                records: [],
+                nativeTypeBindings: [binding],
+                nativeTypeRecords: [record]
+            )
+        let source = try #require(files.values.first)
+
+        #expect(files.count == 1)
+        #expect(source.contains(
+            "@_cdecl(\"\(BridgeGeneration.GeneratedNativeType.exportSymbol(id: id))\")"
+        ))
+        #expect(source.contains("Runtime.NativeTypeOperationsBody"))
+        #expect(source.contains("makeNativeType_\(id.rawValue.hex)"))
     }
 
     @Test("A saved Swift body becomes a signed Native image and baseline restore remains a replacement")
@@ -564,20 +854,26 @@ private struct Fixture {
     let configuration: PatchConfiguration.Document
     let declaration: ReleaseCompiler.DeclarationCandidate
 
-    static func make() throws -> Self {
+    static func make(
+        baseline: String = "public func transform(_ x: Int) -> Int { x + 1 }\n",
+        platform: DevProtocol.ApplePlatform = .iOS
+    ) throws -> Self {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("helix-dev-compilation-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         do {
             let sourceURL = directory.appendingPathComponent("Patch.swift")
-            let baseline = "public func transform(_ x: Int) -> Int { x + 1 }\n"
             try Data(baseline.utf8).write(to: sourceURL)
 
             let compiler = ReleaseCompiler.Driver()
             let toolchain = try compiler.toolchainIdentity()
             let frontend = SwiftFrontend.Driver()
-            let sdk = try frontend.sdkIdentity(name: "iphoneos")
-            let target = "arm64-apple-ios15.0"
+            let sdkName = platform == .iOSSimulator
+                ? "iphonesimulator" : "iphoneos"
+            let sdk = try frontend.sdkIdentity(name: sdkName)
+            let target = platform == .iOSSimulator
+                ? "arm64-apple-ios15.0-simulator"
+                : "arm64-apple-ios15.0"
             let module = "DevCompilationFixture"
             let invocation = InterfaceArchive.FrontendInvocation(
                 moduleName: module,
@@ -665,14 +961,18 @@ private struct Fixture {
                 moduleName: module,
                 targetTriple: target,
                 architecture: "arm64",
-                platform: .iOS,
+                platform: platform,
                 minimumOS: .init(15),
                 xcodeBuild: metadata.xcodeBuild,
                 swiftCompilerFingerprint: toolchain.fingerprint,
                 sdkBuild: sdk.buildVersion,
                 frontendArguments: [
                     "-module-name", module, "-target", target,
-                    "-sdk", sdk.path, "-Onone", "-enable-implicit-dynamic", sourceURL.path,
+                    "-sdk", sdk.path, "-Onone",
+                    "-Xfrontend", "-enable-private-imports",
+                    "-Xfrontend", "-enable-implicit-dynamic",
+                    "-Xfrontend", "-enable-dynamic-replacement-chaining",
+                    sourceURL.path,
                 ],
                 linkArguments: [],
                 moduleSearchPaths: [],
@@ -764,7 +1064,9 @@ private struct Fixture {
     func nativeImport(
         name: String,
         id: Core.NativeImportID?,
-        isEmittedToDevice: Bool
+        isEmittedToDevice: Bool,
+        resultType: Bytecode.ValueType = .int64,
+        resultSwiftType: String = "Swift.Int"
     ) throws -> InterfaceArchive.NativeImportRecord {
         let contract = Core.NativeImportContract.bounded(
             kind: .globalFunction,
@@ -775,7 +1077,7 @@ private struct Fixture {
         )
         let descriptor = try Core.NativeCall.Descriptor.swiftAdapter(
             canonicalCallee: "Fixture.\(name)()",
-            signature: .init(parameters: [], result: "Swift.Int"),
+            signature: .init(parameters: [], result: resultSwiftType),
             effects: .init(),
             contract: contract
         )
@@ -785,25 +1087,30 @@ private struct Fixture {
             descriptor: descriptor,
             silMangledNames: ["$s7Fixture_\(name)"],
             parameterTypes: [],
-            resultType: .int64,
+            resultType: resultType,
             contract: contract,
             isEmittedToDevice: isEmittedToDevice
         )
     }
 
     func archive(
-        nativeImports: [InterfaceArchive.NativeImportRecord]
+        nativeImports: [InterfaceArchive.NativeImportRecord],
+        nativeTypes: [InterfaceArchive.TypeRecord] = []
     ) throws -> InterfaceArchive.Archive {
         var metadata = archive.metadata
         metadata.transformPipelineHash = ShellBuild.transformPipelineHash
         return try InterfaceArchive.Archive.make(
             metadata: metadata,
             compatibility: archive.compatibility,
-            capabilities: Set(archive.capabilities).union([.nativeImportsV1]),
+            capabilities: Set(archive.capabilities).union(
+                nativeTypes.isEmpty
+                    ? [.nativeImportsV1]
+                    : [.nativeImportsV1, .nativeTypesV1]
+            ),
             sources: archive.sources,
             functions: archive.functions,
             nativeImports: nativeImports,
-            nativeTypes: archive.nativeTypes,
+            nativeTypes: nativeTypes,
             frozenValueTypes: archive.frozenValueTypes,
             bridgeRegistrationCount: archive.bridgeRegistrationCount
         )
@@ -811,7 +1118,8 @@ private struct Fixture {
 
     func receipt(
         archive: InterfaceArchive.Archive,
-        bindings: [ShellBuildReceipt.NativeImportBinding]
+        bindings: [ShellBuildReceipt.NativeImportBinding],
+        typeBindings: [ShellBuildReceipt.NativeTypeBinding] = []
     ) throws -> ShellBuildReceipt.Document {
         var metadata = archive.metadata
         metadata.machOUUIDs = []
@@ -829,7 +1137,8 @@ private struct Fixture {
             nativeImportCandidates: archive.nativeImports,
             nativeImportBindings: bindings,
             nativeTypes: archive.nativeTypes,
-            frozenValueTypes: archive.frozenValueTypes
+            frozenValueTypes: archive.frozenValueTypes,
+            nativeTypeBindings: typeBindings
         )
         try receipt.validate()
         return receipt

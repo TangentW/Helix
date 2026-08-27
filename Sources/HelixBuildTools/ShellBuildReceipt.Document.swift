@@ -1,4 +1,5 @@
 import Foundation
+import HelixBytecode
 import HelixCompiler
 import HelixCore
 import HelixDevProtocol
@@ -365,6 +366,39 @@ public struct Factory: Codable, Hashable, Sendable {
     }
 }
 
+private struct NativeTypeIdentity: Hashable, Comparable,
+    CustomStringConvertible {
+    var canonicalName: String
+    var layoutFingerprint: Core.Digest
+    var requiresMainActor: Bool
+
+    init(_ record: InterfaceArchive.TypeRecord) {
+        canonicalName = record.canonicalName
+        layoutFingerprint = record.layoutFingerprint
+        requiresMainActor = record.requiresMainActor
+    }
+
+    init(_ binding: ShellBuildReceipt.NativeTypeBinding) {
+        canonicalName = binding.canonicalName
+        layoutFingerprint = binding.layoutFingerprint
+        requiresMainActor = binding.requiresMainActor
+    }
+
+    static func < (lhs: Self, rhs: Self) -> Bool {
+        if lhs.canonicalName != rhs.canonicalName {
+            return lhs.canonicalName < rhs.canonicalName
+        }
+        if lhs.layoutFingerprint != rhs.layoutFingerprint {
+            return lhs.layoutFingerprint < rhs.layoutFingerprint
+        }
+        return !lhs.requiresMainActor && rhs.requiresMainActor
+    }
+
+    var description: String {
+        "\(canonicalName):\(layoutFingerprint.hex):\(requiresMainActor)"
+    }
+}
+
 public struct Document: Codable, Hashable, Sendable {
     public static let currentSchemaVersion: UInt16 = 1
 
@@ -420,8 +454,9 @@ public struct Document: Codable, Hashable, Sendable {
         self.nativeTypes = nativeTypes.sorted { $0.id.rawValue < $1.id.rawValue }
         self.frozenValueTypes = frozenValueTypes.sorted { $0.key < $1.key }
         self.nativeTypeBindings = nativeTypeBindings.sorted {
-            ($0.canonicalName, $0.layoutFingerprint.hex)
-                < ($1.canonicalName, $1.layoutFingerprint.hex)
+            let lhs = NativeTypeIdentity($0)
+            let rhs = NativeTypeIdentity($1)
+            return lhs < rhs
         }
         self.superclassEdges = superclassEdges.sorted { $0.orderKey < $1.orderKey }
         self.reloadRules = reloadRules.sorted { $0.orderKey < $1.orderKey }
@@ -536,29 +571,78 @@ public struct Document: Codable, Hashable, Sendable {
         }
         guard nativeImportCandidates == nativeImportCandidates.sorted(by: {
             $0.key.rawValue < $1.key.rawValue
-        }), Set(nativeImportCandidates.map(\.key)).count == nativeImportCandidates.count,
-            nativeImportBindings == nativeImportBindings.sorted(by: {
-                $0.key.rawValue < $1.key.rawValue
-            }), Set(nativeImportBindings.map(\.key)).count == nativeImportBindings.count,
-            nativeImportBindings.allSatisfy({ binding in
-                binding.importedModules
-                    == Array(Set(binding.importedModules)).sorted()
-                    && binding.importedModules.allSatisfy(Self.isModulePath)
-                    && nativeImportCandidates.first(where: {
-                        $0.key == binding.key
-                    }).map { record in
-                        Self.isValidNativeImportBinding(
-                            binding,
-                            record: record,
-                            declarations: declarations,
-                            sourcePaths: sourcePaths
-                        )
-                    } == true
-            }), Set(nativeImportBindings.map(\.key))
+        }) else {
+            throw ShellBuildReceipt.Error.invalid(
+                "native import candidates are not ordered by NativeCallKey"
+            )
+        }
+        guard Set(nativeImportCandidates.map(\.key)).count
+                == nativeImportCandidates.count
+        else {
+            throw ShellBuildReceipt.Error.invalid(
+                "native import candidates contain duplicate NativeCallKeys"
+            )
+        }
+        guard nativeImportBindings == nativeImportBindings.sorted(by: {
+            $0.key.rawValue < $1.key.rawValue
+        }) else {
+            throw ShellBuildReceipt.Error.invalid(
+                "native import bindings are not ordered by NativeCallKey"
+            )
+        }
+        guard Set(nativeImportBindings.map(\.key)).count
+                == nativeImportBindings.count
+        else {
+            throw ShellBuildReceipt.Error.invalid(
+                "native import bindings contain duplicate NativeCallKeys"
+            )
+        }
+        let nativeImportCandidatesByKey = Dictionary(
+            uniqueKeysWithValues: nativeImportCandidates.map { ($0.key, $0) }
+        )
+        for binding in nativeImportBindings {
+            guard binding.importedModules
+                    == Array(Set(binding.importedModules)).sorted(),
+                  binding.importedModules.allSatisfy(Self.isModulePath),
+                  let record = nativeImportCandidatesByKey[binding.key],
+                  Self.isValidNativeImportBinding(
+                      binding,
+                      record: record,
+                      declarations: declarations,
+                      sourcePaths: sourcePaths
+                  )
+            else {
+                let generatedContext = binding.generated.map { generated in
+                    let owner = generated.ownerType ?? "<none>"
+                    let invocationParameters = generated
+                        .invocationParameterSwiftTypes
+                        ?? generated.parameterSwiftTypes
+                    return [
+                        "symbol=\(generated.declarationMangledName)",
+                        "dispatch=\(generated.dispatch.rawValue)",
+                        "owner=\(owner)",
+                        "base=\(generated.baseName)",
+                        "labels=\(generated.argumentLabels)",
+                        "parameters=\(generated.parameterSwiftTypes)",
+                        "invocationParameters=\(invocationParameters)",
+                        "result=\(generated.resultSwiftType)",
+                        "nativeModule=\(generated.nativeModuleName ?? "<none>")",
+                        "imports=\(binding.importedModules)",
+                    ].joined(separator: "; ")
+                } ?? ""
+                throw ShellBuildReceipt.Error.invalid(
+                    "native import binding \(binding.key.rawValue.hex) for "
+                        + "\(nativeImportCandidatesByKey[binding.key]?.canonicalCallee ?? "<missing>") "
+                        + "using \(binding.strategy.rawValue) is invalid"
+                        + (generatedContext.isEmpty ? "" : "; " + generatedContext)
+                )
+            }
+        }
+        guard Set(nativeImportBindings.map(\.key))
                 == Set(nativeImportCandidates.map(\.key))
         else {
             throw ShellBuildReceipt.Error.invalid(
-                "native import candidates or bindings are duplicated, unordered, or empty"
+                "native import bindings do not cover every candidate exactly once"
             )
         }
         let entrySymbols = Set(roots.compactMap { root in
@@ -574,43 +658,89 @@ public struct Document: Codable, Hashable, Sendable {
         }
         let nativeTypesByBindingIdentity = Dictionary(
             grouping: nativeTypes,
-            by: {
-                "\($0.canonicalName):\($0.layoutFingerprint.hex):"
-                    + "\($0.requiresMainActor)"
-            }
+            by: NativeTypeIdentity.init
         )
-        guard nativeTypes == nativeTypes.sorted(by: { $0.id.rawValue < $1.id.rawValue }),
-              Set(nativeTypes.map(\.id)).count == nativeTypes.count,
-              nativeTypeBindings == nativeTypeBindings.sorted(by: {
-                  ($0.canonicalName, $0.layoutFingerprint.hex)
-                      < ($1.canonicalName, $1.layoutFingerprint.hex)
-              }),
-              Set(nativeTypeBindings.map {
-                  "\($0.canonicalName):\($0.layoutFingerprint.hex):\($0.requiresMainActor)"
-              }).count == nativeTypeBindings.count,
-              nativeTypeBindings.allSatisfy({
-                  let binding = $0
-                  let identity = "\(binding.canonicalName):"
-                      + "\(binding.layoutFingerprint.hex):"
-                      + "\(binding.requiresMainActor)"
-                  guard let records = nativeTypesByBindingIdentity[identity],
-                        records.count == 1,
-                        let record = records.first
-                  else { return false }
-                  return Self.isValidNativeTypeBinding(
-                      binding,
-                      record: record,
-                      moduleName: metadata.frontendInvocation.moduleName,
-                      sourcePaths: sourcePaths
-                  )
-              }), Set(nativeTypeBindings.map {
-                  "\($0.canonicalName):\($0.layoutFingerprint.hex):\($0.requiresMainActor)"
-              }) == Set(nativeTypes.filter(\.isEmittedToDevice).map {
-                  "\($0.canonicalName):\($0.layoutFingerprint.hex):\($0.requiresMainActor)"
-              })
+        guard nativeTypes == nativeTypes.sorted(by: {
+            $0.id.rawValue < $1.id.rawValue
+        }) else {
+            throw ShellBuildReceipt.Error.invalid(
+                "native types are not ordered by TypeID"
+            )
+        }
+        guard Set(nativeTypes.map(\.id)).count == nativeTypes.count else {
+            throw ShellBuildReceipt.Error.invalid(
+                "native types contain duplicate TypeIDs"
+            )
+        }
+        guard nativeTypeBindings == nativeTypeBindings.sorted(by: {
+            NativeTypeIdentity($0) < NativeTypeIdentity($1)
+        }) else {
+            throw ShellBuildReceipt.Error.invalid(
+                "native type bindings are not canonically ordered"
+            )
+        }
+        let nativeTypeBindingIdentities = nativeTypeBindings.map(
+            NativeTypeIdentity.init
+        )
+        guard Set(nativeTypeBindingIdentities).count
+                == nativeTypeBindings.count
         else {
             throw ShellBuildReceipt.Error.invalid(
-                "native types or bindings are duplicated, unordered, or empty"
+                "native type bindings contain duplicate identities"
+            )
+        }
+        for (binding, identity) in zip(
+            nativeTypeBindings,
+            nativeTypeBindingIdentities
+        ) {
+            guard let records = nativeTypesByBindingIdentity[identity],
+                  records.count == 1,
+                  let record = records.first
+            else {
+                throw ShellBuildReceipt.Error.invalid(
+                    "native type binding \(identity) does not identify exactly one type record"
+                )
+            }
+            guard Self.isValidNativeTypeBinding(
+                binding,
+                record: record,
+                moduleName: metadata.frontendInvocation.moduleName,
+                sourcePaths: sourcePaths
+            ) else {
+                throw ShellBuildReceipt.Error.invalid(
+                    "native type binding \(identity) is invalid; strategy="
+                        + "\(binding.strategy.rawValue), imports="
+                        + "\(binding.importedModules), generated="
+                        + "\(String(describing: binding.generated)), kind="
+                        + "\(record.kind), runtime="
+                        + "\(record.objectiveCRuntimeName ?? "<none>")"
+                )
+            }
+        }
+        let candidateNativeTypeIDs = nativeImportCandidates.reduce(
+            into: Set<Core.TypeID>()
+        ) { result, nativeImport in
+            nativeImport.parameterTypes.forEach {
+                result.formUnion($0.referencedNativeTypeIDs)
+            }
+            result.formUnion(nativeImport.resultType.referencedNativeTypeIDs)
+        }
+        let requiredNativeTypeIdentities = Set(
+            nativeTypes.filter {
+                $0.isEmittedToDevice || candidateNativeTypeIDs.contains($0.id)
+            }.map(
+                NativeTypeIdentity.init
+            )
+        )
+        guard Set(nativeTypeBindingIdentities) == requiredNativeTypeIdentities
+        else {
+            let missing = requiredNativeTypeIdentities
+                .subtracting(nativeTypeBindingIdentities).sorted()
+            let extra = Set(nativeTypeBindingIdentities)
+                .subtracting(requiredNativeTypeIdentities).sorted()
+            throw ShellBuildReceipt.Error.invalid(
+                "native type bindings do not exactly cover emitted or candidate-referenced types; "
+                    + "missing=\(missing), extra=\(extra)"
             )
         }
         guard superclassEdges == superclassEdges.sorted(by: { $0.orderKey < $1.orderKey }),
@@ -841,7 +971,7 @@ public struct Document: Codable, Hashable, Sendable {
             guard let owner = generated.ownerType else { return false }
             return generated.argumentLabels == ["_"]
                 && generated.parameterSwiftTypes.count == 1
-                && generated.resultSwiftType == "Swift.Void"
+                && Core.NativeCall.isVoid(generated.resultSwiftType)
                 && FrontendReceipt.SwiftTypeSpelling.isGeneratedType(owner)
         case .instanceMethod:
             guard let owner = generated.ownerType,
@@ -930,17 +1060,19 @@ public struct Document: Codable, Hashable, Sendable {
 
     private static func isValidGeneratedNativeType(
         _ generated: ShellBuildReceipt.GeneratedNativeType?,
-        canonicalName: String,
+        record: InterfaceArchive.TypeRecord,
         moduleName: String,
         importedModules: [String],
         sourcePaths: Set<String>
     ) -> Bool {
         guard let generated else { return true }
         let modulePrefix = moduleName + "."
-        let isSourceType = canonicalName.hasPrefix(modulePrefix)
-        let expectedSwiftType = isSourceType
-            ? String(canonicalName.dropFirst(modulePrefix.count))
-            : canonicalName
+        let isSourceType = record.canonicalName.hasPrefix(modulePrefix)
+        let acceptedSwiftTypes: Set<String> = if isSourceType {
+            [String(record.canonicalName.dropFirst(modulePrefix.count))]
+        } else {
+            Set(record.swiftTypeAliases + [record.canonicalName])
+        }
         let originIsValid: Bool
         if let nativeModuleName = generated.nativeModuleName {
             originIsValid = !isSourceType
@@ -963,7 +1095,7 @@ public struct Document: Codable, Hashable, Sendable {
         return encodingIsValid
             && originIsValid
             && (isSourceType ? importedModules.isEmpty : !importedModules.isEmpty)
-            && generated.swiftType == expectedSwiftType
+            && acceptedSwiftTypes.contains(generated.swiftType)
             && FrontendReceipt.SwiftTypeSpelling.isGeneratedType(generated.swiftType)
     }
 
@@ -984,7 +1116,7 @@ public struct Document: Codable, Hashable, Sendable {
                 && record.objectiveCRuntimeName == nil
                 && Self.isValidGeneratedNativeType(
                     binding.generated,
-                    canonicalName: binding.canonicalName,
+                    record: record,
                     moduleName: moduleName,
                     importedModules: binding.importedModules,
                     sourcePaths: sourcePaths

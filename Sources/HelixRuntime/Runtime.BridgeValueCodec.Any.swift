@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(ObjectiveC)
+import ObjectiveC
+#endif
 #if canImport(HelixCore)
 import HelixBytecode
 import HelixVM
@@ -6,8 +9,8 @@ import HelixVM
 
 extension Runtime.BridgeValueCodec {
 /// Encodes the supported standard-library subset of a dynamic Swift value.
-/// Native objects, local nominal values, closures, and tuples have no stable
-/// VM-owned representation at this boundary and remain fail-closed.
+/// Native values require an authenticated type catalog and remain fail-closed
+/// through this catalog-free convenience entry point.
 public static func encodeAny(_ value: Any) throws -> VM.Value {
     let encoder = Encoder(limits: .init())
     let result = try encoder.encodeAny(value)
@@ -15,9 +18,50 @@ public static func encodeAny(_ value: Any) throws -> VM.Value {
     return result
 }
 
+/// Encodes the same bounded grammar plus native values already frozen into
+/// the Shell's authenticated native-type catalog.
+public static func encodeAny(
+    _ value: Any,
+    nativeTypeCatalog: VM.NativeTypeCatalog
+) throws -> VM.Value {
+    let encoder = Encoder(limits: .init())
+    let result = try encoder.encodeAny(
+        value,
+        nativeTypeCatalog: nativeTypeCatalog
+    )
+    try encoder.finalize(arguments: [result])
+    return result
+}
+
 /// Decodes a VM-owned existential while preserving its represented Swift
 /// dynamic type, including recursively nested containers.
 public static func decodeAny(_ value: VM.Value) throws -> Any {
+    try decodeAny(value, nativeTypeCatalog: nil)
+}
+
+/// Decodes the same closed existential grammar at a native invocation
+/// boundary, where an authenticated native-type catalog can materialize
+/// frozen native payloads without exposing Swift metadata or arbitrary casts.
+public static func decodeAny(
+    _ value: VM.Value,
+    nativeTypeCatalog: VM.NativeTypeCatalog
+) throws -> Any {
+    try decodeAny(value, nativeTypeCatalog: nativeTypeCatalog as VM.NativeTypeCatalog?)
+}
+
+/// Uses the exact catalog authorized for one NativeImport invocation without
+/// exposing that catalog through generated application code.
+public static func decodeAny(
+    _ value: VM.Value,
+    context: VM.NativeInvocationContext
+) throws -> Any {
+    try decodeAny(value, nativeTypeCatalog: context.nativeTypeCatalog)
+}
+
+private static func decodeAny(
+    _ value: VM.Value,
+    nativeTypeCatalog: VM.NativeTypeCatalog?
+) throws -> Any {
     guard case let .any(erased) = value,
           erased.dynamicType.isAnyPayloadV1,
           erased.payload.matches(erased.dynamicType)
@@ -27,7 +71,8 @@ public static func decodeAny(_ value: VM.Value) throws -> Any {
     return try DynamicAny.decodeValidated(
         erased.payload,
         as: erased.dynamicType,
-        depth: 0
+        depth: 0,
+        nativeTypeCatalog: nativeTypeCatalog
     )
 }
 }
@@ -36,10 +81,27 @@ extension Runtime.BridgeValueCodec.Encoder {
 /// Encodes a dynamic Swift value while charging its complete object graph to
 /// this dispatch's bridge-input limits.
 public func encodeAny(_ value: Any) throws -> VM.Value {
+    try encodeAny(value, nativeTypeCatalog: nil)
+}
+
+/// Encodes dynamic native leaves only when their concrete type has immutable
+/// TypeOps in the supplied Shell catalog.
+public func encodeAny(
+    _ value: Any,
+    nativeTypeCatalog: VM.NativeTypeCatalog
+) throws -> VM.Value {
+    try encodeAny(value, nativeTypeCatalog: nativeTypeCatalog as VM.NativeTypeCatalog?)
+}
+
+private func encodeAny(
+    _ value: Any,
+    nativeTypeCatalog: VM.NativeTypeCatalog?
+) throws -> VM.Value {
     try encodeDynamicContainer(childValueCount: 1) {
         let payload = try Runtime.BridgeValueCodec.DynamicAny.encode(
             value,
-            using: self
+            using: self,
+            nativeTypeCatalog: nativeTypeCatalog
         )
         return .any(
             .init(dynamicType: payload.dynamicType, payload: payload.value)
@@ -57,13 +119,25 @@ enum DynamicAny {
 
     static func encode(
         _ value: Any,
-        using encoder: Runtime.BridgeValueCodec.Encoder
+        using encoder: Runtime.BridgeValueCodec.Encoder,
+        nativeTypeCatalog: VM.NativeTypeCatalog? = nil
     ) throws -> Encoded {
         let reflectedType = String(reflecting: Swift.type(of: value))
-        guard let dynamicType = parseStandardType(reflectedType),
+        let exactNativeType = nativeTypeCatalog.flatMap {
+            nativeDynamicType(of: value, catalog: $0)
+        }
+        guard let dynamicType = parseStandardType(
+                reflectedType,
+                nativeTypeCatalog: nativeTypeCatalog
+              ) ?? exactNativeType,
               dynamicType.isAnyPayloadV1,
-              dynamicType.isSwiftBridgeMaterializableV1,
-              let codec = codec(for: dynamicType)
+              nativeTypeCatalog == nil
+                ? dynamicType.isSwiftBridgeMaterializableV1
+                : dynamicType.isNativeBridgeMaterializableV1,
+              let codec = codec(
+                for: dynamicType,
+                nativeTypeCatalog: nativeTypeCatalog
+              )
         else {
             throw Runtime.BridgeInputError.unsupportedAnyType(reflectedType)
         }
@@ -77,16 +151,50 @@ enum DynamicAny {
         return .init(dynamicType: dynamicType, value: encoded)
     }
 
+    private static func nativeDynamicType(
+        of value: Any,
+        catalog: VM.NativeTypeCatalog
+    ) -> Bytecode.DynamicType? {
+        let exact = catalog.typeIDs(forExactSwiftType: Swift.type(of: value))
+        if exact.count == 1,
+           catalog[exact[0]]?.isCopyable == true {
+            return .native(exact[0])
+        }
+        guard exact.isEmpty,
+              Mirror(reflecting: value).displayStyle == .class
+        else { return nil }
+#if canImport(ObjectiveC)
+        let object = value as AnyObject
+        var current: AnyClass? = object_getClass(object).flatMap(
+            class_getSuperclass
+        )
+        while let type = current {
+            let candidates = catalog.typeIDs(forExactSwiftType: type)
+            if candidates.count == 1,
+               catalog[candidates[0]]?.isCopyable == true {
+                return .native(candidates[0])
+            }
+            guard candidates.isEmpty else { return nil }
+            current = class_getSuperclass(type)
+        }
+#endif
+        return nil
+    }
+
     /// Materializes a value whose complete graph was already validated by the
     /// public Shell boundary. Nested codecs must preserve this invariant so a
     /// large graph is not rescanned at every existential layer.
     static func decodeValidated(
         _ value: VM.Value,
         as dynamicType: Bytecode.DynamicType,
-        depth: Int
+        depth: Int,
+        nativeTypeCatalog: VM.NativeTypeCatalog? = nil
     ) throws -> Any {
         try requireDepth(depth)
-        guard let codec = codec(for: dynamicType) else {
+        guard let codec = codec(
+            for: dynamicType,
+            nativeTypeCatalog: nativeTypeCatalog
+        ) else {
             throw VM.RuntimeTrap.nativeFailure(
                 "Swift Any boundary cannot materialize \(dynamicType)"
             )
@@ -95,11 +203,14 @@ enum DynamicAny {
     }
 
     private static func codec(
-        for type: Bytecode.DynamicType
+        for type: Bytecode.DynamicType,
+        nativeTypeCatalog: VM.NativeTypeCatalog? = nil
     ) -> (any DynamicCodecBox)? {
         switch type {
         case .any:
-            return NonHashableDynamicCodecBox(codec: anyCodec())
+            return NonHashableDynamicCodecBox(
+                codec: anyCodec(nativeTypeCatalog: nativeTypeCatalog)
+            )
         case .bool:
             return scalarCodec(
                 .bool,
@@ -140,17 +251,60 @@ enum DynamicAny {
                     try Runtime.BridgeValueCodec.decode($0, as: Substring.self)
                 }
             )
+        case let .native(id):
+            guard let nativeTypeCatalog,
+                  nativeTypeCatalog[id]?.isCopyable == true
+            else { return nil }
+            return NonHashableDynamicCodecBox(
+                codec: DynamicCodec<Any>(
+                    dynamicType: .native(id),
+                    encode: { value, encoder in
+                        try encoder.encodeNative(
+                            value,
+                            as: id,
+                            catalog: nativeTypeCatalog
+                        )
+                    },
+                    decode: { value, depth in
+                        try requireDepth(depth)
+                        guard case let .native(native) = value,
+                              native.typeID == id
+                        else {
+                            throw VM.RuntimeTrap.typeMismatch(
+                                expected: .native(id),
+                                actual: value.type
+                            )
+                        }
+                        return try nativeTypeCatalog.materialize(native)
+                    }
+                )
+            )
         case let .optional(wrapped):
-            return codec(for: wrapped)?.optionalCodec()
+            return codec(
+                for: wrapped,
+                nativeTypeCatalog: nativeTypeCatalog
+            )?.optionalCodec()
         case let .array(element):
-            return codec(for: element)?.arrayCodec()
+            return codec(
+                for: element,
+                nativeTypeCatalog: nativeTypeCatalog
+            )?.arrayCodec()
         case let .dictionary(key, value):
-            guard let keyCodec = codec(for: key),
-                  let valueCodec = codec(for: value)
+            guard let keyCodec = codec(
+                    for: key,
+                    nativeTypeCatalog: nativeTypeCatalog
+                  ),
+                  let valueCodec = codec(
+                    for: value,
+                    nativeTypeCatalog: nativeTypeCatalog
+                  )
             else { return nil }
             return keyCodec.dictionaryCodec(value: valueCodec)
         case let .set(element):
-            return codec(for: element)?.setCodec()
+            return codec(
+                for: element,
+                nativeTypeCatalog: nativeTypeCatalog
+            )?.setCodec()
         case .arraySlice, .local, .tuple:
             // ArraySlice's nonzero public index base and arbitrary tuple
             // arity cannot be reconstructed through a type-erased Shell ABI.
@@ -259,11 +413,19 @@ enum DynamicAny {
         }
     }
 
-    private static func anyCodec() -> DynamicCodec<Any> {
+    private static func anyCodec(
+        nativeTypeCatalog: VM.NativeTypeCatalog?
+    ) -> DynamicCodec<Any> {
         .init(
             dynamicType: .any,
             encode: { value, encoder in
-                try encoder.encodeAny(value)
+                if let nativeTypeCatalog {
+                    return try encoder.encodeAny(
+                        value,
+                        nativeTypeCatalog: nativeTypeCatalog
+                    )
+                }
+                return try encoder.encodeAny(value)
             },
             decode: { value, depth in
                 try requireDepth(depth)
@@ -278,7 +440,8 @@ enum DynamicAny {
                 return try decodeValidated(
                     erased.payload,
                     as: erased.dynamicType,
-                    depth: depth + 1
+                    depth: depth + 1,
+                    nativeTypeCatalog: nativeTypeCatalog
                 )
             }
         )
@@ -404,7 +567,8 @@ enum DynamicAny {
 
     private static func parseStandardType(
         _ raw: String,
-        depth: Int = 0
+        depth: Int = 0,
+        nativeTypeCatalog: VM.NativeTypeCatalog? = nil
     ) -> Bytecode.DynamicType? {
         guard depth <= Bytecode.DynamicType.maximumNestingDepthV1 else {
             return nil
@@ -434,31 +598,59 @@ enum DynamicAny {
         }
         if let arguments = genericArguments(value, prefix: "Swift.Optional<"),
            arguments.count == 1,
-           let wrapped = parseStandardType(arguments[0], depth: depth + 1) {
+           let wrapped = parseStandardType(
+            arguments[0],
+            depth: depth + 1,
+            nativeTypeCatalog: nativeTypeCatalog
+           ) {
             return .optional(wrapped)
         }
         if let arguments = genericArguments(value, prefix: "Swift.Array<"),
            arguments.count == 1,
-           let element = parseStandardType(arguments[0], depth: depth + 1) {
+           let element = parseStandardType(
+            arguments[0],
+            depth: depth + 1,
+            nativeTypeCatalog: nativeTypeCatalog
+           ) {
             return .array(element)
         }
         if let arguments = genericArguments(value, prefix: "Swift.ArraySlice<"),
            arguments.count == 1,
-           let element = parseStandardType(arguments[0], depth: depth + 1) {
+           let element = parseStandardType(
+            arguments[0],
+            depth: depth + 1,
+            nativeTypeCatalog: nativeTypeCatalog
+           ) {
             return .arraySlice(element)
         }
         if let arguments = genericArguments(value, prefix: "Swift.Set<"),
            arguments.count == 1,
-           let element = parseStandardType(arguments[0], depth: depth + 1) {
+           let element = parseStandardType(
+            arguments[0],
+            depth: depth + 1,
+            nativeTypeCatalog: nativeTypeCatalog
+           ) {
             return .set(element)
         }
         if let arguments = genericArguments(value, prefix: "Swift.Dictionary<"),
            arguments.count == 2,
-           let key = parseStandardType(arguments[0], depth: depth + 1),
-           let element = parseStandardType(arguments[1], depth: depth + 1) {
+           let key = parseStandardType(
+            arguments[0],
+            depth: depth + 1,
+            nativeTypeCatalog: nativeTypeCatalog
+           ),
+           let element = parseStandardType(
+            arguments[1],
+            depth: depth + 1,
+            nativeTypeCatalog: nativeTypeCatalog
+           ) {
             return .dictionary(key: key, value: element)
         }
-        return nil
+        guard let nativeTypeCatalog,
+              let id = nativeTypeCatalog.typeID(forTypeSpelling: value),
+              nativeTypeCatalog[id]?.isCopyable == true
+        else { return nil }
+        return .native(id)
     }
 
     private static func genericArguments(

@@ -270,7 +270,8 @@ static func physicalSignature(
             logicalType: logicalType,
             nativeTypeKinds: nativeTypeKinds,
             targetTriple: targetTriple,
-            allowsImplicitNil: parameter.source.kind == .optionalNone
+            allowsImplicitNil: parameter.source.kind == .optionalNone,
+            allowsSwiftAnyErasure: true
         ) else { return nil }
         let ownership: Core.NativeCall.Ownership = if
             parameter.source.kind == .argument,
@@ -296,7 +297,8 @@ static func physicalSignature(
             logicalType: .bool,
             nativeTypeKinds: nativeTypeKinds,
             targetTriple: targetTriple,
-            allowsImplicitNil: false
+            allowsImplicitNil: false,
+            allowsSwiftAnyErasure: false
         ), physical.kind == .boolean else { return nil }
         result = physical
     } else if logicalResultType == .void {
@@ -310,7 +312,8 @@ static func physicalSignature(
             logicalType: logicalResultType,
             nativeTypeKinds: nativeTypeKinds,
             targetTriple: targetTriple,
-            allowsImplicitNil: false
+            allowsImplicitNil: false,
+            allowsSwiftAnyErasure: false
         ), physical.kind != .block else { return nil }
         // Native Blocks returned by Objective-C require a VM-backed callable
         // wrapper with independent lifetime and invocation metadata. Until that
@@ -441,7 +444,8 @@ private extension FrontendReceipt.ObjectiveCABI {
         logicalType: Bytecode.ValueType?,
         nativeTypeKinds: [Core.TypeID: InterfaceArchive.TypeKind],
         targetTriple: String,
-        allowsImplicitNil: Bool
+        allowsImplicitNil: Bool,
+        allowsSwiftAnyErasure: Bool
     ) -> Core.NativeCall.ABIType? {
         let stripped = strippingOwnership(raw)
         let (physical, physicalOptional) = unwrapOptional(stripped)
@@ -496,7 +500,8 @@ private extension FrontendReceipt.ObjectiveCABI {
         guard objectMatches(
             logicalType,
             nativeTypeKinds: nativeTypeKinds,
-            isNullable: physicalOptional || allowsImplicitNil
+            isNullable: physicalOptional || allowsImplicitNil,
+            allowsSwiftAnyErasure: allowsSwiftAnyErasure
         ), isObjectiveCObjectSpelling(physical)
         else { return nil }
         return .init(
@@ -600,19 +605,23 @@ private extension FrontendReceipt.ObjectiveCABI {
     static func objectMatches(
         _ logicalType: Bytecode.ValueType?,
         nativeTypeKinds: [Core.TypeID: InterfaceArchive.TypeKind],
-        isNullable: Bool
+        isNullable: Bool,
+        allowsSwiftAnyErasure: Bool
     ) -> Bool {
         guard let logicalType else { return isNullable }
         switch logicalType {
         case .string, .error:
             return !isNullable
+        case .any:
+            return allowsSwiftAnyErasure && !isNullable
         case let .native(id):
             return !isNullable && nativeTypeKinds[id] == .reference
         case let .optional(wrapped):
             return isNullable && objectMatches(
                 wrapped,
                 nativeTypeKinds: nativeTypeKinds,
-                isNullable: false
+                isNullable: false,
+                allowsSwiftAnyErasure: allowsSwiftAnyErasure
             )
         default:
             return false

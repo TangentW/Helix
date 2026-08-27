@@ -174,6 +174,23 @@ enum GenericFunction {
         ).loweredType
     }
 
+    /// Substitutes a concrete apply argument list without treating the result
+    /// as proof that the generic requirements hold. Catalog-backed native calls
+    /// use this only as a compiler-spelling discriminator: a resulting function
+    /// type must still match exactly one frozen logical NativeImport binding.
+    static func substituteLoweredType(
+        _ loweredType: String,
+        arguments rawArguments: String
+    ) throws -> String {
+        try concreteSignature(
+            loweredType: loweredType,
+            rawArguments: rawArguments,
+            conformances: nil,
+            typeEnvironment: nil,
+            validatesRequirements: false
+        ).loweredType
+    }
+
     static func validatesCallType(
         _ appliedLoweredType: String,
         against referenceLoweredType: String
@@ -194,7 +211,8 @@ enum GenericFunction {
         loweredType: String,
         rawArguments: String,
         conformances: CanonicalSIL.ProtocolConformance.Environment?,
-        typeEnvironment: CanonicalSIL.TypeEnvironment?
+        typeEnvironment: CanonicalSIL.TypeEnvironment?,
+        validatesRequirements: Bool = true
     ) throws -> ConcreteSignature {
         let clause = try genericClause(in: loweredType)
         let arguments = try arguments(in: rawArguments)
@@ -210,7 +228,7 @@ enum GenericFunction {
                 ($0.0, $0.1)
             }
         )
-        if !clause.requirements.isEmpty {
+        if validatesRequirements, !clause.requirements.isEmpty {
             guard let conformances, let typeEnvironment else {
                 throw SpecializationError.invalidArguments(
                     "its generic requirements have no concrete conformance environment"

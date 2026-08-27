@@ -2,8 +2,9 @@ import Foundation
 import HelixCore
 
 extension XcodeIntegration {
-/// A verified shortcut for an unchanged Hot Patch Prepare. Live Reload never
-/// reuses this state because its Hub invitation is intentionally single-use.
+/// A verified shortcut for unchanged Prepare inputs and output artifacts.
+/// Live Reload separately asks Hub whether its embedded reservation remains
+/// authoritative before reusing or refreshing invitation-specific outputs.
 public struct PrepareState: Codable, Hashable, Sendable {
     public static let currentSchemaVersion: UInt16 = 1
     public static let relativePath = "PrepareState.json"
@@ -32,19 +33,26 @@ public struct PrepareState: Codable, Hashable, Sendable {
     public var artifacts: [Artifact]
     public var eligibleFunctionCount: UInt32
     public var rejectedFunctionCount: UInt32
+    /// A background Catalog was missing when these artifacts were published.
+    /// The next Prepare must recheck the cache instead of treating this Shell
+    /// as the final no-op result for otherwise identical inputs.
+    public var requiresNativeAPICatalogRefresh: Bool
 
     public init(
         schemaVersion: UInt16 = Self.currentSchemaVersion,
         inputHash: Core.Digest,
         artifacts: [Artifact],
         eligibleFunctionCount: UInt32,
-        rejectedFunctionCount: UInt32
+        rejectedFunctionCount: UInt32,
+        requiresNativeAPICatalogRefresh: Bool = false
     ) {
         self.schemaVersion = schemaVersion
         self.inputHash = inputHash
         self.artifacts = artifacts.sorted { $0.path < $1.path }
         self.eligibleFunctionCount = eligibleFunctionCount
         self.rejectedFunctionCount = rejectedFunctionCount
+        self.requiresNativeAPICatalogRefresh =
+            requiresNativeAPICatalogRefresh
     }
 
     public func validate() throws {

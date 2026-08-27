@@ -505,8 +505,11 @@ cannot be safely unloaded; their count and mapped bytes share the same
 process-lifetime native-image budget as Dynamic Replacement generations. A
 failed image load is never published. If loader state cannot be proven clean,
 the App marks native state uncertain and rejects further image-bearing payloads
-until restart. Reconnect identity reports both published development keys and
-mapped image inventory, allowing Hub to reuse the existing session state.
+until restart. Reconnect identity reports the exact published
+`NativeCallKey`-to-`NativeImportID` mapping, the independently published
+development `TypeID` inventory, and mapped-image resource totals. Hub can
+therefore preserve compact IDs already referenced by active HLBC and reuse the
+existing session state.
 
 Two saves may overlap while Hub is compiling the same first-use Swift Adapter.
 If the earlier transaction publishes it first, the App treats the later,

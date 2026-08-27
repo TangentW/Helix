@@ -405,9 +405,13 @@ public actor Service {
     }
 
     /// Reserves the one-time code embedded during an Xcode build.
-    public func reserveAutomaticInvitation() async throws -> Pairing.Reservation {
+    public func reserveAutomaticInvitation(
+        reusing existing: Pairing.Reservation? = nil
+    ) async throws -> Pairing.Reservation {
         guard state == .running else { throw DevSession.ServiceError.notRunning }
-        let reservation = try await broker.reserveAutomaticInvitation()
+        let reservation = try await broker.reserveAutomaticInvitation(
+            reusing: existing
+        )
         guard state == .running else {
             await broker.authority.invalidate(
                 invitationID: reservation.invitationID
@@ -663,9 +667,9 @@ public actor Service {
         do {
             let value: HubControl.Success
             switch request.command {
-            case .reserveAutomaticInvitation:
+            case let .reserveAutomaticInvitation(reusing):
                 value = .automaticInvitationReserved(
-                    try await reserveAutomaticInvitation()
+                    try await reserveAutomaticInvitation(reusing: reusing)
                 )
             case let .registerAndActivate(invitationID, context):
                 value = .automaticInvitationActivated(

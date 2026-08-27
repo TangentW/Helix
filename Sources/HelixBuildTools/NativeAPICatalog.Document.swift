@@ -159,12 +159,12 @@ public struct Entry: Codable, Hashable, Sendable {
         support: NativeAPICatalog.Support = .supported,
         binding: NativeAPICatalog.Binding?
     ) throws {
-        let canonical = try descriptor.validated(contract: contract)
-        self.key = try Core.NativeCall.Key.derive(descriptor: canonical)
-        self.descriptor = canonical
+        let validated = try descriptor.validatedIdentity(contract: contract)
+        self.key = validated.key
+        self.descriptor = validated.descriptor
         self.contract = contract
         self.swiftNames = Array(
-            Set(swiftNames + [canonical.canonicalCallee])
+            Set(swiftNames + [validated.descriptor.canonicalCallee])
         ).sorted()
         self.compilerSymbols = Array(Set(compilerSymbols)).sorted()
         self.support = support
@@ -213,11 +213,11 @@ public struct Document: Codable, Hashable, Sendable {
         }
         for entry in entries {
             do {
-                try entry.descriptor.validate(contract: entry.contract)
-                guard try entry.descriptor.canonicalized() == entry.descriptor,
-                      try Core.NativeCall.Key.derive(
-                          descriptor: entry.descriptor
-                      ) == entry.key
+                let validated = try entry.descriptor.validatedIdentity(
+                    contract: entry.contract
+                )
+                guard validated.descriptor == entry.descriptor,
+                      validated.key == entry.key
                 else {
                     throw NativeAPICatalog.Error.invalid(
                         "entry \(entry.key) has a noncanonical descriptor or mismatched key"

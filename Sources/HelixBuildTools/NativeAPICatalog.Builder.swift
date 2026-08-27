@@ -45,6 +45,7 @@ public struct BuildMetrics: Hashable, Sendable {
 public struct BuildOutput: Sendable {
     public let snapshot: NativeAPICatalog.Snapshot
     public let metrics: NativeAPICatalog.BuildMetrics
+    public let performance: BuildPerformance.Trace
 }
 
 public struct Builder: Sendable {
@@ -52,19 +53,13 @@ public struct Builder: Sendable {
         var frontend: SwiftFrontend.Driver
         var toolchain: ReleaseCompiler.ToolchainIdentity
         var invocation: PreparedInvocation
+        var compilerInputHash: Core.Digest
         var cacheKey: Core.Digest
     }
 
     private struct PreparedInvocation {
         var execution: InterfaceArchive.FrontendInvocation
         var cacheIdentity: InterfaceArchive.FrontendInvocation
-    }
-
-    private struct CacheKey: Codable, Sendable {
-        var schemaVersion: UInt16 = 1
-        var identity: NativeAPICatalog.Identity
-        var invocation: InterfaceArchive.FrontendInvocation
-        var transformPipelineHash: Core.Digest
     }
 
     private struct CachedMetrics: Codable, Hashable, Sendable {
@@ -82,6 +77,11 @@ public struct Builder: Sendable {
         var metrics: CachedMetrics
     }
 
+    private struct DecodedPayload: Sendable {
+        var payload: CachePayload
+        var snapshot: NativeAPICatalog.Snapshot
+    }
+
     public var cache: BuildCache.Store
     public var invocationObserver: SwiftFrontend.InvocationObserver?
 
@@ -96,93 +96,120 @@ public struct Builder: Sendable {
     public func build(
         _ request: NativeAPICatalog.BuildRequest
     ) throws -> NativeAPICatalog.BuildOutput {
-        let prepared = try prepare(request)
+        let performance = BuildPerformance.Recorder()
+        let prepared = try performance.measure(
+            "native_api_catalog.prepare"
+        ) {
+            try prepare(request)
+        }
         var generatedSurfaceMetrics: FrontendReceipt.ManagedNativeSurface
             .Metrics?
-        var validatedPayload: CachePayload?
-        let value = try cache.value(
-            namespace: .nativeAPICatalog,
-            key: prepared.cacheKey,
-            maximumBytes: 384 * 1_024 * 1_024,
-            validate: { data in
-                validatedPayload = try decode(
-                    data,
-                    identity: request.identity,
-                    invocation: prepared.invocation.cacheIdentity
-                )
-            }
+        var validatedPayload: DecodedPayload?
+        let value = try performance.measure(
+            "native_api_catalog.cache_lookup_or_generate"
         ) {
-            let surface = try FrontendReceipt.ManagedNativeSurface.catalog(
-                moduleName: request.identity.moduleName,
-                sourceFileLogicalID: NativeAPICatalog.Projector
-                    .sourceFileLogicalID(moduleName: request.identity.moduleName),
-                minimumOS: request.identity.minimumDeployment,
-                frontend: prepared.frontend,
-                invocation: prepared.invocation.execution,
-                cache: cache,
-                compilerFingerprint: prepared.toolchain.fingerprint,
-                moduleInputHash: prepared.cacheKey
-            )
-            let measuredProjection = NativeAPICatalog.CompilerProjection(
-                sourceFileLogicalID: NativeAPICatalog.Projector
-                    .sourceFileLogicalID(moduleName: request.identity.moduleName),
-                importedTypes: surface.importedTypes,
-                operations: surface.operations,
-                modulesByDeclarationUSR: surface.modulesByDeclarationUSR,
-                referencedModules: []
-            )
-            let projected = try NativeAPICatalog.Projector.project(
-                projection: measuredProjection,
-                identity: request.identity,
-                invocation: prepared.invocation.cacheIdentity
-            )
-            let declarationUSRs = Set(
-                projected.operations.compactMap(\.declarationUSR)
-            )
-            let projection = NativeAPICatalog.CompilerProjection(
-                sourceFileLogicalID: measuredProjection.sourceFileLogicalID,
-                importedTypes: projected.importedTypes,
-                operations: projected.operations,
-                modulesByDeclarationUSR: measuredProjection
-                    .modulesByDeclarationUSR.filter {
-                        declarationUSRs.contains($0.key)
+            try cache.value(
+                namespace: .nativeAPICatalog,
+                key: prepared.cacheKey,
+                maximumBytes: 384 * 1_024 * 1_024,
+                validate: { data in
+                    validatedPayload = try decode(
+                        data,
+                        identity: request.identity,
+                        invocation: prepared.invocation.cacheIdentity,
+                        performance: performance
+                    )
+                }
+            ) {
+                let surface = try performance.measure(
+                    "native_api_catalog.measure_module"
+                ) {
+                    try FrontendReceipt.ManagedNativeSurface.catalog(
+                        moduleName: request.identity.moduleName,
+                        sourceFileLogicalID: NativeAPICatalog.Projector
+                            .sourceFileLogicalID(
+                                moduleName: request.identity.moduleName
+                            ),
+                        minimumOS: request.identity.minimumDeployment,
+                        frontend: prepared.frontend,
+                        invocation: prepared.invocation.execution,
+                        cache: cache,
+                        compilerFingerprint: prepared.toolchain.fingerprint,
+                        moduleInputHash: prepared.compilerInputHash
+                    )
+                }
+                let measuredProjection = NativeAPICatalog.CompilerProjection(
+                    sourceFileLogicalID: NativeAPICatalog.Projector
+                        .sourceFileLogicalID(
+                            moduleName: request.identity.moduleName
+                        ),
+                    importedTypes: surface.importedTypes,
+                    operations: surface.operations,
+                    modulesByDeclarationUSR: surface.modulesByDeclarationUSR,
+                    referencedModules: []
+                )
+                let projected = try performance.measure(
+                    "native_api_catalog.project_module"
+                ) {
+                    try NativeAPICatalog.Projector.project(
+                        projection: measuredProjection,
+                        identity: request.identity,
+                        invocation: prepared.invocation.cacheIdentity
+                    )
+                }
+                let declarationUSRs = Set(
+                    projected.operations.compactMap(\.declarationUSR)
+                )
+                let projection = NativeAPICatalog.CompilerProjection(
+                    sourceFileLogicalID: measuredProjection.sourceFileLogicalID,
+                    importedTypes: projected.importedTypes,
+                    operations: projected.operations,
+                    publishedEntryKeys: try projected.operations.map {
+                        operation in
+                        guard let entry = projected.entriesByOperation[
+                            operation
+                        ] else {
+                            throw NativeAPICatalog.Error.invalid(
+                                "Catalog operation has no stable published entry"
+                            )
+                        }
+                        return entry.key
                     },
-                referencedModules: projected.referencedModules
-            )
-            let entries = projected.entries
-            let filteredEntries = try NativeAPICatalog.Projector.entries(
-                projection: projection,
-                identity: request.identity,
-                invocation: prepared.invocation.cacheIdentity
-            )
-            guard filteredEntries == entries else {
-                let expectedKeys = Set(entries.map(\.key))
-                let filteredKeys = Set(filteredEntries.map(\.key))
-                throw NativeAPICatalog.Error.invalid(
-                    "Catalog projection filtering changed its published entries; "
-                        + "removed=\(expectedKeys.subtracting(filteredKeys).count), "
-                        + "added=\(filteredKeys.subtracting(expectedKeys).count)"
+                    publishedCapabilities: projected.capabilities,
+                    modulesByDeclarationUSR: measuredProjection
+                        .modulesByDeclarationUSR.filter {
+                            declarationUSRs.contains($0.key)
+                        },
+                    referencedModules: projected.referencedModules
                 )
+                let entries = projected.entries
+                let document = NativeAPICatalog.Document(
+                    identity: request.identity,
+                    entries: entries
+                )
+                generatedSurfaceMetrics = surface.metrics
+                let unpublished = surface.metrics.candidateCount
+                    >= UInt64(entries.count)
+                    ? surface.metrics.candidateCount - UInt64(entries.count)
+                    : 0
+                return try performance.measure(
+                    "native_api_catalog.encode_cache"
+                ) {
+                    try encode(CachePayload(
+                        document: document,
+                        compilerProjection: projection,
+                        invocation: prepared.invocation.cacheIdentity,
+                        metrics: .init(
+                            importedTypeCount: UInt64(
+                                projection.importedTypes.count
+                            ),
+                            candidateCount: surface.metrics.candidateCount,
+                            entryCount: UInt64(entries.count),
+                            unpublishedCandidateCount: unpublished
+                        )
+                    ))
+                }
             }
-            let document = NativeAPICatalog.Document(
-                identity: request.identity,
-                entries: entries
-            )
-            generatedSurfaceMetrics = surface.metrics
-            let unpublished = surface.metrics.candidateCount
-                >= UInt64(entries.count)
-                ? surface.metrics.candidateCount - UInt64(entries.count) : 0
-            return try Core.CanonicalJSON.encode(CachePayload(
-                document: document,
-                compilerProjection: projection,
-                invocation: prepared.invocation.cacheIdentity,
-                metrics: .init(
-                    importedTypeCount: UInt64(projection.importedTypes.count),
-                    candidateCount: surface.metrics.candidateCount,
-                    entryCount: UInt64(entries.count),
-                    unpublishedCandidateCount: unpublished
-                )
-            ))
         }
         guard let payload = validatedPayload else {
             throw NativeAPICatalog.Error.invalid(
@@ -190,9 +217,10 @@ public struct Builder: Sendable {
             )
         }
         return output(
-            payload: payload,
+            decoded: payload,
             source: value.source,
-            surfaceMetrics: generatedSurfaceMetrics
+            surfaceMetrics: generatedSurfaceMetrics,
+            performance: performance.trace()
         )
     }
 
@@ -201,27 +229,50 @@ public struct Builder: Sendable {
     public func cached(
         _ request: NativeAPICatalog.BuildRequest
     ) throws -> NativeAPICatalog.BuildOutput? {
-        let prepared = try prepare(request)
-        var payload: CachePayload?
-        guard let value = try cache.cachedValue(
-            namespace: .nativeAPICatalog,
-            key: prepared.cacheKey,
-            maximumBytes: 384 * 1_024 * 1_024,
-            validate: { data in
-                payload = try decode(
-                    data,
-                    identity: request.identity,
-                    invocation: prepared.invocation.cacheIdentity
-                )
-            }
-        ), let payload else { return nil }
-        return output(payload: payload, source: value.source)
+        let performance = BuildPerformance.Recorder()
+        let prepared = try performance.measure(
+            "native_api_catalog.prepare"
+        ) {
+            try prepare(request)
+        }
+        var payload: DecodedPayload?
+        let value = try performance.measure(
+            "native_api_catalog.cache_read"
+        ) {
+            try cache.cachedValue(
+                namespace: .nativeAPICatalog,
+                key: prepared.cacheKey,
+                maximumBytes: 384 * 1_024 * 1_024,
+                validate: { data in
+                    payload = try decode(
+                        data,
+                        identity: request.identity,
+                        invocation: prepared.invocation.cacheIdentity,
+                        performance: performance
+                    )
+                }
+            )
+        }
+        guard let value, let payload else { return nil }
+        return output(
+            decoded: payload,
+            source: value.source,
+            performance: performance.trace()
+        )
     }
 
     public func cacheKey(
         for request: NativeAPICatalog.BuildRequest
     ) throws -> Core.Digest {
         try prepare(request).cacheKey
+    }
+
+    /// Exposes the normalized compiler-fact identity independently from the
+    /// final Catalog cache key for cache diagnostics and integration tests.
+    func compilerInputHash(
+        for request: NativeAPICatalog.BuildRequest
+    ) throws -> Core.Digest {
+        try prepare(request).compilerInputHash
     }
 
     private func prepare(
@@ -293,32 +344,32 @@ public struct Builder: Sendable {
             identity: request.identity,
             frontend: frontend
         )
-        let key = try BuildCache.key(
-            domain: "HLX.BuildCache.NativeAPICatalog.v1",
-            value: CacheKey(
-                identity: request.identity,
-                invocation: invocation.cacheIdentity,
-                transformPipelineHash: ShellBuild.transformPipelineHash
-            )
+        let compilerInputHash = try NativeAPICatalog.Pipeline.compilerInputHash(
+            identity: request.identity,
+            invocation: invocation.cacheIdentity
+        )
+        let key = try NativeAPICatalog.Pipeline.catalogCacheKey(
+            identity: request.identity,
+            invocation: invocation.cacheIdentity
         )
         return .init(
             frontend: frontend,
             toolchain: toolchain,
             invocation: invocation,
+            compilerInputHash: compilerInputHash,
             cacheKey: key
         )
     }
 
     private func output(
-        payload: CachePayload,
+        decoded: DecodedPayload,
         source: BuildCache.Source,
-        surfaceMetrics: FrontendReceipt.ManagedNativeSurface.Metrics? = nil
+        surfaceMetrics: FrontendReceipt.ManagedNativeSurface.Metrics? = nil,
+        performance: BuildPerformance.Trace
     ) -> NativeAPICatalog.BuildOutput {
-        .init(
-            snapshot: .init(
-                document: payload.document,
-                compilerProjection: payload.compilerProjection
-            ),
+        let payload = decoded.payload
+        return .init(
+            snapshot: decoded.snapshot,
             metrics: .init(
                 cacheSource: source,
                 importedTypeCount: payload.metrics.importedTypeCount,
@@ -333,7 +384,8 @@ public struct Builder: Sendable {
                 probeCacheHitCount: surfaceMetrics?.probeCacheHitCount ?? 0,
                 probeCacheMissCount: surfaceMetrics?.probeCacheMissCount ?? 0,
                 probeAttemptCount: surfaceMetrics?.probeAttemptCount ?? 0
-            )
+            ),
+            performance: performance
         )
     }
 
@@ -495,11 +547,19 @@ public struct Builder: Sendable {
     private func decode(
         _ data: Data,
         identity: NativeAPICatalog.Identity,
-        invocation: InterfaceArchive.FrontendInvocation
-    ) throws -> CachePayload {
+        invocation: InterfaceArchive.FrontendInvocation,
+        performance: BuildPerformance.Recorder
+    ) throws -> DecodedPayload {
         let payload: CachePayload
         do {
-            payload = try JSONDecoder().decode(CachePayload.self, from: data)
+            payload = try performance.measure(
+                "native_api_catalog.decode_cache"
+            ) {
+                try PropertyListDecoder().decode(
+                    CachePayload.self,
+                    from: data
+                )
+            }
         } catch {
             throw NativeAPICatalog.Error.invalid(
                 "Catalog cache payload cannot be decoded: \(error)"
@@ -514,45 +574,36 @@ public struct Builder: Sendable {
                 == UInt64(payload.document.entries.count),
               payload.metrics.candidateCount >= payload.metrics.entryCount,
               payload.metrics.unpublishedCandidateCount
-                == payload.metrics.candidateCount - payload.metrics.entryCount,
-              try Core.CanonicalJSON.encode(payload) == data
+                == payload.metrics.candidateCount - payload.metrics.entryCount
         else {
             throw NativeAPICatalog.Error.invalid(
-                "Catalog cache payload is noncanonical or inconsistent"
+                "Catalog cache payload is inconsistent"
             )
         }
-        try validate(
-            .init(
+        let snapshot = try performance.measure(
+            "native_api_catalog.validate_cache"
+        ) {
+            try NativeAPICatalog.Snapshot.validated(
                 document: payload.document,
-                compilerProjection: payload.compilerProjection
-            ),
-            identity: identity,
-            invocation: invocation
-        )
-        return payload
+                compilerProjection: payload.compilerProjection,
+                cacheIdentity: NativeAPICatalog.Pipeline.catalogCacheKey(
+                    identity: identity,
+                    invocation: invocation
+                ),
+                performance: performance
+            )
+        }
+        return .init(payload: payload, snapshot: snapshot)
     }
 
-    private func validate(
-        _ snapshot: NativeAPICatalog.Snapshot,
-        identity: NativeAPICatalog.Identity,
-        invocation: InterfaceArchive.FrontendInvocation
-    ) throws {
-        try snapshot.document.validate()
-        _ = try NativeAPICatalog.Codec.encode(snapshot.document)
-        try snapshot.compilerProjection.validate(moduleName: identity.moduleName)
-        let projected = try NativeAPICatalog.Projector.project(
-            projection: snapshot.compilerProjection,
-            identity: identity,
-            invocation: invocation
-        )
-        guard snapshot.document.identity == identity,
-              snapshot.document.entries == projected.entries,
-              snapshot.compilerProjection.importedTypes
-                == projected.importedTypes,
-              snapshot.compilerProjection.operations == projected.operations
-        else {
+    private func encode(_ payload: CachePayload) throws -> Data {
+        let encoder = PropertyListEncoder()
+        encoder.outputFormat = .binary
+        do {
+            return try encoder.encode(payload)
+        } catch {
             throw NativeAPICatalog.Error.invalid(
-                "Catalog document does not match its compiler projection"
+                "Catalog cache payload cannot be encoded: \(error)"
             )
         }
     }

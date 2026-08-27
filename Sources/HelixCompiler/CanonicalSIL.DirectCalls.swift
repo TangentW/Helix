@@ -216,12 +216,10 @@ public struct DirectCallTable: Sendable {
                         guard case .nativeImport = binding.target else {
                             return false
                         }
-                        return binding.parameterProjection.logicalParameterIndices
-                                != value.parameterProjection.logicalParameterIndices
-                            && Self.nativeVariantsArePhysicallyCompatible(
-                                binding,
-                                value
-                            )
+                        return Self.nativeVariantsArePhysicallyCompatible(
+                            binding,
+                            value
+                        )
                     }
                 } else {
                     false
@@ -470,6 +468,12 @@ public struct DirectCallTable: Sendable {
                 rightSpecialization
             )
         }
+        if case let .nativeImport(leftRequirement) = lhs.target,
+           case let .nativeImport(rightRequirement) = rhs.target,
+           leftRequirement.key != rightRequirement.key {
+            return leftRequirement.key.description
+                < rightRequirement.key.description
+        }
         return false
     }
 
@@ -481,9 +485,10 @@ public struct DirectCallTable: Sendable {
               case let .nativeImport(rhsRequirement) = rhs.target,
               lhs.parameterProjection.physicalParameterCount
                 == rhs.parameterProjection.physicalParameterCount,
-              lhs.resultType == rhs.resultType,
               lhs.effects == rhs.effects,
-              lhs.abiAdapter == rhs.abiAdapter
+              lhs.abiAdapter == rhs.abiAdapter,
+              lhsRequirement.requiredCapability
+                == rhsRequirement.requiredCapability
         else { return false }
 
         var lhsBaseContract = lhsRequirement.contract
@@ -492,12 +497,29 @@ public struct DirectCallTable: Sendable {
         rhsBaseContract.callbacks = []
         guard lhsBaseContract == rhsBaseContract else { return false }
 
+        let lhsProjection = lhs.parameterProjection.logicalParameterIndices
+        let rhsProjection = rhs.parameterProjection.logicalParameterIndices
+        if lhsProjection == rhsProjection {
+            // A generic protocol-extension function can retain one symbol and
+            // one physical projection for several concrete NativeCallKeys. Its
+            // apply substitution produces a concrete function type, which the
+            // lowerer uses to select exactly one distinct logical signature.
+            return lhs.parameterProjection == rhs.parameterProjection
+                && lhs.parameterConventions == rhs.parameterConventions
+                && lhsRequirement.contract.callbacks
+                    == rhsRequirement.contract.callbacks
+                && (lhs.parameterTypes != rhs.parameterTypes
+                    || lhs.resultType != rhs.resultType)
+        }
+
+        guard lhs.resultType == rhs.resultType else { return false }
+
         let lhsParameterTypes = Dictionary(uniqueKeysWithValues: zip(
-            lhs.parameterProjection.logicalParameterIndices,
+            lhsProjection,
             lhs.parameterTypes
         ))
         let rhsParameterTypes = Dictionary(uniqueKeysWithValues: zip(
-            rhs.parameterProjection.logicalParameterIndices,
+            rhsProjection,
             rhs.parameterTypes
         ))
         let lhsConventions = Dictionary(uniqueKeysWithValues: zip(

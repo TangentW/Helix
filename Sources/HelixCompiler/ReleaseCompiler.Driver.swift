@@ -43,8 +43,12 @@ extension ReleaseCompiler {
         public var requestedResources: Core.ResourceLimits
         /// Session-local NativeImport slots used only by trusted Live Reload.
         /// Records must exactly promote cataloged, non-emitted HLXI candidates;
-        /// the persisted Shell interface and its hash remain unchanged.
+        /// records discovered from the same authenticated source transaction
+        /// may also extend the development-only suffix. The persisted Shell
+        /// interface and its hash remain unchanged.
         public var developmentNativeImports: [InterfaceArchive.NativeImportRecord]
+        /// Session-local native types required by newly discovered imports.
+        public var developmentNativeTypes: [InterfaceArchive.TypeRecord]
         public var invocationObserver: SwiftFrontend.InvocationObserver?
 
         public init(
@@ -55,6 +59,7 @@ extension ReleaseCompiler {
             enforceToolchainFingerprint: Bool = true,
             requestedResources: Core.ResourceLimits = .init(),
             developmentNativeImports: [InterfaceArchive.NativeImportRecord] = [],
+            developmentNativeTypes: [InterfaceArchive.TypeRecord] = [],
             invocationObserver: SwiftFrontend.InvocationObserver? = nil
         ) {
             self.init(
@@ -65,6 +70,7 @@ extension ReleaseCompiler {
                 enforceToolchainFingerprint: enforceToolchainFingerprint,
                 requestedResources: requestedResources,
                 developmentNativeImports: developmentNativeImports,
+                developmentNativeTypes: developmentNativeTypes,
                 invocationObserver: invocationObserver
             )
         }
@@ -77,6 +83,7 @@ extension ReleaseCompiler {
             enforceToolchainFingerprint: Bool = true,
             requestedResources: Core.ResourceLimits = .init(),
             developmentNativeImports: [InterfaceArchive.NativeImportRecord] = [],
+            developmentNativeTypes: [InterfaceArchive.TypeRecord] = [],
             invocationObserver: SwiftFrontend.InvocationObserver? = nil
         ) {
             self.init(
@@ -87,6 +94,7 @@ extension ReleaseCompiler {
                 enforceToolchainFingerprint: enforceToolchainFingerprint,
                 requestedResources: requestedResources,
                 developmentNativeImports: developmentNativeImports,
+                developmentNativeTypes: developmentNativeTypes,
                 invocationObserver: invocationObserver
             )
         }
@@ -99,6 +107,7 @@ extension ReleaseCompiler {
             enforceToolchainFingerprint: Bool = true,
             requestedResources: Core.ResourceLimits = .init(),
             developmentNativeImports: [InterfaceArchive.NativeImportRecord] = [],
+            developmentNativeTypes: [InterfaceArchive.TypeRecord] = [],
             invocationObserver: SwiftFrontend.InvocationObserver? = nil
         ) {
             self.archive = archive
@@ -110,6 +119,9 @@ extension ReleaseCompiler {
             self.developmentNativeImports = developmentNativeImports.sorted {
                 ($0.id ?? .init(rawValue: UInt32.max))
                     < ($1.id ?? .init(rawValue: UInt32.max))
+            }
+            self.developmentNativeTypes = developmentNativeTypes.sorted {
+                $0.id.rawValue < $1.id.rawValue
             }
             self.invocationObserver = invocationObserver
         }
@@ -179,6 +191,177 @@ extension ReleaseCompiler {
         }
 
         public init() {}
+
+        private func validateDevelopmentNativeSurface(
+            _ request: ReleaseCompiler.BuildRequest
+        ) throws {
+            let baselineTypes = request.archive.nativeTypes.filter(
+                \.isEmittedToDevice
+            )
+            let baselineTypeIDs = Set(baselineTypes.map(\.id))
+            let archivedByID = Dictionary(
+                uniqueKeysWithValues: request.archive.nativeTypes.map {
+                    ($0.id, $0)
+                }
+            )
+            let archivedByName = Dictionary(
+                uniqueKeysWithValues: request.archive.nativeTypes.map {
+                    ($0.canonicalName, $0)
+                }
+            )
+            let developmentTypes = request.developmentNativeTypes
+            guard developmentTypes.count <= 65_536,
+                  Set(developmentTypes.map(\.id)).count
+                    == developmentTypes.count,
+                  Set(developmentTypes.map(\.canonicalName)).count
+                    == developmentTypes.count,
+                  developmentTypes.allSatisfy({ type in
+                      type.isEmittedToDevice
+                          && type.estimatedSize > 0
+                          && type.estimatedSize
+                            <= UInt64(16 * 1_024 * 1_024)
+                          && (type.kind != .reference || type.isCopyable)
+                  }),
+                  developmentTypes.allSatisfy({ type in
+                      Core.TypeID.derive(
+                          namespace: request.archive.metadata.shellNamespaceID,
+                          canonicalType: type.canonicalName
+                      ) == type.id
+                  })
+            else {
+                throw DriverError.sourceSetMismatch(
+                    "development native types collide with or disagree with the Shell namespace"
+                )
+            }
+            for type in developmentTypes {
+                let existing = archivedByID[type.id]
+                    ?? archivedByName[type.canonicalName]
+                guard let existing else { continue }
+                guard existing.id == type.id,
+                      existing.canonicalName == type.canonicalName,
+                      existing.kind == type.kind,
+                      existing.layoutFingerprint == type.layoutFingerprint,
+                      existing.objectiveCRuntimeName
+                        == type.objectiveCRuntimeName,
+                      existing.isCopyable == type.isCopyable,
+                      existing.requiresMainActor == type.requiresMainActor,
+                      existing.estimatedSize == type.estimatedSize
+                else {
+                    throw DriverError.sourceSetMismatch(
+                        "development native type metadata disagrees with its linked Shell type"
+                    )
+                }
+            }
+            let inferredTypes = inferredDevelopmentNativeTypes(request)
+            let knownTypeIDs = baselineTypeIDs.union(
+                developmentTypes.map(\.id)
+            ).union(inferredTypes.map(\.id))
+            let baselineImportIDs = Set(
+                request.archive.nativeImports.compactMap {
+                    $0.isEmittedToDevice ? $0.id : nil
+                }
+            )
+            let archivedImports = Dictionary(
+                uniqueKeysWithValues: request.archive.nativeImports.map {
+                    ($0.key, $0)
+                }
+            )
+            let imports = request.developmentNativeImports
+            guard imports.count <= 65_536,
+                  Set(imports.map(\.key)).count == imports.count,
+                  Set(imports.compactMap(\.id)).count == imports.count
+            else {
+                throw DriverError.sourceSetMismatch(
+                    "development native imports are oversized, duplicated, or missing compact IDs"
+                )
+            }
+            for record in imports {
+                guard let id = record.id, record.isEmittedToDevice else {
+                    throw DriverError.sourceSetMismatch(
+                        "development native import \(record.canonicalCallee) has no published compact ID"
+                    )
+                }
+                if baselineImportIDs.contains(id) {
+                    guard var archived = archivedImports[record.key],
+                          archived.isEmittedToDevice,
+                          archived.id == id
+                    else {
+                        throw DriverError.sourceSetMismatch(
+                            "development native import \(record.canonicalCallee) collides with a linked Shell compact ID"
+                        )
+                    }
+                    let archivedSymbols = Set(archived.silMangledNames)
+                    let recordSymbols = Set(record.silMangledNames)
+                    archived.silMangledNames = record.silMangledNames
+                    guard archived == record,
+                          archivedSymbols.isSubset(of: recordSymbols)
+                    else {
+                        throw DriverError.sourceSetMismatch(
+                            "development native import \(record.canonicalCallee) disagrees with its linked Shell descriptor"
+                        )
+                    }
+                }
+                let referencedTypeIDs = record.parameterTypes.reduce(
+                    record.resultType.referencedNativeTypeIDs
+                ) { result, type in
+                    result.union(type.referencedNativeTypeIDs)
+                }
+                let unknownTypeIDs = referencedTypeIDs.subtracting(knownTypeIDs)
+                guard unknownTypeIDs.isEmpty else {
+                    throw DriverError.sourceSetMismatch(
+                        "development native import \(record.canonicalCallee) references unpublished native types: "
+                            + unknownTypeIDs.sorted { $0.rawValue < $1.rawValue }
+                                .map(\.description).joined(separator: ", ")
+                    )
+                }
+            }
+        }
+
+        private func effectiveNativeTypeRecords(
+            _ request: ReleaseCompiler.BuildRequest
+        ) -> [InterfaceArchive.TypeRecord] {
+            var records = Dictionary(
+                uniqueKeysWithValues: request.archive.nativeTypes
+                    .filter(\.isEmittedToDevice).map { ($0.id, $0) }
+            )
+            for type in inferredDevelopmentNativeTypes(request)
+                + request.developmentNativeTypes {
+                if var existing = records[type.id] {
+                    existing.swiftTypeAliases = Array(Set(
+                        existing.swiftTypeAliases + type.swiftTypeAliases
+                    )).sorted()
+                    records[type.id] = existing
+                } else {
+                    records[type.id] = type
+                }
+            }
+            return records.values.sorted { $0.id.rawValue < $1.id.rawValue }
+        }
+
+        /// Cataloged development calls may mention a dormant type that is
+        /// already authenticated by HLXI. Promote that exact record for
+        /// compiler type checking so callers do not have to repeat coupled
+        /// metadata. Types discovered after the Shell build still arrive
+        /// explicitly through `developmentNativeTypes`.
+        private func inferredDevelopmentNativeTypes(
+            _ request: ReleaseCompiler.BuildRequest
+        ) -> [InterfaceArchive.TypeRecord] {
+            let referenced = request.developmentNativeImports.reduce(
+                into: Set<Core.TypeID>()
+            ) { result, record in
+                for type in record.parameterTypes + [record.resultType] {
+                    result.formUnion(type.referencedNativeTypeIDs)
+                }
+            }
+            return request.archive.nativeTypes.compactMap { archived in
+                guard referenced.contains(archived.id),
+                      !archived.isEmittedToDevice
+                else { return nil }
+                var promoted = archived
+                promoted.isEmittedToDevice = true
+                return promoted
+            }.sorted { $0.id.rawValue < $1.id.rawValue }
+        }
 
         public func toolchainIdentity(
             compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
@@ -300,6 +483,7 @@ extension ReleaseCompiler {
 
         public func build(_ request: BuildRequest) throws -> BuildResult {
             try request.archive.validate()
+            try validateDevelopmentNativeSurface(request)
             let orderedSourceFiles = try orderedCompleteSourceSet(
                 request.sources,
                 archive: request.archive
@@ -349,8 +533,7 @@ extension ReleaseCompiler {
                     invocation: request.archive.metadata.frontendInvocation
                 )
             let silFile = try CanonicalSIL.File(text: canonicalSIL)
-            let frozenNativeTypeRecords = request.archive.nativeTypes
-                .filter(\.isEmittedToDevice)
+            let frozenNativeTypeRecords = effectiveNativeTypeRecords(request)
             let frozenNativeTypes = Dictionary(
                 uniqueKeysWithValues: frozenNativeTypeRecords.map {
                     ($0.canonicalName, $0.id)
