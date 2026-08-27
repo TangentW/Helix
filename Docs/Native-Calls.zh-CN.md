@@ -59,11 +59,15 @@ Release Prepare 使用受管生产调用面策略。它会把本次成功 App �
 
 生成 Bridge 会根据代码签名保护的 Shell 表重建同一份 Manifest；Prepare 同时输出 canonical `NativeCapabilities.json` 供审计。Release finalize 会把它与最终 Archive 独立比对，并将 SHA-256 固定到 Release baseline。每个签名补丁 target 还会同时携带 Manifest hash、Shell interface hash 与 Mach-O UUID，所以能力内容或 Release 身份只要有一处变化，target 验证就会失败。
 
+这张 Shell 表在 Bridge 中是一份确定性的 schema 1 `ShellDocument`，不再展开成几千个 Swift initializer 表达式。生成器只写入有界的 Base64 数据块；进程启动时由带锁的 loader 做一次 canonical 解码和完整校验，后续并发的 Runtime、Provider 和 Manifest factory 复用同一份不可变 Shell，损坏数据也会稳定返回同一个失败。这样 API 数量增加主要扩大数据，不再让 Swift parser 与 constraint solver 按条目数处理大批构造源码。
+
 生产 Runtime 安装前，Helix 要求 Manifest、Shell 以及不可变的同步/异步 Registry 在条目集合和条目内容上完全一致。Objective-C entry 还会在当前设备重新解析声明 class、selector、派发目标、参数个数与完整 runtime type encoding。C runtime 没有同等的签名反射能力，因此它会验证编译期绑定地址、有限 trampoline 配置、availability 与 policy，绝不接受补丁提供的 pointer 或 signature。设备 ABI 首次成功后会为该 Runtime Engine 固定唯一 Manifest hash 并复用证据；换成另一份 hash 会被拒绝，结构一致性每条入口仍会检查，失败也不会进入缓存。
 
 ## Objective-C 通用执行路径
 
 如果编译器已经证明一条 Objective-C 声明的逻辑类型和物理类型落在支持矩阵内，它会直接绑定到同一个 `Runtime.ObjectiveCInvoker`。Bridge Generator 只输出结构化 Descriptor，不再为每个 selector 生成一段 Swift wrapper。当前通用矩阵包括 Objective-C object/Optional object、精确位宽的整数和浮点数、`Bool`、常见 CoreGraphics/UIKit struct、属性、实例/类方法、initializer、受支持的 `NSError **` 导入，以及一组可复用的同步 Objective-C Block 形状。无法证明表示等价的 Swift value overlay 仍然走精确生成的 Swift Adapter。
+
+Runtime 注册时会遍历已经验证的 Shell 文档，通过唯一一处数据驱动构造点建立全部 Objective-C invoker；生成源码里不再为每个 selector 重复一份 `ResolvedNativeImport` 或 `ObjectiveCInvoker` 表达式。显式 factory 也只允许用于 builtin 或精确 Swift Adapter backend，Objective-C/C Descriptor 不能借 factory 绕过各自的通用 ABI 校验路径。
 
 模块归属不会根据 `UI`/`NS` 前缀或 class 所在模块猜测。普通方法和属性会用精确 Clang USR 查询已导入模块索引，因此 category 可以属于另一个 Framework；继承 initializer 则以 Swift 构造表达式的具体 class 模块为准，实际分配该具体类型，而不是错误地分配 `init` 声明所在的 superclass。归属不唯一时继续走 Swift Adapter。
 

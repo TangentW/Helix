@@ -855,6 +855,8 @@ public struct Document: Codable, Hashable, Sendable {
             return binding.factoryReference.map(isModulePath) == true
                 && binding.generated == nil
                 && binding.cFunction == nil
+                && (record.descriptor.target.backend == .builtin
+                    || record.descriptor.target.backend == .swiftAdapter)
         case .generatedSwiftAdapter:
             return binding.factoryReference == nil
                 && record.descriptor.target.backend == .swiftAdapter

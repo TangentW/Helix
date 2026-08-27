@@ -121,6 +121,12 @@ normal App release is required.
 
 The generated Bridge reconstructs the same Manifest from its code-signed Shell
 table, while Prepare also emits canonical `NativeCapabilities.json` for audit.
+The table itself is embedded as a deterministic schema-1 `ShellDocument`, not
+as thousands of Swift initializer expressions. Its bounded Base64 chunks are
+decoded canonically and validated once by a lock-protected loader; concurrent
+Runtime, provider, and manifest factories reuse the same immutable Shell or the
+same deterministic failure. This keeps descriptor growth in data and avoids
+making Swift parsing and constraint solving scale with the number of entries.
 Release finalization compares that file with the finalized archive and pins its
 SHA-256 in the release baseline. Every signed patch target repeats the Manifest
 hash alongside the Shell interface hash and Mach-O UUID, so changing any entry
@@ -149,6 +155,13 @@ CoreGraphics/UIKit structures, properties, instance/class methods,
 initializers, supported `NSError **` imports, and a reusable set of synchronous
 Objective-C Block shapes. Swift overlays whose value representation cannot be
 proved equivalent still use an exact generated Swift adapter.
+
+At runtime the Bridge filters the already validated Shell document and creates
+all Objective-C registrations through one data-driven construction site. It
+does not repeat a `ResolvedNativeImport` or `ObjectiveCInvoker` expression per
+selector. Explicit factories are now restricted to builtin or exact Swift
+adapter backends, so an Objective-C or C descriptor cannot bypass its generic,
+ABI-checked execution path.
 
 Module provenance is not inferred from `UI`/`NS` prefixes or from the owning
 class alone. Ordinary methods and properties resolve their exact Clang USR in

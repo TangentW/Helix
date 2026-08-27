@@ -3652,7 +3652,8 @@ struct NativeImportDiscoveryTests {
             "private static func makeSynchronousNativeInvokers_0() throws"
         ))
         #expect(primaryBridge.contains(
-            "try VM.NativeCatalog(try makeSynchronousNativeInvokers())"
+            "try VM.NativeCatalog(try makeObjectiveCNativeInvokers() "
+                + "+ try makeSynchronousNativeInvokers())"
         ))
         let sessionTaskType = try #require(shell.archive.nativeTypes.first {
             Set([$0.canonicalName] + $0.swiftTypeAliases)
@@ -3676,8 +3677,8 @@ struct NativeImportDiscoveryTests {
         let expectedSwiftAdapterSnippets = [
             ".textAlignment =", ".accessibilityTraits =",
             "UIFont.systemFont(", ".addingTimeInterval(", ".configuration =",
-            ".title =", "NSMaxRange(argument0)", "scheduledTimer", "asyncAfter",
-            "dataTask", "addObserver", "addOperation", "addCompletion", ".subviews",
+            ".title =", "NSMaxRange(argument0)", "asyncAfter",
+            "dataTask", "addObserver", ".subviews",
             "animateKeyframes", ".configurationUpdateHandler =",
             "UIAction(", "UIAlertAction(", "UIContextualAction(",
             "encodeNativeClosure(", "callbackEncoder.encodeError(", "NSPredicate",
@@ -3739,8 +3740,9 @@ struct NativeImportDiscoveryTests {
             "QuartzCore.CACurrentMediaTime as @convention(c)"
         ))
         #expect(!generatedBridge.contains("any Any"))
-        #expect(generatedBridge.contains("makeResolvedNativeImports_0()"))
-        #expect(generatedBridge.contains("makeSynchronousNativeInvokers_0()"))
+        #expect(generatedBridge.contains("shellDocumentChunks"))
+        #expect(generatedBridge.contains("makeObjectiveCNativeInvokers()"))
+        #expect(!generatedBridge.contains("makeResolvedNativeImports_0()"))
         let changed = baseline
             .replacingOccurrences(of: "interval + 1", with: "interval + 2")
             .replacingOccurrences(of: "seed + 1", with: "seed + 2")
@@ -5120,6 +5122,18 @@ struct NativeImportDiscoveryTests {
                 && $0.generated == nil
                 && $0.importedModules.isEmpty
         })
+        var factoryBypass = output.receipt
+        let objectiveCBindingIndex = try #require(
+            factoryBypass.nativeImportBindings.firstIndex {
+                keys.contains($0.key)
+            }
+        )
+        factoryBypass.nativeImportBindings[objectiveCBindingIndex].strategy = .factory
+        factoryBypass.nativeImportBindings[objectiveCBindingIndex].factoryReference =
+            "UnsafeObjectiveCFactory.make"
+        #expect(throws: ShellBuildReceipt.Error.self) {
+            try factoryBypass.validate()
+        }
         let pointType = try #require(output.receipt.nativeTypes.first {
             $0.canonicalName.split(separator: ".").last == "CGPoint"
         })
@@ -5138,7 +5152,15 @@ struct NativeImportDiscoveryTests {
         )
         let generated = shell.bridge.sourceFiles.values.joined(separator: "\n")
         #expect(generated.contains("Runtime.ObjectiveCInvoker("))
-        #expect(generated.contains("ObjectiveCMetadata(runtimeClassName: \"UIView\""))
+        #expect(
+            generated.components(
+                separatedBy: "Runtime.ObjectiveCInvoker(shellImport:"
+            ).count == 2
+        )
+        #expect(!generated.contains("ObjectiveCMetadata(runtimeClassName:"))
+        #expect(objectiveCRecords.contains {
+            $0.descriptor.objectiveC?.runtimeClassName == "UIView"
+        })
         #expect(generated.contains("VM.NativeTypeOperations.objectiveCStructure("))
         #expect(generated.contains("encoding: \"{CGPoint=dd}\""))
         #expect(!generated.contains("argument0.setNeedsLayout()"))

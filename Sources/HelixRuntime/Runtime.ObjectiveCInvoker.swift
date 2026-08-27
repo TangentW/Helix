@@ -3,6 +3,7 @@ import HelixObjectiveCRuntimeSupport
 #if canImport(HelixCore)
 import HelixBytecode
 import HelixCore
+import HelixVerifier
 import HelixVM
 #endif
 
@@ -47,6 +48,20 @@ public struct ObjectiveCInvoker: VM.NativeInvoker {
             resultType: resultType,
             effects: effects,
             contract: contract
+        )
+    }
+
+    /// Builds the shared Objective-C execution path directly from the exact
+    /// descriptor already authenticated by the Shell.
+    public init(shellImport: Verification.ResolvedNativeImport) {
+        self.init(
+            id: shellImport.id,
+            key: shellImport.key,
+            descriptor: shellImport.descriptor,
+            parameterTypes: shellImport.parameterTypes,
+            resultType: shellImport.resultType,
+            effects: shellImport.effects,
+            contract: shellImport.contract
         )
     }
 

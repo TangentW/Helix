@@ -5,7 +5,7 @@ import HelixCore
 #endif
 
 extension Verification {
-public struct ResolvedEntry: Hashable, Sendable {
+public struct ResolvedEntry: Codable, Hashable, Sendable {
     public var index: Core.EntryIndex
     public var key: Core.FunctionKey
     public var parameterTypes: [Bytecode.ValueType]
@@ -33,7 +33,7 @@ public struct ResolvedEntry: Hashable, Sendable {
     }
 }
 
-public struct ResolvedNativeImport: Hashable, Sendable {
+public struct ResolvedNativeImport: Codable, Hashable, Sendable {
     public var id: Core.NativeImportID
     public var key: Core.NativeCall.Key
     public var descriptor: Core.NativeCall.Descriptor
@@ -89,13 +89,13 @@ public struct ResolvedNativeImport: Hashable, Sendable {
     }
 }
 
-public enum NativeTypeKind: String, Hashable, Sendable {
+public enum NativeTypeKind: String, Codable, Hashable, Sendable {
     case value
     case reference
     case enumeration
 }
 
-public struct ResolvedNativeType: Hashable, Sendable {
+public struct ResolvedNativeType: Codable, Hashable, Sendable {
     public var id: Core.TypeID
     public var canonicalName: String
     public var kind: Verification.NativeTypeKind
@@ -123,7 +123,7 @@ public struct ResolvedNativeType: Hashable, Sendable {
     }
 }
 
-public struct ResolvedFrozenValueType: Hashable, Sendable {
+public struct ResolvedFrozenValueType: Codable, Hashable, Sendable {
     public var definition: Bytecode.LocalTypeDefinition
     public var layoutFingerprint: Core.Digest
     public var isCopyable: Bool

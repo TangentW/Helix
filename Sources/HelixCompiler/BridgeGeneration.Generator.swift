@@ -2,6 +2,7 @@ import Foundation
 import HelixBytecode
 import HelixCore
 import HelixInterface
+import HelixVerifier
 
 public enum BridgeGeneration {}
 
@@ -651,7 +652,7 @@ public struct Generator: Sendable {
             )
         }
         let bridgeTypeName = "\(moduleName)Bridge"
-        let shellFactory = renderShellFactory(archive: archive)
+        let shellFactory = try renderShellFactory(archive: archive)
         let patchBuildContractFactory = renderPatchBuildContractFactory(archive: archive)
         let originalCatalogFactory = renderOriginalCatalogFactory(
             entryGroupNames: entryGroupNames
@@ -3398,7 +3399,9 @@ public struct Generator: Sendable {
             case .factory:
                 guard binding.factoryReference.map(isValidModulePath) == true,
                       binding.generated == nil,
-                      binding.cFunction == nil
+                      binding.cFunction == nil,
+                      record.descriptor.target.backend == .builtin
+                        || record.descriptor.target.backend == .swiftAdapter
                 else {
                     throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
                         binding.id,
@@ -3945,64 +3948,31 @@ public struct Generator: Sendable {
             }
     }
 
-    private func renderShellFactory(archive: InterfaceArchive.Archive) -> String {
-        let entries = archive.functions
-            .filter(\.patchability.isEligible)
-            .sorted { $0.entryIndex! < $1.entryIndex! }
-            .map(renderEntry)
-        let imports = archive.nativeImports
-            .filter(\.isEmittedToDevice)
-            .sorted { $0.id! < $1.id! }
-            .map(renderImport)
-        let types = archive.nativeTypes
-            .filter(\.isEmittedToDevice)
-            .sorted { $0.id.rawValue < $1.id.rawValue }
-            .map(renderType)
-        let frozenValueTypes = archive.frozenValueTypes
-            .sorted { $0.key < $1.key }
-            .map(renderFrozenValueType)
-        let renderedEntries = renderGeneratedArray(
-            entries,
-            elementType: "Verification.ResolvedEntry",
-            factoryName: "makeResolvedEntries",
-            directIndentation: 20
+    private func renderShellFactory(
+        archive: InterfaceArchive.Archive
+    ) throws -> String {
+        let shell = try Verification.ShellInterface(archive: archive)
+        let encoded = try Verification.ShellDocument(shell: shell).encodedBase64()
+        let encodedBytes = Array(encoded.utf8)
+        let chunkSize = 16 * 1_024
+        let chunks = stride(from: 0, to: encodedBytes.count, by: chunkSize).map {
+            start -> String in
+            String(decoding: encodedBytes[
+                start..<min(start + chunkSize, encodedBytes.count)
+            ], as: UTF8.self)
+        }
+        let renderedChunks = renderArray(
+            chunks.map(quoted),
+            indentation: 12
         )
-        let renderedImports = renderGeneratedArray(
-            imports,
-            elementType: "Verification.ResolvedNativeImport",
-            factoryName: "makeResolvedNativeImports",
-            directIndentation: 20
-        )
-        let renderedTypes = renderGeneratedArray(
-            types,
-            elementType: "Verification.ResolvedNativeType",
-            factoryName: "makeResolvedNativeTypes",
-            directIndentation: 20
-        )
-        let renderedFrozenValueTypes = renderGeneratedArray(
-            frozenValueTypes,
-            elementType: "Verification.ResolvedFrozenValueType",
-            factoryName: "makeResolvedFrozenValueTypes",
-            directIndentation: 20
-        )
-        let helpers = [
-            renderedEntries.declarations,
-            renderedImports.declarations,
-            renderedTypes.declarations,
-            renderedFrozenValueTypes.declarations,
-        ].filter { !$0.isEmpty }.joined(separator: "\n\n")
         return """
-        \(helpers.isEmpty ? "" : helpers + "\n\n")
+            private static let shellDocumentChunks: [String] = \(renderedChunks)
+            private static let shellDocumentLoader = Verification.ShellDocument.Loader(
+                base64Chunks: shellDocumentChunks
+            )
+
             public static func makeShellInterface() throws -> Verification.ShellInterface {
-                try Verification.ShellInterface(
-                    interfaceHash: interfaceHash,
-                    compatibility: \(render(archive.compatibility)),
-                    capabilities: \(renderCapabilities(archive.capabilities)),
-                    entries: \(renderedEntries.expression),
-                    imports: \(renderedImports.expression),
-                    types: \(renderedTypes.expression),
-                    frozenValueTypes: \(renderedFrozenValueTypes.expression)
-                )
+                try shellDocumentLoader.load()
             }
         """
     }
@@ -4078,6 +4048,7 @@ public struct Generator: Sendable {
         )
         var synchronousImportExpressions: [String] = []
         var asynchronousImportExpressions: [String] = []
+        var hasObjectiveCInvokers = false
         for binding in imports.sorted(by: { $0.id < $1.id }) {
             guard let record = recordsByID[binding.id], record.isEmittedToDevice else {
                 throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
@@ -4085,14 +4056,18 @@ public struct Generator: Sendable {
                     "catalog lookup"
                 )
             }
-            let expression = try nativeInvokerExpression(
-                binding: binding,
-                record: record
-            )
-            if record.effects.isAsync {
-                asynchronousImportExpressions.append(expression)
+            if binding.strategy == .objectiveCInvoker {
+                hasObjectiveCInvokers = true
             } else {
-                synchronousImportExpressions.append(expression)
+                let expression = try nativeInvokerExpression(
+                    binding: binding,
+                    record: record
+                )
+                if record.effects.isAsync {
+                    asynchronousImportExpressions.append(expression)
+                } else {
+                    synchronousImportExpressions.append(expression)
+                }
             }
         }
         let typeExpressions = types.sorted(by: { $0.id.rawValue < $1.id.rawValue })
@@ -4117,15 +4092,31 @@ public struct Generator: Sendable {
             factoryName: "makeNativeTypeOperations",
             directIndentation: 16
         )
+        let objectiveCHelper = hasObjectiveCInvokers ? """
+            private static func makeObjectiveCNativeInvokers() throws
+                -> [any VM.NativeInvoker] {
+                let shell = try makeShellInterface()
+                return shell.imports.values
+                    .filter {
+                        $0.descriptor.target.backend == .objectiveCMessage
+                    }
+                    .sorted { $0.id < $1.id }
+                    .map { Runtime.ObjectiveCInvoker(shellImport: $0) }
+            }
+        """ : ""
         let helpers = [
+            objectiveCHelper,
             synchronousInvokers.declarations,
             asynchronousInvokers.declarations,
             nativeTypeOperations.declarations,
         ].filter { !$0.isEmpty }.joined(separator: "\n\n")
+        let synchronousExpression = hasObjectiveCInvokers
+            ? "try makeObjectiveCNativeInvokers() + \(synchronousInvokers.expression)"
+            : synchronousInvokers.expression
         return """
         \(helpers.isEmpty ? "" : helpers + "\n\n")
             public static func makeNativeCatalog() throws -> VM.NativeCatalog {
-                try VM.NativeCatalog(\(synchronousInvokers.expression))
+                try VM.NativeCatalog(\(synchronousExpression))
             }
 
             public static func makeAsyncNativeCatalog() throws -> VM.AsyncNativeCatalog {
@@ -4203,17 +4194,10 @@ public struct Generator: Sendable {
                 + "\(render(record.resultType)), effects: \(render(record.effects)), "
                 + "contract: \(render(record.contract)))"
         case .objectiveCInvoker:
-            return """
-            Runtime.ObjectiveCInvoker(
-                id: Core.NativeImportID(rawValue: \(binding.id.rawValue)),
-                key: Core.NativeCall.Key(rawValue: \(render(binding.key.rawValue))),
-                descriptor: \(render(record.descriptor)),
-                parameterTypes: \(renderValueTypes(record.parameterTypes)),
-                resultType: \(render(record.resultType)),
-                effects: \(render(record.effects)),
-                contract: \(render(record.contract))
+            throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
+                binding.id,
+                "Objective-C invokers must be constructed from Shell data"
             )
-            """
         case .cInvoker:
             guard let function = binding.cFunction else {
                 throw BridgeGeneration.Error.generatedNativeImportBindingMismatch(
@@ -4240,77 +4224,6 @@ public struct Generator: Sendable {
             )
             """
         }
-    }
-
-    private func renderEntry(_ record: InterfaceArchive.FunctionRecord) -> String {
-        """
-        Verification.ResolvedEntry(
-            index: .init(rawValue: \(record.entryIndex!.rawValue)),
-            key: Core.FunctionKey(rawValue: \(render(record.key.rawValue))),
-            parameterTypes: \(renderValueTypes(record.parameterTypes)),
-            parameterConventions: \(renderParameterConventions(record.parameterConventions)),
-            resultType: \(render(record.resultType)),
-            effects: \(render(record.effects)),
-            fallbackAllowed: \(record.fallbackAllowed)
-        )
-        """
-    }
-
-    private func renderImport(_ record: InterfaceArchive.NativeImportRecord) -> String {
-        """
-        Verification.ResolvedNativeImport(
-            id: .init(rawValue: \(record.id!.rawValue)),
-            key: Core.NativeCall.Key(rawValue: \(render(record.key.rawValue))),
-            descriptor: \(render(record.descriptor)),
-            parameterTypes: \(renderValueTypes(record.parameterTypes)),
-            resultType: \(render(record.resultType)),
-            contract: \(render(record.contract)),
-            capability: Core.Capability(rawValue: \(quoted(record.capability.rawValue)))
-        )
-        """
-    }
-
-    private func renderType(_ record: InterfaceArchive.TypeRecord) -> String {
-        """
-        Verification.ResolvedNativeType(
-            id: Core.TypeID(rawValue: \(render(record.id.rawValue))),
-            canonicalName: \(quoted(record.canonicalName)),
-            kind: .\(record.kind.rawValue),
-            layoutFingerprint: \(render(record.layoutFingerprint)),
-            isCopyable: \(record.isCopyable),
-            requiresMainActor: \(record.requiresMainActor),
-            estimatedSize: \(record.estimatedSize)
-        )
-        """
-    }
-
-    private func renderFrozenValueType(
-        _ record: InterfaceArchive.FrozenValueTypeRecord
-    ) -> String {
-        """
-        Verification.ResolvedFrozenValueType(
-            definition: \(render(record.definition)),
-            layoutFingerprint: \(render(record.layoutFingerprint)),
-            isCopyable: \(record.isCopyable)
-        )
-        """
-    }
-
-    private func render(_ definition: Bytecode.LocalTypeDefinition) -> String {
-        let kind: String = switch definition.kind {
-        case let .structure(fields):
-            ".structure(fields: [" + fields.map {
-                "Bytecode.LocalStructField(name: \(quoted($0.name)), type: \(render($0.type)))"
-            }.joined(separator: ", ") + "])"
-        case let .enumeration(cases):
-            ".enumeration(cases: [" + cases.map {
-                "Bytecode.LocalEnumCase(name: \(quoted($0.name)), payloadType: \(render($0.payloadType)))"
-            }.joined(separator: ", ") + "])"
-        case .class:
-            preconditionFailure("an indexed Shell value cannot be a class")
-        }
-        return "Bytecode.LocalTypeDefinition(key: \(render(definition.key)), "
-            + "kind: \(kind), conformsToError: \(definition.conformsToError))"
     }
 
     private func render(_ compatibility: Core.Compatibility) -> String {

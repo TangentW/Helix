@@ -73,7 +73,12 @@ let package = Package(
                 "HelixCRuntimeSupport",
             ]
         ),
-        .target(name: "HelixCompiler", dependencies: ["HelixCore", "HelixBytecode", "HelixInterface"]),
+        .target(
+            name: "HelixCompiler",
+            dependencies: [
+                "HelixCore", "HelixBytecode", "HelixInterface", "HelixVerifier",
+            ]
+        ),
         .target(name: "HelixPatch", dependencies: ["HelixCore", "HelixBytecode", "HelixVerifier", "HelixRuntime"]),
         .target(
             name: "HelixReleaseTools",

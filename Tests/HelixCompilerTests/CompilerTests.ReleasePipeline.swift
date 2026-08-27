@@ -833,18 +833,26 @@ struct ReleasePipeline {
         #expect(generatedBridge.contains(decoded.shellInterfaceHash.hex))
         #expect(generatedBridge.contains("makeShellInterface()"))
         #expect(generatedBridge.contains("makeNativeCapabilityManifest()"))
-        #expect(generatedBridge.contains("Verification.ResolvedEntry("))
-        #expect(generatedBridge.contains("parameterConventions: [.owned]"))
-        #expect(generatedBridge.contains("Verification.ResolvedNativeImport("))
-        #expect(generatedBridge.contains("Verification.ResolvedNativeType("))
+        #expect(generatedBridge.contains("shellDocumentChunks"))
+        #expect(generatedBridge.contains("Verification.ShellDocument.Loader("))
+        #expect(!generatedBridge.contains("Verification.ResolvedEntry("))
+        #expect(!generatedBridge.contains("Verification.ResolvedNativeImport("))
+        #expect(!generatedBridge.contains("Verification.ResolvedNativeType("))
         #expect(generatedBridge.contains("makeNativeCatalog()"))
         #expect(generatedBridge.contains("makeNativeTypeCatalog()"))
         #expect(generatedBridge.contains("makeOriginalCatalog("))
         #expect(generatedBridge.contains("makeRuntime("))
         #expect(generatedBridge.contains("FixtureIncrementFactory.make("))
         #expect(generatedBridge.contains("FixturePointFactory.make("))
-        #expect(generatedBridge.contains(nativeImportKey.rawValue.hex))
-        #expect(generatedBridge.contains(nativeTypeLayout.hex))
+        #expect(
+            generatedBridge.components(
+                separatedBy: nativeImportKey.rawValue.hex
+            ).count == 2
+        )
+        #expect(
+            generatedBridge.components(separatedBy: nativeTypeLayout.hex).count
+                == 2
+        )
         #expect(throws: BridgeGeneration.Error.invalidModuleName) {
             try BridgeGeneration.Generator().generate(
                 archive: decoded,
