@@ -689,6 +689,189 @@ struct ObjectiveCInvoker {
             )
         }
     }
+
+    @Test("Swift integer overlays preserve an ABI-compatible unsigned representation")
+    func signedSwiftIntegerOverUnsignedObjectiveCABI() throws {
+        let fixture = try Fixture()
+        let call = try fixture.call(
+            member: "addUnsignedLeft(_:right:)",
+            selector: "addUnsignedLeft:right:",
+            dispatch: .static,
+            kind: .staticMethod,
+            logicalParameters: [
+                .init(type: "Swift.Int"), .init(type: "Swift.Int"),
+            ],
+            logicalResult: "Swift.Int",
+            physicalParameters: [
+                .init(type: fixture.integerABI, source: .argument(0)),
+                .init(type: fixture.integerABI, source: .argument(1)),
+            ],
+            physicalResult: fixture.integerABI
+        )
+
+        try call.invoker.validateRuntimeABI()
+        #expect(
+            try fixture.invoke(
+                call,
+                arguments: [fixture.integer(19), fixture.integer(23)]
+            ) == .returned(fixture.integer(42))
+        )
+    }
+
+    @Test("Abstract declarations defer selector evidence to the concrete receiver")
+    func receiverBoundAbstractDeclaration() throws {
+        let fixture = try Fixture(
+            receiverClass: HelixRuntimeTestAbstractObject.self
+        )
+        let call = try fixture.call(
+            owner: "HelixRuntimeTestAbstractObject",
+            runtimeClass: "HelixRuntimeTestAbstractObject",
+            member: "abstractEcho(_:)",
+            selector: "abstractEcho:",
+            dispatch: .instance,
+            kind: .instanceMethod,
+            implementationLookup: .dynamicObjectWhenDeclarationMissing,
+            logicalParameters: [
+                fixture.objectParameter(), .init(type: "Swift.String"),
+            ],
+            logicalResult: "Swift.String",
+            physicalParameters: [
+                .init(
+                    type: fixture.objectABI("Foundation.NSString"),
+                    source: .argument(1)
+                ),
+            ],
+            physicalResult: fixture.objectABI("Foundation.NSString")
+        )
+
+        try call.invoker.validateRuntimeABI()
+        #expect(
+            try fixture.invoke(
+                call,
+                arguments: [
+                    try fixture.objectValue(HelixRuntimeTestConcreteObject()),
+                    .string("value"),
+                ]
+            ) == .returned(.string("concrete:value"))
+        )
+        #expect(throws: VM.RuntimeTrap.self) {
+            _ = try fixture.invoke(
+                call,
+                arguments: [
+                    try fixture.objectValue(HelixRuntimeTestAbstractObject()),
+                    .string("value"),
+                ]
+            )
+        }
+    }
+
+    @Test("Class-cluster initializers validate the allocated concrete object")
+    func classClusterInitializer() throws {
+        let fixture = try Fixture(receiverClass: HelixRuntimeTestCluster.self)
+        let call = try fixture.call(
+            owner: "HelixRuntimeTestCluster",
+            runtimeClass: "HelixRuntimeTestCluster",
+            dispatchClass: "HelixRuntimeTestCluster",
+            member: "init(value:)",
+            selector: "initWithValue:",
+            dispatch: .initializer,
+            kind: .initializer,
+            implementationLookup: .dynamicObjectWhenDeclarationMissing,
+            logicalParameters: [.init(type: "Swift.String")],
+            logicalResult: fixture.objectTypeName,
+            physicalParameters: [
+                .init(
+                    type: fixture.objectABI("Foundation.NSString"),
+                    source: .argument(0)
+                ),
+            ],
+            physicalResult: fixture.objectABI(fixture.objectTypeName),
+            resultConvention: .directOwned,
+            effects: .init(mayAllocate: true),
+            methodFamily: .initializer
+        )
+
+        try call.invoker.validateRuntimeABI()
+        guard case let .returned(.some(.native(native))) = try fixture.invoke(
+            call,
+            arguments: [.string("cluster")]
+        ) else {
+            Issue.record("class-cluster initializer did not return a native object")
+            return
+        }
+        #expect(
+            native.value(as: HelixRuntimeTestCluster.self)?.value == "cluster"
+        )
+    }
+
+    @Test("Optimized ABI validation retains every temporary encoding owner")
+    func retainsTemporaryEncodingOwners() throws {
+        let receiverType = Core.TypeID(
+            rawValue: .sha256("ObjectiveCInvoker.NSURLComponents")
+        )
+        let effects = Core.Effects(
+            mayAllocate: true,
+            hasExternalSideEffects: true
+        )
+        let contract = Core.NativeImportContract.bounded(
+            kind: .instanceSetter,
+            domain: .application,
+            access: .write,
+            maximumDurationMicroseconds: 2_000,
+            allowsMainThread: true
+        )
+        let descriptor = try Core.NativeCall.Descriptor(
+            target: .init(
+                backend: .objectiveCMessage,
+                module: "Foundation",
+                owner: "NSURLComponents",
+                member: "query.set",
+                entryPoint: "setQuery:",
+                dispatch: .instance,
+                receiverArgumentIndex: 1
+            ),
+            logicalSignature: .init(
+                parameters: [
+                    .init(type: "Swift.Optional<Swift.String>"),
+                    .init(type: "NSURLComponents"),
+                ],
+                result: .init(type: "Swift.Void")
+            ),
+            physicalSignature: .init(
+                callingConvention: .objectiveC,
+                parameters: [.init(
+                    type: .init(
+                        kind: .object,
+                        canonicalName: "NSString",
+                        encoding: "@",
+                        isNullable: true
+                    ),
+                    source: .argument(0)
+                )],
+                result: .void,
+                resultConvention: .direct
+            ),
+            objectiveC: .init(
+                runtimeClassName: "NSURLComponents",
+                methodFamily: .none,
+                property: .init(name: "query", accessor: .setter)
+            ),
+            effects: effects
+        ).validated(contract: contract)
+        let key = try Core.NativeCall.Key.derive(descriptor: descriptor)
+        let invoker = Runtime.ObjectiveCInvoker(
+            id: .init(rawValue: 0),
+            key: key,
+            descriptor: descriptor,
+            parameterTypes: [.optional(.string), .native(receiverType)],
+            resultType: .void,
+            effects: effects,
+            contract: contract
+        )
+
+        try invoker.validateConfiguration()
+        try invoker.validateRuntimeABI()
+    }
 }
 }
 
@@ -702,7 +885,7 @@ extension RuntimeTests.ObjectiveCInvoker {
     struct Fixture {
         let objectTypeID = Core.TypeID(rawValue: .sha256("ObjectiveCInvoker.Object"))
         let pointTypeID = Core.TypeID(rawValue: .sha256("ObjectiveCInvoker.Point"))
-        let objectTypeName = "HelixRuntimeTestSupport.HelixRuntimeTestObject"
+        let objectTypeName: String
         let pointTypeName = "HelixRuntimeTestSupport.HelixRuntimeTestPoint"
         let pointEncoding: String
         let boolEncoding: String
@@ -722,7 +905,9 @@ extension RuntimeTests.ObjectiveCInvoker {
             unsignedEncoding = String(cString: HelixRuntimeTestUnsignedEncoding())
             floatEncoding = String(cString: HelixRuntimeTestFloatEncoding())
             doubleEncoding = String(cString: HelixRuntimeTestDoubleEncoding())
-            receiverTypeName = "HelixRuntimeTestSupport.\(String(describing: Receiver.self))"
+            let typeName = "HelixRuntimeTestSupport.\(String(describing: Receiver.self))"
+            receiverTypeName = typeName
+            objectTypeName = typeName
             catalog = try .init([
                 .reference(
                     id: objectTypeID,
@@ -854,6 +1039,8 @@ extension RuntimeTests.ObjectiveCInvoker {
             selector: String,
             dispatch: Core.NativeCall.Dispatch,
             kind: Core.NativeImportKind,
+            implementationLookup:
+                Core.NativeCall.ObjectiveCImplementationLookup = .declaringClass,
             access: Core.NativeImportAccess = .pure,
             callbacks: [Core.NativeImportCallback] = [],
             logicalParameters: [Core.NativeCall.LogicalParameter],
@@ -912,6 +1099,7 @@ extension RuntimeTests.ObjectiveCInvoker {
                     dispatchClassName: dispatch == .instance
                         ? nil : (dispatchClass ?? runtimeClass),
                     methodFamily: methodFamily,
+                    implementationLookup: implementationLookup,
                     lexicalSuperclassName: lexicalSuperclass,
                     errorFailure: errorFailure,
                     property: property

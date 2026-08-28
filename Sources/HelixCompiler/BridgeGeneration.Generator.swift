@@ -3800,7 +3800,11 @@ public struct Generator: Sendable {
         archive: InterfaceArchive.Archive
     ) throws {
         func mismatch(_ reason: String) -> BridgeGeneration.Error {
-            .generatedNativeImportBindingMismatch(binding.id, reason)
+            .generatedNativeImportBindingMismatch(
+                binding.id,
+                "\(reason) for \(record.canonicalCallee) "
+                    + "[NativeCallKey \(record.key.rawValue.hex)]"
+            )
         }
         let expectedDeadlineMode: Core.NativeImportDeadlineMode =
             record.effects.isAsync ? .suspending : .bounded
@@ -3875,6 +3879,12 @@ public struct Generator: Sendable {
         ) else {
             throw mismatch("parameter bridge shape")
         }
+        guard generatedSwiftCallMatchesDescriptor(
+            generated,
+            target: record.descriptor.target
+        ) else {
+            throw mismatch("Swift call target")
+        }
         switch generated.dispatch {
         case .globalFunction:
             guard generated.ownerType == nil,
@@ -3889,7 +3899,7 @@ public struct Generator: Sendable {
                   generated.baseName == "init",
                   isValidGeneratedSwiftTypeSpelling(owner),
                   isNativeType(record.resultType),
-                  generated.resultSwiftType == owner
+                  record.descriptor.target.dispatch == .initializer
             else {
                 throw mismatch("initializer dispatch")
             }
@@ -3909,8 +3919,7 @@ public struct Generator: Sendable {
                   generated.argumentLabels == ["_"],
                   record.parameterTypes.count == 1,
                   isNativeType(record.parameterTypes[0]),
-                  isNativeType(record.resultType),
-                  generated.resultSwiftType == owner
+                  isNativeType(record.resultType)
             else {
                 throw mismatch("native upcast dispatch")
             }
@@ -3921,8 +3930,7 @@ public struct Generator: Sendable {
                   isValidGeneratedSwiftTypeSpelling(owner),
                   generated.argumentLabels == ["_"],
                   record.parameterTypes == [.any],
-                  isNativeType(record.resultType),
-                  generated.resultSwiftType == owner
+                  isNativeType(record.resultType)
             else {
                 throw mismatch("AnyObject bridge dispatch")
             }
@@ -3954,8 +3962,8 @@ public struct Generator: Sendable {
                   let owner = generated.ownerType,
                   isValidGeneratedSwiftTypeSpelling(owner),
                   record.parameterTypes.last.map(isNativeType) == true,
-                  generated.parameterSwiftTypes.last == owner,
-                  invocationParameterSwiftTypes.last == owner,
+                  record.descriptor.target.receiverArgumentIndex
+                    == UInt16(exactly: record.parameterTypes.count - 1),
                   isGeneratedResultType(record.resultType)
             else {
                 throw mismatch("instance method dispatch")
@@ -3967,8 +3975,7 @@ public struct Generator: Sendable {
                   generated.argumentLabels.isEmpty,
                   record.parameterTypes.count == 1,
                   isNativeType(record.parameterTypes[0]),
-                  generated.parameterSwiftTypes == [owner],
-                  invocationParameterSwiftTypes == [owner],
+                  record.descriptor.target.receiverArgumentIndex == 0,
                   record.resultType != .void,
                   isGeneratedResultType(record.resultType)
             else {
@@ -3982,8 +3989,7 @@ public struct Generator: Sendable {
                   generated.argumentLabels == ["_"],
                   record.parameterTypes.count == 2,
                   isNativeType(record.parameterTypes[1]),
-                  generated.parameterSwiftTypes.last == owner,
-                  invocationParameterSwiftTypes.last == owner,
+                  record.descriptor.target.receiverArgumentIndex == 1,
                   record.resultType == .void
             else {
                 throw mismatch("reference property setter dispatch")
@@ -3996,10 +4002,9 @@ public struct Generator: Sendable {
                   generated.argumentLabels == ["_"],
                   record.parameterTypes.count == 2,
                   isNativeType(record.parameterTypes[1]),
-                  generated.parameterSwiftTypes.last == owner,
-                  invocationParameterSwiftTypes.last == owner,
+                  record.descriptor.target.receiverArgumentIndex == 1,
                   record.resultType == record.parameterTypes[1],
-                  generated.resultSwiftType == owner
+                  isNativeType(record.resultType)
             else {
                 throw mismatch("value property setter dispatch")
             }
@@ -4050,6 +4055,83 @@ public struct Generator: Sendable {
             throw error
         } catch {
             throw mismatch("generated Swift type syntax")
+        }
+    }
+
+    /// Binds every rendered Swift token to the compiler-published call target
+    /// without requiring unrelated result/receiver spellings to be textually
+    /// identical. Swift overlays commonly expose aliases such as `NSDecimal`
+    /// and `Decimal` for one nominal identity; the typed value checks below
+    /// remain authoritative for parameters and results.
+    func generatedSwiftCallMatchesDescriptor(
+        _ generated: BridgeGeneration.GeneratedNativeImport,
+        target: Core.NativeCall.Target
+    ) -> Bool {
+        guard target.backend == .swiftAdapter else { return false }
+        let modulePrefix = target.module + "."
+        guard target.entryPoint.hasPrefix(modulePrefix) else { return false }
+        let targetRelative = String(target.entryPoint.dropFirst(modulePrefix.count))
+        let callable = generated.baseName + "("
+            + generated.argumentLabels.map { ($0 == "_" ? "_" : $0) + ":" }
+                .joined() + ")"
+        let owner = generated.ownerType.map { value in
+            value.hasPrefix(modulePrefix)
+                ? String(value.dropFirst(modulePrefix.count)) : value
+        }
+
+        func matches(_ expected: String) -> Bool {
+            if generated.nativeModuleName != nil {
+                return targetRelative == expected
+            }
+            // App-owned adapters include a deterministic `HelixExternal`
+            // identity namespace which is intentionally absent from rendered
+            // source spellings imported through @_private(sourceFile:).
+            return targetRelative == expected
+                || targetRelative == "HelixExternal." + expected
+        }
+
+        switch generated.dispatch {
+        case .globalFunction:
+            // Source declarations use their semantic callee directly, while
+            // synthesized external adapters append `.call` to keep generated
+            // entry-point identities distinct. Both spellings are produced by
+            // the compiler pipeline and bind the same exact callable tokens.
+            return matches(callable) || matches(callable + ".call")
+        case .initializer:
+            return owner.map { matches($0 + "." + callable) } == true
+        case .staticMethod, .instanceMethod:
+            return owner.map {
+                let semanticCallee = $0 + "." + callable
+                return matches(semanticCallee)
+                    || matches(semanticCallee + ".call")
+            } == true
+        case .nativeUpcast:
+            guard let owner else { return false }
+            let prefix = owner + ".upcast(from:"
+            if generated.nativeModuleName != nil {
+                return targetRelative.hasPrefix(prefix)
+                    && targetRelative.hasSuffix(")")
+            }
+            let externalPrefix = "HelixExternal." + prefix
+            return (targetRelative.hasPrefix(prefix)
+                    || targetRelative.hasPrefix(externalPrefix))
+                && targetRelative.hasSuffix(")")
+        case .anyObjectBridge:
+            return owner.map {
+                matches($0 + ".bridge(from:Swift.Any)")
+            } == true
+        case .staticGetter, .instanceGetter:
+            return owner.map {
+                matches($0 + "." + generated.baseName + ".get")
+            } == true
+        case .staticSetter, .instanceSetter:
+            return owner.map {
+                matches($0 + "." + generated.baseName + ".set")
+            } == true
+        case .instanceValueSetter:
+            return owner.map {
+                matches($0 + "." + generated.baseName + ".mutate")
+            } == true
         }
     }
 
@@ -4541,7 +4623,8 @@ public struct Generator: Sendable {
             return "Core.NativeCall.ObjectiveCMetadata(runtimeClassName: "
                 + "\(quoted(metadata.runtimeClassName)), dispatchClassName: "
                 + "\(dispatchClass), methodFamily: "
-                + ".\(metadata.methodFamily.rawValue), lexicalSuperclassName: "
+                + ".\(metadata.methodFamily.rawValue), implementationLookup: "
+                + ".\(metadata.implementationLookup.rawValue), lexicalSuperclassName: "
                 + "\(superclass), errorFailure: \(failure), property: \(property))"
         } ?? "nil"
         let isolation = descriptor.logicalSignature.isolation.map(quoted) ?? "nil"

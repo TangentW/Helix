@@ -8,6 +8,96 @@ import Testing
 extension BuildToolsTests {
 @Suite("Native API Catalog")
 struct NativeAPICatalogTests {
+    @Test("Managed Catalog inherits MainActor isolation through type ancestry")
+    func inheritsMainActorThroughSymbolGraphAncestry() throws {
+        let graph = try JSONDecoder().decode(
+            SwiftFrontend.SymbolGraph.Document.self,
+            from: Data(
+                """
+                {
+                  "metadata": {
+                    "formatVersion": {"major": 0, "minor": 6, "patch": 0},
+                    "generator": "test"
+                  },
+                  "module": {"name": "ActorFixture"},
+                  "symbols": [
+                    {
+                      "kind": {"identifier": "swift.class", "displayName": "Class"},
+                      "identifier": {"precise": "base", "interfaceLanguage": "swift"},
+                      "pathComponents": ["Base"],
+                      "names": {"title": "Base"},
+                      "declarationFragments": [
+                        {"kind": "attribute", "spelling": "MainActor", "preciseIdentifier": "s:ScM"}
+                      ],
+                      "accessLevel": "public"
+                    },
+                    {
+                      "kind": {"identifier": "swift.class", "displayName": "Class"},
+                      "identifier": {"precise": "middle", "interfaceLanguage": "swift"},
+                      "pathComponents": ["Middle"],
+                      "names": {"title": "Middle"},
+                      "declarationFragments": [],
+                      "accessLevel": "public"
+                    },
+                    {
+                      "kind": {"identifier": "swift.class", "displayName": "Class"},
+                      "identifier": {"precise": "leaf", "interfaceLanguage": "swift"},
+                      "pathComponents": ["Leaf"],
+                      "names": {"title": "Leaf"},
+                      "declarationFragments": [],
+                      "accessLevel": "public"
+                    },
+                    {
+                      "kind": {"identifier": "swift.class", "displayName": "Class"},
+                      "identifier": {"precise": "unrelated", "interfaceLanguage": "swift"},
+                      "pathComponents": ["Unrelated"],
+                      "names": {"title": "Unrelated"},
+                      "declarationFragments": [],
+                      "accessLevel": "public"
+                    }
+                  ],
+                  "relationships": [
+                    {"kind": "inheritsFrom", "source": "middle", "target": "base"},
+                    {"kind": "inheritsFrom", "source": "leaf", "target": "middle"}
+                  ]
+                }
+                """.utf8
+            )
+        )
+
+        #expect(
+            FrontendReceipt.ManagedNativeSurface
+                .inheritedMainActorTypeIdentifiers(in: graph)
+                == ["base", "middle", "leaf"]
+        )
+    }
+
+    @Test("Managed Catalog only retries compiler-proven MainActor failures")
+    func recognizesMainActorInferenceFailures() {
+        #expect(FrontendReceipt.ManagedNativeSurface.isMainActorInferenceFailure(
+            status: 1,
+            diagnostics: """
+            warning: call to main actor-isolated initializer in a synchronous nonisolated context [#ActorIsolatedCall]
+            error: sending 'value' risks causing data races [#SendingRisksDataRace]
+            """
+        ))
+        #expect(!FrontendReceipt.ManagedNativeSurface.isMainActorInferenceFailure(
+            status: 1,
+            diagnostics: "error: sending 'value' risks causing data races"
+        ))
+        #expect(!FrontendReceipt.ManagedNativeSurface.isMainActorInferenceFailure(
+            status: 0,
+            diagnostics: "main actor-isolated call in nonisolated context"
+        ))
+        #expect(!FrontendReceipt.ManagedNativeSurface.isMainActorInferenceFailure(
+            status: 1,
+            diagnostics: """
+            warning: this declaration is main actor-isolated
+            error: sending an unrelated value risks causing data races
+            """
+        ))
+    }
+
     @Test("Catalog codec is canonical and validates stable keys")
     func canonicalCodec() throws {
         let entry = try swiftEntry()
@@ -1304,6 +1394,121 @@ struct NativeAPICatalogTests {
         }
     }
 
+    @Test("Catalog infers MainActor members inherited across module boundaries")
+    func infersCrossModuleMainActorMembers() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "helix-cross-module-actor-catalog-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let compilerURL = URL(fileURLWithPath: "/usr/bin/swiftc")
+        let frontend = SwiftFrontend.Driver(compilerURL: compilerURL)
+        let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
+        let target = "arm64-apple-ios15.0-simulator"
+        let baseModule = "ActorBaseCatalog"
+        let childModule = "ActorChildCatalog"
+        let baseSource = Data(
+            """
+            @MainActor open class ActorBase {
+                public init() {}
+            }
+            """.utf8
+        )
+        let childSource = Data(
+            """
+            import ActorBaseCatalog
+
+            public final class ActorChild: ActorBase {
+                public override init() { super.init() }
+                public func update(_ value: Int) -> Int { value + 1 }
+                nonisolated public func identity(_ value: Int) -> Int { value }
+            }
+            """.utf8
+        )
+        let baseURL = directory.appendingPathComponent("ActorBase.swift")
+        let childURL = directory.appendingPathComponent("ActorChild.swift")
+        try baseSource.write(to: baseURL)
+        try childSource.write(to: childURL)
+        for (sourceURL, moduleName) in [
+            (baseURL, baseModule),
+            (childURL, childModule),
+        ] {
+            let compilation = try frontend.run(arguments: [
+                sourceURL.path,
+                "-emit-module", "-parse-as-library",
+                "-swift-version", "6",
+                "-module-name", moduleName,
+                "-target", target,
+                "-sdk", sdk.path,
+                "-I", directory.path,
+                "-emit-module-path", directory.appendingPathComponent(
+                    "\(moduleName).swiftmodule"
+                ).path,
+            ])
+            guard compilation.terminationStatus == 0 else {
+                throw FrontendReceipt.Error.frontendFailed(
+                    compilation.standardError
+                )
+            }
+        }
+
+        let toolchain = try ReleaseCompiler.Driver().toolchainIdentity(
+            compilerURL: compilerURL
+        )
+        var moduleContent = Data()
+        moduleContent.append(baseSource)
+        moduleContent.append(childSource)
+        let output = try NativeAPICatalog.Builder(cache: .init(
+            rootURL: directory.appendingPathComponent("Cache")
+        )).build(.init(
+            identity: .init(
+                provenance: .thirdPartyModule,
+                xcodeProductBuild: "integration-test",
+                sdkProductBuild: sdk.buildVersion,
+                compilerFingerprint: toolchain.fingerprint,
+                targetTriple: target,
+                minimumDeployment: .init(15),
+                swiftLanguageMode: "6",
+                moduleName: childModule,
+                moduleContentHash: .sha256(moduleContent),
+                moduleSearchPathHash: .sha256(directory.path),
+                dependencyGraphHash: .sha256(baseSource)
+            ),
+            frontendInvocation: .init(
+                moduleName: "ActorCatalogConsumer",
+                targetTriple: target,
+                sdkName: sdk.name,
+                sdkBuild: sdk.buildVersion,
+                optimization: "-Onone",
+                semanticArguments: [
+                    "-parse-as-library", "-I", directory.path,
+                ]
+            ),
+            compilerURL: compilerURL,
+            precomputedToolchain: toolchain,
+            precomputedSDK: sdk
+        ))
+
+        let update = try #require(output.snapshot.document.entries.first {
+            $0.descriptor.canonicalCallee.contains("ActorChild.update(_:)")
+        })
+        #expect(update.descriptor.effects.requiresMainActor)
+        let identity = try #require(output.snapshot.document.entries.first {
+            $0.descriptor.canonicalCallee.contains("ActorChild.identity(_:)")
+        })
+        #expect(!identity.descriptor.effects.requiresMainActor)
+        #expect(output.snapshot.compilerProjection.importedTypes.contains {
+            $0.canonicalName.hasSuffix(".ActorChild")
+                && $0.requiresMainActor
+        })
+        try output.snapshot.document.validate()
+    }
+
     @Test("Module Catalog classifies Objective-C messages and C functions")
     func buildsClangModuleCatalog() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -1683,6 +1888,18 @@ struct NativeAPICatalogTests {
                 && $0.descriptor.target.owner == "UIViewController"
                 && $0.descriptor.target.entryPoint
                     == "presentViewController:animated:completion:"
+        })
+        #expect(output.snapshot.document.entries.contains {
+            $0.descriptor.target.backend == .swiftAdapter
+                && $0.swiftNames.contains(
+                    "UIKit.UIActivityViewController.init("
+                        + "activityItems:applicationActivities:)"
+                )
+                && $0.compilerSymbols.contains(
+                    "c:objc(cs)UIActivityViewController(im)"
+                        + "initWithActivityItems:applicationActivities:"
+                )
+                && $0.descriptor.effects.requiresMainActor
         })
         #expect(output.snapshot.document.entries.contains {
             $0.descriptor.target.backend == .objectiveCMessage

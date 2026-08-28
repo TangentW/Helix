@@ -914,6 +914,18 @@ struct NativeImportDiscoveryTests {
         ))
         #expect(!FrontendReceipt.ManagedNativeSurface.supportsAvailability(
             try availability(
+                #"[{"domain":"Swift","deprecated":{"major":5}}]"#
+            ),
+            minimumOS: minimumOS
+        ))
+        #expect(!FrontendReceipt.ManagedNativeSurface.supportsAvailability(
+            try availability(
+                #"[{"domain":"*","isUnconditionallyDeprecated":true}]"#
+            ),
+            minimumOS: minimumOS
+        ))
+        #expect(!FrontendReceipt.ManagedNativeSurface.supportsAvailability(
+            try availability(
                 #"[{"domain":"iOS","isUnconditionallyUnavailable":true}]"#
             ),
             minimumOS: minimumOS
@@ -1843,6 +1855,13 @@ struct NativeImportDiscoveryTests {
             diagnostics: """
             error: reference to generic type 'Measurement' requires arguments \
             in <...>
+            """
+        ))
+        #expect(FrontendReceipt.ManagedNativeSurface.isDeterministicProbeRejection(
+            status: 1,
+            diagnostics: """
+            error: reference to class property 'typeListColor' is not \
+            concurrency-safe because it involves shared mutable state
             """
         ))
         #expect(!FrontendReceipt.ManagedNativeSurface.isDeterministicProbeRejection(

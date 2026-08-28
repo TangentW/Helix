@@ -56,18 +56,28 @@ extension Runtime.ObjectiveCInvoker {
             )
         }
         var nativeResult = HelixRuntimeObjectiveCResult()
-        let succeeded = pointers.withUnsafeBufferPointer { buffer in
-            helix_runtime_objective_c_validate(
-                declaration.pointer,
-                dispatchClass?.pointer,
-                selector.pointer,
-                lexicalSuperclass?.pointer,
-                dispatch,
-                buffer.baseAddress,
-                buffer.count,
-                resultEncoding.pointer,
-                &nativeResult
-            )
+        let stringOwners = encodings + [
+            declaration, dispatchClass, selector, lexicalSuperclass,
+            resultEncoding,
+        ].compactMap { $0 }
+        // Unsafe pointers do not retain the allocations they address. Keep
+        // every encoding and metadata owner alive through the foreign call.
+        let succeeded = withExtendedLifetime(stringOwners) {
+            pointers.withUnsafeBufferPointer { buffer in
+                helix_runtime_objective_c_validate(
+                    declaration.pointer,
+                    dispatchClass?.pointer,
+                    selector.pointer,
+                    lexicalSuperclass?.pointer,
+                    dispatch,
+                    objectiveC.implementationLookup
+                        == .dynamicObjectWhenDeclarationMissing,
+                    buffer.baseAddress,
+                    buffer.count,
+                    resultEncoding.pointer,
+                    &nativeResult
+                )
+            }
         }
         guard succeeded,
               nativeResult.status == HelixRuntimeObjectiveCStatusSuccess

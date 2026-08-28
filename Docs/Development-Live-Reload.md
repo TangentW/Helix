@@ -388,6 +388,11 @@ For a MainActor-isolated measured declaration, a non-Sendable callback retains
 the enclosing MainActor restriction even when the printed SDK typealias omits
 it; an explicitly `@Sendable` callback keeps its own declared executor
 contract. The exact frontend probe remains authoritative for the final ABI.
+MainActor type isolation also propagates through the Symbol Graph inheritance
+closure. When a cross-graph relationship omits that fact, only a matching
+compiler actor diagnostic permits a MainActor retry; explicit `nonisolated`
+still wins. A Swift 6 shared-mutable-state diagnostic rejects only that
+candidate and does not abort background Catalog publication.
 For each such imported SDK type, Helix also nominates the exact zero-argument
 `Type()` expression even when an inherited or importer-synthesized initializer
 is absent from the symbol graph. It becomes a NativeImport only when the same
@@ -400,8 +405,12 @@ error-conversion shape fails closed. Swift-overlay names such as `Bundle` and
 physical aliases such as `CGFloat` are resolved from compiler identity and
 source evidence instead of guessed from Objective-C runtime spelling. Those
 compiler-proven Swift/SIL spellings are retained as server-side aliases of the
-same compiler-proven native identity for later patch compilation; ambiguous aliases are
-omitted and none enter the device interface. Symbol-graph implicitly unwrapped
+same compiler-proven native identity for later patch compilation. In
+particular, a successfully typechecked Swift initializer unifies differently
+printed owner and result nominals, including renamed nested value or reference
+types, while an Objective-C reference keeps its runtime class as canonical
+identity. Ambiguous aliases are omitted and none enter the device interface.
+Symbol-graph implicitly unwrapped
 optionals such as `UIViewController.view: UIView!` remain valid probe syntax
 and are measured by the frontend as their exact Optional ABI instead of being
 dropped before compilation. This

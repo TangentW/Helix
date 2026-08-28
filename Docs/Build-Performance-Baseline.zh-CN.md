@@ -170,14 +170,41 @@ Pack key、compiler input、module map、toolchain、SDK、Clang binary 与 boot
 （0.364 s）以及 toolchain/Pack 规划。它们已经变成次要且有界的成本，不再构成缩减 SDK
 覆盖范围的理由。所有缓存和报告 schema 继续保持版本 1。
 
+## Stage 5 Catalog-first 稳态实测
+
+2026-08-28 又在真实 arm64 iPhone 17 Simulator destination 上测量了最终
+Catalog-first 接入。后台预热已经发布 2 个 module、4,609 条 entry 的完整能力面后，使用
+新 transform identity 的第一次构建填充当前 Shell 与 object：Prepare 为 15.505 秒，
+其中 Catalog 读取及完整校验 1.905 秒、application frontend 4.691 秒、紧凑 Shell
+materialize 7.834 秒；Bridge 为 1.961 秒，其中 application Swift object 编译 0.784 秒、
+两份 Adapter Pack object 物化 0.370 秒。紧接着的源码不变构建进入稳定状态：
+
+| 稳态 Live Reload 项目 | 结果 |
+| --- | ---: |
+| Xcode Build 墙钟 | 约 14.3 s |
+| Prepare 总计 | 0.179 s |
+| Prepare state | 命中 |
+| Catalog 读取 / application frontend / Shell materialize | 未发生 |
+| Bridge 总计 | 0.421 s |
+| Bridge state | 命中 |
+| Application 与 Adapter Pack 编译 | 未发生 |
+
+尚未消费的一次性 Hub reservation 可以由精确 state hit 安全复用；一旦被消费，或任何
+语义输入变化，仍会走正常的会话相关路径。真实 Swift 6 Demo 预热生成了约 8.1 MiB 的
+UIKit Catalog；同一 canonical job 从用户缓存精确复跑，包括完整 payload 与 projection
+校验，耗时 1.911 秒。这些仍是本机单次观测，不是 P95，但足以证明分钟级 SDK 扫描已经
+移出无变化 Xcode Build 的延迟路径。
+
 ## 模块 Catalog 冷生成证据
 
 模块级 Catalog Producer 已经对当前安装的 iPhone Simulator SDK 中真实 UIKit 做过验证，
 不是只跑小型人造 fixture。显式开启的集成测试从空的私有缓存开始，并要求最终 Catalog
 确实包含 `UIView.backgroundColor`、`UIViewController.present` 与 `UIView.animate` 三条
-精确 Objective-C 记录。2026-08-27 的成功运行耗时 195.123 秒。这证明全 SDK 覆盖链路
-能成立，也证明冷索引本身代价很大；它绝不是可接受的每次 Prepare 耗时，文档也不会把
-它写成普通构建性能。
+精确 Objective-C 记录，以及
+`UIActivityViewController.init(activityItems:applicationActivities:)` 的精确 MainActor
+Swift Adapter。最近一次 2026-08-28 冷运行耗时 229.653 秒；增加该断言前，2026-08-27
+的一次运行耗时 195.123 秒。这证明全 SDK 覆盖链路能成立，也证明冷索引本身代价很大；
+它绝不是可接受的每次 Prepare 耗时，文档也不会把它写成普通构建性能。
 
 顺序执行的早期版本运行约 5 分钟后被主动停止。改成最多 4 个 worker 的有界调度后，
 采样到的测试进程 CPU 利用率从约 14% 提高到约 95%，内存占比仍约 2%；成功运行期间的
@@ -188,8 +215,25 @@ Pack key、compiler input、module map、toolchain、SDK、Clang binary 与 boot
 UIKit 还暴露了小 fixture 没发现的两条正确性边界：不同 overlay 类型可能共享一个泛型
 Swift SIL 实现，模块图也可能展示由其他模块声明的 protocol 默认实现。Catalog 现在用
 owner、USR 与完整签名区分前者，并从错误模块中剔除后者；普通源码分析仍保持失败关闭，
-Objective-C/C 模块权限也没有被放宽。
+Objective-C/C 模块权限也没有被放宽。真实 Swift 6 Demo 还证明，SDK 子类可能继承
+MainActor 却不在自己的 Symbol Graph 行重复标注，历史 imported global 也可能被诊断为
+并发不安全共享可变状态。前者会带着继承 actor 权限重新测量；后者只确定性拒绝该候选，
+不会中止整个模块。
 
 因此产品结论很明确：完整 SDK Catalog 只能按 SDK/模块身份做一次后台生成。Catalog-first
 Prepare 必须读取经过验证的命中，或只对源码当前需要的 API 做小范围查询，绝不能把这次
-195 秒扫描重新塞回每次本地构建。schema、协议、产物与产品版本全部继续保持 1。
+约 230 秒扫描重新塞回每次本地构建。schema、协议、产物与产品版本全部继续保持 1。
+
+## 最终 Hot Patch Release 证据
+
+2026-08-28 还使用仓库内 Release Demo 和同一台 arm64 iPhone 17 Simulator 对最终实现
+做了完整验收。发布出的 schema 1 capability manifest 含 3,657 条 entry。新 transform
+identity 完成一次冷填充后，源码不变的 Release Build 中 Prepare state 命中耗时 0.406
+秒，Bridge state 命中耗时 2.824 秒；当时磁盘仅剩约 469 MiB，完整 Xcode 调用耗时
+20.83 秒。该次 Bridge 命中没有重新执行 Swift 编译。
+
+把 Demo 中唯一标记的计价函数改为修复值后，生成、签名、验证并投递一条 entry 的补丁
+共耗时 19.101 秒。安装后的 Release App 在 generation 1 把实际显示的运费从 `¥19.99`
+改为 `¥0.00`，随后回滚又恢复到经过审计的原始实现。这证明紧凑的 Catalog-backed
+manifest、通用调用器、生成式 Swift Adapter Pack、补丁编译器和运行时激活链在当前
+schema 1 合同下能够端到端一致工作；这些仍是本机功能实测，不是跨机器延迟承诺。

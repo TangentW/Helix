@@ -42,6 +42,27 @@ static NSString *helix_bounded_text(
         ? value : [value substringToIndex:maximum_length];
 }
 
+static void helix_set_parameter_encoding_mismatch(
+    HelixRuntimeObjectiveCResult *result,
+    size_t index,
+    const char *catalog_encoding,
+    const char *runtime_encoding
+) {
+    NSString *catalog = catalog_encoding == NULL ? nil
+        : [NSString stringWithUTF8String:catalog_encoding];
+    NSString *runtime = runtime_encoding == NULL ? nil
+        : [NSString stringWithUTF8String:runtime_encoding];
+    helix_set_message(
+        result,
+        [NSString stringWithFormat:
+            @"Objective-C parameter %zu encoding disagrees with its catalog "
+             "(catalog %@, runtime %@)",
+            index,
+            helix_bounded_text(catalog, 128, @"missing"),
+            helix_bounded_text(runtime, 128, @"missing")]
+    );
+}
+
 static const char *helix_skip_qualifiers(const char *encoding) {
     if (encoding == NULL) {
         return NULL;
@@ -81,6 +102,54 @@ static bool helix_encoding_matches(
         return helix_encoding_matches(expected + 1, actual + 1);
     }
     return strcmp(expected, actual) == 0;
+}
+
+static bool helix_integer_signedness_is_abi_compatible(
+    const char *expected,
+    const char *actual
+) {
+    if (expected[1] != '\0' || actual[1] != '\0') {
+        return false;
+    }
+    const char *signed_encodings = "csilq";
+    const char *unsigned_encodings = "CSILQ";
+    const char *expected_signed = strchr(signed_encodings, expected[0]);
+    const char *expected_unsigned = strchr(unsigned_encodings, expected[0]);
+    const char *actual_signed = strchr(signed_encodings, actual[0]);
+    const char *actual_unsigned = strchr(unsigned_encodings, actual[0]);
+    return (expected_signed != NULL && actual_unsigned != NULL
+            && expected_signed - signed_encodings
+                == actual_unsigned - unsigned_encodings)
+        || (expected_unsigned != NULL && actual_signed != NULL
+            && expected_unsigned - unsigned_encodings
+                == actual_signed - signed_encodings);
+}
+
+static bool helix_catalog_encoding_matches(
+    const char *catalog_value,
+    const char *runtime_value
+) {
+    const char *catalog = helix_skip_qualifiers(catalog_value);
+    const char *runtime = helix_skip_qualifiers(runtime_value);
+    if (catalog == NULL || runtime == NULL
+        || *catalog == '\0' || *runtime == '\0') {
+        return false;
+    }
+    if (catalog[0] == '@' || runtime[0] == '@') {
+        return helix_object_encoding_matches(catalog, runtime);
+    }
+    if (catalog[0] == '^' && runtime[0] == '^') {
+        return helix_catalog_encoding_matches(catalog + 1, runtime + 1);
+    }
+    if (strcmp(catalog, runtime) == 0) {
+        return true;
+    }
+    // Clang Importer deliberately exposes some unsigned Objective-C APIs as
+    // Swift.Int. Canonical SIL then proves the signed Swift boundary even
+    // though the Objective-C declaration retains its unsigned encoding. The
+    // release-authenticated catalog remains the semantic authority; the
+    // runtime boundary only needs the corresponding C integer representation.
+    return helix_integer_signedness_is_abi_compatible(catalog, runtime);
 }
 
 static bool helix_argument_kind_matches(
@@ -151,6 +220,13 @@ static NSMethodSignature *helix_signature(const char *encoding) {
         }
     }
     return signature;
+}
+
+static void helix_release_retained_object(void **value) {
+    if (value != NULL && *value != NULL) {
+        CFRelease(*value);
+        *value = NULL;
+    }
 }
 
 static bool helix_class_is_or_inherits_from(Class candidate, Class expected) {
@@ -241,6 +317,7 @@ bool helix_runtime_objective_c_validate(
     const char *selector_name,
     const char *lexical_superclass_name,
     HelixRuntimeObjectiveCDispatch dispatch,
+    bool allows_dynamic_object_implementation,
     const char *const *parameter_encodings,
     size_t parameter_count,
     const char *result_encoding,
@@ -258,6 +335,13 @@ bool helix_runtime_objective_c_validate(
             && dispatch != HelixRuntimeObjectiveCDispatchClass
             && dispatch != HelixRuntimeObjectiveCDispatchInitializer)) {
         helix_set_message(result, @"Objective-C ABI validation input is incomplete");
+        return false;
+    }
+    if (allows_dynamic_object_implementation
+        && ((dispatch != HelixRuntimeObjectiveCDispatchInstance
+                && dispatch != HelixRuntimeObjectiveCDispatchInitializer)
+            || lexical_superclass_name != NULL)) {
+        helix_set_message(result, @"dynamic-object Objective-C lookup is invalid for this dispatch");
         return false;
     }
 
@@ -322,6 +406,19 @@ bool helix_runtime_objective_c_validate(
                 dispatch
             );
             if (method == NULL) {
+                if (allows_dynamic_object_implementation
+                    && (dispatch == HelixRuntimeObjectiveCDispatchInstance
+                        || dispatch == HelixRuntimeObjectiveCDispatchInitializer)
+                    && lexical_superclass_name == NULL) {
+                    // Public Objective-C abstract classes and class clusters
+                    // can declare an instance method in their imported SDK
+                    // interface while installing it only on concrete runtime
+                    // subclasses. The authenticated catalog authorizes the
+                    // declaration; the concrete receiver and complete ABI are
+                    // revalidated immediately before every invocation.
+                    result->status = HelixRuntimeObjectiveCStatusSuccess;
+                    return true;
+                }
                 result->status = HelixRuntimeObjectiveCStatusSelectorUnavailable;
                 helix_set_message(result, @"cataloged Objective-C selector is unavailable");
                 return false;
@@ -335,7 +432,7 @@ bool helix_runtime_objective_c_validate(
                 helix_set_message(result, @"Objective-C method arity disagrees with its catalog");
                 return false;
             }
-            if (!helix_encoding_matches(
+            if (!helix_catalog_encoding_matches(
                     result_encoding,
                     signature.methodReturnType
                 )) {
@@ -344,12 +441,17 @@ bool helix_runtime_objective_c_validate(
                 return false;
             }
             for (size_t index = 0; index < parameter_count; index += 1) {
-                if (!helix_encoding_matches(
+                if (!helix_catalog_encoding_matches(
                         parameter_encodings[index],
                         [signature getArgumentTypeAtIndex:index + 2]
                     )) {
                     result->status = HelixRuntimeObjectiveCStatusSignatureMismatch;
-                    helix_set_message(result, @"Objective-C parameter encoding disagrees with its catalog");
+                    helix_set_parameter_encoding_mismatch(
+                        result,
+                        index,
+                        parameter_encodings[index],
+                        [signature getArgumentTypeAtIndex:index + 2]
+                    );
                     return false;
                 }
             }
@@ -389,6 +491,7 @@ bool helix_runtime_objective_c_invoke(
     const char *selector_name,
     const char *lexical_superclass_name,
     HelixRuntimeObjectiveCDispatch dispatch,
+    bool allows_dynamic_object_implementation,
     bool returns_retained,
     void *receiver,
     const HelixRuntimeObjectiveCArgument *arguments,
@@ -410,9 +513,17 @@ bool helix_runtime_objective_c_invoke(
         helix_set_message(result, @"Objective-C invocation input is incomplete");
         return false;
     }
+    if (allows_dynamic_object_implementation
+        && ((dispatch != HelixRuntimeObjectiveCDispatchInstance
+                && dispatch != HelixRuntimeObjectiveCDispatchInitializer)
+            || lexical_superclass_name != NULL)) {
+        helix_set_message(result, @"dynamic-object Objective-C lookup is invalid for this dispatch");
+        return false;
+    }
 
     @autoreleasepool {
-        void *allocated_target = NULL;
+        void *allocated_target
+            __attribute__((cleanup(helix_release_retained_object))) = NULL;
         @try {
             NSString *declaration_name = [NSString
                 stringWithUTF8String:declaration_class_name];
@@ -450,18 +561,26 @@ bool helix_runtime_objective_c_invoke(
             }
             SEL selector = sel_registerName(selector_name);
             __unsafe_unretained id target = nil;
-            // The cataloged declaration class authorizes the selector and its
-            // ABI. Invocation still targets the concrete receiver, preserving
-            // ordinary Objective-C dynamic dispatch without trusting methods
-            // that exist only on an unexpected runtime subclass.
+            // The cataloged declaration authorizes the selector and ABI.
+            // Ordinary Objective-C dispatch still targets the concrete object;
+            // a method absent from the declaring runtime class is accepted only
+            // when the compiler-authorized lookup policy permits that fallback.
             Class declaration_class = declaration_owner;
             IMP lexical_implementation = NULL;
             if (dispatch == HelixRuntimeObjectiveCDispatchClass) {
                 target = dispatch_owner;
             } else if (dispatch == HelixRuntimeObjectiveCDispatchInitializer) {
-                // Allocation is delayed until every catalog/runtime ABI check
-                // has passed, so a rejected descriptor cannot leak an object.
-                target = nil;
+                // Class clusters can return a private placeholder whose class,
+                // rather than the public allocation class, implements init.
+                // The cleanup attribute balances +alloc on every pre-invoke
+                // failure; successful init consumes that ownership below.
+                allocated_target = (__bridge_retained void *)[dispatch_owner alloc];
+                target = (__bridge id)allocated_target;
+                if (target == nil) {
+                    result->status = HelixRuntimeObjectiveCStatusInvocationFailure;
+                    helix_set_message(result, @"Objective-C allocation returned nil");
+                    return false;
+                }
             } else {
                 target = (__bridge id)receiver;
                 if (target == nil || !helix_class_is_or_inherits_from(
@@ -501,6 +620,24 @@ bool helix_runtime_objective_c_invoke(
                 selector,
                 dispatch
             );
+            Method dynamic_method = NULL;
+            if (lexical_superclass_name == NULL) {
+                dynamic_method = dispatch
+                    == HelixRuntimeObjectiveCDispatchClass
+                    ? class_getClassMethod(dispatch_owner, selector)
+                    : class_getInstanceMethod(object_getClass(target), selector);
+                if (dynamic_method == NULL) {
+                    result->status = HelixRuntimeObjectiveCStatusSelectorUnavailable;
+                    helix_set_message(result, @"Objective-C receiver does not implement the cataloged selector");
+                    return false;
+                }
+                if (method == NULL
+                    && allows_dynamic_object_implementation
+                    && (dispatch == HelixRuntimeObjectiveCDispatchInstance
+                        || dispatch == HelixRuntimeObjectiveCDispatchInitializer)) {
+                    method = dynamic_method;
+                }
+            }
             if (method == NULL) {
                 result->status = HelixRuntimeObjectiveCStatusSelectorUnavailable;
                 helix_set_message(result, @"cataloged Objective-C selector is unavailable");
@@ -523,14 +660,6 @@ bool helix_runtime_objective_c_invoke(
                 return false;
             }
             if (lexical_superclass_name == NULL) {
-                Method dynamic_method = dispatch
-                    == HelixRuntimeObjectiveCDispatchClass
-                    ? class_getClassMethod(dispatch_owner, selector)
-                    : class_getInstanceMethod(
-                        dispatch == HelixRuntimeObjectiveCDispatchInitializer
-                            ? dispatch_owner : object_getClass(target),
-                        selector
-                    );
                 const char *dynamic_encoding = dynamic_method == NULL
                     ? NULL : method_getTypeEncoding(dynamic_method);
                 NSMethodSignature *dynamic_signature = dynamic_encoding == NULL
@@ -541,7 +670,10 @@ bool helix_runtime_objective_c_invoke(
                     return false;
                 }
             }
-            if (!helix_encoding_matches(result_encoding, signature.methodReturnType)) {
+            if (!helix_catalog_encoding_matches(
+                    result_encoding,
+                    signature.methodReturnType
+                )) {
                 result->status = HelixRuntimeObjectiveCStatusSignatureMismatch;
                 helix_set_message(result, @"Objective-C return encoding disagrees with its catalog");
                 return false;
@@ -558,9 +690,14 @@ bool helix_runtime_objective_c_invoke(
             for (size_t index = 0; index < argument_count; index += 1) {
                 const HelixRuntimeObjectiveCArgument *argument = &arguments[index];
                 const char *actual = [signature getArgumentTypeAtIndex:index + 2];
-                if (!helix_encoding_matches(argument->encoding, actual)) {
+                if (!helix_catalog_encoding_matches(argument->encoding, actual)) {
                     result->status = HelixRuntimeObjectiveCStatusSignatureMismatch;
-                    helix_set_message(result, @"Objective-C parameter encoding disagrees with its catalog");
+                    helix_set_parameter_encoding_mismatch(
+                        result,
+                        index,
+                        argument->encoding,
+                        actual
+                    );
                     return false;
                 }
                 if (!helix_argument_kind_matches(argument->kind, actual)) {
@@ -587,18 +724,6 @@ bool helix_runtime_objective_c_invoke(
                 } else {
                     result->status = HelixRuntimeObjectiveCStatusInvalidInput;
                     helix_set_message(result, @"Objective-C argument kind is invalid");
-                    return false;
-                }
-            }
-            if (dispatch == HelixRuntimeObjectiveCDispatchInitializer) {
-                // Transfer +alloc ownership out of ARC. Successful init-family
-                // dispatch transfers that same +1 result across the C ABI;
-                // an exception before the transfer is the only local release.
-                allocated_target = (__bridge_retained void *)[dispatch_owner alloc];
-                target = (__bridge id)allocated_target;
-                if (target == nil) {
-                    result->status = HelixRuntimeObjectiveCStatusInvocationFailure;
-                    helix_set_message(result, @"Objective-C allocation returned nil");
                     return false;
                 }
             }
@@ -652,9 +777,6 @@ bool helix_runtime_objective_c_invoke(
             result->status = HelixRuntimeObjectiveCStatusSuccess;
             return true;
         } @catch (NSException *exception) {
-            if (allocated_target != NULL) {
-                CFRelease(allocated_target);
-            }
             result->status = HelixRuntimeObjectiveCStatusException;
             helix_set_message(
                 result,

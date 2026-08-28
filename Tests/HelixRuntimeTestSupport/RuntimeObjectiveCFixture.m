@@ -125,6 +125,55 @@ HelixRuntimeTestObject *HelixRuntimeTestMakeIncompatibleEchoObject(void) {
     return [[HelixRuntimeTestIncompatibleEchoObject alloc] init];
 }
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wincomplete-implementation"
+@implementation HelixRuntimeTestAbstractObject
+@end
+#pragma clang diagnostic pop
+
+@implementation HelixRuntimeTestConcreteObject
+
+- (NSString *)abstractEcho:(NSString *)value {
+    return [@"concrete:" stringByAppendingString:value];
+}
+
+@end
+
+@interface HelixRuntimeTestConcreteCluster : HelixRuntimeTestCluster {
+    NSString *_clusterValue;
+}
+@end
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wincomplete-implementation"
+@implementation HelixRuntimeTestCluster
+
++ (instancetype)allocWithZone:(struct _NSZone *)zone {
+    if (self == HelixRuntimeTestCluster.class) {
+        return [HelixRuntimeTestConcreteCluster allocWithZone:zone];
+    }
+    return [super allocWithZone:zone];
+}
+
+@end
+#pragma clang diagnostic pop
+
+@implementation HelixRuntimeTestConcreteCluster
+
+- (instancetype)initWithValue:(NSString *)value {
+    self = [super init];
+    if (self != nil) {
+        _clusterValue = [value copy];
+    }
+    return self;
+}
+
+- (NSString *)value {
+    return _clusterValue;
+}
+
+@end
+
 @implementation HelixRuntimeTestLyingObject
 
 - (BOOL)isKindOfClass:(Class)aClass {

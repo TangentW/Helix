@@ -79,6 +79,7 @@ extension FrontendReceipt.ManagedNativeSurface {
         var sourceFileLogicalID: String
         var importedModules: [String]
         var requiresMainActor: Bool
+        var allowsMainActorInference: Bool
         var mayThrow: Bool
     }
 
@@ -108,6 +109,7 @@ extension FrontendReceipt.ManagedNativeSurface {
         var resultType: String
         var importedModules: [String]
         var requiresMainActor: Bool
+        var allowsMainActorInference: Bool
         var mayThrow: Bool
 
         init(_ candidate: Candidate) {
@@ -122,6 +124,7 @@ extension FrontendReceipt.ManagedNativeSurface {
             resultType = candidate.resultType
             importedModules = candidate.importedModules.sorted()
             requiresMainActor = candidate.requiresMainActor
+            allowsMainActorInference = candidate.allowsMainActorInference
             mayThrow = candidate.mayThrow
         }
     }
@@ -397,14 +400,15 @@ extension FrontendReceipt.ManagedNativeSurface {
             probedSurface.types,
             ownerSurfacesByModule: resolution.ownerSurfacesByModule
         )
-        enrichedTypes = try FrontendReceipt.Adapter().mergeImportedNativeTypes(
-            discoveredTypes: enrichedTypes,
-            operationTypes: signatureTypes
+        let canonicalSurface = try canonicalizingCompilerNominalAliases(
+            importedTypes: enrichedTypes + signatureTypes,
+            operations: probedSurface.operations
         )
+        enrichedTypes = canonicalSurface.importedTypes
         return Expansion(
             importedTypes: enrichedTypes,
             operations: try canonicalizedOperations(
-                probedSurface.operations,
+                canonicalSurface.operations,
                 importedTypes: enrichedTypes
             ),
             modulesByDeclarationUSR: resolution.modulesByDeclarationUSR,
@@ -510,12 +514,13 @@ extension FrontendReceipt.ManagedNativeSurface {
             probedSurface.types,
             ownerSurfacesByModule: [moduleName: surfaces]
         )
-        let importedTypes = try FrontendReceipt.Adapter().mergeImportedNativeTypes(
-            discoveredTypes: probeImportedTypes.filter {
+        let canonicalSurface = try canonicalizingCompilerNominalAliases(
+            importedTypes: probeImportedTypes.filter {
                 !uninhabitedCanonicalNames.contains($0.canonicalName)
-            },
-            operationTypes: signatureTypes
-        ).map { type in
+            } + signatureTypes,
+            operations: probedSurface.operations
+        )
+        let importedTypes = canonicalSurface.importedTypes.map { type in
             var type = type
             // Module ownership is temporary authority while measurement
             // reconciles weaker probe observations. The persisted projection
@@ -525,7 +530,7 @@ extension FrontendReceipt.ManagedNativeSurface {
             return type
         }
         let operations = try canonicalizedOperations(
-            probedSurface.operations.map { operation in
+            canonicalSurface.operations.map { operation in
                 var dormant = operation
                 dormant.isEmittedToDevice = false
                 return dormant
@@ -549,6 +554,176 @@ extension FrontendReceipt.ManagedNativeSurface {
             modulesByDeclarationUSR: modulesByDeclarationUSR,
             metrics: metrics
         )
+    }
+
+    /// A successfully typechecked Swift initializer proves that its declaring
+    /// owner and result are the same nominal identity. Swift overlays can print
+    /// those two positions differently (including renamed nested types), so
+    /// reconcile the compiler spellings before assigning native TypeIDs.
+    static func canonicalizingCompilerNominalAliases(
+        importedTypes: [FrontendReceipt.Adapter.ImportedNativeType],
+        operations: [FrontendReceipt.Adapter.ImportedOperation]
+    ) throws -> (
+        importedTypes: [FrontendReceipt.Adapter.ImportedNativeType],
+        operations: [FrontendReceipt.Adapter.ImportedOperation]
+    ) {
+        let aliases = try compilerNominalAliases(in: operations)
+        guard !aliases.isEmpty else {
+            return (
+                try FrontendReceipt.Adapter().mergeImportedNativeTypes(
+                    discoveredTypes: [],
+                    operationTypes: importedTypes
+                ),
+                operations
+            )
+        }
+        let normalizedTypes = importedTypes.map { original in
+            var type = original
+            let canonicalName = FrontendReceipt.SwiftTypeSpelling
+                .replacingNominalAliases(
+                    in: original.canonicalName,
+                    aliases: aliases
+                )
+            let swiftType = FrontendReceipt.SwiftTypeSpelling
+                .replacingNominalAliases(
+                    in: original.swiftType,
+                    aliases: aliases
+                )
+            // Objective-C references intentionally use their runtime class
+            // name as canonical identity even when generated Swift uses a
+            // module-qualified overlay spelling. Pure Swift reference types
+            // have no runtime-class identity and follow the compiler alias.
+            if original.objectiveCRuntimeName == nil {
+                type.canonicalName = canonicalName
+            }
+            type.swiftType = swiftType
+            let priorNames = [original.canonicalName, original.swiftType]
+                + original.aliases
+            let rewrittenNames = priorNames.map {
+                FrontendReceipt.SwiftTypeSpelling.replacingNominalAliases(
+                    in: $0,
+                    aliases: aliases
+                )
+            }
+            type.aliases = Array(Set(priorNames + rewrittenNames)).filter {
+                $0 != type.canonicalName && $0 != type.swiftType
+            }.sorted()
+            return type
+        }
+        let adapter = FrontendReceipt.Adapter()
+        return (
+            try adapter.mergeImportedNativeTypes(
+                discoveredTypes: [],
+                operationTypes: normalizedTypes
+            ),
+            operations.map {
+                adapter.applyingSwiftTypeAliases($0, aliases: aliases)
+            }
+        )
+    }
+
+    private static func compilerNominalAliases(
+        in operations: [FrontendReceipt.Adapter.ImportedOperation]
+    ) throws -> [String: String] {
+        var targetsBySource: [String: Set<String>] = [:]
+        var modulesBySource: [String: Set<String>] = [:]
+        for operation in operations {
+            guard operation.dispatch == .initializer,
+                  operation.compilerOperation == nil,
+                  operation.objectiveC == nil,
+                  operation.c == nil,
+                  operation.declarationUSR?.hasPrefix("s:") == true,
+                  isPlainNominal(operation.ownerType),
+                  isPlainNominal(operation.resultSwiftType),
+                  operation.ownerType != operation.resultSwiftType
+            else { continue }
+            targetsBySource[operation.ownerType, default: []]
+                .insert(operation.resultSwiftType)
+            modulesBySource[operation.ownerType, default: []]
+                .formUnion(operation.importedModules)
+        }
+        var raw: [String: String] = [:]
+        func recordAlias(_ source: String, target: String) throws {
+            if let existing = raw[source], existing != target {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "compiler-proven native nominal alias \(source) has conflicting targets"
+                )
+            }
+            raw[source] = target
+        }
+        for source in targetsBySource.keys.sorted() {
+            let targets = targetsBySource[source] ?? []
+            guard targets.count == 1, let target = targets.first else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "compiler-proven native nominal alias \(source) has conflicting targets"
+                )
+            }
+            try recordAlias(source, target: target)
+            if let module = target.split(separator: ".").first.map(String.init),
+               modulesBySource[source]?.contains(module) == true,
+               !source.hasPrefix(module + ".") {
+                let qualifiedSource = module + "." + source
+                if qualifiedSource != target {
+                    try recordAlias(qualifiedSource, target: target)
+                }
+            }
+        }
+        guard !raw.isEmpty else { return [:] }
+
+        func resolvedTarget(source: String, target: String) throws -> String {
+            var current = target
+            var visited = Set([source])
+            for _ in 0...raw.count {
+                guard visited.insert(current).inserted else {
+                    throw FrontendReceipt.Error.invalidRequest(
+                        "compiler-proven native nominal aliases contain a cycle at \(source)"
+                    )
+                }
+                let next = FrontendReceipt.SwiftTypeSpelling
+                    .replacingNominalAliases(in: current, aliases: raw)
+                if next == current { return current }
+                current = next
+            }
+            throw FrontendReceipt.Error.invalidRequest(
+                "compiler-proven native nominal aliases do not converge at \(source)"
+            )
+        }
+
+        var resolved: [String: String] = [:]
+        for source in raw.keys.sorted() {
+            resolved[source] = try resolvedTarget(
+                source: source,
+                target: raw[source] ?? source
+            )
+        }
+        for source in raw.keys.sorted() {
+            var strictPrefixes = raw
+            strictPrefixes.removeValue(forKey: source)
+            let inherited = FrontendReceipt.SwiftTypeSpelling
+                .replacingNominalAliases(
+                    in: source,
+                    aliases: strictPrefixes
+                )
+            guard inherited != source else { continue }
+            let inheritedTarget = try resolvedTarget(
+                source: source,
+                target: inherited
+            )
+            guard inheritedTarget == resolved[source] else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "compiler-proven native nominal alias \(source) conflicts with its enclosing type"
+                )
+            }
+        }
+        return resolved.filter { $0.key != $0.value }
+    }
+
+    private static func isPlainNominal(_ raw: String) -> Bool {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value == raw
+            && FrontendReceipt.SwiftTypeSpelling.isGeneratedType(value)
+            && FrontendReceipt.SwiftTypeSpelling.nominalTokens(in: value)
+                == [value]
     }
 
     /// Probe batches are independent cache units. Apply aliases again after
@@ -799,6 +974,9 @@ extension FrontendReceipt.ManagedNativeSurface {
             "swift.init", "swift.method", "swift.property",
             "swift.type.method", "swift.type.property",
         ]
+        let mainActorTypeIdentifiers = inheritedMainActorTypeIdentifiers(
+            in: graph
+        )
         var owners: [String: SwiftFrontend.SymbolGraph.Symbol] = [:]
         var ambiguousOwners = Set<String>()
         for symbol in graph.symbols {
@@ -868,7 +1046,7 @@ extension FrontendReceipt.ManagedNativeSurface {
                 swiftPath: owner.pathComponents.joined(separator: "."),
                 runtimeName: clangRuntimeName(precise),
                 genericParameters: genericParameters,
-                requiresMainActor: requiresMainActor(owner),
+                requiresMainActor: mainActorTypeIdentifiers.contains(precise),
                 members: (membersByOwner[precise] ?? []).sorted {
                     ($0.pathComponents.joined(separator: "\u{0}"),
                      $0.identifier.precise)
@@ -877,6 +1055,47 @@ extension FrontendReceipt.ManagedNativeSurface {
                 }
             )
         }
+    }
+
+    /// Symbol Graphs record a global actor on its declaring superclass but do
+    /// not necessarily repeat that attribute on subclasses. Swift still
+    /// inherits the isolation, so derive the transitive same-module closure
+    /// before nominating member probes.
+    static func inheritedMainActorTypeIdentifiers(
+        in graph: SwiftFrontend.SymbolGraph.Document
+    ) -> Set<String> {
+        let typeIdentifiers = Set(graph.symbols.compactMap { symbol in
+            switch symbol.kind.identifier {
+            case "swift.class", "swift.enum", "swift.struct":
+                symbol.identifier.precise
+            default:
+                nil
+            }
+        })
+        var isolated = Set(graph.symbols.compactMap { symbol in
+            typeIdentifiers.contains(symbol.identifier.precise)
+                && requiresMainActor(symbol)
+                ? symbol.identifier.precise : nil
+        })
+        var childrenByParent: [String: Set<String>] = [:]
+        for relationship in graph.relationships
+        where relationship.kind == "inheritsFrom"
+            && typeIdentifiers.contains(relationship.source)
+            && typeIdentifiers.contains(relationship.target) {
+            childrenByParent[relationship.target, default: []]
+                .insert(relationship.source)
+        }
+        var pending = isolated.sorted()
+        var next = 0
+        while pending.indices.contains(next) {
+            let parent = pending[next]
+            next += 1
+            for child in (childrenByParent[parent] ?? []).sorted()
+            where isolated.insert(child).inserted {
+                pending.append(child)
+            }
+        }
+        return isolated
     }
 
     private static func catalogImportedType(
@@ -956,6 +1175,9 @@ extension FrontendReceipt.ManagedNativeSurface {
                   )
             else { return nil }
             let actor = requiresMainActor(symbol)
+            let isNonisolated = symbol.declarationFragments.contains {
+                $0.spelling == "nonisolated"
+            }
             let importedModules = Array(Set(
                 [graph.module.name] + referencedSwiftModules(in: symbol)
             )).sorted()
@@ -977,6 +1199,7 @@ extension FrontendReceipt.ManagedNativeSurface {
                 sourceFileLogicalID: sourceFileLogicalID,
                 importedModules: importedModules,
                 requiresMainActor: actor,
+                allowsMainActorInference: !actor && !isNonisolated,
                 mayThrow: signature.mayThrow
             )
         }
@@ -1138,6 +1361,7 @@ extension FrontendReceipt.ManagedNativeSurface {
                 sourceFileLogicalID: importedType.sourceFileLogicalID,
                 importedModules: importedType.importedModules,
                 requiresMainActor: surface.requiresMainActor,
+                allowsMainActorInference: !surface.requiresMainActor,
                 mayThrow: false
             ))
         }
@@ -1180,6 +1404,7 @@ extension FrontendReceipt.ManagedNativeSurface {
                 sourceFileLogicalID: importedType.sourceFileLogicalID,
                 importedModules: importedModules,
                 requiresMainActor: requiresActor,
+                allowsMainActorInference: !requiresActor && !isNonisolated,
                 mayThrow: mayThrow
             )
         }
@@ -2115,7 +2340,9 @@ extension FrontendReceipt.ManagedNativeSurface {
             && FrontendReceipt.SwiftTypeSpelling.isGeneratedType(
                 operation.resultSwiftType
             )
-            && operation.requiresMainActor == candidate.requiresMainActor
+            && (operation.requiresMainActor == candidate.requiresMainActor
+                || (candidate.allowsMainActorInference
+                    && operation.requiresMainActor))
             && operation.mayThrow == candidate.mayThrow
     }
 
@@ -2314,10 +2541,16 @@ extension FrontendReceipt.ManagedNativeSurface {
                     diagnostics: diagnostics,
                     candidate: candidate
                 )
-                if !escapingParameters.isEmpty {
+                let inferMainActor = candidate.allowsMainActorInference
+                    && isMainActorInferenceFailure(
+                        status: status,
+                        diagnostics: diagnostics
+                    )
+                if !escapingParameters.isEmpty || inferMainActor {
                     return try probeSingleton(
                         candidate,
                         forcingEscaping: escapingParameters,
+                        inferringMainActor: inferMainActor,
                         importedTypes: importedTypes,
                         frontend: frontend,
                         invocation: invocation,
@@ -2360,21 +2593,30 @@ extension FrontendReceipt.ManagedNativeSurface {
     private static func probeSingleton(
         _ candidate: Candidate,
         forcingEscaping initialParameters: Set<Int>,
+        inferringMainActor initiallyInferringMainActor: Bool = false,
         importedTypes: [FrontendReceipt.Adapter.ImportedNativeType],
         frontend: SwiftFrontend.Driver,
         invocation: InterfaceArchive.FrontendInvocation,
         metrics: inout Metrics
     ) throws -> ProbeResult {
         var escapingParameters = initialParameters
+        var inferringMainActor = initiallyInferringMainActor
+        var probeCandidate = inferringMainActor
+            ? mainActorProbeCandidate(candidate) : candidate
         while true {
             do {
-                return try measure(
-                    [candidate],
+                let measured = try measure(
+                    [probeCandidate],
                     importedTypes: importedTypes,
                     frontend: frontend,
                     invocation: invocation,
                     forcedEscapingParameters: [0: escapingParameters],
                     metrics: &metrics
+                )
+                return rebinding(
+                    measured,
+                    from: probeCandidate,
+                    to: candidate
                 )
             } catch let error as SwiftFrontend.Error {
                 guard case let .compilationFailed(status, diagnostics) = error
@@ -2389,6 +2631,16 @@ extension FrontendReceipt.ManagedNativeSurface {
                     escapingParameters.formUnion(discovered)
                     continue
                 }
+                if !inferringMainActor,
+                   candidate.allowsMainActorInference,
+                   isMainActorInferenceFailure(
+                       status: status,
+                       diagnostics: diagnostics
+                   ) {
+                    inferringMainActor = true
+                    probeCandidate = mainActorProbeCandidate(candidate)
+                    continue
+                }
                 metrics.rejectedSingletonCount += 1
                 guard isDeterministicProbeRejection(
                     status: status,
@@ -2401,6 +2653,49 @@ extension FrontendReceipt.ManagedNativeSurface {
                 )
             }
         }
+    }
+
+    private static func mainActorProbeCandidate(
+        _ candidate: Candidate
+    ) -> Candidate {
+        var result = candidate
+        result.parameterTypes = result.parameterTypes.map {
+            inheritedCallbackType($0, requiresMainActor: true)
+        }
+        result.resultType = inheritedCallbackType(
+            result.resultType,
+            requiresMainActor: true
+        )
+        result.requiresMainActor = true
+        result.allowsMainActorInference = false
+        return result
+    }
+
+    private static func rebinding(
+        _ result: ProbeResult,
+        from measuredCandidate: Candidate,
+        to sourceCandidate: Candidate
+    ) -> ProbeResult {
+        guard measuredCandidate != sourceCandidate else { return result }
+        return .init(
+            types: result.types.map {
+                var value = $0
+                if value.candidate == measuredCandidate {
+                    value.candidate = sourceCandidate
+                }
+                return value
+            },
+            operations: result.operations.map {
+                var value = $0
+                if value.candidate == measuredCandidate {
+                    value.candidate = sourceCandidate
+                }
+                return value
+            },
+            cacheableCandidates: Set(result.cacheableCandidates.map {
+                $0 == measuredCandidate ? sourceCandidate : $0
+            })
+        )
     }
 
     private static func measure(
@@ -2752,6 +3047,7 @@ extension FrontendReceipt.ManagedNativeSurface {
             "instance member ",
             "is unavailable",
             "is only available in",
+            "is not concurrency-safe because it involves shared mutable state",
             "missing argument",
             "no exact matches in call",
             "reference to generic type",
@@ -2769,6 +3065,24 @@ extension FrontendReceipt.ManagedNativeSurface {
             return unresolvedContextualName
                 || stableSemanticFragments.contains { error.contains($0) }
         }
+    }
+
+    static func isMainActorInferenceFailure(
+        status: Int32,
+        diagnostics: String
+    ) -> Bool {
+        guard status == 1 else { return false }
+        return diagnostics.lowercased().split(whereSeparator: \.isNewline)
+            .contains { line in
+                line.contains("main actor-isolated")
+                    && (line.contains("[#actorisolatedcall]")
+                        || line.contains(
+                            "main actor isolation inferred from inheritance"
+                        )
+                        || line.contains("synchronous nonisolated context")
+                        || line.contains("nonisolated context")
+                        || line.contains("risks causing data races"))
+            }
     }
 
     private static func compilerErrorMessages(_ diagnostics: String) -> [String] {
@@ -3255,10 +3569,14 @@ extension FrontendReceipt.ManagedNativeSurface {
         _ values: [SwiftFrontend.SymbolGraph.Availability],
         minimumOS: Core.SemanticVersion
     ) -> Bool {
-        let swift = values.filter { $0.domain == "Swift" }
-        guard !swift.contains(where: {
+        let compilerWide = values.filter {
+            $0.domain == "Swift" || $0.domain == "*"
+        }
+        guard !compilerWide.contains(where: {
             $0.isUnconditionallyUnavailable == true
                 || $0.isUnconditionallyDeprecated == true
+                || $0.deprecated != nil
+                || $0.obsoleted != nil
         }) else { return false }
         let ios = values.filter { $0.domain == "iOS" }
         // Generated bridges compile against the captured current SDK with the

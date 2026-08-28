@@ -242,23 +242,40 @@ extension Runtime.ObjectiveCInvoker {
         }
         let returnsRetained = descriptor.physicalSignature.resultConvention
             == .directOwned
-        let succeeded = cArguments.withUnsafeBufferPointer { buffer in
-            helix_runtime_objective_c_invoke(
-                runtimeClass.pointer,
-                dispatchClass?.pointer,
-                selector.pointer,
-                lexicalSuperclass?.pointer,
-                dispatch,
-                returnsRetained,
-                receiver.map { Unmanaged.passUnretained($0).toOpaque() },
-                buffer.baseAddress,
-                buffer.count,
-                resultEncoding.pointer,
-                resultKind,
-                resultAllocation.pointer,
-                resultAllocation.byteCount,
-                &nativeResult
-            )
+        let stringOwners = strings + [
+            runtimeClass, dispatchClass, selector, lexicalSuperclass,
+            resultEncoding,
+        ].compactMap { $0 }
+        // The C records contain only unretained pointers. Their Swift string,
+        // byte-storage, object, and block owners must span the complete native
+        // frame, including optimized builds.
+        let succeeded = withExtendedLifetime(prepared) {
+            withExtendedLifetime(receiver) {
+                withExtendedLifetime(stringOwners) {
+                    cArguments.withUnsafeBufferPointer { buffer in
+                        helix_runtime_objective_c_invoke(
+                            runtimeClass.pointer,
+                            dispatchClass?.pointer,
+                            selector.pointer,
+                            lexicalSuperclass?.pointer,
+                            dispatch,
+                            objectiveC.implementationLookup
+                                == .dynamicObjectWhenDeclarationMissing,
+                            returnsRetained,
+                            receiver.map {
+                                Unmanaged.passUnretained($0).toOpaque()
+                            },
+                            buffer.baseAddress,
+                            buffer.count,
+                            resultEncoding.pointer,
+                            resultKind,
+                            resultAllocation.pointer,
+                            resultAllocation.byteCount,
+                            &nativeResult
+                        )
+                    }
+                }
+            }
         }
         let nativeError: NSError? = nativeResult.retained_error.map {
             Unmanaged<NSError>.fromOpaque($0).takeRetainedValue()

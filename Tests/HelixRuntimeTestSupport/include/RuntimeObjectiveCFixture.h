@@ -83,6 +83,22 @@ FOUNDATION_EXPORT BOOL HelixRuntimeTestRedirectingPropertyIsInstalled(void);
 FOUNDATION_EXPORT HelixRuntimeTestObject *
     HelixRuntimeTestMakeIncompatibleEchoObject(void);
 
+/// Models a public abstract Objective-C declaration whose implementation is
+/// installed only by the concrete object returned at runtime.
+@interface HelixRuntimeTestAbstractObject : NSObject
+- (NSString *)abstractEcho:(NSString *)value;
+@end
+
+@interface HelixRuntimeTestConcreteObject : HelixRuntimeTestAbstractObject
+@end
+
+/// Models an Objective-C class cluster whose allocated private placeholder,
+/// rather than the public class object, implements the initializer.
+@interface HelixRuntimeTestCluster : NSObject
+@property(nonatomic, copy, readonly) NSString *value;
+- (instancetype)initWithValue:(NSString *)value;
+@end
+
 /// Deliberately lies through NSObject's dynamic query. Runtime tests use this
 /// to prove native invocation checks the actual class hierarchy instead.
 @interface HelixRuntimeTestLyingObject : NSObject

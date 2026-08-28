@@ -51,6 +51,14 @@ Typed AST 与 SIL 证据会进入和业务模块相同的原生调用分类器�
 USR 与签名分别保存；反过来，由其他 Swift 模块声明的 protocol 默认实现或合成操作不会
 混进当前模块 Catalog。Objective-C/C 如果出现模块证据错配，仍然直接失败。
 
+全局 actor 隔离会沿 Symbol Graph 的 `inheritsFrom` 关系做传递闭包，因为 SDK 可能只在
+`UIViewController` 上标出 `@MainActor`，而不会在 `UIActivityViewController` 等子类上
+重复标注。继承关系跨出当前 graph、声明仍缺少标注时，Helix 只会在编译器诊断明确证明
+MainActor 违规后，用 actor-isolated 探针重试；成功结果仍绑定并缓存到原始候选身份。
+显式 `nonisolated` 声明绝不会被升级。Swift 6 若明确报告某个共享可变状态不具备并发
+安全性，则只把该候选确定性拒绝，不会让整个模块 Catalog 失败。Helix 不会用全模块
+`@preconcurrency import` 压掉错误，因为那也会削弱真正的 actor 证据。
+
 完整 Catalog 与 compiler projection 会一起按模块身份进入全局内容缓存。Swift 和
 Clang 模块加载参数中的项目目录、DerivedData 等物理路径会替换成有顺序的占位符；真正
 决定复用权限的是 identity 中的模块内容、语义搜索空间与依赖图 hash。因此，两个项目
@@ -122,7 +130,11 @@ imported Objective-C reference type 现在也遵循同一原则。Compiler 会�
 证据缺失或存在歧义时，Helix 会拒绝该通用路径或保留精确 Swift Adapter，绝不会悄悄
 把 `super` 调用降级成动态派发。
 
-Swift 层先把已经验证的 VM value 和 callback 权限投影成 ABI slot；一个很小的 Objective-C shim 再到 Catalog 指定的声明 class（或已固定的词法 superclass）上解析精确 selector，逐项比较运行时 type encoding 和 storage kind，并验证另行记录的 class 派发目标确实继承该声明 class，然后通过 `NSInvocation` 调用实际 receiver。这样既保留普通 Objective-C override 的动态派发，也不会让只存在于意外动态子类上的 selector 扩张 Catalog 权限。receiver 继承关系直接从 Objective-C runtime 的真实 class hierarchy 读取，不依赖可被对象重写的 `isKindOfClass:`；普通动态 override 的完整 ABI 也必须与目录声明一致后才能执行。属性调用直接使用编译器已经证明的 accessor selector，不要求系统运行时一定保留可选的 Objective-C property metadata；UIKit 等系统 Framework 即使裁掉这类元数据也能正常调用。Shim 还会捕获 Objective-C exception，处理 initializer 与 retained/autoreleased method family，并在一个明确的 ownership 边界把 object result 交回 Swift。Runtime 解码前会再次检查 receiver class、平台 availability、nilability、struct encoding/size/alignment、deadline、MainActor 入口、临时存储上限和返回长度。
+Swift 层先把已经验证的 VM value 和 callback 权限投影成 ABI slot；一个很小的 Objective-C shim 再到 Catalog 指定的声明 class（或已固定的词法 superclass）上解析精确 selector，逐项比较运行时 type encoding 和 storage kind，并验证另行记录的 class 派发目标确实继承该声明 class，然后通过 `NSInvocation` 调用实际 receiver。这样既保留普通 Objective-C override 的动态派发，动态子类也不能使用超出编译器 Catalog 权限的 selector。
+
+公开抽象类和 class cluster 还有一种合法情形：SDK 声明了实例方法，但实现只安装在运行时的私有具体子类上；class-cluster initializer 也可能只由 `+alloc` 返回的私有对象实现 `init`。编译器生成的 Descriptor 会显式授权普通实例调用和 initializer 采用 dynamic-object implementation lookup；启动时先验证声明类上能够取得的全部证据，声明类缺少实现时只把 selector/encoding 核对延后到真实 receiver 或实际分配对象出现。真正调用前仍要求该对象属于获准的继承体系、实现 Catalog 指定的 selector，并拥有兼容的完整 ABI。没有编译器签发这项策略的 Descriptor、类方法和词法 `super` 都不能使用这条回退；initializer 验证失败时会先归还尚未完成 `init` 的 `+alloc` 所有权。receiver 继承关系直接从 Objective-C runtime 的真实 class hierarchy 读取，不依赖可被对象重写的 `isKindOfClass:`；普通动态 override 的完整 ABI 也必须与目录声明一致后才能执行。属性调用直接使用编译器已经证明的 accessor selector，不要求系统运行时一定保留可选的 Objective-C property metadata；UIKit 等系统 Framework 即使裁掉这类元数据也能正常调用。Shim 还会捕获 Objective-C exception，处理 initializer 与 retained/autoreleased method family，并在一个明确的 ownership 边界把 object result 交回 Swift。Runtime 解码前会再次检查 receiver class、平台 availability、nilability、struct encoding/size/alignment、deadline、MainActor 入口、临时存储上限和返回长度。
+
+Catalog 与 runtime 的比较还会处理一条由编译器定义的表示规则：Clang Importer 可能把 Objective-C 无符号整数导入成 `Swift.Int`，因此 canonical SIL 证明的是有符号 Swift 逻辑边界，而 Objective-C 声明仍保留无符号 encoding。只有对应且表示宽度完全相同的 C 整数正负号 encoding 才按 ABI 等价接受。selector、参数个数、storage size、对象/标量、结构体等校验不会放宽，动态 override 的签名仍严格一致；字节码看到的语义契约仍由经过认证、来自编译器证据的 Descriptor 决定。
 
 这条路径消除了受支持 Objective-C 调用的逐方法可执行 Bridge，但它绝不是任意 selector 入口：每次调用仍必须有编译器证明的精确 Descriptor。已链接 Shell 用紧凑 ID 保存实际使用项，认证 Build Receipt 则保存尚未使用的受管开发候选。开发代码第一次使用候选时，Compiler 会在已链接前缀之后确定性分配 session-local ID，App 再从 Descriptor 构造同一个通用 Invoker；Shell interface hash 不会变化。这种 Registry 增长只允许发生在认证开发事务中，生产环境仍只能使用随 Release 发布的能力 Manifest。
 

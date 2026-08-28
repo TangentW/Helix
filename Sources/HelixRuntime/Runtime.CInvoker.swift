@@ -157,16 +157,23 @@ private func invokeNative(
         )
     }
     var nativeResult = HelixRuntimeCResult()
-    let succeeded = cArguments.withUnsafeBufferPointer { buffer in
-        helix_runtime_c_invoke(
-            function,
-            buffer.baseAddress,
-            buffer.count,
-            resultEncoding.pointer,
-            resultStorage.pointer,
-            resultStorage.byteCount,
-            &nativeResult
-        )
+    let encodingOwners = encodings + [resultEncoding]
+    // C argument records retain neither their encoding strings nor byte
+    // buffers. Keep both owner arrays alive until the trampoline returns.
+    let succeeded = withExtendedLifetime(storage) {
+        withExtendedLifetime(encodingOwners) {
+            cArguments.withUnsafeBufferPointer { buffer in
+                helix_runtime_c_invoke(
+                    function,
+                    buffer.baseAddress,
+                    buffer.count,
+                    resultEncoding.pointer,
+                    resultStorage.pointer,
+                    resultStorage.byteCount,
+                    &nativeResult
+                )
+            }
+        }
     }
     guard succeeded, nativeResult.status == HelixRuntimeCStatusSuccess else {
         throw VM.RuntimeTrap.nativeFailure(

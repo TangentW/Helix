@@ -746,6 +746,13 @@ struct NativeCall {
             try missingDispatchClass.validate(contract: contract)
         }
 
+        var invalidReceiverLookup = new
+        invalidReceiverLookup.objectiveC?.implementationLookup =
+            .dynamicObjectWhenDeclarationMissing
+        #expect(throws: Core.NativeCall.DescriptorError.self) {
+            try invalidReceiverLookup.validate(contract: contract)
+        }
+
         var alloc = new
         alloc.target.entryPoint = "__allocObject"
         alloc.objectiveC?.methodFamily = .alloc

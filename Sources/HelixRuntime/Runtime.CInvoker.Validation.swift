@@ -65,12 +65,17 @@ static func validate(
         let pointers: [UnsafePointer<CChar>?] = strings.map {
             UnsafePointer($0.pointer)
         }
-        let supported = pointers.withUnsafeBufferPointer {
-            helix_runtime_c_signature_is_supported(
-                $0.baseAddress,
-                $0.count,
-                result.pointer
-            )
+        let encodingOwners = strings + [result]
+        // Unsafe pointers do not retain the CString allocations. Preserve the
+        // owners explicitly across the C trampoline query under optimization.
+        let supported = withExtendedLifetime(encodingOwners) {
+            pointers.withUnsafeBufferPointer {
+                helix_runtime_c_signature_is_supported(
+                    $0.baseAddress,
+                    $0.count,
+                    result.pointer
+                )
+            }
         }
         return supported ? nil : "C invoker has no AOT trampoline for the cataloged ABI shape"
     } catch {

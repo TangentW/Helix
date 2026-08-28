@@ -361,6 +361,13 @@ extension NativeImportDiscovery {
                             runtimeClassName: evidence.runtimeClassName,
                             dispatchClassName: evidence.dispatchClassName,
                             methodFamily: evidence.methodFamily,
+                            implementationLookup:
+                                evidence.lexicalSuperclassName == nil
+                                    && nativeDispatch(
+                                        for: declaration.dispatch
+                                    ) != .static
+                                ? .dynamicObjectWhenDeclarationMissing
+                                : .declaringClass,
                             lexicalSuperclassName:
                                 evidence.lexicalSuperclassName,
                             errorFailure: evidence.errorFailure,

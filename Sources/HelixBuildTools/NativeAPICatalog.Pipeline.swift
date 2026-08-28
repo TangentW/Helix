@@ -52,7 +52,11 @@ enum Pipeline {
                 + "synthesized-objective-c-initializers:"
                 + "objective-c-protocol-anyobject-surface:"
                 + "swift-overlay-extension-module-ownership:"
-                + "canonical-declaration-owner-aliases"
+                + "canonical-declaration-owner-aliases:"
+                + "inherited-main-actor-symbol-graph-closure:"
+                + "compiler-inferred-main-actor-probes:"
+                + "line-bound-main-actor-diagnostics:"
+                + "compiler-wide-deprecation-filter"
         )
         return hasher.finalize()
     }()
@@ -76,11 +80,14 @@ enum Pipeline {
                 + "module-scoped-clang-value-type-identity:"
                 + "precise-imported-enum-kind:"
                 + "catalog-authority-weak-observation-reconciliation:"
+                + "compiler-proven-initializer-nominal-aliases:"
+                + "pure-swift-reference-alias-identity:"
                 + "logical-physical-signature-projection:"
                 + "native-call-descriptor-v1:binding-classification:"
                 + "complete-catalog-publication:compiler-projection-v1:"
                 + "published-operation-entry-index:"
                 + "published-native-capability-projection:"
+                + "declaration-missing-objective-c-implementation-lookup:"
                 + "vm-native-operation-precedence:binary-cache-payload"
         )
         return hasher.finalize()

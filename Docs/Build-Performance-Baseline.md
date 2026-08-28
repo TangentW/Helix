@@ -185,16 +185,50 @@ Hub-contract Swift compile (0.364 s), and toolchain/Pack planning. These are
 now bounded secondary costs rather than a reason to enumerate fewer SDK APIs.
 All cache and report schemas remain version 1.
 
+## Stage 5 Catalog-first steady-state evidence
+
+The final Catalog-first integration was measured again on August 28, 2026 with
+the real arm64 iPhone 17 Simulator destination. After background prewarm had
+published the complete two-module, 4,609-entry capability surface, the first
+build using the new transform identity populated current Shell and object
+facts. Prepare reported 15.505 seconds, including 1.905 seconds to read and
+validate Catalogs, 4.691 seconds for the application frontend, and 7.834
+seconds to materialize the compact Shell. Bridge reported 1.961 seconds,
+including 0.784 seconds for the application Swift object and 0.370 seconds for
+two Adapter Pack objects. The immediately unchanged build represented the
+stable state:
+
+| Stable Live Reload item | Result |
+| --- | ---: |
+| Xcode build wall time | about 14.3 s |
+| Prepare total | 0.179 s |
+| Prepare state | hit |
+| Catalog read / application frontend / Shell materialization | absent |
+| Bridge total | 0.421 s |
+| Bridge state | hit |
+| Application and Adapter Pack compilation | absent |
+
+The unconsumed one-time Hub reservation was safely reused by the exact state
+hit; after consumption or any semantic input change, the normal session-bound
+path runs again. A real Swift-6 Demo prewarm produced an approximately 8.1 MiB
+UIKit Catalog. Replaying the exact same canonical job from the user cache
+completed in 1.911 seconds, including full payload and projection validation.
+These are single local observations, not P95 claims, but they demonstrate that
+the minute-scale SDK scan is outside the unchanged Xcode latency path.
+
 ## Module Catalog cold-generation evidence
 
 The module-level Catalog producer was exercised against the installed UIKit
 from the iPhone Simulator SDK, not only a synthetic fixture. Its opt-in
 integration test starts with an empty private cache and requires the resulting
 Catalog to contain the exact Objective-C entries for
-`UIView.backgroundColor`, `UIViewController.present`, and `UIView.animate`.
-The successful run on August 27, 2026 took 195.123 seconds. This is evidence of
-correct whole-SDK coverage and of a substantial cold indexing cost; it is not
-an acceptable per-Prepare latency and is not represented as one.
+`UIView.backgroundColor`, `UIViewController.present`, and `UIView.animate`,
+plus the exact MainActor Swift Adapter for
+`UIActivityViewController.init(activityItems:applicationActivities:)`. The
+latest successful cold run on August 28, 2026 took 229.653 seconds; the earlier
+August 27 run took 195.123 seconds before the additional assertion. This is
+evidence of correct whole-SDK coverage and of a substantial cold indexing cost;
+it is not an acceptable per-Prepare latency and is not represented as one.
 
 An earlier sequential run was stopped after roughly five minutes. Bounded
 four-worker scheduling raised observed test-process CPU utilization from about
@@ -210,10 +244,33 @@ missed: distinct overlay types can share one generic Swift SIL implementation,
 and a module graph can surface protocol defaults owned by another module. The
 Catalog now keeps the former distinct using owner/USR/signature evidence and
 omits the latter from the wrong module. These fixes preserve fail-closed source
-discovery and do not broaden Objective-C/C module authority.
+discovery and do not broaden Objective-C/C module authority. The Swift-6 Demo
+additionally proved that SDK subclasses may inherit MainActor without repeating
+the attribute in their Symbol Graph row, and that a legacy imported global may
+be diagnosed as concurrency-unsafe shared mutable state. The former is measured
+with inherited actor authority; the latter is rejected as one deterministic
+candidate instead of aborting the module.
 
 The product conclusion is therefore explicit: full SDK Catalog generation is
 one-time background work keyed by SDK/module identity. Catalog-first Prepare
 must consume a validated hit or perform a small source-demanded query; it must
-never put this 195-second scan back onto every local build. Schema, protocol,
+never put this roughly 230-second scan back onto every local build. Schema, protocol,
 artifact, and product versions remain 1.
+
+## Final Hot Patch Release evidence
+
+The final implementation was also exercised end to end on August 28, 2026
+against the checked-in Release Demo and the same arm64 iPhone 17 Simulator. Its
+published schema-1 capability manifest contained 3,657 entries. After the new
+transform identity had populated its cold facts, an unchanged Release build
+reported a 0.406-second Prepare state hit and a 2.824-second Bridge state hit;
+the complete Xcode invocation took 20.83 seconds on a machine with only about
+469 MiB of free disk space. Bridge performed no Swift compilation on that hit.
+
+Changing the one marked pricing body produced, signed, verified, and staged a
+one-entry patch in 19.101 seconds. The installed Release App then changed the
+observed delivery fee from `¥19.99` to `¥0.00` at generation 1 and restored the
+audited original after rollback. This verifies that the compact Catalog-backed
+manifest, generic invokers, generated Swift Adapter Pack, patch compiler, and
+runtime activation path agree on the current schema-1 contract; it is a local
+functional measurement, not a cross-machine latency promise.

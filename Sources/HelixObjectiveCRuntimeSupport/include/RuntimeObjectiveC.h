@@ -70,12 +70,16 @@ bool helix_runtime_objective_c_object_conforms_to_protocol(
 
 /// Revalidates one cataloged declaration against the Objective-C metadata in
 /// the running OS before a production Runtime accepts its capability table.
+/// A compiler-authorized declaration missing from the public runtime class can
+/// defer its concrete implementation and ABI evidence until invocation
+/// receives or allocates the dynamic object.
 bool helix_runtime_objective_c_validate(
     const char *declaration_class_name,
     const char *dispatch_class_name,
     const char *selector_name,
     const char *lexical_superclass_name,
     HelixRuntimeObjectiveCDispatch dispatch,
+    bool allows_dynamic_object_implementation,
     const char *const *parameter_encodings,
     size_t parameter_count,
     const char *result_encoding,
@@ -90,6 +94,7 @@ bool helix_runtime_objective_c_invoke(
     const char *selector_name,
     const char *lexical_superclass_name,
     HelixRuntimeObjectiveCDispatch dispatch,
+    bool allows_dynamic_object_implementation,
     bool returns_retained,
     void *receiver,
     const HelixRuntimeObjectiveCArgument *arguments,

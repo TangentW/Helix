@@ -331,6 +331,15 @@ public enum ObjectiveCPropertyAccessor: String, Codable, Hashable, Sendable,
     case setter
 }
 
+/// Selects where the runtime may obtain an ordinary instance method's
+/// implementation after the compiler has proved its Objective-C declaration.
+public enum ObjectiveCImplementationLookup: String, Codable, Hashable,
+    Sendable, CaseIterable
+{
+    case declaringClass
+    case dynamicObjectWhenDeclarationMissing
+}
+
 /// A compiler-observed Objective-C property declaration. The exact accessor
 /// selector is stored separately in `Target`; this value preserves declaration
 /// identity without requiring optional property metadata at runtime.
@@ -358,6 +367,10 @@ public struct ObjectiveCMetadata: Codable, Hashable, Sendable {
     /// receiver value and keep this nil.
     public var dispatchClassName: String?
     public var methodFamily: Core.NativeCall.ObjectiveCMethodFamily
+    /// Compiler-authorized fallback for public abstract classes and class
+    /// clusters that install a declared method only on concrete subclasses.
+    public var implementationLookup:
+        Core.NativeCall.ObjectiveCImplementationLookup
     /// Runtime class at which an explicit lexical `super` lookup starts.
     /// Ordinary calls keep this nil and retain Objective-C dynamic dispatch.
     public var lexicalSuperclassName: String?
@@ -368,6 +381,8 @@ public struct ObjectiveCMetadata: Codable, Hashable, Sendable {
         runtimeClassName: String,
         dispatchClassName: String? = nil,
         methodFamily: Core.NativeCall.ObjectiveCMethodFamily = .none,
+        implementationLookup:
+            Core.NativeCall.ObjectiveCImplementationLookup = .declaringClass,
         lexicalSuperclassName: String? = nil,
         errorFailure: Core.NativeCall.ObjectiveCErrorFailure? = nil,
         property: Core.NativeCall.ObjectiveCProperty? = nil
@@ -375,6 +390,7 @@ public struct ObjectiveCMetadata: Codable, Hashable, Sendable {
         self.runtimeClassName = runtimeClassName
         self.dispatchClassName = dispatchClassName
         self.methodFamily = methodFamily
+        self.implementationLookup = implementationLookup
         self.lexicalSuperclassName = lexicalSuperclassName
         self.errorFailure = errorFailure
         self.property = property
@@ -1131,6 +1147,14 @@ public struct Descriptor: Codable, Hashable, Sendable {
                 if (target.dispatch == .instance)
                     != (objectiveC.dispatchClassName == nil) {
                     failures.append("dispatch class mismatch")
+                }
+                if objectiveC.implementationLookup
+                    == .dynamicObjectWhenDeclarationMissing,
+                   ((target.dispatch != .instance
+                        && target.dispatch != .initializer)
+                       || objectiveC.lexicalSuperclassName != nil)
+                {
+                    failures.append("invalid Objective-C implementation lookup")
                 }
                 if let property = objectiveC.property,
                    target.dispatch == .initializer

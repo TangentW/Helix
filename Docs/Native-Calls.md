@@ -100,6 +100,17 @@ default or synthesized operation owned by another module is not published in
 the current module's Catalog. Objective-C or C module disagreement remains a
 hard evidence error.
 
+Global-actor isolation is derived from the transitive `inheritsFrom` closure,
+because SDK Symbol Graphs may annotate `UIViewController` without repeating
+`@MainActor` on subclasses such as `UIActivityViewController`. If a relationship
+crosses a graph boundary and the declaration remains unannotated, Helix retries
+only a compiler diagnostic that explicitly proves a MainActor violation with an
+actor-isolated probe. The successful fact is cached under the original candidate
+identity; an explicit `nonisolated` declaration is never promoted. Swift 6
+diagnostics for concurrency-unsafe shared mutable state are instead isolated as
+deterministic per-candidate rejections. Helix does not suppress them with a
+module-wide `@preconcurrency import`, which would also weaken real actor evidence.
+
 The complete validated document and compiler projection are cached together
 under the module identity. Absolute project and DerivedData locations in Swift
 and Clang module-loading flags are replaced by ordered placeholders; the
@@ -264,8 +275,21 @@ cataloged declaration class (or the pinned lexical superclass), compares every
 runtime type encoding and storage kind, verifies that the separately recorded
 class dispatch target inherits from that declaration class, and invokes the
 concrete receiver through `NSInvocation`. Ordinary Objective-C override dispatch is therefore
-preserved, while a selector that exists only on an unexpected runtime subclass
-cannot expand the cataloged authority. Receiver ancestry is read directly from
+preserved, while a runtime subclass cannot name a selector beyond the
+compiler-cataloged authority. Public abstract classes and class clusters may
+declare an instance method in the SDK but install it only on a concrete private
+subclass. Class-cluster initializers can likewise install `init` only on the
+private object returned by `+alloc`. Compiler-generated descriptors explicitly
+authorize dynamic-object implementation lookup for ordinary instance calls and
+initializers: startup validates everything available on the declaration class,
+and a missing implementation defers only the selector/encoding evidence until
+a real receiver or allocated object exists. Invocation then requires that
+object to inherit the authorized class and implement the cataloged selector
+with a compatible complete ABI. Descriptors without this compiler-issued
+policy, class methods, and lexical `super` calls cannot use this fallback. A
+failed initializer validation releases its pending `+alloc` ownership before
+returning.
+Receiver ancestry is read directly from
 the Objective-C runtime rather than through overridable `isKindOfClass:`
 messaging, and an ordinary dynamic override must retain the declaration's
 complete ABI before it can be invoked. Property calls use the compiler-proven
@@ -276,6 +300,15 @@ families, and returns object results at one explicit ownership boundary. The
 runtime also rechecks receiver class, platform availability, nilability,
 structure encoding/size/alignment, deadline, MainActor entry, temporary
 storage, and result length before decoding the result.
+
+The catalog/runtime comparison also models one compiler-defined representation
+rule: Clang Importer may expose an unsigned Objective-C integer as `Swift.Int`,
+so canonical SIL records a signed logical boundary while the declaration keeps
+its unsigned Objective-C encoding. Corresponding signed/unsigned C integer
+encodings are accepted only when they are the same representation width. This
+does not relax selector, arity, storage-size, object/scalar, structure, or
+dynamic-override checks; override signatures remain strict. The authenticated,
+compiler-derived Descriptor remains the semantic contract seen by bytecode.
 
 This removes per-method executable Bridge code for supported Objective-C calls;
 it does not permit arbitrary selectors. Every executable call must still be an
