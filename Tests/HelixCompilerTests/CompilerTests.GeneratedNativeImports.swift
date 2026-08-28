@@ -45,6 +45,119 @@ struct GeneratedNativeImports {
         ))
     }
 
+    @Test("App-owned owners preserve a namespace equal to their module")
+    func preservesModuleNamedApplicationNamespace() {
+        let generator = BridgeGeneration.Generator()
+
+        func generated(
+            dispatch: BridgeGeneration.GeneratedNativeImport.Dispatch,
+            baseName: String,
+            labels: [String] = []
+        ) -> BridgeGeneration.GeneratedNativeImport {
+            .init(
+                declarationMangledName: "$s17LiveReloadFeature"
+                    + "06ScreenC10ControllerC",
+                sourceFileLogicalID: "Sources/LiveReloadFeature.Screen.swift",
+                dispatch: dispatch,
+                ownerType: "LiveReloadFeature.ScreenViewController",
+                baseName: baseName,
+                argumentLabels: labels,
+                parameterSwiftTypes: [],
+                resultSwiftType: "Swift.Void"
+            )
+        }
+
+        func target(
+            _ member: String,
+            dispatch: Core.NativeCall.Dispatch
+        ) -> Core.NativeCall.Target {
+            .init(
+                backend: .swiftAdapter,
+                module: "LiveReloadFeature",
+                owner: "LiveReloadFeature.ScreenViewController",
+                member: member,
+                entryPoint: "LiveReloadFeature.LiveReloadFeature."
+                    + "ScreenViewController.\(member)",
+                dispatch: dispatch,
+                receiverArgumentIndex: dispatch == .instance ? 0 : nil
+            )
+        }
+
+        #expect(generator.generatedSwiftCallMatchesDescriptor(
+            generated(dispatch: .initializer, baseName: "init"),
+            target: target("init()", dispatch: .initializer)
+        ))
+        #expect(generator.generatedSwiftCallMatchesDescriptor(
+            generated(dispatch: .staticMethod, baseName: "make"),
+            target: target("make()", dispatch: .static)
+        ))
+        #expect(generator.generatedSwiftCallMatchesDescriptor(
+            generated(dispatch: .instanceMethod, baseName: "refresh"),
+            target: target("refresh()", dispatch: .instance)
+        ))
+        #expect(generator.generatedSwiftCallMatchesDescriptor(
+            generated(dispatch: .instanceGetter, baseName: "detailLabel"),
+            target: target("detailLabel.get", dispatch: .instance)
+        ))
+        #expect(!generator.generatedSwiftCallMatchesDescriptor(
+            generated(dispatch: .instanceGetter, baseName: "detailLabel"),
+            target: .init(
+                backend: .swiftAdapter,
+                module: "LiveReloadFeature",
+                owner: "ScreenViewController",
+                member: "detailLabel.get",
+                entryPoint: "LiveReloadFeature.ScreenViewController."
+                    + "detailLabel.get",
+                dispatch: .instance,
+                receiverArgumentIndex: 0
+            )
+        ))
+    }
+
+    @Test("App-local imported globals preserve their compiler namespace")
+    func acceptsNamespacedImportedGlobalIdentity() {
+        let generated = BridgeGeneration.GeneratedNativeImport(
+            declarationMangledName: "$sSo18CACurrentMediaTimeSdyF",
+            sourceFileLogicalID: "Sources/Animation.swift",
+            dispatch: .globalFunction,
+            baseName: "CACurrentMediaTime",
+            argumentLabels: [],
+            parameterSwiftTypes: [],
+            resultSwiftType: "Swift.Double"
+        )
+        func target(_ entryPoint: String) -> Core.NativeCall.Target {
+            .init(
+                backend: .swiftAdapter,
+                module: "Fixture",
+                member: String(entryPoint.dropFirst("Fixture.".count)),
+                entryPoint: entryPoint,
+                dispatch: .global
+            )
+        }
+        let generator = BridgeGeneration.Generator()
+
+        #expect(generator.generatedSwiftCallMatchesDescriptor(
+            generated,
+            target: target(
+                "Fixture.HelixExternal.__C.CACurrentMediaTime().call"
+            )
+        ))
+        #expect(!generator.generatedSwiftCallMatchesDescriptor(
+            generated,
+            target: target("Fixture.__C.CACurrentMediaTime().call")
+        ))
+        #expect(!generator.generatedSwiftCallMatchesDescriptor(
+            generated,
+            target: target("Fixture.HelixExternal.__C.CAFrameTime().call")
+        ))
+        #expect(!generator.generatedSwiftCallMatchesDescriptor(
+            generated,
+            target: target(
+                "Fixture.HelixExternal.__C?.CACurrentMediaTime().call"
+            )
+        ))
+    }
+
     @Test("Swift aliases may spell an initializer owner and result differently")
     func acceptsCompilerProvenInitializerAliases() throws {
         let fixture = try makeAliasInitializerFixture()

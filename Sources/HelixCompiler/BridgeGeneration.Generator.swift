@@ -4075,8 +4075,16 @@ public struct Generator: Sendable {
             + generated.argumentLabels.map { ($0 == "_" ? "_" : $0) + ":" }
                 .joined() + ")"
         let owner = generated.ownerType.map { value in
-            value.hasPrefix(modulePrefix)
-                ? String(value.dropFirst(modulePrefix.count)) : value
+            guard let nativeModuleName = generated.nativeModuleName else {
+                // App-owned spellings are source-relative. Their first nominal
+                // component may legitimately equal the application module
+                // (Module.Module.NestedType), so textual prefix removal would
+                // change the declaration identity.
+                return value
+            }
+            let nativeModulePrefix = nativeModuleName + "."
+            return value.hasPrefix(nativeModulePrefix)
+                ? String(value.dropFirst(nativeModulePrefix.count)) : value
         }
 
         func matches(_ expected: String) -> Bool {
@@ -4096,7 +4104,24 @@ public struct Generator: Sendable {
             // synthesized external adapters append `.call` to keep generated
             // entry-point identities distinct. Both spellings are produced by
             // the compiler pipeline and bind the same exact callable tokens.
-            return matches(callable) || matches(callable + ".call")
+            if matches(callable) || matches(callable + ".call") {
+                return true
+            }
+            guard generated.nativeModuleName == nil else { return false }
+            // App-local adapters for imported globals preserve the compiler's
+            // declaring namespace in their identity (for example `__C`) even
+            // though Swift invokes the declaration as an unqualified global.
+            // The identity-only namespace is never rendered; the exact
+            // declaration identity and typed checks remain authoritative.
+            let prefix = "HelixExternal."
+            let suffix = "." + callable + ".call"
+            guard targetRelative.hasPrefix(prefix),
+                  targetRelative.hasSuffix(suffix)
+            else { return false }
+            let namespace = String(
+                targetRelative.dropFirst(prefix.count).dropLast(suffix.count)
+            )
+            return isValidModulePath(namespace)
         case .initializer:
             return owner.map { matches($0 + "." + callable) } == true
         case .staticMethod, .instanceMethod:
