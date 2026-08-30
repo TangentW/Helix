@@ -18,6 +18,14 @@ production hot patching.
 
 ![Helix system architecture](Assets/Helix.Architecture.svg)
 
+## Live Reload in action
+
+Edit Swift in Xcode and save. Helix compiles and activates the change in the
+running App without rebuilding or reinstalling it, while preserving its
+in-memory state.
+
+https://github.com/user-attachments/assets/7b3d4124-23a0-44ad-8c27-57a5080d03d6
+
 ## Start here
 
 | Goal | Guide |

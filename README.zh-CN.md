@@ -13,6 +13,13 @@ Helix 让 Swift 真正拥有线上热修复与实时热重载能力。开发阶�
 
 ![Helix 系统架构](Assets/Helix.Architecture.zh-CN.svg)
 
+## 实时热重载演示
+
+在 Xcode 中修改 Swift 代码并保存，Helix 无需重新构建或安装 App，即可编译并
+激活修改，同时保留运行中的内存状态。
+
+https://github.com/user-attachments/assets/7b3d4124-23a0-44ad-8c27-57a5080d03d6
+
 ## 从这里开始
 
 | 目标 | 指南 |
