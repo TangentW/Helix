@@ -176,6 +176,9 @@ public struct FrontendJobNormalizer: Sendable {
                 index += 2
                 continue
             }
+            if let search = BuildCapture.SearchPaths.attached(argument) {
+                searchPaths.append(absolute(search.path, relativeTo: workingDirectory))
+            }
             if argument.hasSuffix(".swift"), !argument.hasPrefix("-") {
                 sources.append(absolute(argument, relativeTo: workingDirectory))
             }
@@ -267,6 +270,23 @@ public struct FrontendJobNormalizer: Sendable {
         }
         var result: [String] = []
         for argument in arguments {
+            if BuildCapture.SearchPaths.isRuntimePath(argument),
+               let flag = result.last, BuildCapture.SearchPaths.flags.contains(flag) {
+                // A misplaced dyld runpath is a search-path value, not a
+                // response file whose absence should abort capture replay.
+                result.removeLast()
+                result.append(flag + argument)
+                continue
+            }
+            if BuildCapture.SearchPaths.isRuntimePath(argument), result.count >= 3,
+               let forwarding = result.last, ["-Xcc", "-Xfrontend"].contains(forwarding),
+               result[result.count - 3] == forwarding,
+               BuildCapture.SearchPaths.flags.contains(result[result.count - 2]) {
+                let flag = result[result.count - 2]
+                result.removeLast(2)
+                result.append(flag + argument)
+                continue
+            }
             guard argument.hasPrefix("@"), argument.count > 1 else {
                 result.append(argument)
                 continue
@@ -281,7 +301,7 @@ public struct FrontendJobNormalizer: Sendable {
             result.append(
                 contentsOf: try expandResponseFiles(
                     nested,
-                    workingDirectory: URL(fileURLWithPath: path).deletingLastPathComponent(),
+                    workingDirectory: workingDirectory,
                     depth: depth + 1,
                     activePaths: activePaths.union([path])
                 )

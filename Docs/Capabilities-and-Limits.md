@@ -1031,3 +1031,9 @@ approval are independent of whether the bytecode engine works technically.
 For the surrounding flows, read [Architecture](Architecture.md),
 [Production Hot Patching](Production-Hot-Patching.md), and
 [Development Live Reload](Development-Live-Reload.md).
+
+File-private duplicate nominal names in different extension files are accepted
+by the source index. Declaration USRs and logical file scope keep them distinct.
+Their ambiguous textual SIL layouts cannot cross a structural HLBC boundary;
+this limitation does not block indexing unrelated methods in the same module.
+See [file-scoped identity compatibility](Architecture.md#file-scoped-source-identities).

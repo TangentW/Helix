@@ -274,3 +274,92 @@ audited original after rollback. This verifies that the compact Catalog-backed
 manifest, generic invokers, generated Swift Adapter Pack, patch compiler, and
 runtime activation path agree on the current schema-1 contract; it is a local
 functional measurement, not a cross-machine latency promise.
+
+## 2026-09-05 large-module indexing
+
+The integration report prompted a synthetic 2,500-file, single-module benchmark.
+It contains 2,500 public scalar functions and 147,780 source bytes, with no
+external imports. Helix was a Debug test build on arm64 macOS, using Apple Swift
+6.3.3, Simulator SDK build `23F81a`, and target
+`arm64-apple-ios15.0-simulator`. Each case ran once, without concurrent builds.
+Toolchain discovery and fixture creation are outside the timed receipt operation.
+The cold case starts with an empty Helix fixture cache, while system compiler
+caches can already be warm.
+
+The comparison below isolates SIL resolver reuse: both versions already contain
+the large-argument replay and file-scoped identity fixes. CPU sampling found that
+source declaration indexing rebuilt the entire module's symbol/location maps
+and resolved filesystem paths for every declaration. The adapter now builds one
+immutable resolver per SIL module, reuses it for functions, properties, and
+observers, and canonicalizes each distinct source path once during construction.
+`frontend.index_sil_functions` records that separate construction stage.
+
+| Receipt operation | Before resolver reuse | After resolver reuse |
+| --- | ---: | ---: |
+| Cold receipt | 99.020 s | 12.884 s |
+| Unchanged receipt cache hit | 0.829 s | 0.828 s |
+| One function-body edit, receipt miss | 100.116 s | 12.806 s |
+| Cold source-declaration indexing substage | 86.598 s | 0.439 s |
+
+The new resolver construction took 0.036 s. The unchanged hit launched zero
+compiler subprocesses; each miss launched seven measured subprocesses and still
+indexed all 2,500 declarations. The receipt was about 7.04 MB. The regression
+checks hit/miss behavior, unchanged receipt equality, body-change invalidation,
+and stable root symbols. Existing negative tests retain ambiguous-location
+rejection. The [reproducible fixture](../Tests/HelixBuildToolsTests/BuildToolsTests.LargeModulePerformance.swift)
+can export the exact toolchain and per-stage/subprocess trace with
+`HELIX_LARGE_MODULE_REPORT`; intermediate measurement files are not repository artifacts.
+
+Reproduce at large scale from the repository root:
+
+```sh
+HELIX_LARGE_MODULE_SOURCE_COUNT=2500 \
+HELIX_LARGE_MODULE_REPORT=/tmp/helix-large-module.json \
+swift test --scratch-path .build/validation --filter LargeModulePerformance
+```
+
+The regular suite uses 32 files; the explicit benchmark accepts 2 through 5,000.
+These results measure frontend receipt generation, not full Xcode Prepare,
+Bridge compilation, or save-to-device activation/UI latency. A 148 KB scalar
+fixture does not model the reported commercial module's business complexity,
+100 native imports, or 240 MB of compiler inputs. The report's 405.3-second failed
+cold Prepare and roughly 89-second typed AST are external observations, not
+before/after measurements of this fixture. Commercial-project steady saves and
+its complete cold Catalog closure still need measurement in that project.
+The supported pause/resume and local-cache prewarming workflow is documented in
+[Incremental build facts](Incremental-Build-Facts.md#search-paths-and-resumable-catalog-prewarm).
+
+The subsequent parser optimization reuses the declaration inventory across
+closed-dispatch rewriting and compiles the five fixed declaration expressions
+once. Repeating the same 2,500-file fixture with the same toolchain produced
+10.144 s for cold receipt generation, 10.093 s after a body edit, and 0.843 s for
+an unchanged hit. Identity and semantic SIL parsing each took about 1.93 s,
+compared with about 3.30 s above. This is another single-run Debug-build
+observation within the same receipt-only measurement boundary. Factory-body
+replacement and concurrent modules are covered by `CompilerTests.ModuleParsing`.
+
+## Large dependency input planning
+
+The 2026-09-05 planning fixture creates 100 framework directories with 20 headers
+and one module map each: 2,100 input files, 4,137,190 bytes. With a Debug Helix
+build on the same machine, planning those 100 module identities took 14.034 s
+before directory-inventory reuse and path-filter optimization, and 2.560 s after.
+All 100 module content hashes matched across the two runs. Each planned identity
+also matched a fresh independent capture in the regression test.
+
+The measurement includes Catalog input planning only. Fixture creation, the
+initial aggregate capture, and reference checks are outside the timed operation;
+it does not compile dependencies or generate their API Catalogs. These are
+single-run observations, not a benchmark of the commercial project's complete
+240 MB input set. Directory creation/removal, nested changes, permission changes,
+directory links, content edits, and retention limits have dedicated regressions.
+
+```sh
+HELIX_DEPENDENCY_MODULE_COUNT=100 \
+HELIX_DEPENDENCY_PLANNING_REPORT=/tmp/helix-dependency-planning.json \
+swift test --scratch-path .build/validation --filter DependencyPlanning
+```
+
+The regular suite uses eight modules; explicit measurements accept 1 through 256.
+The fixture is maintained in
+[BuildToolsTests.DependencyPlanning](../Tests/HelixBuildToolsTests/BuildToolsTests.DependencyPlanning.swift).

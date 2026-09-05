@@ -424,6 +424,16 @@ public final class Bootstrap: @unchecked Sendable {
             self.cacheDirectory = cacheDirectory
         }
 
+        /// Builds the startup policy for a project that explicitly qualified
+        /// its physical-device loading matrix. The original initializer is unchanged.
+        public init(deviceNativeMatrixQualified: Bool) {
+            self.init()
+            if deviceNativeMatrixQualified {
+                supportedBackends = [.hlbc, .nativeDynamicReplacement]
+                nativeChainingProbePassed = true
+            }
+        }
+
         private static var defaultBackends: [LiveReload.Backend] {
             #if os(iOS) && targetEnvironment(simulator)
             [.hlbc, .nativeDynamicReplacement]

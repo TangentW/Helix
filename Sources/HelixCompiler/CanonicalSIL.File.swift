@@ -223,11 +223,10 @@ public struct File: Sendable {
             typeEnvironment: rawTypeEnvironment
         )
         functions = parsedFunctions.map { dispatch.rewrite($0) }
-        typeEnvironment = try .init(
-            text: text,
-            functions: functions,
-            protocolConformances: parsedConformances
-        )
+        // Dispatch rewriting changes function bodies, not the declaration
+        // inventory. Reuse that inventory and refresh only affected factories.
+        typeEnvironment = functions == parsedFunctions ? rawTypeEnvironment
+            : try rawTypeEnvironment.replacingFactoryCandidates(functions)
         protocolConformances = parsedConformances
         protocolDispatchInventory = dispatchInventory
         sourceModuleByFile = sourceModules

@@ -25,17 +25,31 @@ public struct Source: Codable, Hashable, Sendable {
 public struct NominalType: Codable, Hashable, Sendable {
     public var moduleName: String
     public var canonicalName: String
+    /// An additive scope for private/fileprivate names. Absence preserves v1 IDs.
+    public var sourceFileLogicalID: String?
 
     public init(moduleName: String, canonicalName: String) {
+        self.init(moduleName: moduleName, canonicalName: canonicalName, sourceFileLogicalID: nil)
+    }
+
+    public init(moduleName: String, canonicalName: String, sourceFileLogicalID: String?) {
         self.moduleName = moduleName
         self.canonicalName = canonicalName
+        self.sourceFileLogicalID = sourceFileLogicalID
     }
 
     public var id: LiveReload.NominalTypeID {
-        .derive(module: moduleName, canonicalName: canonicalName)
+        if let sourceFileLogicalID {
+            .derive(module: moduleName, canonicalName: canonicalName,
+                    sourceFileLogicalID: sourceFileLogicalID)
+        } else {
+            .derive(module: moduleName, canonicalName: canonicalName)
+        }
     }
 
-    fileprivate var orderKey: String { "\(moduleName).\(canonicalName)" }
+    fileprivate var orderKey: String {
+        "\(moduleName).\(canonicalName)" + (sourceFileLogicalID.map { "\u{0}\($0)" } ?? "")
+    }
 }
 
 public struct NativeReplacement: Codable, Hashable, Sendable {
@@ -866,11 +880,15 @@ public struct Document: Codable, Hashable, Sendable {
         }
         if let nominal = root.nominalType {
             try validateNominal(nominal)
+            guard nominal.sourceFileLogicalID.map({ $0 == declaration.sourceFileLogicalID }) ?? true else {
+                throw ShellBuildReceipt.Error.invalid("nominal scope disagrees with its declaration source")
+            }
         }
     }
 
     private static func validateNominal(_ nominal: ShellBuildReceipt.NominalType) throws {
-        guard isModulePath(nominal.moduleName), isBoundText(nominal.canonicalName) else {
+        guard isModulePath(nominal.moduleName), isBoundText(nominal.canonicalName),
+              nominal.sourceFileLogicalID.map(isSafeLogicalPath) ?? true else {
             throw ShellBuildReceipt.Error.invalid("nominal type identity is invalid")
         }
     }

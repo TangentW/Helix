@@ -258,3 +258,84 @@ Measured before/after Demo evidence is maintained in
 [Build performance observability and baseline](Build-Performance-Baseline.md).
 All cache, state, telemetry, protocol, artifact, and product schema versions
 remain `1`; this optimization introduces no compatibility branch.
+
+## Large-module compiler replay
+
+Compiler launches switch to an owner-private, invocation-local Swift response
+file above 3,000 arguments or 128 KiB of argument bytes. Nested response files
+retain the invocation working directory; files are removed after completion or
+launch failure. This avoids Foundation's non-catchable argument-count exception.
+Captured bridging headers, PCH output directories, and C++ interoperability
+modes are replayed together with Clang arguments. Direct typed-AST, typecheck,
+and SIL calls resolve default macro plugins from the selected toolchain,
+including when the compiler is the `/usr/bin/swiftc` Xcode shim. This covers
+toolchain macros such as `@TaskLocal`; archive validation still rejects arbitrary
+plugin-loading arguments. Changing compiler inputs still requires a full build.
+
+The transform pipeline identity changes for these replay semantics. Rebuild the
+Shell to refresh prior build facts; no persisted ABI or archive schema is changed.
+
+Within each SIL parse, nominal declarations and error-storage facts are now
+extracted once. Closed protocol-dispatch rewriting reuses that inventory and
+refreshes factory analysis when function bodies change. The five fixed
+declaration grammar expressions are compiled once and shared as immutable
+expressions; source-dependent expressions are not retained globally. This
+reduces repeated parsing in large modules while preserving declaration errors,
+factory invalidation, and the existing canonical SIL/receipt identities.
+
+## Search paths and resumable Catalog prewarm
+
+Missing or unreadable `-F`, `-I`, and `-Fsystem` inputs produce `HLXBLD001`
+warnings naming the corresponding Xcode search-path setting. They are skipped
+during input discovery. An unreadable existing root disables cache reuse;
+a missing root remains in the input fingerprint so creating it invalidates
+previous facts. A misplaced `@executable_path`, `@loader_path`, or `@rpath`
+search path is preserved as a literal compiler argument and diagnosed with an
+`LD_RUNPATH_SEARCH_PATHS` hint. It is not opened as a response file. Real missing
+response files still fail. Relative nested response files resolve against the
+captured working directory, as Swift does.
+
+Catalog dependency expansion plans only newly discovered modules. The aggregate
+closure still has a 256-module bound; splitting it across waves does not bypass
+that bound. This reduces repeated input-directory scans without reusing
+unverified module identities.
+
+Within one synchronous Catalog plan, modules also share a bounded directory
+inventory. Each root and nested directory is checked by device/inode, mode,
+mtime, and ctime before its listing is reused; a change rebuilds that listing.
+Enumeration is streamed with the existing per-root bound, directory links are
+not followed, and at most 250,000 root/entry records are retained across the
+plan. No inventory survives the planning call or crosses tasks. Selected module
+maps and interface files are still read and hashed through the stable-read
+path for each module. Lookup helpers operate on path components without creating
+filesystem URLs merely to inspect suffixes.
+
+A module map at the search-root level now includes helper headers in that root
+even when their filenames do not start with the imported module name. Such
+header changes invalidate input hashes. This corrects incomplete invalidation
+for that layout; other stable module snapshots retain their existing identities.
+
+After a successful Live Reload Prepare, the private job and log are under
+`<profile-output>/.NativeAPICatalogPrewarm/<hash>.json` and `<hash>.log`. The
+automatic background worker continues to handle normal prewarming. To resume an
+interrupted job manually, run from its captured project working directory:
+
+```sh
+helix xcode catalog-prewarm --job "/absolute/path/to/job.json" --max-modules 1
+```
+
+`--max-modules` accepts 1 through 256 and limits newly generated modules per
+invocation. Verified cache hits do not consume the budget. A pause returns
+success and keeps the job; repeating the command resumes from completed module
+caches. Completion retires the job. Interrupting a compiler probe may require
+restarting that unfinished module. A concurrently running worker holds the job
+lock, and a second invocation reports that it is already running. Changed
+compiler, SDK, or module inputs require a fresh Prepare job.
+
+Prewarming populates the same user cache used by subsequent builds, normally
+`~/Library/Caches/Helix/BuildFacts` (or the captured `HELIX_BUILD_CACHE_DIR`).
+This supports preparing that local cache before later builds; it does not add
+an unchecked cross-machine Catalog import. Toolchain, SDK, target, semantic
+arguments, module bytes, and transform identity must still match. Cold cost
+depends on each module's actual API surface: multiplying UIKit's historical
+230-second measurement by the number of imports is not a measured estimate.

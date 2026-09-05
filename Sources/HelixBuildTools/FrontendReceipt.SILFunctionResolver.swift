@@ -21,6 +21,9 @@ struct SILFunctionResolver: Sendable {
 
     init(file: CanonicalSIL.File) {
         self.file = file
+        // Many functions share a source file. Resolve its symlinks once while
+        // constructing this module-local, immutable location index.
+        var canonicalPaths: [String: String] = [:]
         functionsByMangledName = Dictionary(
             grouping: file.functions,
             by: \.mangledName
@@ -28,9 +31,11 @@ struct SILFunctionResolver: Sendable {
         functionsByDeclarationLocation = Dictionary(grouping: file.functions.compactMap {
             function -> (DeclarationLocationKey, CanonicalSIL.Function)? in
             guard let location = function.declarationLocation else { return nil }
+            let path = canonicalPaths[location.file] ?? Self.canonicalPath(location.file)
+            canonicalPaths[location.file] = path
             return (
                 .init(
-                    file: Self.canonicalPath(location.file),
+                    file: path,
                     line: location.line,
                     column: location.column
                 ),

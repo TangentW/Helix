@@ -96,7 +96,9 @@ extension CLI.Application {
         )
         var snapshots: [NativeAPICatalog.Snapshot] = []
         var prewarmRequests: [NativeAPICatalog.BuildRequest] = []
-        var requestedModules = Set(importedModules)
+        var requestedModules = Set(try NativeAPICatalog.Planner.catalogModules(
+            importedModules, excluding: metadata.frontendInvocation.moduleName
+        ))
         var processedModules = Set<String>()
         var unresolvedModules = Set<String>()
         var cacheHits: UInt64 = 0
@@ -114,7 +116,11 @@ extension CLI.Application {
         )
         while true {
             let plan = try performance.measure("prepare.catalog_plan") {
-                planRequest.importedModules = Array(requestedModules).sorted()
+                // Previously processed modules already have exact identities.
+                // Re-scanning their input trees for every newly found dependency
+                // makes a large transitive closure quadratic in filesystem work.
+                planRequest.importedModules = requestedModules
+                    .subtracting(processedModules).subtracting(unresolvedModules).sorted()
                 return try NativeAPICatalog.Planner().plan(planRequest)
             }
             unresolvedModules.formUnion(plan.unresolvedModules)
@@ -174,7 +180,10 @@ extension CLI.Application {
                 }
             }
             let previousCount = requestedModules.count
-            requestedModules.formUnion(discoveredModules)
+            requestedModules = Set(try NativeAPICatalog.Planner.catalogModules(
+                Array(requestedModules.union(discoveredModules)),
+                excluding: metadata.frontendInvocation.moduleName
+            ))
             if requestedModules.count == previousCount { break }
         }
         let unresolved = unresolvedModules.sorted()
@@ -260,15 +269,34 @@ extension CLI.Application {
     func prewarmXcodeCatalogs(
         _ arguments: [String]
     ) throws -> CLI.Result {
+        if arguments == ["--help"] {
+            return .init(exitCode: 0, standardOutput: """
+            Usage: helix xcode catalog-prewarm --job <path> [--max-modules <1...256>]
+            Run from the captured project working directory. A module limit pauses
+            after that many cache misses; rerun the same job to resume. Completed
+            modules are reused and do not consume the limit. Changed build inputs
+            require a new Prepare job. The job is retired only after completion.
+
+            """)
+        }
         let options = try CLI.Arguments(
             arguments,
-            valueOptions: ["job"],
+            valueOptions: ["job", "max-modules"],
             flagOptions: []
         )
         guard options.positionals.isEmpty else {
             throw CLI.Error.usage(
                 "xcode catalog-prewarm accepts no positional arguments"
             )
+        }
+        let maximumModules: Int
+        if let value = try options.value("max-modules") {
+            guard let count = Int(value), (1...256).contains(count) else {
+                throw CLI.Error.usage("--max-modules must be an integer in 1...256")
+            }
+            maximumModules = count
+        } else {
+            maximumModules = 256
         }
         let jobURL = files.resolve(try options.require("job"))
         let descriptor = Darwin.open(
@@ -376,24 +404,43 @@ extension CLI.Application {
         var processedModules = Set(
             initialPlan.requests.map { $0.identity.moduleName }
         ).subtracting(initialRequestModules)
-        var requestedModules = Set(job.planRequest.importedModules)
+        var requestedModules = Set(try NativeAPICatalog.Planner.catalogModules(
+            job.planRequest.importedModules,
+            excluding: job.planRequest.metadata.frontendInvocation.moduleName
+        ))
         var pending = job.requests
         var completedCount = 0
+        var generatedCount = 0
         while !pending.isEmpty {
             var referencedModules = Set<String>()
             for request in pending {
+                let output: NativeAPICatalog.BuildOutput
+                if let cached = try builder.cached(request) {
+                    output = cached
+                } else {
+                    guard generatedCount < maximumModules else {
+                        return .init(exitCode: 0, standardOutput:
+                            "Catalog prewarm paused: \(generatedCount) generated, "
+                            + "\(completedCount - generatedCount) cached; "
+                            + "rerun --job \(jobURL.path) to resume\n")
+                    }
+                    output = try builder.build(request)
+                    if output.metrics.cacheSource != .hit { generatedCount += 1 }
+                }
                 processedModules.insert(request.identity.moduleName)
-                let output = try builder.build(request)
                 completedCount += 1
                 referencedModules.formUnion(
                     output.snapshot.referencedModules
                 )
             }
             let previousCount = requestedModules.count
-            requestedModules.formUnion(referencedModules)
+            requestedModules = Set(try NativeAPICatalog.Planner.catalogModules(
+                Array(requestedModules.union(referencedModules)),
+                excluding: job.planRequest.metadata.frontendInvocation.moduleName
+            ))
             guard requestedModules.count != previousCount else { break }
             var followupRequest = job.planRequest
-            followupRequest.importedModules = Array(requestedModules).sorted()
+            followupRequest.importedModules = requestedModules.subtracting(processedModules).sorted()
             let followup = try NativeAPICatalog.Planner().plan(
                 followupRequest
             )

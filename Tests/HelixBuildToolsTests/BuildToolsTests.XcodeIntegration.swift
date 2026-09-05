@@ -457,7 +457,7 @@ struct XcodeIntegrationContract {
         #expect(!semantic.contains("/Build/Outputs.json"))
         #expect(try XcodeIntegration.CompilerArguments.moduleSearchArguments(
             from: captured
-        ) == ["-I", "/Build/Products"])
+        ) == ["-I", "/Build/Products", "-F", "/Frameworks"])
 
         #expect(throws: XcodeIntegration.CompilerArgumentError.missing(
             "-enable-dynamic-replacement-chaining"

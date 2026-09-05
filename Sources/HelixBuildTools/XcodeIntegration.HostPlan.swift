@@ -73,6 +73,8 @@ public struct Profile: Codable, Hashable, Sendable {
     public var namespaceSeed: String
     public var featureID: String
     public var patch: XcodeIntegration.PatchSettings?
+    /// Explicit project-owned qualification; omission keeps device Native disabled.
+    public var deviceNativeMatrixQualified: Bool?
 
     public init(
         id: String,
@@ -94,9 +96,38 @@ public struct Profile: Codable, Hashable, Sendable {
         self.namespaceSeed = namespaceSeed
         self.featureID = featureID
         self.patch = patch
+        self.deviceNativeMatrixQualified = nil
+    }
+
+    public init(
+        id: String,
+        workflow: XcodeIntegration.Workflow,
+        schemeName: String,
+        applicationTargetName: String,
+        configurationName: String,
+        bundleIdentifier: String,
+        namespaceSeed: String,
+        featureID: String,
+        patch: XcodeIntegration.PatchSettings? = nil,
+        deviceNativeMatrixQualified: Bool
+    ) {
+        self.init(
+            id: id, workflow: workflow, schemeName: schemeName,
+            applicationTargetName: applicationTargetName, configurationName: configurationName,
+            bundleIdentifier: bundleIdentifier, namespaceSeed: namespaceSeed,
+            featureID: featureID, patch: patch
+        )
+        self.deviceNativeMatrixQualified = deviceNativeMatrixQualified
     }
 
     public var runtimePackageProduct: String { workflow.runtimePackageProduct }
+
+    public var runtimeAutostartSymbol: String {
+        guard workflow == .liveReload else { return "hlx_runtime_autostart_v1" }
+        return deviceNativeMatrixQualified == true
+            ? "hlx_dev_runtime_autostart_device_native_qualified_v1"
+            : "hlx_dev_runtime_autostart_v1"
+    }
 }
 
 /// Hub-owned routing for one Xcode host. It records only the selected targets
@@ -276,6 +307,11 @@ public struct HostPlan: Codable, Hashable, Sendable {
     }
 
     private static func validate(_ profile: XcodeIntegration.Profile) throws {
+        guard profile.deviceNativeMatrixQualified != true || profile.workflow == .liveReload else {
+            throw XcodeIntegration.Error.invalidHostPlan(
+                "device Native qualification is available only for Live Reload profiles"
+            )
+        }
         guard isFileComponent(profile.id),
               isDisplayName(profile.schemeName),
               isDisplayName(profile.applicationTargetName),

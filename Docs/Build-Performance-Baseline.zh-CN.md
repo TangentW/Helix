@@ -237,3 +237,75 @@ identity 完成一次冷填充后，源码不变的 Release Build 中 Prepare st
 改为 `¥0.00`，随后回滚又恢复到经过审计的原始实现。这证明紧凑的 Catalog-backed
 manifest、通用调用器、生成式 Swift Adapter Pack、补丁编译器和运行时激活链在当前
 schema 1 合同下能够端到端一致工作；这些仍是本机功能实测，不是跨机器延迟承诺。
+
+## 2026-09-05 大模块索引实测
+
+根据接入报告，新增了单模块 2,500 文件的合成基准，共 2,500 个 public 标量函数、
+147,780 字节源码，没有外部 import。Helix 使用 arm64 macOS 上的 Debug 测试构建，
+Apple Swift 6.3.3、Simulator SDK build `23F81a`，目标为
+`arm64-apple-ios15.0-simulator`。每个场景单次运行，期间没有其他并发构建。
+计时不含工具链发现和 fixture 创建；冷路径使用空的 Helix fixture 缓存，系统编译缓存
+可能已经预热。
+
+下表只比较 SIL resolver 复用前后：两次运行都已包含大参数重放与文件作用域身份修正。
+CPU 采样发现，源码索引原本在每个声明上重建整个模块的 symbol/location 映射，并反复
+解析文件路径。现在每个 SIL 模块只创建一次不可变 resolver，函数、属性、observer
+共用它；建立索引时，每个不同源文件路径只解析一次。新增
+`frontend.index_sil_functions` 阶段记录这次建立成本。
+
+| Receipt 操作 | 复用前 | 复用后 |
+| --- | ---: | ---: |
+| 冷 receipt | 99.020 s | 12.884 s |
+| 无改动 receipt 缓存命中 | 0.829 s | 0.828 s |
+| 单个函数体修改，receipt miss | 100.116 s | 12.806 s |
+| 冷路径中的源码声明索引子阶段 | 86.598 s | 0.439 s |
+
+新的 resolver 建立耗时 0.036 秒。无改动命中没有启动编译子进程；每次 miss 均记录
+7 次子进程调用，仍索引全部 2,500 个声明。Receipt 约 7.04 MB。回归测试检查命中/失效、
+无改动 receipt 一致性、函数体变化触发失效和 root symbol 稳定性，已有负例继续验证
+location 歧义会被拒绝。[可复现 fixture](../Tests/HelixBuildToolsTests/BuildToolsTests.LargeModulePerformance.swift)
+可通过 `HELIX_LARGE_MODULE_REPORT` 导出精确工具链、阶段与子进程数据，中间测量文件
+不作为仓库产物保存。
+
+在仓库根目录复现大规模运行：
+
+```sh
+HELIX_LARGE_MODULE_SOURCE_COUNT=2500 \
+HELIX_LARGE_MODULE_REPORT=/tmp/helix-large-module.json \
+swift test --scratch-path .build/validation --filter LargeModulePerformance
+```
+
+常规测试使用 32 个文件；显式基准允许 2 到 5,000 个文件。这些数字衡量 frontend
+receipt 生成，不包含完整 Xcode Prepare、Bridge 编译或保存到设备激活、UI 刷新的延迟。
+148 KB 的标量 fixture 不能代表报告中商业模块的业务复杂度、100 个原生 import 和
+240 MB compiler inputs。报告中的失败冷 Prepare 405.3 秒、typed AST 约 89 秒是接入方
+观察，不能作为这个 fixture 的优化前数据。商业工程稳态保存和完整冷 Catalog 闭包
+仍需要在该工程测量。已支持的暂停、续跑与本机缓存预热操作见
+[增量构建事实](Incremental-Build-Facts.zh-CN.md#搜索路径与-catalog-预热续跑)。
+
+后续解析优化在闭合派发重写前后复用声明记录，五个固定声明正则只编译一次。
+用相同工具链再次运行同一 2,500 文件 fixture，冷 receipt 为 10.144 秒，函数体修改后
+为 10.093 秒，无改动命中为 0.843 秒。Identity 与 semantic SIL 解析各约 1.93 秒，
+上表运行时各约 3.30 秒。这仍是同一 receipt 测量边界内的单次 Debug 构建观察。
+`CompilerTests.ModuleParsing` 覆盖 factory body 替换和多个模块的并发解析。
+
+## 大量依赖的输入规划
+
+2026-09-05 的规划 fixture 创建 100 个 framework 目录，每个包含 20 个头文件和一个
+module map，共 2,100 个输入文件、4,137,190 字节。同机 Debug Helix 构建下，规划
+100 个模块身份耗时从目录记录复用和路径筛选优化前的 14.034 秒降到 2.560 秒。
+前后 100 个模块的内容 hash 全部一致；回归测试还逐个对照独立重新捕获的身份。
+
+这里只计时 Catalog 输入规划，fixture 创建、首次整体输入捕获和参考结果校验均不在
+计时内，没有编译依赖或生成其 API Catalog。这是单次观察，不代表商业工程完整
+240 MB 输入集。目录创建/删除、子目录变化、权限变化、目录链接、内容修改和保留数量
+上限都有单独回归覆盖。
+
+```sh
+HELIX_DEPENDENCY_MODULE_COUNT=100 \
+HELIX_DEPENDENCY_PLANNING_REPORT=/tmp/helix-dependency-planning.json \
+swift test --scratch-path .build/validation --filter DependencyPlanning
+```
+
+常规测试使用 8 个模块，显式测量接受 1 到 256 个。Fixture 位于
+[BuildToolsTests.DependencyPlanning](../Tests/HelixBuildToolsTests/BuildToolsTests.DependencyPlanning.swift)。

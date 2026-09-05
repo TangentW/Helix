@@ -149,6 +149,15 @@ Imported Optional property 在比较或复制时还会产生 address-form SIL。
 
 `.automatic` 是生成配置和公开 API 的默认值。经过资格验证的 iOS Simulator 会优先选择原生 Swift Dynamic Replacement，直接保留 Swift 编译器的普通函数体语义，避免把 HLBC 语法覆盖变成日常热重载上限；只要变化 root 不能全部使用该后端，就回退到验证后的 HLBC。物理设备默认仍选择 HLBC，除非另有明确通过的 device/native 矩阵；生产 Hot Patch 不具备这项开发期 image 加载权限。
 
+接入方完成设备、OS、签名和 replacement chaining 组合验证后，可以在 `HostPlan.json`
+的 `profiles` 数组中，为 Live Reload Profile 显式设置
+`"deviceNativeMatrixQualified": true`。省略或设为 `false` 会保留真机 HLBC 默认值；
+Hot Patch Profile 不接受 `true`。修改后重新生成集成并完整构建 App。同一个 Profile 值
+会同时配置 Hub 路由和 App 公布的后端能力；独立的
+`hlx_dev_runtime_autostart_device_native_qualified_v1` C 入口启用资格配置，旧的
+`hlx_dev_runtime_autostart_v1` 行为不变。这个字段记录接入方的资格决定，并不替代真机
+验证；资源限制和签名 image 校验仍然生效。
+
 仓库 Simulator E2E 会把同一套八次更新、五个 UIKit 场景分别通过自动原生路由和强制 HLBC 各执行一轮。强制 HLBC 轮次会验证纯 Swift SDK 候选从 dormant 状态首次使用、签名按需 Adapter 加载、generation 激活和最终源码恢复，全程无需重新安装 Shell。原生 image 无法安全卸载，因此数量和累计映射字节仍是进程生命周期资源边界，接近边界时会明确要求重启 App；另一个 128 代确定性 soak 独立验证 HLBC 生命周期。
 
 ## 为什么代码激活后页面不会天然重绘
@@ -156,6 +165,10 @@ Imported Optional property 在比较或复制时还会产生 address-form SIL。
 替换函数只会改变之后的调用，不会让 UIKit 再次调用已经完成的 `viewDidLoad`、`loadView` 或 initializer。因此 Helix 把 UI 更新作为第二个明确阶段。
 
 `ReloadIndex` 记录变化的源码/类型身份和 hint。UIKit target discovery 现在完全自动化，业务代码不再维护 `typeRegistry`。Coordinator 会从 `String(reflecting:)` 与 Objective-C runtime class name 还原编译器使用的稳定 nominal ID，并沿具体类的 superclass 链与变化类型匹配。
+
+文件作用域 nominal ID 还包含运行时反射无法还原的逻辑源文件路径。这类 private root
+需要显式 reload boundary 或手动刷新，Helix 不会把它匹配到另一个同名类型。
+详见[文件作用域身份](Architecture.zh-CN.md#文件作用域的源码类型身份)。
 
 实例搜索从 foreground active/inactive 的 `UIWindowScene` 开始，遍历 root、presented、navigation、tab、split 与 child controller 图；默认只保留已经加载且可见的 controller，并按对象 identity 去重。它会先匹配 controller，只有仍未命中的类型才扫描这些 controller 已加载的 UIView tree，从而避免普通页面修改每次都付出完整 view walk。修改基类也能直接命中当前展示的子类实例。
 

@@ -151,3 +151,19 @@ Release 审计会扫描最终 bundle，而不是信任 target 名称。生产 Ru
 仓库目前包含可运行的受限 HLBC 生产客户端链，以及可运行的 Simulator HLBC Live Reload 链。后者已经在同一个 App 进程中验证修改后的实现和第二代 baseline 恢复。Hot Patch Demo 还能把签名补丁模拟为一次本地下载，并走正常验签、安装、激活与回滚路径。
 
 仓库还包含四个接近业务代码的 corpus 文件，以及确定性的 128 代进程内 soak；后者覆盖失败保存、激活、回滚、调用、snapshot 压缩和 generation ID 单调性。这些证据仍不代表 App Store 下发已经合规，也不代表任意 Swift 语法、真实 iPhone 执行、外部 top-200 应用 corpus、真机长时间内存压力/前后台循环或外部 Registry/HSM/审批控制面已经完成。具体边界见[能力与限制](Capabilities-and-Limits.zh-CN.md)。
+
+### 文件作用域的源码类型身份
+
+源码 nominal 以编译器 USR 区分声明，并在逻辑源文件作用域中查找展示名。
+`private`、`fileprivate` 类型、其嵌套声明和 typealias 可在不同文件重复出现；
+相互矛盾的 USR 和非文件私有声明的重名仍报错。Swift 文本 SIL 摘要没有保留
+这类名字的消歧信息，因此重名布局及其子类型不进入结构化 HLBC codec，
+其他声明仍正常索引。
+
+`ShellBuildReceipt.NominalType` 在 schema 1 增加可选 `sourceFileLogicalID`。
+字段缺省时保持原始编码和 `HLX.NominalType.v1` 身份；文件私有 root 使用新增
+`HLX.NominalType.FileScoped.v2`，输入为模块、源码拼写和逻辑路径。修改正文或
+迁移 checkout 不改变这个 nominal ID；移动逻辑源文件需重建 Shell。
+transform pipeline identity 同步更新，使旧本地 receipt 和 Shell 完整重建。
+已有公开 API 和未限定文件作用域的持久化 ID 含义不变。仅靠反射的 UI 发现无法
+恢复私有类型的逻辑文件作用域，这类 root 需显式匹配 boundary，或在代码激活后手动刷新。

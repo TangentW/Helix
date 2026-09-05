@@ -50,6 +50,20 @@ public static func capture(
     workingDirectory: URL,
     importedModules: Set<String>? = nil
 ) -> BuildCache.CompilerInputs.Snapshot {
+    capture(
+        arguments: arguments, currentModuleName: currentModuleName,
+        workingDirectory: workingDirectory, importedModules: importedModules,
+        directoryCache: nil
+    )
+}
+
+static func capture(
+    arguments: [String],
+    currentModuleName: String,
+    workingDirectory: URL,
+    importedModules: Set<String>?,
+    directoryCache: DirectoryInventoryCache?
+) -> BuildCache.CompilerInputs.Snapshot {
     let parsed = parseArguments(
         arguments,
         currentModuleName: currentModuleName,
@@ -192,10 +206,8 @@ public static func capture(
             continue
         }
         do {
-            let subpaths = try boundedSubpaths(
-                of: resolved,
-                maximumCount: 250_000
-            )
+            let subpaths = try directoryCache?.subpaths(of: resolved, maximumCount: 250_000)
+                ?? boundedSubpaths(of: resolved, maximumCount: 250_000)
             var moduleMapRoots = Set<String>()
             if location.kind == .searchRoot, let dependencyModules {
                 for subpath in subpaths where isModuleMapPath(subpath) {
@@ -309,9 +321,9 @@ private static func importedModuleContainer(
     _ path: String,
     modules: Set<String>
 ) -> Bool {
-    let name = URL(fileURLWithPath: path).lastPathComponent
-    return modules.contains {
-        name == "\($0).swiftmodule" || name == "\($0).framework"
+    let name = (path as NSString).lastPathComponent
+    return [".swiftmodule", ".framework"].contains { suffix in
+        name.hasSuffix(suffix) && modules.contains(String(name.dropLast(suffix.count)))
     }
 }
 
@@ -335,26 +347,23 @@ private static func belongsToImportedModule(
 ) -> Bool {
     let components = path.split(separator: "/").map(String.init)
     let name = components.last ?? path
-    if modules.contains(where: { module in
-        components.contains("\(module).swiftmodule")
-            || components.contains("\(module).framework")
-            || name == "\(module).swiftmodule"
-            || name == "\(module).swiftinterface"
-            || name == "\(module).private.swiftinterface"
-            || name == "\(module).swiftdoc"
-            || name == "\(module).swiftsourceinfo"
-            || name == "\(module).modulemap"
-            || name == "\(module).h"
+    if components.contains(where: { component in
+        [".swiftmodule", ".framework"].contains { suffix in
+            component.hasSuffix(suffix)
+                && modules.contains(String(component.dropLast(suffix.count)))
+        }
+    }) || [".swiftinterface", ".private.swiftinterface", ".swiftdoc", ".swiftsourceinfo", ".modulemap", ".h"].contains(where: { suffix in
+        name.hasSuffix(suffix) && modules.contains(String(name.dropLast(suffix.count)))
     }) {
         return true
     }
     return moduleMapRoots.contains { root in
-        root == "." || path == root || path.hasPrefix(root + "/")
+        root.isEmpty || root == "." || path == root || path.hasPrefix(root + "/")
     }
 }
 
 private static func isModuleMapPath(_ path: String) -> Bool {
-    URL(fileURLWithPath: path).lastPathComponent.lowercased()
+    (path as NSString).lastPathComponent.lowercased()
         .hasSuffix(".modulemap")
 }
 
@@ -378,7 +387,7 @@ private static func moduleMap(
 }
 
 static func isCompilerInterfacePath(_ path: String) -> Bool {
-    let name = URL(fileURLWithPath: path).lastPathComponent.lowercased()
+    let name = (path as NSString).lastPathComponent.lowercased()
     let suffixes = [
         ".swiftmodule", ".swiftinterface", ".swiftdoc", ".swiftsourceinfo",
         ".swiftcrossimport", ".abi.json", ".modulemap", ".pcm", ".pch",
@@ -435,7 +444,7 @@ static func boundedSubpaths(
 }
 
 private static func isHeaderInterfacePath(_ path: String) -> Bool {
-    let name = URL(fileURLWithPath: path).lastPathComponent.lowercased()
+    let name = (path as NSString).lastPathComponent.lowercased()
     return [".h", ".hh", ".hpp", ".inc", ".pch", ".apinotes"]
         .contains { name.hasSuffix($0) }
 }

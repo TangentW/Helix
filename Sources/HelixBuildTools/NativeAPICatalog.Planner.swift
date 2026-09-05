@@ -53,6 +53,15 @@ public struct BuildPlan: Sendable {
 public struct Planner: Sendable {
     public init() {}
 
+    /// Validates an accumulated closure before planning only its new members.
+    public static func catalogModules(_ importedModules: [String], excluding currentModule: String) throws -> [String] {
+        let modules = try ModuleSelection.catalogModules(importedModules, excluding: currentModule)
+        guard modules.count <= 256 else {
+            throw NativeAPICatalog.Error.invalid("Catalog planning exceeds the 256-module build bound")
+        }
+        return modules
+    }
+
     public func plan(
         _ request: NativeAPICatalog.PlanRequest
     ) throws -> NativeAPICatalog.BuildPlan {
@@ -76,15 +85,10 @@ public struct Planner: Sendable {
                 "Catalog planning identity is incomplete or disagrees with the build"
             )
         }
-        let modules = try ModuleSelection.catalogModules(
+        let modules = try Self.catalogModules(
             request.importedModules,
             excluding: request.metadata.frontendInvocation.moduleName
         )
-        guard modules.count <= 256 else {
-            throw NativeAPICatalog.Error.invalid(
-                "Catalog planning exceeds the 256-module build bound"
-            )
-        }
         guard request.compilerInputs.isComplete else {
             return .init(requests: [], unresolvedModules: modules)
         }
@@ -101,13 +105,15 @@ public struct Planner: Sendable {
         )
         var requests: [NativeAPICatalog.BuildRequest] = []
         var unresolved: [String] = []
+        let directoryCache = BuildCache.CompilerInputs.DirectoryInventoryCache()
         for module in modules {
             let inputs = BuildCache.CompilerInputs.capture(
                 arguments: request.compilerArguments,
                 currentModuleName:
                     request.metadata.frontendInvocation.moduleName,
                 workingDirectory: request.workingDirectory,
-                importedModules: [module]
+                importedModules: [module],
+                directoryCache: directoryCache
             )
             guard inputs.isComplete else {
                 unresolved.append(module)

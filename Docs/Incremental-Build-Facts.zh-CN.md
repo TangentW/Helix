@@ -195,3 +195,65 @@ schema 1 构建性能报告会记录决策，但不会泄露完整路径或编�
 
 真实 Demo 的优化前后数据记录在[构建性能观测与基线](Build-Performance-Baseline.zh-CN.md)。
 缓存、状态、观测、协议、产物和产品版本都继续保持 `1`，没有新增旧方案兼容分支。
+
+## 大模块编译重放
+
+编译调用超过 3,000 个参数或 128 KiB 参数字节时，自动使用仅当前用户可访问、
+每次调用独立的 Swift response file。嵌套 response file 保留调用的工作目录；
+成功或启动失败后均清理临时文件，避免 Foundation 参数数量超限直接 abort。
+捕获的 bridging header、PCH 输出目录和 C++ 互操作模式与 Clang 参数一起重放。
+直接 typed-AST、typecheck 和 SIL 调用从选中的工具链解析默认宏插件路径，
+也适用于 `/usr/bin/swiftc` Xcode shim。这覆盖 `@TaskLocal` 等工具链宏；
+archive 校验仍拒绝任意插件加载参数。编译输入变化仍要求完整构建。
+
+这些编译重放语义更新了 transform pipeline identity。旧 Shell 需完整重建
+以更新构建事实；持久化 ABI 和 archive schema 不变。
+
+每次 SIL 解析只提取一次 nominal 声明和 error storage 事实。闭合协议派发重写复用这份
+记录，并在函数体变化时重新分析 factory。五个固定的声明语法正则只编译一次，以不可变
+对象共享；源码相关的动态表达式不会留在全局缓存。这减少了大模块的重复解析，同时
+保留声明错误、factory 失效规则及原有 canonical SIL/receipt 身份。
+
+## 搜索路径与 Catalog 预热续跑
+
+不存在或不可读的 `-F`、`-I`、`-Fsystem` 输入会产生 `HLXBLD001` warning，指出对应
+的 Xcode 搜索路径设置，并在输入发现时跳过。已有但不可读的目录会禁用缓存复用；
+不存在的目录仍保留在输入指纹中，之后创建它会使旧事实失效。误放的
+`@executable_path`、`@loader_path`、`@rpath` 搜索路径会作为字面编译参数保留，并提示
+检查 `LD_RUNPATH_SEARCH_PATHS`，不会被当作 response file 打开。真正缺失的 response
+file 仍会报错；嵌套相对 response file 按 Swift 行为相对于捕获的工作目录解析。
+
+Catalog 依赖扩展只规划本轮新发现的模块，避免反复扫描已经处理过的模块输入目录。
+整个依赖闭包仍限制为 256 个模块，分轮扩展不能绕过总量限制，也不会复用未验证的
+模块身份。
+
+同一次同步 Catalog 规划内，各模块还会共用有总量限制的目录记录。复用前检查根目录
+及各子目录的 device/inode、权限、mtime 和 ctime，变化后重新列目录。遍历以流式执行，
+保留原有单搜索根目录上限，不跟随目录符号链接；整个规划最多保留 250,000 条根目录/目录项
+记录，不跨规划调用或任务共享。每个模块选中的 module map 和接口文件仍通过稳定读取
+路径重新读取、计算内容 hash。路径筛选直接检查路径组成，不再仅为检查文件名后缀
+创建可能触发文件系统查询的 URL。
+
+位于搜索根目录的 module map 现在会包含该目录内没有模块名前缀的辅助头文件；修改
+这些头文件会使输入 hash 失效。这修正了这种目录布局下失效不完整的问题，其他稳定
+模块 snapshot 保持原有身份。
+
+Live Reload Prepare 成功后，私有任务与日志位于
+`<profile-output>/.NativeAPICatalogPrewarm/<hash>.json` 和 `<hash>.log`。
+正常构建仍自动启动后台 worker。中断后手动续跑时，在任务捕获的工程工作目录执行：
+
+```sh
+helix xcode catalog-prewarm --job "/absolute/path/to/job.json" --max-modules 1
+```
+
+`--max-modules` 接受 1 到 256，限制单次新生成的模块数，已经验证的缓存命中不占额度。
+达到上限后成功退出并保留任务，再次运行同一命令会复用已经完成的模块；全部完成后
+才删除任务。中断 compiler probe 后，尚未完成的那个模块可能需要重新生成。并发 worker
+由任务文件锁协调，已有 worker 时新调用会提示任务正在运行。compiler、SDK 或模块
+输入发生变化后，需要重新 Prepare 生成任务。
+
+预热填充后续构建使用的同一用户缓存，默认为 `~/Library/Caches/Helix/BuildFacts`，
+也可以是任务捕获的 `HELIX_BUILD_CACHE_DIR`。因此可以提前准备本机缓存；这里没有新增
+跳过校验的跨机器 Catalog 导入。工具链、SDK、target、语义参数、模块字节和 transform
+身份仍须匹配。冷生成成本取决于各模块实际 API 面，不能把 UIKit 历史约 230 秒的单点
+数据乘以 import 数量，当成已经测得的大工程预热时间。

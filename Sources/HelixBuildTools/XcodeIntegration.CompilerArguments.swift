@@ -16,6 +16,8 @@ public enum CompilerArguments {
             "-module-alias", "-enable-upcoming-feature",
             "-enable-experimental-feature", "-clang-target", "-resource-dir",
             "-vfsoverlay",
+            "-import-objc-header", "-pch-output-dir",
+            "-cxx-interoperability-mode",
         ]
         let standalone: Set<String> = [
             "-enable-library-evolution", "-enable-testing", "-warnings-as-errors",
@@ -55,8 +57,10 @@ public enum CompilerArguments {
                 continue
             }
             if standalone.contains(argument)
+                || argument.hasPrefix("-cxx-interoperability-mode=")
                 || argument.hasPrefix("-I/")
                 || argument.hasPrefix("-F/")
+                || argument.hasPrefix("-Fsystem/")
                 || (argument.hasPrefix("-D") && argument.count > 2)
             {
                 try validate(argument)
@@ -81,6 +85,14 @@ public enum CompilerArguments {
         var index = 0
         while index < capturedArguments.count {
             let argument = capturedArguments[index]
+            if let prefix = ["-Fsystem/", "-F/", "-I/"].first(where: argument.hasPrefix) {
+                let flag = String(prefix.dropLast())
+                let path = String(argument.dropFirst(flag.count))
+                try validate(path)
+                result.append(contentsOf: [flag, path])
+                index += 1
+                continue
+            }
             guard ["-I", "-F", "-Fsystem"].contains(argument) else {
                 index += 1
                 continue

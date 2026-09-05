@@ -75,6 +75,18 @@ public struct NominalTypeID: Core.DigestIdentity {
         hasher.append(canonicalName)
         return .init(rawValue: hasher.finalize())
     }
+
+    /// Version-2 identity for a file-scoped nominal. Source content and absolute
+    /// checkout paths never participate; moving the logical file requires a rebuild.
+    public static func derive(
+        module: String, canonicalName: String, sourceFileLogicalID: String
+    ) -> Self {
+        var hasher = Core.StableHasher(domain: "HLX.NominalType.FileScoped.v2")
+        hasher.append(module)
+        hasher.append(canonicalName)
+        hasher.append(sourceFileLogicalID)
+        return .init(rawValue: hasher.finalize())
+    }
 }
 
 /// The application-defined name of a UIKit recreation factory.

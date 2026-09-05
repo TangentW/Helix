@@ -889,7 +889,7 @@ extension FrontendReceipt.Adapter {
     func resolvedAccessorFunction(
         _ accessor: FrontendReceipt.TypedAST.Object,
         source: SourceState,
-        silFile: CanonicalSIL.File,
+        silResolver: FrontendReceipt.SILFunctionResolver,
         declarationUSR: String
     ) throws -> CanonicalSIL.Function {
         guard let accessorUSR = accessor["usr"] as? String,
@@ -900,7 +900,7 @@ extension FrontendReceipt.Adapter {
             )
         }
         guard
-            let sil = try FrontendReceipt.SILFunctionResolver(file: silFile)
+            let sil = try silResolver
                 .function(for: accessor, source: source)
         else {
             throw FrontendReceipt.Error.missingSILFunction("$s" + accessorUSR.dropFirst(2))

@@ -545,6 +545,17 @@ back to verified HLBC. Physical-device builds continue to select HLBC unless a
 separate device/native matrix has been explicitly qualified; production Hot
 Patch never receives this development image-loading authority.
 
+A Live Reload entry in `HostPlan.json`'s `profiles` array may explicitly set
+`"deviceNativeMatrixQualified": true` after the integrating project has qualified
+its device, OS, signing, and replacement-chaining combination. Omission or
+`false` retains the device HLBC default; Hot Patch rejects `true`. Regenerate the
+integration and rebuild the App after changing this setting. The same Profile
+value configures Hub routing and the App's advertised backends. A separate
+`hlx_dev_runtime_autostart_device_native_qualified_v1` C entry enables the qualified
+startup policy; the existing `hlx_dev_runtime_autostart_v1` behavior is unchanged.
+The setting records the project's qualification decision, rather than running a
+device qualification test. Resource limits and signed-image checks still apply.
+
 The checked-in Simulator E2E runs the same eight-update, five-scenario UIKit
 workflow twice: once through automatic native routing and once with HLBC forced.
 The forced run proves first use of a dormant pure-Swift SDK candidate, signed
@@ -565,6 +576,11 @@ discovery is automatic; application code does not maintain a `typeRegistry`.
 For each action, the coordinator reconstructs the compiler's stable nominal ID
 from `String(reflecting:)`/Objective-C runtime class names, walks the concrete
 class's superclass chain, and compares those IDs with the changed type IDs.
+
+File-scoped nominal IDs also contain a logical source path that runtime
+reflection cannot reconstruct. Such private roots need an explicit reload
+boundary or manual refresh; Helix does not match them to an unrelated type with
+the same display name. See [file-scoped identity](Architecture.md#file-scoped-source-identities).
 
 The instance search starts from foreground-active or foreground-inactive
 `UIWindowScene` windows. It traverses root, presented, navigation, tab, split,

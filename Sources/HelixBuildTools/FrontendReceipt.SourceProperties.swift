@@ -12,7 +12,7 @@ extension FrontendReceipt.Adapter {
         moduleName: String,
         configuration: PatchConfiguration.Document,
         demangled: [String: String],
-        silFile: CanonicalSIL.File,
+        silResolver: FrontendReceipt.SILFunctionResolver,
         nativeTypes: [String: Core.TypeID],
         importedSwiftTypeAliases: [String: String]
     ) throws -> [Draft] {
@@ -91,7 +91,7 @@ extension FrontendReceipt.Adapter {
                     moduleName: moduleName,
                     effects: effects,
                     isolation: isolation,
-                    silFile: silFile
+                    silResolver: silResolver
                 ) {
                 drafts.append(draft)
             }
@@ -130,7 +130,7 @@ extension FrontendReceipt.Adapter {
                     moduleName: moduleName,
                     effects: effects,
                     isolation: isolation,
-                    silFile: silFile
+                    silResolver: silResolver
                 ) {
                 drafts.append(draft)
             }
@@ -155,12 +155,12 @@ extension FrontendReceipt.Adapter {
         moduleName: String,
         effects: Core.Effects,
         isolation: String?,
-        silFile: CanonicalSIL.File
+        silResolver: FrontendReceipt.SILFunctionResolver
     ) throws -> Draft? {
         guard let usr = accessor["usr"] as? String, usr.hasPrefix("s:") else {
             return nil
         }
-        guard let sil = try FrontendReceipt.SILFunctionResolver(file: silFile)
+        guard let sil = try silResolver
             .function(for: accessor, source: source, baseName: name)
         else { return nil }
         // Async and throwing accessors require a different invocation ABI.

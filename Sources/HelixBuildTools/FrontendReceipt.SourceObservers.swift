@@ -17,7 +17,7 @@ extension FrontendReceipt.Adapter {
         moduleName: String,
         configuration: PatchConfiguration.Document,
         demangled: [String: String],
-        silFile: CanonicalSIL.File,
+        silResolver: FrontendReceipt.SILFunctionResolver,
         typeEnvironment: CanonicalSIL.TypeEnvironment,
         nativeTypes: [String: Core.TypeID],
         localValueTypes: [String: Bytecode.LocalTypeKey],
@@ -94,7 +94,7 @@ extension FrontendReceipt.Adapter {
             let sil = try resolvedAccessorFunction(
                 accessor,
                 source: source,
-                silFile: silFile,
+                silResolver: silResolver,
                 declarationUSR: declarationUSR
             )
             guard let parameters = try sourceAccessorParameters(

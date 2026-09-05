@@ -125,6 +125,7 @@ public struct Driver: Sendable {
     public var defaultWorkingDirectoryURL: URL?
     public var invocationObserver: SwiftFrontend.InvocationObserver?
     private let sdkIdentityCache: SDKIdentityCache
+    let pluginResourceCache = PluginResourceCache()
 
     public init(
         compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
@@ -149,11 +150,15 @@ public struct Driver: Sendable {
         guard FileManager.default.isExecutableFile(atPath: compilerURL.path) else {
             throw SwiftFrontend.Error.executableNotFound(compilerURL.path)
         }
-        let semanticArguments = purpose.applying(
+        var semanticArguments = purpose.applying(
             to: additionalArguments,
             compilerURL: compilerURL
         )
-        let arguments = [
+        let isFrontend = compilerURL.lastPathComponent == "swift-frontend"
+        if isFrontend {
+            semanticArguments = try directFrontendReplayArguments(semanticArguments)
+        }
+        let arguments = (isFrontend ? ["-frontend"] : []) + [
             "-emit-sil", optimization,
             "-module-name", moduleName,
             "-Xllvm", "-sil-print-debuginfo",
@@ -202,7 +207,7 @@ public struct Driver: Sendable {
             "-module-name", invocation.moduleName,
             "-target", invocation.targetTriple,
             "-sdk", sdk.path,
-        ] + (try directFrontendArguments(invocation.semanticArguments))
+        ] + (try directFrontendReplayArguments(invocation.semanticArguments))
             + normalizedSources.map(\.path)
         let output = try run(arguments: arguments)
         guard output.terminationStatus == 0 else {
@@ -251,7 +256,7 @@ public struct Driver: Sendable {
             "-module-name", invocation.moduleName,
             "-target", invocation.targetTriple,
             "-sdk", sdk.path,
-        ] + (try directFrontendArguments(invocation.semanticArguments))
+        ] + (try directFrontendReplayArguments(invocation.semanticArguments))
             + normalizedSources.flatMap {
                 primaries.contains($0) ? ["-primary-file", $0.path] : [$0.path]
             }
@@ -279,11 +284,15 @@ public struct Driver: Sendable {
                 actual: sdk.buildVersion
             )
         }
-        let semanticArguments = purpose.applying(
+        var semanticArguments = purpose.applying(
             to: invocation.semanticArguments + additionalArguments,
             compilerURL: compilerURL
         )
-        let arguments = [
+        let isFrontend = compilerURL.lastPathComponent == "swift-frontend"
+        if isFrontend {
+            semanticArguments = try directFrontendReplayArguments(semanticArguments)
+        }
+        let arguments = (isFrontend ? ["-frontend"] : []) + [
             "-emit-sil", invocation.optimization,
             "-module-name", invocation.moduleName,
             "-target", invocation.targetTriple,
@@ -354,6 +363,11 @@ public struct Driver: Sendable {
         return result
     }
 
+    private func directFrontendReplayArguments(_ arguments: [String]) throws -> [String] {
+        let unwrapped = try directFrontendArguments(arguments)
+        return unwrapped + (try defaultPluginArguments(existing: unwrapped))
+    }
+
     public func sdkIdentity(name: String) throws -> SwiftFrontend.Driver.SDKIdentity {
         guard name == "iphoneos" || name == "iphonesimulator" else {
             throw SwiftFrontend.Error.sdkResolutionFailed("unsupported SDK name \(name)")
@@ -399,6 +413,9 @@ public struct Driver: Sendable {
     }
 
     public func run(arguments: [String], workingDirectory: URL? = nil) throws -> SwiftFrontend.Output {
+        guard arguments.allSatisfy({ !$0.utf8.contains(0) }) else {
+            throw SwiftFrontend.Error.launchFailed("compiler argument contains NUL")
+        }
         let startedAt = DispatchTime.now().uptimeNanoseconds
         let kind = invocationKind(arguments: arguments)
         let executableName = compilerURL.lastPathComponent
@@ -421,7 +438,11 @@ public struct Driver: Sendable {
         let captureDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("helix-frontend-capture-\(UUID().uuidString)", isDirectory: true)
         do {
-            try FileManager.default.createDirectory(at: captureDirectory, withIntermediateDirectories: false)
+            try FileManager.default.createDirectory(
+                at: captureDirectory,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
         } catch {
             throw SwiftFrontend.Error.launchFailed("cannot create output capture: \(error)")
         }
@@ -436,7 +457,25 @@ public struct Driver: Sendable {
 
         let process = Process()
         process.executableURL = compilerURL
-        process.arguments = arguments
+        if SwiftFrontend.ResponseFile.isRequired(for: arguments) {
+            guard ["swiftc", "swift", "swift-frontend", "swift-driver", "clang", "clang++"]
+                .contains(compilerURL.lastPathComponent)
+            else {
+                throw SwiftFrontend.Error.launchFailed(
+                    "argument list exceeds direct launch limits for \(executableName)"
+                )
+            }
+            let responseURL = captureDirectory.appendingPathComponent("arguments.resp")
+            do {
+                try SwiftFrontend.ResponseFile.render(arguments)
+                    .write(to: responseURL, atomically: true, encoding: .utf8)
+            } catch {
+                throw SwiftFrontend.Error.launchFailed("cannot write response file: \(error)")
+            }
+            process.arguments = ["@\(responseURL.path)"]
+        } else {
+            process.arguments = arguments
+        }
         process.currentDirectoryURL = workingDirectory
             ?? defaultWorkingDirectoryURL
         process.environment = environment

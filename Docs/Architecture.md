@@ -996,3 +996,22 @@ arbitrary Swift syntax, physical-iPhone execution, an external top-200
 application corpus, long-duration device memory/background cycling, or the
 external Registry/HSM/approval control plane. Those boundaries are summarized
 in [Capabilities and Limits](Capabilities-and-Limits.md).
+
+### File-scoped source identities
+
+Source nominal discovery keys declarations by compiler USR and resolves display
+names within their logical source file. `private` and `fileprivate` names, their
+nested declarations, and aliases may repeat across files. Contradictory USRs or
+non-file-scoped duplicate declarations remain errors. Swift's textual SIL summary
+omits the discriminator for these names, so ambiguous layouts and their children
+are unavailable to structural HLBC codecs; unaffected declarations still index.
+
+`ShellBuildReceipt.NominalType` adds an optional `sourceFileLogicalID` in schema 1.
+Absent fields retain the exact prior encoding and `HLX.NominalType.v1` identity.
+Scoped roots use the additive `HLX.NominalType.FileScoped.v2` derivation over module,
+source spelling, and logical path. Source edits and checkout relocation do not
+change this nominal ID; logical file moves require a new Shell. The transform
+pipeline identity is revised so earlier local receipts and Shells require a full
+rebuild. Existing public APIs and persisted unscoped IDs retain their meaning.
+Reflection-only UI discovery cannot infer a private logical file scope; such
+roots need an explicit matching boundary or manual refresh after code activation.

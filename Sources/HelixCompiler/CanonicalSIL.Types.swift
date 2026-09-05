@@ -76,6 +76,7 @@ public struct TypeEnvironment: Sendable {
 
     private struct NominalHeader {
         var isFinal: Bool
+        var isFileScoped: Bool
         var kind: String
         var name: String
         var conformances: [String]
@@ -94,6 +95,8 @@ public struct TypeEnvironment: Sendable {
         var genericDefinitions: [
             Bytecode.LocalTypeKey: RawGenericDefinition
         ] = [:]
+        var fileScopes: [Bytecode.LocalTypeKey: Bool] = [:]
+        var ambiguousNames = Set<Bytecode.LocalTypeKey>()
 
         // Canonical SIL starts with a declaration summary before function
         // bodies. Walk that brace tree so nested namespace identities remain
@@ -101,6 +104,18 @@ public struct TypeEnvironment: Sendable {
         mutating func parse() throws -> DefinitionInventory {
             try scanScope(parentScope: nil, stopsAtClosingBrace: false)
             removeDefinitionsWithImplicitOuterArchetypes()
+            // The textual SIL summary does not carry private discriminators.
+            // Keep unrelated definitions usable but never guess these layouts.
+            func isUnambiguous(_ key: Bytecode.LocalTypeKey) -> Bool {
+                var name: String? = key.rawValue
+                while let current = name {
+                    if ambiguousNames.contains(.init(rawValue: current)) { return false }
+                    name = TypeEnvironment.parentScope(of: current)
+                }
+                return true
+            }
+            definitions = definitions.filter { isUnambiguous($0.key) }
+            genericDefinitions = genericDefinitions.filter { isUnambiguous($0.key) }
             return .init(
                 concrete: definitions,
                 generic: genericDefinitions
@@ -193,6 +208,18 @@ public struct TypeEnvironment: Sendable {
                 relativeTo: parentScope
             )
             let key = Bytecode.LocalTypeKey(rawValue: name)
+            let isFileScoped = header.isFileScoped || parentScope.map {
+                fileScopes[.init(rawValue: $0)] == true
+            } == true
+            if let existingScope = fileScopes[key] {
+                guard existingScope && isFileScoped else {
+                    throw CanonicalSIL.LoweringError.malformedSIL("duplicate nominal type \(name)")
+                }
+                ambiguousNames.insert(key)
+                definitions.removeValue(forKey: key)
+                genericDefinitions.removeValue(forKey: key)
+            }
+            fileScopes[key] = isFileScoped
             var fields: [RawField] = []
             var hasUnparsedInstanceStorage = false
             var cases: [RawEnumCase] = []
@@ -205,6 +232,7 @@ public struct TypeEnvironment: Sendable {
                 let member = lines[index].trimmingCharacters(in: .whitespaces)
                 if member == "}" {
                     index += 1
+                    guard !ambiguousNames.contains(key) else { return }
                     let conformances = header.conformances
                     // Existing non-final classes belong to the frozen Shell. A
                     // downloaded image can add only final logical classes, so
@@ -451,6 +479,16 @@ public struct TypeEnvironment: Sendable {
         // parsed. Build everything whose field graph is already resolvable,
         // then rebuild strictly once those aliases have been injected.
         try rebuildFactoryTables(allowingUnresolvedTypes: true)
+    }
+
+    /// Reuses declarations from the same SIL text after closed-dispatch rewriting.
+    /// Factory detection must see the rewritten bodies; layout and error-storage
+    /// facts still come from the original, already validated declaration text.
+    func replacingFactoryCandidates(_ functions: [CanonicalSIL.Function]) throws -> Self {
+        var result = self
+        result.factoryCandidates = functions
+        try result.rebuildFactoryTables(allowingUnresolvedTypes: true)
+        return result
     }
 
     /// Returns an environment that resolves the exact native types frozen in
@@ -3021,6 +3059,10 @@ public struct TypeEnvironment: Sendable {
         }
         return .init(
             isFinal: !captures[0].isEmpty,
+            isFileScoped: line.range(
+                of: #"(?:^|\s)(?:private|fileprivate)\s"#,
+                options: .regularExpression
+            ) != nil,
             kind: captures[1],
             name: name,
             conformances: conformances,
@@ -3039,6 +3081,19 @@ public struct TypeEnvironment: Sendable {
 
     private static let hostedMethodPattern =
         #"^(?:(?:@[^\s]+|public|internal|package|private|fileprivate|override|final|dynamic|class|nonisolated)\s+)*func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)(?:\s+(?:async|throws|rethrows))*\s*$"#
+
+    // Only fixed grammar expressions are shared. Source-dependent patterns
+    // retain their existing lifetime and cannot grow an unbounded global cache.
+    private static let declarationExpressions: [String: NSRegularExpression] = {
+        let patterns = [nominalHeaderPattern, extensionHeaderPattern,
+                        storedFieldPattern, enumCaseDeclarationPattern, hostedMethodPattern]
+        return Dictionary(uniqueKeysWithValues: patterns.map { pattern in
+            guard let expression = try? NSRegularExpression(pattern: pattern) else {
+                preconditionFailure("invalid internal SIL declaration expression")
+            }
+            return (pattern, expression)
+        })
+    }()
 
     private static func hasUnsupportedFrozenExistential(
         in spelling: String
@@ -3325,7 +3380,8 @@ public struct TypeEnvironment: Sendable {
     }
 
     private static func captures(_ value: String, pattern: String) -> [String]? {
-        guard let expression = try? NSRegularExpression(pattern: pattern) else { return nil }
+        guard let expression = declarationExpressions[pattern]
+            ?? (try? NSRegularExpression(pattern: pattern)) else { return nil }
         let range = NSRange(value.startIndex..., in: value)
         guard let match = expression.firstMatch(in: value, range: range) else { return nil }
         return (1..<match.numberOfRanges).map { index in

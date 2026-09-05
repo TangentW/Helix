@@ -25,7 +25,9 @@ extension SwiftFrontend.CanonicalSILPurpose {
               !Self.containsSemanticPreservationOption(arguments)
         else { return arguments }
 
-        if compilerURL.resolvingSymlinksInPath().lastPathComponent == "swift-frontend" {
+        // Swift chooses driver/frontend mode from argv[0], even when swiftc
+        // is a symlink to the same swift-frontend executable.
+        if compilerURL.lastPathComponent == "swift-frontend" {
             return arguments + [Self.semanticPreservationOption]
         }
         return arguments + ["-Xfrontend", Self.semanticPreservationOption]

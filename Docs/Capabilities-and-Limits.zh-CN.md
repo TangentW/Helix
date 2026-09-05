@@ -171,3 +171,7 @@ Swift Package 的平台下限为 macOS 14 与 iOS 15。补丁绑定一个 finali
 当前 Release Builder 允许 internal 与 enterprise HLBC policy。App Store 通道仍是 `policyBlocked`，受控 Native Release 后端尚未实现。平台政策、签名与组织审批独立于字节码引擎是否在技术上能运行。
 
 完整流程见[总体架构](Architecture.zh-CN.md)、[生产热补丁](Production-Hot-Patching.zh-CN.md)和[开发期热重载](Development-Live-Reload.zh-CN.md)。
+
+不同 extension 文件中的同名文件私有 nominal 可以完成源码索引，USR 和逻辑
+文件作用域将它们区分开。存在歧义的文本 SIL 布局不能跨结构化 HLBC 边界，
+但不阻塞同模块其他方法的索引。兼容规则见[文件作用域身份](Architecture.zh-CN.md#文件作用域的源码类型身份)。

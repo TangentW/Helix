@@ -159,9 +159,7 @@ public struct Adapter: Sendable {
                 demangled: demangled
             )
         }
-        let sourceNominalsByName = Dictionary(uniqueKeysWithValues: sourceNominals.map {
-            ($0.canonicalName, $0)
-        })
+        let sourceNominalsByName = SourceNominalIndex(sourceNominals)
         let sourceNominalAliasIndex = SourceNominalAliasIndex(
             sourceNominals: sourceNominals,
             moduleName: moduleName
@@ -496,6 +494,11 @@ public struct Adapter: Sendable {
                     requiredImportedOperationSourceIDs
             )
         }
+        // Build location and symbol indexes once for this immutable SIL module.
+        // Recreating them for every declaration makes large modules quadratic.
+        let silResolver = performance.measure("frontend.index_sil_functions") {
+            FrontendReceipt.SILFunctionResolver(file: silFile)
+        }
         var drafts: [Draft] = []
         try performance.measure("frontend.index_source_declarations") {
         for document in documents {
@@ -521,7 +524,7 @@ public struct Adapter: Sendable {
                 moduleName: moduleName,
                 configuration: effectiveConfiguration,
                 demangled: demangled,
-                silFile: silFile,
+                silResolver: silResolver,
                 typeEnvironment: declarationTypeEnvironment,
                 nativeTypes: nativeTypeIDs,
                 localValueTypes: localValueTypes,
@@ -984,10 +987,14 @@ extension FrontendReceipt.Adapter {
         }
     }
 
-    struct SourceNominal: Sendable {
+    struct SourceNominal: Sendable, Equatable {
+        var declarationIdentity: String
+        var declarationOffset: Int?
         var canonicalName: String
         var sourceFileLogicalID: String
         var kind: SourceNominalKind
+        var isFileScoped: Bool
+        var hasAmbiguousName: Bool = false
         /// A private nominal member cannot be named by generated file-scope
         /// declarations, even in its defining file. Codecs need this exact
         /// frontend access fact before promising a source reconstruction path.
@@ -1015,6 +1022,7 @@ extension FrontendReceipt.Adapter {
         var isFileScopeNameable: Bool
         var isAvailabilityConstrained: Bool
         var isGenericContext: Bool
+        var sourceFileLogicalID: String? = nil
     }
 
     struct SourceNominalAliasIndex: Sendable {
@@ -1032,6 +1040,7 @@ extension FrontendReceipt.Adapter {
             var candidates: [String: [Candidate]] = [:]
             for nominal in sourceNominals
             where nominal.isFileScopeNameable
+                    && !nominal.hasAmbiguousName
                     && !nominal.isAvailabilityConstrained {
                 let relative = nominal.canonicalName.hasPrefix(modulePrefix)
                     ? String(nominal.canonicalName.dropFirst(modulePrefix.count))
@@ -1146,7 +1155,7 @@ extension FrontendReceipt.Adapter {
         moduleName: String,
         demangled: [String: String]
     ) throws -> [SourceNominal] {
-        var byName: [String: SourceNominal] = [:]
+        var byUSR: [String: SourceNominal] = [:]
         for document in documents {
             guard let filename = document["filename"] as? String else {
                 throw FrontendReceipt.Error.malformedAST(
@@ -1167,14 +1176,15 @@ extension FrontendReceipt.Adapter {
                 parentCanonicalName: nil,
                 isInsideGenericContext: false,
                 isInsidePrivateMemberScope: false,
+                isInsideFileScope: false,
                 isInsideAvailabilityConstrainedScope: false,
                 source: source,
                 moduleName: moduleName,
                 demangled: demangled,
-                byName: &byName
+                byUSR: &byUSR
             )
         }
-        return byName.values.sorted { $0.canonicalName < $1.canonicalName }
+        return try Self.resolveSourceNominalNames(Array(byUSR.values))
     }
 
     func collectSourceNominals(
@@ -1182,11 +1192,12 @@ extension FrontendReceipt.Adapter {
         parentCanonicalName: String?,
         isInsideGenericContext: Bool,
         isInsidePrivateMemberScope: Bool,
+        isInsideFileScope: Bool,
         isInsideAvailabilityConstrainedScope: Bool,
         source: SourceState,
         moduleName: String,
         demangled: [String: String],
-        byName: inout [String: SourceNominal]
+        byUSR: inout [String: SourceNominal]
     ) throws {
         for value in items {
             guard let item = value as? [String: Any],
@@ -1218,42 +1229,37 @@ extension FrontendReceipt.Adapter {
                 let entersPrivateMemberScope = isInsidePrivateMemberScope
                     || (parentCanonicalName != nil
                         && (item["access"] as? String) == "private")
+                let entersFileScope = isInsideFileScope
+                    || ["private", "fileprivate"].contains(item["access"] as? String ?? "")
                 let entersAvailabilityConstrainedScope =
                     isInsideAvailabilityConstrainedScope
                     || Self.hasAvailabilityAttribute(item)
                 if !entersGenericContext {
                     let nominal = SourceNominal(
+                        declarationIdentity: item["usr"] as? String ?? "",
+                        declarationOffset: sourceRange(in: item)?.start,
                         canonicalName: canonicalName,
                         sourceFileLogicalID: source.logicalPath,
                         kind: nominalKind,
+                        isFileScoped: entersFileScope,
                         isFileScopeNameable: !entersPrivateMemberScope,
                         isAvailabilityConstrained:
                             entersAvailabilityConstrainedScope
                     )
-                    if let existing = byName[canonicalName],
-                       existing.sourceFileLogicalID != nominal.sourceFileLogicalID
-                        || existing.kind != nominal.kind
-                        || existing.isFileScopeNameable
-                            != nominal.isFileScopeNameable
-                        || existing.isAvailabilityConstrained
-                            != nominal.isAvailabilityConstrained {
-                        throw FrontendReceipt.Error.malformedAST(
-                            "source nominal \(canonicalName) has conflicting declarations"
-                        )
-                    }
-                    byName[canonicalName] = nominal
+                    try Self.insertSourceNominal(nominal, into: &byUSR)
                 }
                 try collectSourceNominals(
                     items: members,
                     parentCanonicalName: relativeName,
                     isInsideGenericContext: entersGenericContext,
                     isInsidePrivateMemberScope: entersPrivateMemberScope,
+                    isInsideFileScope: entersFileScope,
                     isInsideAvailabilityConstrainedScope:
                         entersAvailabilityConstrainedScope,
                     source: source,
                     moduleName: moduleName,
                     demangled: demangled,
-                    byName: &byName
+                    byUSR: &byUSR
                 )
             case "typealias", "typealias_decl":
                 guard !isInsideGenericContext,
@@ -1266,34 +1272,29 @@ extension FrontendReceipt.Adapter {
                     && (parentCanonicalName == nil
                         || (item["access"] as? String) != "private")
                 let alias = SourceNominal(
+                    declarationIdentity: item["usr"] as? String ?? "",
+                    declarationOffset: sourceRange(in: item)?.start,
                     canonicalName: canonicalName,
                     sourceFileLogicalID: source.logicalPath,
                     kind: .alias,
+                    isFileScoped: isInsideFileScope
+                        || ["private", "fileprivate"].contains(item["access"] as? String ?? ""),
                     isFileScopeNameable: isNameable,
                     isAvailabilityConstrained:
                         isInsideAvailabilityConstrainedScope
                             || Self.hasAvailabilityAttribute(item)
                 )
-                if let existing = byName[canonicalName],
-                   existing.sourceFileLogicalID != alias.sourceFileLogicalID
-                    || existing.kind != alias.kind
-                    || existing.isFileScopeNameable != alias.isFileScopeNameable
-                    || existing.isAvailabilityConstrained
-                        != alias.isAvailabilityConstrained {
-                    throw FrontendReceipt.Error.malformedAST(
-                        "source type name \(canonicalName) has conflicting declarations"
-                    )
-                }
-                byName[canonicalName] = alias
+                try Self.insertSourceNominal(alias, into: &byUSR)
             case "extension_decl":
                 guard let mangled = item["extended_type"] as? String,
                       let fullName = demangled[mangled],
                       let members = item["members"] as? [Any]
                 else { continue }
                 let prefix = moduleName + "."
-                let relativeName = fullName.hasPrefix(prefix)
-                    ? String(fullName.dropFirst(prefix.count))
-                    : fullName
+                let sourceName = Self.sourceNominalSpelling(fullName)
+                let relativeName = sourceName.hasPrefix(prefix)
+                    ? String(sourceName.dropFirst(prefix.count))
+                    : sourceName
                 try collectSourceNominals(
                     items: members,
                     parentCanonicalName: relativeName,
@@ -1301,13 +1302,15 @@ extension FrontendReceipt.Adapter {
                         || Self.hasGenericSignature(item)
                         || fullName.contains("<"),
                     isInsidePrivateMemberScope: isInsidePrivateMemberScope,
+                    isInsideFileScope: isInsideFileScope
+                        || fullName.contains(" in _"),
                     isInsideAvailabilityConstrainedScope:
                         isInsideAvailabilityConstrainedScope
                             || Self.hasAvailabilityAttribute(item),
                     source: source,
                     moduleName: moduleName,
                     demangled: demangled,
-                    byName: &byName
+                    byUSR: &byUSR
                 )
             default:
                 continue
@@ -1666,7 +1669,7 @@ extension FrontendReceipt.Adapter {
             ($0.canonicalName, $0)
         })
         let sourceTypeNames = Set(sourceNominals.map(\.canonicalName))
-        let sourceReferences = sourceNominals.filter { $0.kind == .reference }
+        let sourceReferences = sourceNominals.filter { $0.kind == .reference && !$0.hasAmbiguousName }
         let sourceValues = sourceNominals.filter { $0.kind.isValue }
         if let collision = sourceValues.first(where: {
             catalogByName[$0.canonicalName] != nil
@@ -1884,7 +1887,7 @@ extension FrontendReceipt.Adapter {
         _ sourceNominals: [SourceNominal]
     ) -> [String: Bytecode.LocalTypeKey] {
         var result: [String: Bytecode.LocalTypeKey] = [:]
-        for nominal in sourceNominals where nominal.kind.isValue {
+        for nominal in sourceNominals where nominal.kind.isValue && !nominal.hasAmbiguousName {
             result[nominal.canonicalName] = nominal.localTypeKey
             result[nominal.localTypeKey.rawValue] = nominal.localTypeKey
         }
@@ -1901,7 +1904,7 @@ extension FrontendReceipt.Adapter {
         typeEnvironment: CanonicalSIL.TypeEnvironment
     ) throws -> [InterfaceArchive.FrozenValueTypeRecord] {
         let sourceValues = Dictionary(uniqueKeysWithValues: sourceNominals
-            .filter { $0.kind.isValue }
+            .filter { $0.kind.isValue && !$0.hasAmbiguousName }
             .map { ($0.localTypeKey, $0) })
         var pending: [Bytecode.LocalTypeKey] = []
         func collect(_ type: Bytecode.ValueType) {
@@ -1985,7 +1988,7 @@ extension FrontendReceipt.Adapter {
             ($0.canonicalName, $0)
         })
         let sourceByName = Dictionary(uniqueKeysWithValues: sourceNominals
-            .filter { $0.kind == .reference }
+            .filter { $0.kind == .reference && !$0.hasAmbiguousName }
             .map { ($0.canonicalName, $0) })
         let importedByName = Dictionary(uniqueKeysWithValues: importedTypes.map {
             ($0.canonicalName, $0)
@@ -2258,12 +2261,12 @@ extension FrontendReceipt.Adapter {
         moduleName: String,
         configuration: PatchConfiguration.Document,
         demangled: [String: String],
-        silFile: CanonicalSIL.File,
+        silResolver: FrontendReceipt.SILFunctionResolver,
         typeEnvironment: CanonicalSIL.TypeEnvironment,
         nativeTypes: [String: Core.TypeID],
         localValueTypes: [String: Bytecode.LocalTypeKey],
         importedSwiftTypeAliases: [String: String],
-        sourceNominals: [String: SourceNominal],
+        sourceNominals: SourceNominalIndex,
         sourceNominalAliasIndex: SourceNominalAliasIndex,
         drafts: inout [Draft]
     ) throws {
@@ -2282,7 +2285,7 @@ extension FrontendReceipt.Adapter {
                     moduleName: moduleName,
                     configuration: configuration,
                     demangled: demangled,
-                    silFile: silFile,
+                    silResolver: silResolver,
                     typeEnvironment: typeEnvironment,
                     nativeTypes: nativeTypes,
                     localValueTypes: localValueTypes,
@@ -2300,7 +2303,7 @@ extension FrontendReceipt.Adapter {
                     moduleName: moduleName,
                     configuration: configuration,
                     demangled: demangled,
-                    silFile: silFile,
+                    silResolver: silResolver,
                     typeEnvironment: typeEnvironment,
                     nativeTypes: nativeTypes,
                     localValueTypes: localValueTypes,
@@ -2316,7 +2319,7 @@ extension FrontendReceipt.Adapter {
                         moduleName: moduleName,
                         configuration: configuration,
                         demangled: demangled,
-                        silFile: silFile,
+                        silResolver: silResolver,
                         typeEnvironment: typeEnvironment,
                         nativeTypes: nativeTypes,
                         localValueTypes: localValueTypes,
@@ -2332,7 +2335,7 @@ extension FrontendReceipt.Adapter {
                         moduleName: moduleName,
                         configuration: configuration,
                         demangled: demangled,
-                        silFile: silFile,
+                        silResolver: silResolver,
                         nativeTypes: nativeTypes,
                         importedSwiftTypeAliases: importedSwiftTypeAliases
                     ))
@@ -2346,7 +2349,7 @@ extension FrontendReceipt.Adapter {
                     moduleName: moduleName,
                     configuration: configuration,
                     demangled: demangled,
-                    silFile: silFile,
+                    silResolver: silResolver,
                     typeEnvironment: typeEnvironment,
                     nativeTypes: nativeTypes,
                     localValueTypes: localValueTypes,
@@ -2361,7 +2364,7 @@ extension FrontendReceipt.Adapter {
                 let canonicalName = [context?.canonicalName, name]
                     .compactMap { $0 }.joined(separator: ".")
                 let moduleQualifiedName = "\(moduleName).\(canonicalName)"
-                let nominal = sourceNominals[moduleQualifiedName]
+                let nominal = sourceNominals.resolve(moduleQualifiedName, in: source.logicalPath)
                 try walk(
                     items: members,
                     context: .init(
@@ -2370,14 +2373,15 @@ extension FrontendReceipt.Adapter {
                         kind: nominal?.kind,
                         referenceTypeID: nominal?.kind == .reference
                             ? nativeTypes[moduleQualifiedName] : nil,
-                        localValueTypeKey: nominal?.kind.isValue == true
+                        localValueTypeKey: nominal?.kind.isValue == true && nominal?.hasAmbiguousName != true
                             ? nominal?.localTypeKey : nil,
                         isFileScopeNameable:
-                            nominal?.isFileScopeNameable != false,
+                            nominal?.isFileScopeNameable != false && nominal?.hasAmbiguousName != true,
                         isAvailabilityConstrained:
                             nominal?.isAvailabilityConstrained == true,
                         isGenericContext: context?.isGenericContext == true
-                            || Self.hasGenericSignature(item)
+                            || Self.hasGenericSignature(item),
+                        sourceFileLogicalID: nominal?.isFileScoped == true ? source.logicalPath : nil
                     ),
                     source: source,
                     locationMap: locationMap,
@@ -2385,7 +2389,7 @@ extension FrontendReceipt.Adapter {
                     moduleName: moduleName,
                     configuration: configuration,
                     demangled: demangled,
-                    silFile: silFile,
+                    silResolver: silResolver,
                     typeEnvironment: typeEnvironment,
                     nativeTypes: nativeTypes,
                     localValueTypes: localValueTypes,
@@ -2400,12 +2404,13 @@ extension FrontendReceipt.Adapter {
                       let members = item["members"] as? [Any]
                 else { continue }
                 let prefix = moduleName + "."
-                let canonicalName = fullName.hasPrefix(prefix)
-                    ? String(fullName.dropFirst(prefix.count))
-                    : fullName
-                let moduleQualifiedName = fullName.hasPrefix(prefix)
-                    ? fullName : "\(moduleName).\(fullName)"
-                let nominal = sourceNominals[moduleQualifiedName]
+                let sourceName = Self.sourceNominalSpelling(fullName)
+                let canonicalName = sourceName.hasPrefix(prefix)
+                    ? String(sourceName.dropFirst(prefix.count))
+                    : sourceName
+                let moduleQualifiedName = sourceName.hasPrefix(prefix)
+                    ? sourceName : "\(moduleName).\(sourceName)"
+                let nominal = sourceNominals.resolve(moduleQualifiedName, in: source.logicalPath)
                 try walk(
                     items: members,
                     context: .init(
@@ -2414,15 +2419,16 @@ extension FrontendReceipt.Adapter {
                         kind: nominal?.kind,
                         referenceTypeID: nominal?.kind == .reference
                             ? nativeTypes[moduleQualifiedName] : nil,
-                        localValueTypeKey: nominal?.kind.isValue == true
+                        localValueTypeKey: nominal?.kind.isValue == true && nominal?.hasAmbiguousName != true
                             ? nominal?.localTypeKey : nil,
                         isFileScopeNameable:
-                            nominal?.isFileScopeNameable != false,
+                            nominal?.isFileScopeNameable != false && nominal?.hasAmbiguousName != true,
                         isAvailabilityConstrained:
                             nominal?.isAvailabilityConstrained == true
                                 || Self.hasAvailabilityAttribute(item),
                         isGenericContext: Self.hasGenericSignature(item)
-                            || fullName.contains("<")
+                            || fullName.contains("<"),
+                        sourceFileLogicalID: nominal?.isFileScoped == true ? source.logicalPath : nil
                     ),
                     source: source,
                     locationMap: locationMap,
@@ -2430,7 +2436,7 @@ extension FrontendReceipt.Adapter {
                     moduleName: moduleName,
                     configuration: configuration,
                     demangled: demangled,
-                    silFile: silFile,
+                    silResolver: silResolver,
                     typeEnvironment: typeEnvironment,
                     nativeTypes: nativeTypes,
                     localValueTypes: localValueTypes,
@@ -2454,7 +2460,7 @@ extension FrontendReceipt.Adapter {
         moduleName: String,
         configuration: PatchConfiguration.Document,
         demangled: [String: String],
-        silFile: CanonicalSIL.File,
+        silResolver: FrontendReceipt.SILFunctionResolver,
         typeEnvironment: CanonicalSIL.TypeEnvironment,
         nativeTypes: [String: Core.TypeID],
         localValueTypes: [String: Bytecode.LocalTypeKey],
@@ -2479,7 +2485,7 @@ extension FrontendReceipt.Adapter {
             return nil
         }
         let astMangledName = "$s" + usr.dropFirst(2)
-        guard let sil = try FrontendReceipt.SILFunctionResolver(file: silFile)
+        guard let sil = try silResolver
             .function(for: item, source: source, baseName: baseName)
         else {
             throw FrontendReceipt.Error.missingSILFunction(astMangledName)
@@ -3051,7 +3057,8 @@ extension FrontendReceipt.Adapter {
             memberRole: .functionBody,
             reloadRole: Self.reloadRole(baseName: baseName),
             nominalType: context.map {
-                .init(moduleName: moduleName, canonicalName: $0.canonicalName)
+                .init(moduleName: moduleName, canonicalName: $0.canonicalName,
+                      sourceFileLogicalID: $0.sourceFileLogicalID)
             },
             sourceBodyTransform: sourceBodyTransform,
             nativeReplacement: isAsync ? nil : nativeReplacement

@@ -64,7 +64,8 @@ extension FrontendReceipt.Adapter {
                 guard $0.referenceTypeID != nil || $0.localValueTypeKey != nil else {
                     return nil
                 }
-                return .init(moduleName: moduleName, canonicalName: $0.canonicalName)
+                return .init(moduleName: moduleName, canonicalName: $0.canonicalName,
+                             sourceFileLogicalID: $0.sourceFileLogicalID)
             },
             nativeReplacement: .init(
                 declarationAnchorUTF8Offset: anchorOffset,

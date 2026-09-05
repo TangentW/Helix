@@ -1054,7 +1054,7 @@ private func registerXcodeLiveSession(
         compilerPath: prepared.compilerURL.path,
         nativeOutputDirectory: nativeOutput.path,
         backendPreference: backendPreference,
-        deviceNativeMatrixQualified: false,
+        deviceNativeMatrixQualified: context.profile.deviceNativeMatrixQualified == true,
         debounceMilliseconds: 120,
         maximumSourceBytes: 8 * 1_024 * 1_024,
         nativeImageSoftLimit: 50
@@ -1316,6 +1316,10 @@ private func performPrepareXcodeShell(
     let capture = try performance.measure("prepare.capture_frontend") {
         try capturedXcodeFeature(context, at: targetCaptureURL)
     }
+    let searchWarnings = BuildCapture.SearchPaths.warnings(
+        arguments: capture.analysisJob.arguments,
+        workingDirectory: context.environment.sourceRootURL
+    ).joined()
     let sourceImports = try performance.measure("prepare.scan_imports") {
         try FrontendReceipt.SourceImports.scan(sources: capture.frontendSources)
     }
@@ -1430,7 +1434,8 @@ private func performPrepareXcodeShell(
                     standardOutput: "Prepared \(context.profile.id) Helix Shell at "
                         + "\(context.environment.shellOutputURL.path)\n"
                         + "Functions: \(state.eligibleFunctionCount) eligible, "
-                        + "\(state.rejectedFunctionCount) rejected\n"
+                        + "\(state.rejectedFunctionCount) rejected\n",
+                    standardError: searchWarnings
                 )
             } else {
                 let existing = try loadXcodeHubReservation(context)
@@ -1465,7 +1470,8 @@ private func performPrepareXcodeShell(
                             "Prepared \(context.profile.id) Helix Shell at "
                             + "\(context.environment.shellOutputURL.path)\n"
                             + "Functions: \(state.eligibleFunctionCount) eligible, "
-                            + "\(state.rejectedFunctionCount) rejected\n"
+                            + "\(state.rejectedFunctionCount) rejected\n",
+                        standardError: searchWarnings
                     )
                 }
                 restoredFrontendOutput = try? loadPreparedFrontendOutput(
@@ -1733,7 +1739,8 @@ private func performPrepareXcodeShell(
             + "\(context.environment.shellOutputURL.path)\n"
             + "Functions: \(materialized.report.eligibleFunctionCount) eligible, "
             + "\(materialized.report.rejectedFunctionCount) rejected\n"
-            + catalogPrewarmStatus
+            + catalogPrewarmStatus,
+        standardError: searchWarnings
     )
 }
 
@@ -2073,8 +2080,7 @@ private func performCompileXcodeBridge(
     } catch let error as XcodeIntegration.BridgeCompilationError {
         throw CLI.Error.input(error.description)
     }
-    let autostartSymbol = context.profile.workflow == .liveReload
-        ? "hlx_dev_runtime_autostart_v1" : "hlx_runtime_autostart_v1"
+    let autostartSymbol = context.profile.runtimeAutostartSymbol
     let constructor = """
     extern void \(autostartSymbol)(void);
 

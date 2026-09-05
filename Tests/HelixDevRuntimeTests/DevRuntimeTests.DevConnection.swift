@@ -93,6 +93,12 @@ struct DevConnectionBootstrap {
             supportedBackends: [.hlbc, .nativeDynamicReplacement]
         )
         #expect(!explicitNative.nativeChainingProbePassed)
+        let qualified = DevRuntime.Bootstrap.Options(deviceNativeMatrixQualified: true)
+        try qualified.validate()
+        #expect(qualified.supportedBackends.contains(.nativeDynamicReplacement))
+        #expect(qualified.nativeChainingProbePassed)
+        let unqualified = DevRuntime.Bootstrap.Options(deviceNativeMatrixQualified: false)
+        #expect(unqualified.supportedBackends == DevRuntime.Bootstrap.Options().supportedBackends)
         try explicitNative.validate()
     }
 

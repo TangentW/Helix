@@ -19,11 +19,13 @@ enum Bootstrap {
         category: "Helix"
     )
 
-    static func start() {
+    static func start(deviceNativeMatrixQualified: Bool = false) {
         guard !didStart else { return }
         didStart = true
         do {
-            session = try DevRuntime.ApplicationSession()
+            session = try DevRuntime.ApplicationSession(options: .init(
+                deviceNativeMatrixQualified: deviceNativeMatrixQualified
+            ))
         } catch {
             didStart = false
             logger.error(
@@ -39,6 +41,14 @@ enum Bootstrap {
 public func helixDevRuntimeAutostartV1() {
     Task { @MainActor in
         DevSupport.Bootstrap.start()
+    }
+}
+
+/// Separate versioned entry preserves the default autostart ABI and policy.
+@_cdecl("hlx_dev_runtime_autostart_device_native_qualified_v1")
+public func helixDevRuntimeAutostartDeviceNativeQualifiedV1() {
+    Task { @MainActor in
+        DevSupport.Bootstrap.start(deviceNativeMatrixQualified: true)
     }
 }
 #endif
