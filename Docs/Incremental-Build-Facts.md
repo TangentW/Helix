@@ -21,6 +21,7 @@ override; the normal owner-local location is
 | --- | --- | --- |
 | SDK identity | SDK path and build returned by `xcrun` | Swift driver instance, SDK name, `DEVELOPER_DIR`, and `TOOLCHAINS` |
 | Module frontend | Validated receipt, diagnostics, and toolchain identity | Compiler-capture bytes, compiler fingerprint, non-SDK module/header interface snapshot, metadata, policy, catalog, configuration, and every logical/physical source identity and content hash |
+| Compiler checkpoints | Parsed and revalidated typed AST, identity SIL, and semantic SIL intermediates | Compiler-capture bytes, exact toolchain/compiler path, frontend invocation and SDK identity, transform pipeline, complete compiler-input digest, and every logical/physical source identity and content hash |
 | Symbol graph | Validated SDK module symbol graph | Compiler fingerprint, SDK/frontend invocation, and module |
 | Managed probe | The uniquely measured operations and native signature types for one candidate | Compiler fingerprint, transform pipeline, SDK/frontend invocation, minimum OS, normalized candidate, and imported boundary types |
 | Native API Catalog | Canonical module document plus the opaque compiler projection that deterministically reconstructs it | Xcode/SDK/compiler, target/deployment/language mode, module-content/search/dependency digests, normalized module-loading semantics, and transform pipeline |
@@ -71,6 +72,27 @@ frontend can still reuse symbol graphs and individual declaration probes. This
 matters after an ordinary source edit: Helix does not need to rediscover an
 unchanged UIKit or Foundation surface merely because the module receipt
 changed.
+
+If receipt analysis fails after successful compilation, completed compiler
+stages remain as owner-private UTF-8 checkpoints. A retry reparses each stage;
+AST source membership, compiler version, and import coverage must still match.
+Sources and compiler interfaces are confirmed after each compiler invocation
+and after each checkpoint hit. Incomplete input discovery bypasses all these
+checkpoints, and a failed compiler invocation or parser never publishes one.
+Policy, Catalog selection, and non-compiler configuration are excluded from the
+checkpoint key, so correcting a later receipt conflict can reuse compilation.
+Source, compiler arguments, toolchain, SDK, or transform changes cannot do so.
+
+Each checkpoint retains at most 256 MiB; larger output follows normal parsing
+without being stored. After a complete module receipt is successfully stored,
+its three intermediate payloads are retired under nonblocking per-key locks. Lock
+inodes remain stable for other processes. Retirement is best effort; retained
+failed-run entries have no aggregate disk quota and may be removed with the
+owner-local `v1/compiler_checkpoint` cache directory when no build is running.
+These files contain compiler-format and source-path information, are bound to
+the exact local compiler context, and are neither portable Catalog artifacts
+nor a published ABI. A valid complete receipt remains the fast path for a
+subsequent Prepare or materialization retry.
 
 Only deterministic singleton probe rejections are cached. A transient compiler
 failure is not converted into a permanent rejection. Probe batches are split
@@ -124,7 +146,9 @@ reuse those candidates even when the broader module receipt changes.
 
 Every cached value is decoded and semantically validated by its consumer:
 
-- canonical encoding, schema, key and payload SHA-256 must match;
+- manifest canonical encoding, schema, key and payload SHA-256 must match;
+- structured payloads retain their own canonical encoding checks; private raw
+  compiler checkpoints must be valid UTF-8 and pass the current AST/SIL parser;
 - receipts must pass their full structural validation and match current source,
   metadata and toolchain identities;
 - symbol graphs, measured operations, and their native signature types pass the
@@ -237,6 +261,8 @@ paths or compiler arguments. Relevant counters include:
 
 - `frontend_cache.module_hit_count`, `module_miss_count`,
   `module_repair_count`, and `module_bypass_count`;
+- `frontend_checkpoint.<typed_ast|identity_sil|semantic_sil>_<hit|generated|repaired|bypassed>_count`
+  and `frontend_checkpoint.retired_count`;
 - `managed_native.symbol_graph_cache_hit_count` and `_miss_count`;
 - `managed_native.probe_cache_hit_count`, `_miss_count`, and
   `cached_rejection_count`;
@@ -271,6 +297,14 @@ and SIL calls resolve default macro plugins from the selected toolchain,
 including when the compiler is the `/usr/bin/swiftc` Xcode shim. This covers
 toolchain macros such as `@TaskLocal`; archive validation still rejects arbitrary
 plugin-loading arguments. Changing compiler inputs still requires a full build.
+
+Canonical SIL uses a separate private output file. With bridging-PCH driver jobs,
+`-o -` may route SIL to stderr; a successful exit with no valid SIL output is now
+rejected before declaration analysis. Subprocess stdout-byte metrics therefore
+exclude the SIL file; `frontend.identity_sil_bytes` and `frontend.semantic_sil_bytes`
+remain the corresponding payload measurements. See
+[Large-project integration](Large-Project-Integration.md) for mixed-framework
+replay, headless installation, compiler launcher chaining, and resource bounds.
 
 The transform pipeline identity changes for these replay semantics. Rebuild the
 Shell to refresh prior build facts; no persisted ABI or archive schema is changed.

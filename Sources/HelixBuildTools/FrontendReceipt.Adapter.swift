@@ -26,7 +26,8 @@ public struct Adapter: Sendable {
         toolchain suppliedToolchain: ReleaseCompiler.ToolchainIdentity?,
         compilerInputHash: Core.Digest?,
         expectedImports: FrontendReceipt.SourceImports.Result? = nil,
-        expectedSources: [ShellBuildReceipt.Source]? = nil
+        expectedSources: [ShellBuildReceipt.Source]? = nil,
+        checkpoints: FrontendReceipt.CompilerCheckpoints.Context? = nil
     ) throws -> FrontendReceipt.Output {
         let performance = BuildPerformance.Recorder()
         try performance.measure("frontend.validate_request") {
@@ -63,69 +64,75 @@ public struct Adapter: Sendable {
             compilerURL: request.compilerURL,
             invocationObserver: performance.subprocessObserver
         )
-        let astOutput = try performance.measure("frontend.emit_typed_ast") {
-            try frontend.emitTypedAST(
-                sourceFiles: orderedSources.map(\.url),
-                invocation: request.metadata.frontendInvocation
-            )
-        }
-        performance.setCounter(
-            "frontend.typed_ast_bytes",
-            value: UInt64(astOutput.utf8.count)
+        let ast = try FrontendReceipt.CompilerCheckpoints.read(
+            .typedAST, context: checkpoints, performance: performance,
+            produce: {
+                try performance.measure("frontend.emit_typed_ast") {
+                    try frontend.emitTypedAST(sourceFiles: orderedSources.map(\.url),
+                                             invocation: request.metadata.frontendInvocation)
+                }
+            },
+            parse: { text in
+                performance.setCounter("frontend.typed_ast_bytes", value: UInt64(text.utf8.count))
+                let documents = try performance.measure("frontend.parse_typed_ast") {
+                    try FrontendReceipt.TypedAST.parseDocuments(text)
+                }
+                let expectedPaths = Set(sourceStates.map { $0.url.path })
+                let actualPaths = documents.compactMap { $0["filename"] as? String }.map {
+                    URL(fileURLWithPath: $0).resolvingSymlinksInPath().standardizedFileURL.path
+                }
+                guard actualPaths.count == expectedPaths.count, Set(actualPaths) == expectedPaths else {
+                    throw FrontendReceipt.Error.malformedAST("typed AST source documents do not match the requested source set")
+                }
+                let modules = try performance.measure("frontend.collect_imports") {
+                    Array(Set(try documents.flatMap {
+                        imports(in: try FrontendReceipt.TypedAST.items(in: $0))
+                    })).filter { $0 != request.metadata.frontendInvocation.moduleName }.sorted()
+                }
+                if let expectedImports, !expectedImports.covers(compilerModules: modules) {
+                    throw FrontendReceipt.SourceImports.ValidationError.compilerImportMismatch
+                }
+                try validateCompilerVersion(documents, toolchain: toolchain)
+                return (documents: documents, modules: modules)
+            }
         )
-        let documents = try performance.measure("frontend.parse_typed_ast") {
-            try FrontendReceipt.TypedAST.parseDocuments(astOutput)
-        }
-        let importedModules = try performance.measure("frontend.collect_imports") {
-            Array(Set(try documents.flatMap {
-                imports(in: try FrontendReceipt.TypedAST.items(in: $0))
-            })).filter { $0 != request.metadata.frontendInvocation.moduleName }
-                .sorted()
-        }
-        if let expectedImports,
-           !expectedImports.covers(compilerModules: importedModules) {
-            // Refuse the dependency identity before any finer-grained cache
-            // can consume or publish it.
-            throw FrontendReceipt.SourceImports.ValidationError
-                .compilerImportMismatch
-        }
-        try validateCompilerVersion(documents, toolchain: toolchain)
+        let documents = ast.documents
+        let importedModules = ast.modules
         let demangled = try performance.measure("frontend.demangle_types") {
             try FrontendReceipt.Demangler(
                 compilerURL: request.compilerURL,
                 invocationObserver: performance.subprocessObserver
             ).demangle(FrontendReceipt.TypedAST.mangledTypes(in: documents))
         }
-        let canonicalSIL = try performance.measure("frontend.emit_identity_sil") {
-            try frontend.emitCanonicalSIL(
-                sourceFiles: orderedSources.map(\.url),
-                invocation: request.metadata.frontendInvocation
-            )
-        }
-        performance.setCounter(
-            "frontend.identity_sil_bytes",
-            value: UInt64(canonicalSIL.utf8.count)
+        let silFile = try FrontendReceipt.CompilerCheckpoints.read(
+            .identitySIL, context: checkpoints, performance: performance,
+            produce: {
+                try performance.measure("frontend.emit_identity_sil") {
+                    try frontend.emitCanonicalSIL(sourceFiles: orderedSources.map(\.url),
+                                                 invocation: request.metadata.frontendInvocation)
+                }
+            },
+            parse: { text in
+                performance.setCounter("frontend.identity_sil_bytes", value: UInt64(text.utf8.count))
+                return try performance.measure("frontend.parse_identity_sil") { try CanonicalSIL.File(text: text) }
+            }
         )
-        let silFile = try performance.measure("frontend.parse_identity_sil") {
-            try CanonicalSIL.File(text: canonicalSIL)
-        }
         // Native-call discovery needs source-level default-argument
         // provenance. Even at -Onone, mandatory SIL transforms may inline an
         // imported default generator once nearby call shapes change.
-        let operationSIL = try performance.measure("frontend.emit_semantic_sil") {
-            try frontend.emitCanonicalSIL(
-                sourceFiles: orderedSources.map(\.url),
-                invocation: request.metadata.frontendInvocation,
-                purpose: .semanticLowering
-            )
-        }
-        performance.setCounter(
-            "frontend.semantic_sil_bytes",
-            value: UInt64(operationSIL.utf8.count)
+        let operationSILFile = try FrontendReceipt.CompilerCheckpoints.read(
+            .semanticSIL, context: checkpoints, performance: performance,
+            produce: {
+                try performance.measure("frontend.emit_semantic_sil") {
+                    try frontend.emitCanonicalSIL(sourceFiles: orderedSources.map(\.url),
+                        invocation: request.metadata.frontendInvocation, purpose: .semanticLowering)
+                }
+            },
+            parse: { text in
+                performance.setCounter("frontend.semantic_sil_bytes", value: UInt64(text.utf8.count))
+                return try performance.measure("frontend.parse_semantic_sil") { try CanonicalSIL.File(text: text) }
+            }
         )
-        let operationSILFile = try performance.measure("frontend.parse_semantic_sil") {
-            try CanonicalSIL.File(text: operationSIL)
-        }
         let moduleName = request.metadata.frontendInvocation.moduleName
         let effectiveConfiguration = try performance.measure(
             "frontend.resolve_calling_surface"
@@ -2190,11 +2197,14 @@ extension FrontendReceipt.Adapter {
         try sources.map { source in
             let url = source.url.resolvingSymlinksInPath().standardizedFileURL
             let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
-            guard values.isRegularFile == true, let size = values.fileSize,
-                  size <= 64 * 1_024 * 1_024
-            else {
+            guard values.isRegularFile == true, let size = values.fileSize else {
                 throw FrontendReceipt.Error.invalidRequest(
-                    "source is missing, non-regular, or too large: \(url.path)"
+                    "source is not a regular file: \(url.path)"
+                )
+            }
+            guard size <= 64 * 1_024 * 1_024 else {
+                throw FrontendReceipt.Error.invalidRequest(
+                    "source \(source.logicalPath) is \(size) bytes; maximum is 67108864 bytes (64 MiB): \(url.path)"
                 )
             }
             let contents = try Data(contentsOf: url, options: .mappedIfSafe)

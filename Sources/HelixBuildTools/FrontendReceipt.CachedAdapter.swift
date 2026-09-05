@@ -147,6 +147,38 @@ public struct CachedAdapter: Sendable {
                 contentHash: $0.contentHash
             )
         }
+        let checkpointIdentity = try BuildCache.key(
+            domain: "HLX.BuildCache.CompilerCheckpointInputs.v1",
+            value: FrontendReceipt.CompilerCheckpoints.Identity(
+                compilerCaptureHash: .sha256(compilerCapture), toolchain: toolchain,
+                compilerPath: request.compilerURL.path, compilerInputHash: compilerInputHash,
+                invocation: request.metadata.frontendInvocation,
+                transformPipelineHash: request.metadata.transformPipelineHash,
+                sources: expectedSources, physicalPaths: states.map { $0.url.path }
+            )
+        )
+        let checkpoints = FrontendReceipt.CompilerCheckpoints.Context(
+            cache: cache, identity: checkpointIdentity,
+            confirmInputs: {
+                var confirmedInputs = BuildCache.CompilerInputs.capture(
+                    arguments: inputArguments,
+                    currentModuleName: request.metadata.frontendInvocation.moduleName,
+                    workingDirectory: workingDirectory
+                        ?? request.sources.first?.url.deletingLastPathComponent()
+                        ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath),
+                    importedModules: Set(sourceImports.modules)
+                )
+                confirmedInputs.isComplete = confirmedInputs.isComplete && sourceImports.isComplete
+                let confirmedSources = try adapter.loadSources(
+                    request.sources.sorted { $0.logicalPath < $1.logicalPath }
+                ).map {
+                    ShellBuildReceipt.Source(logicalPath: $0.logicalPath, contentHash: $0.contentHash)
+                }
+                guard confirmedInputs == compilerInputs, confirmedSources == expectedSources else {
+                    throw FrontendReceipt.SourceImports.ValidationError.sourceChanged
+                }
+            }
+        )
         var generatedOutput: FrontendReceipt.Output?
         var validatedPayload: Payload?
         let value: BuildCache.Value
@@ -172,7 +204,8 @@ public struct CachedAdapter: Sendable {
                         toolchain: toolchain,
                         compilerInputHash: compilerInputHash,
                         expectedImports: sourceImports,
-                        expectedSources: expectedSources
+                        expectedSources: expectedSources,
+                        checkpoints: checkpoints
                     )
                     generatedOutput = output
                     var confirmedInputs = BuildCache.CompilerInputs.capture(
@@ -278,6 +311,9 @@ public struct CachedAdapter: Sendable {
                 throw FrontendReceipt.Error.frontendFailed(
                     "module cache reported a miss without producing a receipt"
                 )
+            }
+            if value.source == .generated || value.source == .repaired {
+                performance.setCounter("frontend_checkpoint.retired_count", value: checkpoints.retire())
             }
             performance.merge(output.performance)
             output.performance = performance.trace()

@@ -363,3 +363,59 @@ swift test --scratch-path .build/validation --filter DependencyPlanning
 The regular suite uses eight modules; explicit measurements accept 1 through 256.
 The fixture is maintained in
 [BuildToolsTests.DependencyPlanning](../Tests/HelixBuildToolsTests/BuildToolsTests.DependencyPlanning.swift).
+
+## Recoverable compiler stages
+
+The same 2,500-file scalar fixture was rerun after introducing validated compiler
+checkpoints. On this host, cold receipt generation took 10.532 s, an unchanged
+receipt hit 0.892 s, and a body-edit miss 10.577 s. Each miss recorded six
+subprocesses and retired all three intermediate payloads after receipt storage;
+the unchanged hit launched none. This single observation is close to the earlier
+10.144/0.843/10.093 s parser baseline; checkpoints primarily reduce failed-run
+retries rather than cold compiler work.
+
+`BuildToolsTests.CompilerCheckpoints` runs a real compiler through all three
+stages, deliberately fails later on a source/native codec conflict, corrects
+only that configuration, and requires three checkpoint hits with no repeated
+AST/SIL emission. Its recovered receipt must equal a full uncached receipt.
+Input changes, malformed output, corrupt data, locked entries and symlinks have
+separate regression coverage. These observations do not measure the commercial
+project's approximately 380-second failed Prepare.
+
+## Mixed system-framework integration
+
+On September 5, 2026, the system-framework fixture compiled and produced a valid
+receipt with Foundation, UIKit, AVFoundation and Photos in one module. It combines
+qualified/unqualified `Progress`, an Objective-C bridging header, C++ interoperability
+with `gnu++20`, the `@TaskLocal` macro, implicit dynamic replacement, and an initial
+driver build using explicit modules. Target: `arm64-apple-ios15.0-simulator`,
+iPhone Simulator SDK build `23F81a`, Swift 6.3.3. Each measurement starts with an
+empty private Helix cache; it does not clear system or toolchain caches.
+
+| Source files | Source bytes | Initial explicit-module build | Cold receipt | Unchanged receipt hit |
+| --- | --- | --- | --- | --- |
+| 32 | 4,014 | 7.118 s | 16.956 s | 0.016 s |
+| 2,500 | 280,628 | 7.385 s | 30.010 s | 0.924 s |
+
+Both runs require byte-equivalent warm receipts and no warm compiler subprocesses.
+The larger run records 2,504 declarations, six native types, four native imports,
+three generated/retired checkpoints, and four declaration-module symbol graphs.
+These are source-demanded SDK queries, not four complete Native API Catalogs.
+They do not measure 100-module cold prewarm, commercial save-to-screen latency,
+Bridge linking, or device activation.
+
+This fixture found an additional replay bug: with a bridging-PCH job, Swift
+driver writes `-o -` SIL to stderr. The driver now reads an explicit private SIL
+file and validates its canonical header before analysis. The mixed-language
+regression covers both SIL entry points; missing output fails immediately.
+
+```sh
+HELIX_SYSTEM_FRAMEWORK_SOURCE_COUNT=2500 \
+HELIX_SYSTEM_FRAMEWORK_REPORT=/tmp/helix-system-frameworks.json \
+swift test --scratch-path .build/validation --no-parallel --filter SystemFrameworkIntegrationTests
+```
+
+The regular suite uses eight sources; measurements accept 2 through 2,500.
+The JSON retains SDK/toolchain identity, target, timings and the cold trace.
+See [Large-project integration](Large-Project-Integration.md) for the installation
+and compiler-wrapper contracts and the current resource bounds.

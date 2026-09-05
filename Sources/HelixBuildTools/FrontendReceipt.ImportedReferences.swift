@@ -37,6 +37,15 @@ extension FrontendReceipt.Adapter {
         var objectiveCRuntimeName: String? = nil
         var requiresMainActor: Bool
         var isolationEvidence: ImportedIsolationEvidence = .enclosingContext
+        /// An in-memory diagnostic example, never a persisted identity input.
+        var sourceLocation: Core.SourceLocation? = nil
+
+        private enum CodingKeys: String, CodingKey {
+            case canonicalName, swiftType, kind, aliases, representation
+            case sourceFileLogicalID, importedModules, nativeModuleName
+            case objectiveCModuleName, objectiveCRuntimeName
+            case requiresMainActor, isolationEvidence
+        }
     }
     func discoverImportedNativeTypes(
         documents: [FrontendReceipt.TypedAST.Object],
@@ -113,6 +122,16 @@ extension FrontendReceipt.Adapter {
 
             func record(_ rawType: Any?) {
                 guard let mangled = rawType as? String else { return }
+                let firstUse = uses.count
+                defer {
+                    var location = sourceRange(in: item).flatMap {
+                        source.sourceLocation(atUTF8Offset: $0.start)
+                    }
+                    location?.file = source.logicalPath
+                    for index in firstUse..<uses.count {
+                        uses[index].sourceLocation = location
+                    }
+                }
                 let spelling = demangled[mangled].map(
                     normalizeImportedTypeSpelling
                 )
@@ -407,8 +426,9 @@ extension FrontendReceipt.Adapter {
                     } else if use.swiftType == use.canonicalName {
                         existing.aliases.append(use.swiftType)
                     } else {
-                        throw FrontendReceipt.Error.invalidRequest(
-                            "imported native type \(use.canonicalName) has conflicting Swift spellings"
+                        throw FrontendReceipt.ImportedNominalIdentity.conflict(
+                            "imported native type \(use.canonicalName) has conflicting Swift spellings",
+                            uses: [existing, use]
                         )
                     }
                 }
@@ -425,18 +445,10 @@ extension FrontendReceipt.Adapter {
                     // actor-neutral value semantics.
                 } else if existing.kind != use.kind
                             || existing.representation != use.representation {
-                    throw FrontendReceipt.Error.invalidRequest(
+                    throw FrontendReceipt.ImportedNominalIdentity.conflict(
                         "imported native type \(use.canonicalName) has conflicting "
-                            + "representations: \(existing.kind.rawValue)/"
-                            + "\(existing.representation.rawValue) versus "
-                            + "\(use.kind.rawValue)/\(use.representation.rawValue); "
-                            + "existing Swift=\(existing.swiftType), aliases="
-                            + "\(existing.aliases), runtime="
-                            + "\(existing.objectiveCRuntimeName ?? "none"), source="
-                            + "\(existing.sourceFileLogicalID); incoming Swift="
-                            + "\(use.swiftType), aliases=\(use.aliases), runtime="
-                            + "\(use.objectiveCRuntimeName ?? "none"), source="
-                            + "\(use.sourceFileLogicalID)"
+                            + "representations",
+                        uses: [existing, use]
                     )
                 } else {
                     try mergeImportedIsolation(into: &existing, from: use)
@@ -444,12 +456,12 @@ extension FrontendReceipt.Adapter {
                 existing.importedModules = Array(Set(
                     existing.importedModules + use.importedModules
                 )).sorted()
-                mergeImportedOrigin(into: &existing, from: use)
                 if let existingModule = existing.objectiveCModuleName,
                    let incomingModule = use.objectiveCModuleName,
                    existingModule != incomingModule {
-                    throw FrontendReceipt.Error.invalidRequest(
-                        "imported native type \(use.canonicalName) has conflicting declaring modules"
+                    throw FrontendReceipt.ImportedNominalIdentity.conflict(
+                        "imported native type \(use.canonicalName) has conflicting declaring modules",
+                        uses: [existing, use]
                     )
                 }
                 existing.objectiveCModuleName = existing.objectiveCModuleName
@@ -457,11 +469,10 @@ extension FrontendReceipt.Adapter {
                 if let existingRuntimeName = existing.objectiveCRuntimeName,
                    let incomingRuntimeName = use.objectiveCRuntimeName,
                    existingRuntimeName != incomingRuntimeName {
-                    throw FrontendReceipt.Error.invalidRequest(
+                    throw FrontendReceipt.ImportedNominalIdentity.conflict(
                         "imported native type \(use.canonicalName) has conflicting "
-                            + "Objective-C runtime identities: \(existingRuntimeName) "
-                            + "from \(existing.sourceFileLogicalID) versus "
-                            + "\(incomingRuntimeName) from \(use.sourceFileLogicalID)"
+                            + "Objective-C runtime identities",
+                        uses: [existing, use]
                     )
                 }
                 existing.objectiveCRuntimeName = existing.objectiveCRuntimeName
@@ -469,6 +480,7 @@ extension FrontendReceipt.Adapter {
                 existing.aliases = Array(Set(
                     existing.aliases + use.aliases
                 )).sorted()
+                mergeImportedOrigin(into: &existing, from: use)
                 result[use.canonicalName] = existing
             } else {
                 var canonical = use
@@ -671,8 +683,9 @@ extension FrontendReceipt.Adapter {
         switch (existing.isolationEvidence, incoming.isolationEvidence) {
         case (.importedDeclaration, .importedDeclaration):
             guard existing.requiresMainActor == incoming.requiresMainActor else {
-                throw FrontendReceipt.Error.invalidRequest(
-                    "imported native type \(incoming.canonicalName) has conflicting declaration isolation"
+                throw FrontendReceipt.ImportedNominalIdentity.conflict(
+                    "imported native type \(incoming.canonicalName) has conflicting declaration isolation",
+                    uses: [existing, incoming]
                 )
             }
         case (.importedDeclaration, .enclosingContext):
@@ -697,20 +710,27 @@ extension FrontendReceipt.Adapter {
     ) {
         switch (existing.nativeModuleName, incoming.nativeModuleName) {
         case (.none, .none):
-            existing.sourceFileLogicalID = min(
-                existing.sourceFileLogicalID,
-                incoming.sourceFileLogicalID
-            )
+            if (incoming.sourceFileLogicalID, incoming.sourceLocation?.line ?? Int.max,
+                incoming.sourceLocation?.column ?? Int.max)
+                < (existing.sourceFileLogicalID, existing.sourceLocation?.line ?? Int.max,
+                   existing.sourceLocation?.column ?? Int.max) {
+                existing.sourceFileLogicalID = incoming.sourceFileLogicalID
+                existing.sourceLocation = incoming.sourceLocation
+            }
         case (.none, .some):
             existing.nativeModuleName = incoming.nativeModuleName
             existing.sourceFileLogicalID = incoming.sourceFileLogicalID
+            existing.sourceLocation = incoming.sourceLocation
         case (.some, .none):
             break
         case let (.some(existingModule), .some(incomingModule)):
-            if (incomingModule, incoming.sourceFileLogicalID)
-                < (existingModule, existing.sourceFileLogicalID) {
+            if (incomingModule, incoming.sourceFileLogicalID,
+                incoming.sourceLocation?.line ?? Int.max, incoming.sourceLocation?.column ?? Int.max)
+                < (existingModule, existing.sourceFileLogicalID,
+                   existing.sourceLocation?.line ?? Int.max, existing.sourceLocation?.column ?? Int.max) {
                 existing.nativeModuleName = incomingModule
                 existing.sourceFileLogicalID = incoming.sourceFileLogicalID
+                existing.sourceLocation = incoming.sourceLocation
             }
         }
     }
@@ -782,27 +802,33 @@ extension FrontendReceipt.Adapter {
     private func normalizeImportedNominalIdentities(
         _ uses: [ImportedNativeType]
     ) throws -> [ImportedNativeType] {
-        let usesByCanonicalName = Dictionary(grouping: uses, by: \.canonicalName)
+        let indicesByCanonicalName = Dictionary(grouping: uses.indices) {
+            uses[$0].canonicalName
+        }
         var overlayByRuntime: [String: String] = [:]
         var normalized = uses
-        for runtimeName in usesByCanonicalName.keys.sorted() {
-            guard let matchingUses = usesByCanonicalName[runtimeName] else {
+        for runtimeName in indicesByCanonicalName.keys.sorted() {
+            guard let indices = indicesByCanonicalName[runtimeName] else {
                 continue
             }
-            let overlayNames = Set(matchingUses.compactMap { use in
-                use.swiftType != runtimeName ? use.swiftType : nil
-            })
-            guard !overlayNames.isEmpty else { continue }
-            guard overlayNames.count == 1, let overlayName = overlayNames.first else {
-                throw FrontendReceipt.Error.invalidRequest(
-                    "imported nominal \(runtimeName) has ambiguous Swift overlay identities"
-                )
+            let matchingUses = indices.map { uses[$0] }
+            guard let overlayName = try FrontendReceipt.ImportedNominalIdentity
+                .overlaySpelling(canonicalName: runtimeName, uses: matchingUses)
+            else { continue }
+            // Normalize Swift spellings before either the nested identity pass
+            // or the final merge consumes them. Keep raw ABI spellings intact.
+            for index in indices
+            where normalized[index].swiftType != runtimeName
+                && normalized[index].swiftType != overlayName {
+                normalized[index].aliases = Array(Set(
+                    normalized[index].aliases + [normalized[index].swiftType]
+                )).sorted()
+                normalized[index].swiftType = overlayName
             }
             var overlayComponents = overlayName.split(separator: ".")
-            let moduleRoots = Set(matchingUses.flatMap(\.importedModules)
-                .compactMap { $0.split(separator: ".").first })
+            let moduleRoots = FrontendReceipt.ImportedNominalIdentity.moduleRoots(in: matchingUses)
             if let first = overlayComponents.first,
-               moduleRoots.contains(first) {
+               moduleRoots.contains(String(first)) {
                 overlayComponents.removeFirst()
             }
             guard overlayComponents.count >= 2 else {
@@ -828,8 +854,7 @@ extension FrontendReceipt.Adapter {
                 // not a nominal alias, so keep every runtime identity exact.
                 continue
             }
-            for index in normalized.indices
-            where normalized[index].canonicalName == runtimeName {
+            for index in indicesByCanonicalName[runtimeName] ?? [] {
                 normalized[index].aliases = Array(Set(
                     normalized[index].aliases
                         + [runtimeName, normalized[index].swiftType]

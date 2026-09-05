@@ -67,6 +67,8 @@ func executeXcode(_ arguments: [String]) throws -> CLI.Result {
     let command = arguments[0]
     let tail = Array(arguments.dropFirst())
     switch command {
+    case "install": return try installXcodeProject(tail)
+    case "inspect": return try inspectXcodeProjectTargets(tail)
     case "generate": return try generateXcodeIntegration(tail)
     case "validate": return try validateXcodeIntegration(tail)
     case "phase":
@@ -2939,7 +2941,7 @@ private func loadHostPlan(at url: URL) throws -> XcodeIntegration.HostPlan {
     }
 }
 
-private func validateHostInputs(
+func validateHostInputs(
     plan: XcodeIntegration.HostPlan,
     planURL: URL
 ) throws -> CLI.XcodeValidationReport {

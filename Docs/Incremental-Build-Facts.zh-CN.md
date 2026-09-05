@@ -18,6 +18,7 @@ specialization。任何缓存事实在使用前都要重新匹配当前语义输
 | --- | --- | --- |
 | SDK identity | `xcrun` 返回的 SDK 路径和 build | Swift driver 实例、SDK 名、`DEVELOPER_DIR`、`TOOLCHAINS` |
 | 模块 frontend | 已验证的 receipt、诊断和工具链 identity | 编译捕获内容、编译器指纹、非 SDK 模块/头文件接口快照、metadata、策略、catalog、配置，以及每个源码的逻辑路径、物理路径和内容 hash |
+| 编译检查点 | 重新解析验证的 typed AST、identity SIL、semantic SIL 中间结果 | 编译捕获、精确工具链/编译器路径、frontend invocation 与 SDK、transform pipeline、完整 compiler-input digest，以及全部源码的逻辑/物理路径与内容 hash |
 | Symbol graph | 已验证的 SDK 模块公开符号图 | 编译器指纹、SDK/frontend invocation、模块名 |
 | 单候选探测 | 某个候选最终测得的操作及其原生签名类型 | 编译器指纹、变换流水线、SDK/frontend invocation、最低系统、规范化候选和边界类型 |
 | Native API Catalog | canonical 模块 Document，以及能确定性重建它的不透明 compiler projection | Xcode/SDK/compiler、target/deployment/language mode、模块内容/搜索/依赖 digest、规范化模块加载语义与变换流水线 |
@@ -56,6 +57,20 @@ build/fingerprint 绑定，不会逐文件重复扫描；当前模块自己的�
 graph 和单个声明的探测结果。也就是说，业务代码做了一次普通修改，不会因此重新
 扫描和探测一遍完全没变的 UIKit 或 Foundation。
 
+编译成功而后续 receipt 分析失败时，已完成的编译阶段保留为用户私有的 UTF-8 检查点。
+重试会重新解析每一阶段；AST 的源文件集合、编译器版本和 import 覆盖范围仍须匹配。
+每次 compiler 调用后以及每次检查点命中后，都会重新核对源码和接口输入。输入发现
+不完整时不启用检查点，编译或解析失败的结果也不会保存。检查点 key 不包含后续阶段
+使用的策略、Catalog 选择和非编译配置，因此修正 receipt 冲突后可复用相同的编译工作；
+源码、编译参数、工具链、SDK 或 transform 改变则不能复用。
+
+每个检查点最多保存 256 MiB，超过时正常解析但不缓存。完整模块 receipt 成功存入缓存
+后，会尝试非阻塞获取各自的 key 锁并清理三个中间 payload，保留锁 inode 以便其他进程协调。
+清理是尽力执行；失败构建遗留的条目没有总磁盘配额，可在没有构建运行时删除当前用户
+缓存中的 `v1/compiler_checkpoint` 目录。这些文件含编译器格式和源码路径，只适用于
+精确的本地编译上下文，不是可移植 Catalog 或公开 ABI。后续 Prepare 或物化失败重试
+仍优先使用已经完成且验证通过的完整 receipt。
+
 探测失败也不是一概写缓存。只有经过递归拆分后、可确定复现的单候选拒绝才会缓存；
 临时编译器故障不会变成永久“不支持”。正常探测和校验完成后，才保存候选的最终
 结果。每条缓存还只保存该候选的 receiver、参数、回调或返回值实际引用的原生类型。
@@ -92,7 +107,9 @@ miss，并递归跟进引用到的 module。任务文件以原子方式发布到
 
 每种缓存结果都由实际消费者重新解码并做语义校验：
 
-- canonical 编码、schema、key、payload SHA-256 必须一致；
+- manifest 的 canonical 编码、schema、key、payload SHA-256 必须一致；
+- 结构化 payload 继续检查其 canonical 编码；私有原始编译检查点必须是有效 UTF-8，
+  并通过当前的 AST/SIL parser；
 - receipt 必须完整通过结构校验，并匹配当前源码、metadata 和工具链；
 - symbol graph、实测操作及其原生签名类型走与新生成结果相同的验证；
 - Prepare state 会比较整个生成目录，包括文件权限和意外多出的条目；
@@ -176,6 +193,8 @@ schema 1 构建性能报告会记录决策，但不会泄露完整路径或编�
 
 - `frontend_cache.module_hit_count`、`module_miss_count`、
   `module_repair_count`、`module_bypass_count`；
+- `frontend_checkpoint.<typed_ast|identity_sil|semantic_sil>_<hit|generated|repaired|bypassed>_count`
+  和 `frontend_checkpoint.retired_count`；
 - `managed_native.symbol_graph_cache_hit_count`、`_miss_count`；
 - `managed_native.probe_cache_hit_count`、`_miss_count`、
   `cached_rejection_count`；
@@ -197,6 +216,13 @@ schema 1 构建性能报告会记录决策，但不会泄露完整路径或编�
 缓存、状态、观测、协议、产物和产品版本都继续保持 `1`，没有新增旧方案兼容分支。
 
 ## 大模块编译重放
+
+Canonical SIL 使用单独的私有输出文件。包含 bridging PCH 的 driver job 可能把 `-o -`
+输出写到 stderr；进程成功退出但没有有效 SIL 时，现在会在声明分析前明确报错。
+因此 subprocess stdout 字节不再包含 SIL 文件；对应 payload 仍通过
+`frontend.identity_sil_bytes`、`frontend.semantic_sil_bytes` 统计。
+系统框架混合重放、无 GUI 安装、编译器 launcher 串联及资源边界见
+[大型工程接入](Large-Project-Integration.zh-CN.md)。
 
 编译调用超过 3,000 个参数或 128 KiB 参数字节时，自动使用仅当前用户可访问、
 每次调用独立的 Swift response file。嵌套 response file 保留调用的工作目录；

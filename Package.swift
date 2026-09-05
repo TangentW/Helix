@@ -149,7 +149,7 @@ let package = Package(
             dependencies: [
                 "HelixCore", "HelixBytecode", "HelixInterface", "HelixCompiler",
                 "HelixPatch", "HelixReleaseTools", "HelixDevProtocol", "HelixDevTools",
-                "HelixBuildTools",
+                "HelixBuildTools", "HelixHubCore",
             ]
         ),
         .executableTarget(
@@ -226,7 +226,7 @@ let package = Package(
             name: "HelixHubCoreTests",
             dependencies: [
                 "HelixHubCore", "HelixBuildTools", "HelixDevProtocol",
-                "HelixDevTools", "HelixCore", "HelixPatch", "HelixReleaseTools",
+                "HelixDevTools", "HelixCore", "HelixPatch", "HelixReleaseTools", "HelixCLIKit",
             ]
         ),
         .testTarget(

@@ -6,10 +6,56 @@ import HelixCore
 import HelixDevTools
 import HelixPatch
 import HelixReleaseTools
+import HelixCLIKit
 import Testing
 
 @Suite("Helix Hub project installation", .serialized)
 struct ProjectInstallationTests {
+    @Test("Headless inspection and installation use the transactional Hub path")
+    func installsThroughCLI() throws {
+        let root = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let projectURL = root.appendingPathComponent("Example.xcodeproj")
+        let project = try Hub.ProjectFileParser().parse(projectURL: projectURL)
+        let planned = try Hub.OnboardingPlanner().plan(.init(project: project,
+            capabilities: try .init([.liveReload]), profiles: [.init(id: "live", capability: .liveReload,
+                applicationTargetName: "LiveApp", featureTargetName: "LiveFeature", featureModuleName: "LiveFeature",
+                schemeName: "Live", configurationName: "Debug", bundleIdentifier: "dev.example.live", namespaceSeed: "fixture")]))
+        var plan = planned.hostPlan
+        plan.profiles[0].deviceNativeMatrixQualified = true
+        let input = root.appendingPathComponent("InputPlan.json")
+        try XcodeIntegration.HostPlanCodec.encode(plan).write(to: input)
+        let app = CLI.Application(currentDirectoryURL: root)
+        let inspection = app.run(["xcode", "inspect", "--project", projectURL.path, "--json"])
+        #expect(inspection.exitCode == 0)
+        let inspected = try JSONDecoder().decode(CLI.XcodeProjectInspection.self, from: Data(inspection.standardOutput.utf8))
+        #expect(inspected.targets.contains { $0.name == "LiveFeature" && $0.configurations.contains("Debug") })
+        let arguments = ["xcode", "install", "--project", projectURL.path, "--plan", input.path, "--json"]
+        let first = app.run(arguments)
+        #expect(first.exitCode == 0, "\(first.standardError)")
+        let report = try JSONDecoder().decode(CLI.XcodeInstallationReport.self, from: Data(first.standardOutput.utf8))
+        #expect(report.writtenRelativePaths.contains("Example.xcodeproj/project.pbxproj"))
+        let projectData = try Data(contentsOf: projectURL.appendingPathComponent("project.pbxproj"))
+        #expect(app.run(arguments).exitCode == 0)
+        #expect(try Data(contentsOf: projectURL.appendingPathComponent("project.pbxproj")) == projectData)
+        #expect(try XcodeIntegration.HostPlanCodec.decode(Data(contentsOf: URL(fileURLWithPath: report.hostPlanPath))) == plan)
+        plan.profiles[0].applicationTargetName = "MissingApp"
+        try XcodeIntegration.HostPlanCodec.encode(plan).write(to: input)
+        #expect(app.run(arguments).exitCode != 0)
+        #expect(try Data(contentsOf: projectURL.appendingPathComponent("project.pbxproj")) == projectData)
+        plan.profiles[0].applicationTargetName = "LiveApp"
+        plan.profiles[0].workflow = .hotPatch
+        plan.profiles[0].deviceNativeMatrixQualified = nil
+        plan.profiles[0].patch = .init(actionTargetName: "Patch", actionSchemeName: "Patch",
+            recipePath: ".helix/MissingRecipe.json", signingCertificatePath: ".helix/Certificate.json",
+            trustedRootPath: ".helix/TrustedRoot.json")
+        try XcodeIntegration.HostPlanCodec.encode(plan).write(to: input)
+        let missingAssets = app.run(arguments)
+        #expect(missingAssets.exitCode != 0)
+        #expect(missingAssets.standardError.contains("quick-patch recipe"))
+        #expect(try Data(contentsOf: projectURL.appendingPathComponent("project.pbxproj")) == projectData)
+    }
+
     @Test("Fresh project receives both workflows idempotently")
     func installsBothWorkflows() throws {
         let root = try fixture()

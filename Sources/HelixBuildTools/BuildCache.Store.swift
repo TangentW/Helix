@@ -9,6 +9,7 @@ public enum BuildCache {}
 extension BuildCache {
 public enum Namespace: String, Codable, Hashable, Sendable {
     case moduleFrontend = "module_frontend"
+    case compilerCheckpoint = "compiler_checkpoint"
     case nativeAPICatalog = "native_api_catalog"
     case symbolGraph = "symbol_graph"
     case managedProbe = "managed_probe"
@@ -280,6 +281,34 @@ public struct Store: Sendable {
             return nil
         }
         return .init(data: data, source: .hit)
+    }
+
+    /// Best-effort retirement of a superseded private intermediate. Keep the
+    /// lock inode so another process cannot lock a different file for this key.
+    func discard(namespace: BuildCache.Namespace, key: Core.Digest) -> Bool {
+        let version = rootURL.appendingPathComponent("v1", isDirectory: true)
+        let directory = version.appendingPathComponent(namespace.rawValue, isDirectory: true)
+        do {
+            try Self.validateAncestorChain(rootURL)
+            for url in [rootURL, version, directory] {
+                var information = Darwin.stat()
+                guard lstat(url.path, &information) == 0, Self.isPrivateDirectory(information) else { return false }
+            }
+            let descriptor = try Self.openLock(directory.appendingPathComponent(".\(key.hex).lock"))
+            defer {
+                _ = flock(descriptor, LOCK_UN)
+                Darwin.close(descriptor)
+            }
+            // A successful foreground build must not wait for another
+            // process that is still producing this intermediate.
+            guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else { return false }
+            let entry = directory.appendingPathComponent(key.hex, isDirectory: true)
+            var information = Darwin.stat()
+            guard lstat(entry.path, &information) == 0, Self.isPrivateDirectory(information) else { return false }
+            return Self.quarantine(entry, manager: .default)
+        } catch {
+            return false
+        }
     }
 
     private static func load(

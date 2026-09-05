@@ -160,6 +160,10 @@ Canonical Swift debug metadata 会降低成经过 Verifier 检查的 HLBC source
 
 ## 安全与资源边界
 
+构建侧源码、compiler input、Catalog、checkpoint、worker 和缓存边界见
+[大型工程接入](Large-Project-Integration.zh-CN.md#当前构建侧资源边界)。这些截止条件与
+Runtime 内存记账不同，不构成宿主进程 RSS 硬预算。
+
 生产与开发路径都会对未知版本、capability、目标、身份、重复记录、畸形容器和资源超限 fail closed。生产字节码具有 fuel、deadline、stack、register、调用深度、值形状、NativeImport 和内存计量。可变大小 VM 操作会原子预留已验证的最坏分配上界、退回未使用部分并保留实际计费；下载与 live transfer 会在分配和执行前进行有界检查。
 
 开发期 Live Reload 会限制 artifact 字节与保留 generation。同步 Swift NativeImport 无法被硬抢占；只有具备 deadline 与 checkpoint 的 bounded/cooperative import 才适合进入生产 Catalog。真实设备尾延迟和内存压力仍需真机验证。

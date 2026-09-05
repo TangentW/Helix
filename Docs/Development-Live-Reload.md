@@ -2,6 +2,9 @@
 
 [简体中文](Development-Live-Reload.zh-CN.md)
 
+For scripted installation, compiler-wrapper coexistence, Prepare recovery, and
+large-module measurements, see [Large-project integration](Large-Project-Integration.md).
+
 Helix Live Reload shortens the edit–run loop for an already running development
 App. After Hub enables the project and Xcode completes one normal Run, saving a
 supported Swift implementation can compile a new generation, transfer it to a

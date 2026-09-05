@@ -38,12 +38,14 @@ public static func scan(sources: [FrontendReceipt.Source]) throws -> Result {
     for source in sources.sorted(by: { $0.logicalPath < $1.logicalPath }) {
         let url = source.url.resolvingSymlinksInPath().standardizedFileURL
         let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
-        guard values.isRegularFile == true,
-              let size = values.fileSize,
-              size <= 64 * 1_024 * 1_024
-        else {
+        guard values.isRegularFile == true, let size = values.fileSize else {
             throw FrontendReceipt.Error.invalidRequest(
-                "source is missing, non-regular, or too large: \(url.path)"
+                "source is not a regular file: \(url.path)"
+            )
+        }
+        guard size <= 64 * 1_024 * 1_024 else {
+            throw FrontendReceipt.Error.invalidRequest(
+                "source \(source.logicalPath) is \(size) bytes; maximum is 67108864 bytes (64 MiB): \(url.path)"
             )
         }
         let data = try Data(contentsOf: url, options: .mappedIfSafe)

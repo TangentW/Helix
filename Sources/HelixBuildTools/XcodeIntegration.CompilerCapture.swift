@@ -65,6 +65,11 @@ public enum CompilerCapture {
             set -eu
             umask 077
 
+            if [ "${HELIX_COMPILER_PROXY_ACTIVE:-}" = 1 ]; then
+                echo "error: recursive Helix compiler invocation; wrappers must call the provided Swift compiler" >&2
+                exit 2
+            fi
+
             # XCBuild queries a custom SWIFT_EXEC before it creates a target
             # build environment. Forward those discovery calls through xcrun;
             # real target compilation supplies the exact selected toolchain.
@@ -82,6 +87,25 @@ public enum CompilerCapture {
             if [ ! -x "$real_compiler" ]; then
                 echo "error: Helix cannot execute the selected Swift compiler" >&2
                 exit 2
+            fi
+            if [ "$real_compiler" -ef "$0" ]; then
+                echo "error: HELIX_REAL_SWIFT_EXEC points to the Helix proxy itself" >&2
+                exit 2
+            fi
+            compiler_wrapper="${HELIX_SWIFT_COMPILER_WRAPPER:-}"
+            if [ -n "$compiler_wrapper" ]; then
+                case "$compiler_wrapper" in
+                    /*) ;;
+                    *)
+                        echo "error: HELIX_SWIFT_COMPILER_WRAPPER must be an absolute executable path" >&2
+                        exit 2
+                        ;;
+                esac
+                if [ ! -f "$compiler_wrapper" ] || [ ! -x "$compiler_wrapper" ] ||
+                   [ "$compiler_wrapper" -ef "$0" ] || [ "$compiler_wrapper" -ef "$real_compiler" ]; then
+                    echo "error: HELIX_SWIFT_COMPILER_WRAPPER must name a distinct executable launcher" >&2
+                    exit 2
+                fi
             fi
             temporary=
 
@@ -143,7 +167,11 @@ public enum CompilerCapture {
                 /bin/mkdir -p "$proxy_directory"
             fi
             set +e
-            "$real_compiler" "$@"
+            if [ -n "$compiler_wrapper" ]; then
+                HELIX_COMPILER_PROXY_ACTIVE=1 "$compiler_wrapper" "$real_compiler" "$@"
+            else
+                HELIX_COMPILER_PROXY_ACTIVE=1 "$real_compiler" "$@"
+            fi
             compiler_status=$?
             set -e
             if [ "$compiler_status" -ne 0 ]; then

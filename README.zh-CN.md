@@ -53,6 +53,8 @@ Release App。
 
 ## 环境要求
 
+脚本接入、编译缓存串联、失败恢复与规模边界见[大型工程接入](Docs/Large-Project-Integration.zh-CN.md)。
+
 - 构建侧工具和 Helix 应用要求 macOS 14 或更高版本。
 - App Runtime target 要求 iOS 15 或更高版本。
 - 编译器集成与 fixture 需要包含 Swift 6 工具链的 Xcode。

@@ -63,6 +63,9 @@ tools into an iOS Release App.
 
 ## Requirements
 
+Scripted onboarding, compiler-cache chaining, recovery, and scale boundaries are
+documented in [Large-project integration](Docs/Large-Project-Integration.md).
+
 - macOS 14 or newer for build-side tools and the Helix application.
 - iOS 15 or newer for App runtime targets.
 - Xcode with a Swift 6 toolchain for compiler-backed integration and fixtures.

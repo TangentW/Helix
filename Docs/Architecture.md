@@ -897,6 +897,13 @@ generated-file manifest removes obsolete owned files while preserving unknown
 files in the integration directory; the registry's last-applied plan is used
 only to recover removal when generated files are missing.
 
+Headless `helix xcode install` applies a supplied Host Plan through the same
+transactional Hub installer; the CLI has no separate PBX mutation engine.
+The compiler proxy can chain an explicitly exported transparent launcher while
+capturing the actual compiler and original arguments. The selected source
+configuration still requires Helix's effective `SWIFT_EXEC`. See
+[Large-project integration](Large-Project-Integration.md) for the launcher contract.
+
 For a same-target integration, a Hub-owned empty Swift trigger ensures that the
 normal Sources phase invokes a transparent configuration-scoped compiler proxy.
 After the real compile succeeds, the proxy validates that exact invocation,
@@ -1015,3 +1022,34 @@ pipeline identity is revised so earlier local receipts and Shells require a full
 rebuild. Existing public APIs and persisted unscoped IDs retain their meaning.
 Reflection-only UI discovery cannot infer a private logical file scope; such
 roots need an explicit matching boundary or manual refresh after code activation.
+
+### Imported nominal spelling identities
+
+Imported type observations first establish an ABI/runtime identity or an exact,
+compiler-proven alias set. Within that group, one normalization entry recognizes
+an observed module-qualified spelling and its exact relative spelling, such as
+`Foundation.Progress` and `Progress`, before nested identity and merge consumers
+run. The observed qualified form is used for generated Swift; original spellings
+remain aliases. Only one proven module prefix may be removed for comparison;
+nested scopes and generic arguments remain significant. Distinct qualified
+modules, unrelated short aliases, and different runtime classes are not unified.
+Catalog declaring-module evidence also recognizes reexported module prefixes.
+
+Identity conflicts report all distinct conflicting facts with a deterministic
+source example, including Swift spelling, imports, measured provenance, runtime,
+representation and isolation. Typed-AST observations include line/column when
+available. These locations are diagnostic evidence, not nominal ID components.
+They are excluded from serialized compiler projections.
+The transform identity is revised to discard older local receipts/projections;
+existing persisted type-ID derivations and archive schemas are unchanged.
+
+### Recoverable compiler stages
+
+The module receipt cache now has three private compiler checkpoints below it:
+typed AST, identity SIL, and semantic SIL. Each has an exact compiler/source/
+input identity and is reparsed on reuse; later receipt validation still runs.
+Successful receipt publication retires its intermediates, while a failure leaves
+completed stages available for the same compiler inputs. This changes local
+build-fact storage only, not the public Shell or patch format. The validation,
+retention, and failure boundaries are specified in
+[Incremental Build Facts](Incremental-Build-Facts.md#reuse-layers).

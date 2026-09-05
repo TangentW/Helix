@@ -166,15 +166,7 @@ public struct Driver: Sendable {
             + wholeModuleArguments(sourceCount: sourceFiles.count, existing: semanticArguments)
             + semanticArguments
             + sourceFiles.map(\.path)
-            + ["-o", "-"]
-        let output = try run(arguments: arguments)
-        guard output.terminationStatus == 0 else {
-            throw SwiftFrontend.Error.compilationFailed(
-                status: output.terminationStatus,
-                diagnostics: output.standardError
-            )
-        }
-        return output.standardOutput
+        return try emitSILFile(arguments: arguments)
     }
 
     /// Typechecks sources and returns diagnostics emitted by a successful
@@ -302,15 +294,8 @@ public struct Driver: Sendable {
             sourceCount: sourceFiles.count,
             existing: semanticArguments
         ) + semanticArguments
-            + sourceFiles.map(\.path) + ["-o", "-"]
-        let output = try run(arguments: arguments)
-        guard output.terminationStatus == 0 else {
-            throw SwiftFrontend.Error.compilationFailed(
-                status: output.terminationStatus,
-                diagnostics: output.standardError
-            )
-        }
-        return output.standardOutput
+            + sourceFiles.map(\.path)
+        return try emitSILFile(arguments: arguments)
     }
 
     private func wholeModuleArguments(

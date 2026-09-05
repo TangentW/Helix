@@ -6,6 +6,14 @@ import Testing
 extension CompilerTests {
 @Suite("Large-module frontend replay")
 struct FrontendReplay {
+    @Test("Successful process exit without SIL is rejected before declaration analysis")
+    func rejectsMissingSIL() throws {
+        #expect(throws: SwiftFrontend.Error.self) {
+            try SwiftFrontend.Driver(compilerURL: URL(fileURLWithPath: "/bin/echo"))
+                .emitCanonicalSIL(sourceFiles: [], moduleName: "MissingSIL")
+        }
+    }
+
     @Test("Response files bound argv count and bytes independently")
     func responseFileLimits() throws {
         #expect(!SwiftFrontend.ResponseFile.isRequired(for: Array(repeating: "x", count: 3_000)))

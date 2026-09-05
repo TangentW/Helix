@@ -309,3 +309,50 @@ swift test --scratch-path .build/validation --filter DependencyPlanning
 
 常规测试使用 8 个模块，显式测量接受 1 到 256 个。Fixture 位于
 [BuildToolsTests.DependencyPlanning](../Tests/HelixBuildToolsTests/BuildToolsTests.DependencyPlanning.swift)。
+
+## 可恢复编译阶段的成本
+
+加入经过验证的编译检查点后，再次运行相同的 2,500 文件标量 fixture。本机冷 receipt
+为 10.532 秒，无改动命中 0.892 秒，正文修改后 miss 为 10.577 秒。每次 miss 记录六次
+子进程，完整 receipt 保存后清理全部三个中间 payload；无改动命中不启动子进程。
+本次单次观察接近此前 parser 优化后的 10.144/0.843/10.093 秒。检查点主要降低失败
+重试的成本，不减少冷编译本身的工作。
+
+`BuildToolsTests.CompilerCheckpoints` 使用真实编译器完成三个阶段，再故意触发源码
+value 与原生 codec 的冲突；仅修正该配置后，要求三个检查点全部命中、不重复发起
+AST/SIL 编译，并将恢复的 receipt 与完整无缓存结果逐项比较。输入改变、非法输出、
+数据损坏、条目被锁和符号链接另有回归覆盖。这些证据不等同于商业工程约 380 秒的
+失败 Prepare 实测。
+
+## 真实系统框架混合接入
+
+2026-09-05，系统框架 fixture 在同一模块中编译并生成通过校验的 receipt，包含
+Foundation、UIKit、AVFoundation 与 Photos。配置同时覆盖限定/非限定 `Progress`、
+Objective-C bridging header、`gnu++20` C++ interoperability、`@TaskLocal` 宏、
+implicit dynamic replacement，以及开启 explicit modules 的初始 driver 编译。
+目标为 `arm64-apple-ios15.0-simulator`，iPhone Simulator SDK build `23F81a`，
+Swift 6.3.3。每次测量使用空的私有 Helix 缓存，不清空系统或工具链缓存。
+
+| 源码文件数 | 源码字节 | 初始 explicit-module 编译 | 冷 receipt | 无改动 receipt 命中 |
+| --- | --- | --- | --- | --- |
+| 32 | 4,014 | 7.118 秒 | 16.956 秒 | 0.016 秒 |
+| 2,500 | 280,628 | 7.385 秒 | 30.010 秒 | 0.924 秒 |
+
+两次均要求 warm receipt 与 cold 相同，且 warm 不启动编译子进程。大档记录
+2,504 declarations、6 native types、4 native imports、三个生成并清理的 checkpoint，
+以及四个声明模块的 symbol graph。这些是源码按需 SDK 查询，不是四个完整 Native API
+Catalog，也不代表 100 模块冷预热、商业工程保存到屏幕延迟、Bridge 链接或真机激活。
+
+该 fixture 额外发现：含 bridging PCH job 时，Swift driver 把 `-o -` 的 SIL 写入 stderr。
+现改为读取明确指定的私有 SIL 文件，分析前验证 canonical header。混编回归覆盖两个 SIL
+入口，没有输出时立即报错。
+
+```sh
+HELIX_SYSTEM_FRAMEWORK_SOURCE_COUNT=2500 \
+HELIX_SYSTEM_FRAMEWORK_REPORT=/tmp/helix-system-frameworks.json \
+swift test --scratch-path .build/validation --no-parallel --filter SystemFrameworkIntegrationTests
+```
+
+常规测试使用 8 文件；测量接受 2 至 2,500 文件。JSON 保存 SDK/toolchain 身份、target、
+耗时和 cold trace。安装、编译器包装器合同及当前资源上限见
+[大型工程接入](Large-Project-Integration.zh-CN.md)。

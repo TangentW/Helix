@@ -2,6 +2,9 @@
 
 [English](Development-Live-Reload.md)
 
+脚本安装、编译器包装器共存、Prepare 失败恢复及大模块测量见
+[大型工程接入](Large-Project-Integration.zh-CN.md)。
+
 Helix Live Reload 用于缩短正在运行的开发 App 的修改循环。Hub 为工程启用 Helix、Xcode 正常 Run 一次后，保存一个受支持的 Swift 实现，就可以在同一进程中编译新 generation、传给 Simulator 或开发设备、激活代码并刷新受影响的 UI。
 
 这是开发功能，与生产补丁的产物、密钥、存储和生命周期完全隔离。

@@ -1003,6 +1003,11 @@ the Mac with the original logical source diagnostic.
 
 ## Security and resource boundaries
 
+For host-side source, compiler-input, Catalog, checkpoint, worker, and cache
+bounds, see [Large-project integration](Large-Project-Integration.md#current-build-side-resource-bounds).
+These cutoffs are distinct from runtime memory accounting and do not impose a
+host-process RSS budget.
+
 Production and development fail closed on unknown versions, capabilities,
 targets, identities, duplicate records, malformed containers, and resource
 limits. Production bytecode has fuel, deadline, stack, register, call-depth,

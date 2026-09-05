@@ -117,6 +117,10 @@ HLBC 仍不是“在设备上执行任意 Swift”。无法证明的 ABI、运�
 
 ## 可选诊断
 
+CI 和脚本接入可使用 `helix xcode inspect` 与
+`helix xcode install --project PATH --plan PATH`，安装复用 Hub 的事务工程修改引擎。
+完整 plan 示例、编译器包装器串联、重试行为及规模边界见[大型工程接入](Large-Project-Integration.zh-CN.md)。
+
 正常使用不需要命令行。排查工程状态时可以运行：
 
 ```bash

@@ -186,6 +186,11 @@ API coverage.
 
 ## Optional diagnostics
 
+CI and scripted project onboarding can use `helix xcode inspect` and
+`helix xcode install --project PATH --plan PATH`. Installation uses the same
+transactional project engine as Hub. See [Large-project integration](Large-Project-Integration.md)
+for a complete plan example, compiler-wrapper chaining, retry behavior, and bounds.
+
 Normal use requires no CLI command. For project diagnostics:
 
 ```bash

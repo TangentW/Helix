@@ -684,11 +684,15 @@ static let xcodeHelp = """
 Usage: helix xcode <command>
 
 Commands:
+  inspect       List Xcode targets, configurations, and shared schemes
+  install       Install a Host Plan into the Xcode project without the Hub GUI
   generate      Generate deterministic xcconfig, file-list, and Scheme scripts
   validate      Validate the checked-in Host Plan and every referenced input
   doctor        Inspect the active Xcode build environment for one profile
   phase         Run one versioned Xcode prepare/finalize/audit/session phase
   post-compile  Complete an automatically captured same-target Swift build
+  catalog-prewarm
+                Resume validated module Catalog generation in bounded batches
 """ + "\n"
 
 private static let patchHelp = """

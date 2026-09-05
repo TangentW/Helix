@@ -113,6 +113,11 @@ Async function root 出于不同原因复用同一套精确 range 源码 body �
 
 ## 开发期架构
 
+无 GUI 的 `helix xcode install` 使用同一 Hub 事务安装器应用传入的 Host Plan，CLI 不另建
+PBX 修改引擎。Compiler proxy 可串联明确导出的透明 launcher，同时捕获真实编译器与原始
+参数；所选源码 configuration 的有效 `SWIFT_EXEC` 仍须指向 Helix。
+launcher 合同见[大型工程接入](Large-Project-Integration.zh-CN.md)。
+
 Hub 默认直接使用现有 App target 作为 application 与源码 module；已有 framework 可以选择，但不是接入前置条件。Target 发现只判断 Xcode 是否能调度源码编译，不会盘点 `.swift` 文件或枚举 filesystem-synchronized group；实际 membership 始终以成功的 Swift frontend invocation 为准。它会复用或安装 Swift package、链接 `HelixAppIntegration`、让动态 `HelixDevSupport` 仅对开发 configuration 可用，并创建或更新共享 Scheme。业务源码没有稳定 Runtime import 或启动调用。
 
 Live Reload phase 把已处理的 App plist 声明为构建输入，在 Xcode 正常生成和处理之后、签名之前幂等补齐本地网络声明。修改 App bundle 的 Helix 收尾 phase 会追加在该 target 已有的 link、资源、Embed Frameworks、extension 与其他 copy phase 之后；已处理 plist 本身可能需要等待嵌入内容，因此不能让它的消费者反过来位于 embed phase 之前，否则 Xcode 会形成 target 内依赖环。Helix 既不复制也不覆盖业务 plist，因此每次构建仍以项目自身的 plist 设置为准。Compiler capture、生成 artifact 与处理后的构建产物无法完全表达为静态输入集合，因此 Helix 的 configuration wrapper 只对所选 configuration 自动关闭 Xcode user-script sandbox；移除接入后原 build setting 会自动恢复。
@@ -167,3 +172,27 @@ Release 审计会扫描最终 bundle，而不是信任 target 名称。生产 Ru
 transform pipeline identity 同步更新，使旧本地 receipt 和 Shell 完整重建。
 已有公开 API 和未限定文件作用域的持久化 ID 含义不变。仅靠反射的 UI 发现无法
 恢复私有类型的逻辑文件作用域，这类 root 需显式匹配 boundary，或在代码激活后手动刷新。
+
+### Imported nominal 的拼写身份
+
+Imported type 先建立 ABI/runtime 身份或编译器证明的精确 alias 集合，再在同一组内
+通过统一入口处理模块限定名与其完整相对名，例如 `Foundation.Progress` 与 `Progress`。
+归一发生在嵌套身份和最终合并之前，生成的 Swift 使用已观察到的限定形式，原始拼写
+保留为 alias。比较时只允许移除一个有模块证据的前缀，嵌套作用域和泛型参数保持原义。
+不同限定模块、仅共享短名字的类型和不同 runtime class 不会因此合并。
+Catalog 的声明模块证据也能识别经由 reexport 使用的模块前缀。
+
+身份冲突诊断列出每组不同的冲突事实，包括 Swift 拼写、imports、实测来源、runtime、
+表示和隔离规则，并选取一个确定的源文件示例。Typed AST 有位置时包含行列；重复的
+使用位置不会淹没冲突事实。这些位置仅用于诊断，不进入 nominal ID 派生。
+它们也不进入序列化的 compiler projection。
+Transform identity 同步更新，使旧本地 receipt/projection 失效；已有持久化 type ID
+派生规则和 archive schema 不变。
+
+### 可恢复的编译阶段
+
+模块 receipt 缓存下增加 typed AST、identity SIL 和 semantic SIL 三个私有编译检查点。
+每个检查点绑定精确的 compiler、源码与输入身份，复用时重新解析，后续 receipt 校验
+继续执行。完整 receipt 成功保存后清理对应中间产物；失败时保留已经完成的阶段，
+供编译输入相同的重试使用。这只改变本地构建事实的存储，不改变公开 Shell 或补丁格式。
+具体校验、保留和失效边界见[增量构建事实](Incremental-Build-Facts.zh-CN.md#分层复用什么)。

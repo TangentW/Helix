@@ -4,7 +4,8 @@ import HelixCore
 import HelixInterface
 
 /// Version-pinned adapter from Swift's typed JSON AST and canonical SIL to the
-/// stable Shell Build Receipt. Compiler dump formats are never persisted.
+/// stable Shell Build Receipt. Raw compiler formats are confined to private,
+/// exact-toolchain checkpoints and never become a published artifact contract.
 public enum FrontendReceipt {}
 
 extension FrontendReceipt {
