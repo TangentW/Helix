@@ -24,6 +24,14 @@
 - Add concise English comments for non-obvious invariants, ABI or wire-format
   constraints, concurrency behavior, and security decisions. Do not narrate
   self-explanatory code.
+- Identity, deduplication, and cache keys must name their authority and scope.
+  Compiler debug placeholders and display spellings are not declaration identity;
+  preserve candidates until compiler USR, ABI, source scope, or artifact evidence
+  proves equivalence. Never resolve conflicting evidence by taking the first item.
+- Fail-closed diagnostics must include the conflicting values, their provenance,
+  and a locatable example for each distinct fact available at the rejection point.
+  Aggregate independent failures where their prerequisites remain valid; report
+  blocked checks explicitly and never publish results derived from invalid facts.
 - Every feature or refactor must include tests proportional to its risk,
   including negative and boundary cases where relevant.
 - Work in explicit stages. Before starting the next stage, review the current

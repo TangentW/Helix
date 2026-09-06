@@ -46,8 +46,10 @@ for unusual projects, not as mandatory setup.
 
 ## What Helix installs
 
-All edits are committed as one recoverable transaction. A failure cannot leave
-half an integration in the project.
+All edits use one recoverable file transaction. PBX edits preserve unchanged
+tokens and comments, pass independent system property-list validation, and are
+read back before commit. A failure rolls back project and generated-file changes;
+any rollback failure is reported explicitly.
 
 | Area | Automatic behavior |
 | --- | --- |
@@ -67,6 +69,14 @@ Native API lists, hosts, ports, pairing secrets, LLDB scripts, or shell `PATH`
 settings for Helix.
 
 ## Change or remove the integration
+
+The selected source configuration uses `SWIFT_USE_INTEGRATED_DRIVER=NO`, so
+Xcode's built-in Swift compilation cache is unavailable there. Helix's build-fact
+cache is separate. Doctor reports this cost and detects obsolete generated kits;
+reapply integration after an update to receive current settings, including the
+supplemental linker-response compatibility setting. See
+[large-project integration](Large-Project-Integration.md) for all affected
+settings, compiler-launcher chaining, and `post-compile --diagnose`.
 
 Nothing selected during onboarding is locked. Reopen the project in Helix at
 any time, change its App target, source target, scheme, or configuration, and

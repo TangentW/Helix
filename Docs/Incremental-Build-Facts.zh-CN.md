@@ -32,7 +32,10 @@ specialization。任何缓存事实在使用前都要重新匹配当前语义输
 
 持久缓存 key 使用 canonical JSON 和带版本的 hash domain，不依赖文件修改时间。
 源码内容、编译捕获内容、编译器可执行文件指纹、SDK build、target、最低系统、优化
-级别和 frontend 语义参数，都在会影响对应结果的层级进入 key。
+级别和 frontend 语义参数，都在会影响对应结果的层级进入 key。捕获的 `-g`、
+`-gline-tables-only`、`-gnone` 按原顺序保留，因为声明解析会使用 SIL scope 来源。
+本次依据实际函数定义判定 SIL 身份的修订更新了 transform hash，使旧 Shell/module
+事实失效，不改变 wire schema。详见[编译器身份](Compiler-Identity.zh-CN.md)。
 
 Helix 会先从源码中提取真正使用的 Swift `import`，再与编译器 receipt 中的导入模块
 交叉校验。Swift 与常见 Clang 搜索参数（`-I`、`-F`、`-Fsystem`、`-iquote`、
@@ -104,6 +107,12 @@ miss，并递归跟进引用到的 module。任务文件以原子方式发布到
 因为普通源码修改造成 module receipt miss 时，这些候选仍有实际复用价值。
 
 ## 命中前仍然要验证
+
+`xcode post-compile --diagnose` 即使已有完整模块 receipt 缓存，也会运行当前 frontend
+检查。它共用正常生成的依赖分析，重新解析验证 compiler checkpoint，成功或失败均
+保留检查点，不发布模块 receipt、不回收检查点。修正后的正常构建可以复用编译再按
+正常规则发布。诊断可读已有 Catalog，不执行冷编目或预热；具体边界见
+[大型工程接入](Large-Project-Integration.zh-CN.md#一次收集独立的-frontend-问题)。
 
 每种缓存结果都由实际消费者重新解码并做语义校验：
 

@@ -14,6 +14,7 @@ struct SystemFrameworkIntegrationTests {
         var target: String
         var sourceCount: Int
         var sourceBytes: Int
+        var debugScopeCount: Int
         var importedModules: [String]
         var explicitBuildMicroseconds: UInt64
         var coldReceiptMicroseconds: UInt64
@@ -62,6 +63,10 @@ struct SystemFrameworkIntegrationTests {
 
                 """
             }
+            if index == 1 {
+                contents += "enum SecondaryContext { @TaskLocal static var value: Int = 2 }\n"
+                contents += "public func secondaryContextValue() -> Int { SecondaryContext.value }\n"
+            }
             let bytes = Data(contents.utf8)
             sourceBytes += bytes.count
             try bytes.write(to: url)
@@ -71,7 +76,7 @@ struct SystemFrameworkIntegrationTests {
         let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
         let target = "arm64-apple-ios15.0-simulator"
         let captured = [
-            "-Xfrontend", "-enable-private-imports", "-Xfrontend", "-enable-implicit-dynamic",
+            "-g", "-Xfrontend", "-enable-private-imports", "-Xfrontend", "-enable-implicit-dynamic",
             "-Xfrontend", "-enable-dynamic-replacement-chaining", "-explicit-module-build",
             "-cxx-interoperability-mode=default", "-Xcc", "-std=gnu++20",
             "-import-objc-header", header.path, "-pch-output-dir", root.path,
@@ -84,12 +89,19 @@ struct SystemFrameworkIntegrationTests {
         try #require(initial.terminationStatus == 0, "\(initial.standardError)")
         let explicitMicroseconds = (DispatchTime.now().uptimeNanoseconds - initialStarted) / 1_000
         let semantic = try XcodeIntegration.CompilerArguments.semanticArguments(from: captured)
+        #expect(semantic.contains("-g"))
         let metadata = InterfaceArchive.ReleaseMetadata(bundleID: "dev.helix.system-frameworks", buildNumber: "1",
             shellNamespaceID: .derive(bundleID: "dev.helix.system-frameworks", buildNumber: "1", seed: "fixture"),
             machOUUIDs: [], targetTriple: target, minimumOS: .init(15), xcodeBuild: "fixture", sdkBuild: sdk.buildVersion,
             frontendInvocation: .init(moduleName: "SystemFrameworkFixture", targetTriple: target, sdkName: sdk.name,
                 sdkBuild: sdk.buildVersion, optimization: "-Onone", semanticArguments: semantic),
             transformPipelineHash: ShellBuild.transformPipelineHash, sourceBaselineHash: .sha256("computed"))
+        let debugSIL = try frontend.emitCanonicalSIL(sourceFiles: sources.map(\.url), invocation: metadata.frontendInvocation)
+        let debugScopeCount = debugSIL.split(separator: "\n").filter { $0.hasPrefix("sil_scope ") }.count
+        try #require(debugScopeCount > 0)
+        let debugFile = try CanonicalSIL.File(text: debugSIL)
+        #expect(debugFile.functions.contains { $0.declarationLocation?.file.hasSuffix("Feature0.swift") == true })
+        #expect(debugFile.functions.contains { $0.declarationLocation?.file.hasSuffix("Feature1.swift") == true })
         let configuration = try PatchConfiguration.Document.parse(yaml: """
         schema: 1
         modules:
@@ -118,7 +130,7 @@ struct SystemFrameworkIntegrationTests {
         if let path = environment["HELIX_SYSTEM_FRAMEWORK_REPORT"] {
             try #require(path.hasPrefix("/"))
             try Core.CanonicalJSON.encode(Measurement(sdk: sdk, toolchain: toolchain, target: target,
-                sourceCount: count, sourceBytes: sourceBytes,
+                sourceCount: count, sourceBytes: sourceBytes, debugScopeCount: debugScopeCount,
                 importedModules: cold.importedModules, explicitBuildMicroseconds: explicitMicroseconds,
                 coldReceiptMicroseconds: coldMicroseconds, warmReceiptMicroseconds: warmMicroseconds,
                 trace: cold.performance)).write(to: URL(fileURLWithPath: path), options: .atomic)

@@ -36,15 +36,23 @@ extension FrontendReceipt.Adapter {
     ) throws {
         guard !nominal.declarationIdentity.isEmpty else {
             throw FrontendReceipt.Error.malformedAST(
-                "source nominal \(nominal.canonicalName) has no declaration USR"
+                "source nominal has no declaration USR: \(sourceNominalEvidence(nominal))"
             )
         }
         if let existing = declarations[nominal.declarationIdentity], existing != nominal {
             throw FrontendReceipt.Error.malformedAST(
-                "source nominal USR \(nominal.declarationIdentity) has conflicting declarations"
+                "source nominal USR \(nominal.declarationIdentity) has conflicting declarations: "
+                + [existing, nominal].map(sourceNominalEvidence).sorted().joined(separator: "; ")
             )
         }
         declarations[nominal.declarationIdentity] = nominal
+    }
+
+    private static func sourceNominalEvidence(_ value: SourceNominal) -> String {
+        "USR=\(value.declarationIdentity), name=\(value.canonicalName), "
+        + "source=\(value.sourceFileLogicalID), UTF-8 offset=\(value.declarationOffset.map(String.init) ?? "unknown"), "
+        + "kind=\(value.kind), fileScoped=\(value.isFileScoped), ambiguousName=\(value.hasAmbiguousName), "
+        + "fileScopeNameable=\(value.isFileScopeNameable), availabilityConstrained=\(value.isAvailabilityConstrained)"
     }
 
     static func resolveSourceNominalNames(_ nominals: [SourceNominal]) throws -> [SourceNominal] {
@@ -55,7 +63,8 @@ extension FrontendReceipt.Adapter {
                   Set(values.map(\.sourceFileLogicalID)).count == values.count
             else {
                 throw FrontendReceipt.Error.malformedAST(
-                    "source nominal \(name) has conflicting declarations"
+                    "source nominal \(name) has conflicting declarations: "
+                    + values.map(sourceNominalEvidence).sorted().joined(separator: "; ")
                 )
             }
             ambiguousNames.insert(name)

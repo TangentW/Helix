@@ -53,14 +53,55 @@ public struct CachedAdapter: Sendable {
         precomputedToolchain: ReleaseCompiler.ToolchainIdentity? = nil,
         precomputedCompilerInputs: BuildCache.CompilerInputs.Snapshot? = nil
     ) throws -> FrontendReceipt.Output {
-        let performance = BuildPerformance.Recorder()
+        try generate(
+            request, compilerCapture: compilerCapture, compilerArguments: compilerArguments,
+            workingDirectory: workingDirectory, precomputedToolchain: precomputedToolchain,
+            precomputedCompilerInputs: precomputedCompilerInputs, diagnostics: nil)
+    }
+
+    public func diagnose(
+        _ request: FrontendReceipt.Request,
+        compilerCapture: Data,
+        compilerArguments: [String] = [],
+        workingDirectory: URL? = nil,
+        precomputedToolchain: ReleaseCompiler.ToolchainIdentity? = nil,
+        precomputedCompilerInputs: BuildCache.CompilerInputs.Snapshot? = nil,
+        catalogFailure: String? = nil
+    ) throws -> FrontendReceipt.DiagnosticReport {
+        let session = FrontendReceipt.DiagnosticSession(collectFailures: true, catalogFailure: catalogFailure)
+        do {
+            let output = try generate(
+            request, compilerCapture: compilerCapture, compilerArguments: compilerArguments,
+            workingDirectory: workingDirectory, precomputedToolchain: precomputedToolchain,
+            precomputedCompilerInputs: precomputedCompilerInputs, diagnostics: session)
+            return session.report(output: output)
+        } catch {
+            if error is CancellationError { throw error }
+            if session.checks.isEmpty {
+                return .failure(stage: "frontend.setup", reason: String(describing: error))
+            }
+            return session.report(output: nil, error: error)
+        }
+    }
+
+    private func generate(
+        _ request: FrontendReceipt.Request,
+        compilerCapture: Data,
+        compilerArguments: [String] = [],
+        workingDirectory: URL? = nil,
+        precomputedToolchain: ReleaseCompiler.ToolchainIdentity? = nil,
+        precomputedCompilerInputs: BuildCache.CompilerInputs.Snapshot? = nil,
+        diagnostics: FrontendReceipt.DiagnosticSession?
+    ) throws -> FrontendReceipt.Output {
+        let performance = diagnostics?.performance ?? BuildPerformance.Recorder()
         let adapter = FrontendReceipt.Adapter()
         try performance.measure("frontend_cache.validate_request") {
             try adapter.validate(request)
         }
         let states = try performance.measure("frontend_cache.load_sources") {
             try adapter.loadSources(
-                request.sources.sorted { $0.logicalPath < $1.logicalPath }
+                request.sources.sorted { $0.logicalPath < $1.logicalPath },
+                collectFailures: diagnostics != nil
             )
         }
         let sourceImports = performance.measure("frontend_cache.scan_imports") {
@@ -107,39 +148,11 @@ public struct CachedAdapter: Sendable {
                 request,
                 cache: nil,
                 toolchain: toolchain,
-                compilerInputHash: nil
+                compilerInputHash: nil, diagnostics: diagnostics
             )
-            performance.merge(output.performance)
+            if diagnostics == nil { performance.merge(output.performance) }
             output.performance = performance.trace()
             return output
-        }
-        let key = try performance.measure("frontend_cache.make_key") {
-            let catalogIdentities = try request.nativeAPICatalogs.map {
-                CatalogIdentity(
-                    moduleName: $0.document.identity.moduleName,
-                    artifactIdentity: try $0.cacheIdentity()
-                )
-            }
-            return try BuildCache.key(
-                domain: "HLX.BuildCache.ModuleFrontend.v1",
-                value: Key(
-                    compilerCaptureSHA256: .sha256(compilerCapture),
-                    toolchain: toolchain,
-                    compilerInputs: compilerInputs,
-                    metadata: request.metadata,
-                    configuration: request.configuration,
-                    nativeImportCatalog: request.nativeImportCatalog,
-                    nativeAPICatalogs: catalogIdentities,
-                    callingSurfacePolicy: request.callingSurfacePolicy,
-                    sources: states.map {
-                        SourceIdentity(
-                            logicalPath: $0.logicalPath,
-                            physicalPath: $0.url.path,
-                            contentHash: $0.contentHash
-                        )
-                    }
-                )
-            )
         }
         let expectedSources = states.map {
             ShellBuildReceipt.Source(
@@ -179,6 +192,46 @@ public struct CachedAdapter: Sendable {
                 }
             }
         )
+        if let diagnostics {
+            // Diagnosis rechecks compiler facts, bypasses the complete receipt
+            // cache, and retains validated checkpoints for the next correction.
+            let output = try adapter.generate(request, cache: cache, toolchain: toolchain,
+                compilerInputHash: compilerInputHash, expectedImports: sourceImports,
+                expectedSources: expectedSources, checkpoints: checkpoints, diagnostics: diagnostics)
+            try checkpoints.confirmInputs()
+            guard output.receipt.sources == expectedSources else {
+                throw FrontendReceipt.SourceImports.ValidationError.sourceChanged
+            }
+            return output
+        }
+        let key = try performance.measure("frontend_cache.make_key") {
+            let catalogIdentities = try request.nativeAPICatalogs.map {
+                CatalogIdentity(
+                    moduleName: $0.document.identity.moduleName,
+                    artifactIdentity: try $0.cacheIdentity()
+                )
+            }
+            return try BuildCache.key(
+                domain: "HLX.BuildCache.ModuleFrontend.v1",
+                value: Key(
+                    compilerCaptureSHA256: .sha256(compilerCapture),
+                    toolchain: toolchain,
+                    compilerInputs: compilerInputs,
+                    metadata: request.metadata,
+                    configuration: request.configuration,
+                    nativeImportCatalog: request.nativeImportCatalog,
+                    nativeAPICatalogs: catalogIdentities,
+                    callingSurfacePolicy: request.callingSurfacePolicy,
+                    sources: states.map {
+                        SourceIdentity(
+                            logicalPath: $0.logicalPath,
+                            physicalPath: $0.url.path,
+                            contentHash: $0.contentHash
+                        )
+                    }
+                )
+            )
+        }
         var generatedOutput: FrontendReceipt.Output?
         var validatedPayload: Payload?
         let value: BuildCache.Value

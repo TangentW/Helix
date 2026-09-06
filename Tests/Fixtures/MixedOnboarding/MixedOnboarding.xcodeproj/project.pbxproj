@@ -1,0 +1,286 @@
+// !$*UTF8*$!
+{
+	archiveVersion = "1";
+	classes = {
+	};
+	objectVersion = "60";
+	objects = {
+		98EDD35F41572799B2741474 = {
+			isa = "PBXFileReference";
+			lastKnownFileType = "sourcecode.swift";
+			path = "Sources/MixedFixture.Application.swift";
+			sourceTree = "SOURCE_ROOT";
+		};
+		E7F3D5BED1CBB6384C7A99A3 = {
+			isa = "PBXBuildFile";
+			fileRef = "98EDD35F41572799B2741474";
+		};
+		9062C07675B74B0921859D84 = {
+			isa = "PBXFileReference";
+			lastKnownFileType = "sourcecode.cpp.objcpp";
+			path = "Sources/MixedFixture.Bridged.mm";
+			sourceTree = "SOURCE_ROOT";
+		};
+		70E691BF45009A2EAB2F3648 = {
+			isa = "PBXBuildFile";
+			fileRef = "9062C07675B74B0921859D84";
+		};
+		4222E23C5FFB8436FF563B32 = {
+			isa = "PBXFileReference";
+			lastKnownFileType = "sourcecode.swift";
+			path = "Sources/MixedFixture.Frameworks.swift";
+			sourceTree = "SOURCE_ROOT";
+		};
+		3AFF2102522BF7F4D9864011 = {
+			isa = "PBXBuildFile";
+			fileRef = "4222E23C5FFB8436FF563B32";
+		};
+		303BB83A5334634224752D40 = {
+			isa = "PBXFileReference";
+			lastKnownFileType = "sourcecode.swift";
+			path = "Sources/MixedFixture.PrimaryContext.swift";
+			sourceTree = "SOURCE_ROOT";
+		};
+		6AF467F95E3E4D0577B91151 = {
+			isa = "PBXBuildFile";
+			fileRef = "303BB83A5334634224752D40";
+		};
+		080F1BBBDDC8789C4E063D63 = {
+			isa = "PBXFileReference";
+			lastKnownFileType = "sourcecode.swift";
+			path = "Sources/MixedFixture.SecondaryContext.swift";
+			sourceTree = "SOURCE_ROOT";
+		};
+		DC3A2945311B76C069002F41 = {
+			isa = "PBXBuildFile";
+			fileRef = "080F1BBBDDC8789C4E063D63";
+		};
+		590B9A19B267A79C8A6E5F91 = {
+			isa = "PBXFileReference";
+			lastKnownFileType = "sourcecode.swift";
+			path = "Sources/MixedFixture.swift";
+			sourceTree = "SOURCE_ROOT";
+		};
+		B989F66ED375DE788A1A356E = {
+			isa = "PBXBuildFile";
+			fileRef = "590B9A19B267A79C8A6E5F91";
+		};
+		C8142041B2F5E777ECAE8BC1 = {
+			isa = "PBXFileReference";
+			lastKnownFileType = "sourcecode.c.h";
+			path = "Headers/MixedFixture.Bridging.h";
+			sourceTree = "SOURCE_ROOT";
+		};
+		87817DB8A53E4BAF4B7A2322 = {
+			isa = "PBXFileReference";
+			explicitFileType = "wrapper.application";
+			includeInIndex = "0";
+			path = "MixedApp.app";
+			sourceTree = "BUILT_PRODUCTS_DIR";
+		};
+		54203753FCB91CE20BAD3F9A = {
+			isa = "PBXGroup";
+			children = (
+				"87817DB8A53E4BAF4B7A2322",
+			);
+			name = "Products";
+			sourceTree = "<group>";
+		};
+		73BE0F300C7CA7E643525976 = {
+			isa = "PBXGroup";
+			children = (
+				"98EDD35F41572799B2741474",
+				"9062C07675B74B0921859D84",
+				"4222E23C5FFB8436FF563B32",
+				"303BB83A5334634224752D40",
+				"080F1BBBDDC8789C4E063D63",
+				"590B9A19B267A79C8A6E5F91",
+				"C8142041B2F5E777ECAE8BC1",
+				"54203753FCB91CE20BAD3F9A",
+			);
+			sourceTree = "<group>";
+		};
+		C5F5C4F1F2717E4D150D2F28 = {
+			isa = "PBXSourcesBuildPhase";
+			buildActionMask = "2147483647";
+			files = (
+				"E7F3D5BED1CBB6384C7A99A3",
+				"70E691BF45009A2EAB2F3648",
+				"3AFF2102522BF7F4D9864011",
+				"6AF467F95E3E4D0577B91151",
+				"DC3A2945311B76C069002F41",
+				"B989F66ED375DE788A1A356E",
+			);
+			runOnlyForDeploymentPostprocessing = "0";
+		};
+		58E684D2C7500190DE1E6846 = {
+			isa = "PBXFrameworksBuildPhase";
+			buildActionMask = "2147483647";
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = "0";
+		};
+		7427CFE9D4F826124A731511 = {
+			isa = "XCBuildConfiguration";
+			name = "Debug";
+			buildSettings = {
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_MODULE_NAME = "MixedOnboarding";
+				PRODUCT_BUNDLE_IDENTIFIER = "dev.helix.mixed-onboarding";
+				SDKROOT = "iphoneos";
+				IPHONEOS_DEPLOYMENT_TARGET = "15.0";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				TARGETED_DEVICE_FAMILY = "1,2";
+				SWIFT_VERSION = "6.0";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_STRICT_CONCURRENCY = "complete";
+				SWIFT_ENABLE_EXPLICIT_MODULES = "YES";
+				SWIFT_OBJC_INTEROP_MODE = "objcxx";
+				SWIFT_OBJC_BRIDGING_HEADER = "Headers/MixedFixture.Bridging.h";
+				CLANG_ENABLE_MODULES = "YES";
+				CLANG_ENABLE_OBJC_ARC = "YES";
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_CXX_LIBRARY = "libc++";
+				GENERATE_INFOPLIST_FILE = "YES";
+				INFOPLIST_KEY_UILaunchScreen_Generation = "YES";
+				DEBUG_INFORMATION_FORMAT = "dwarf";
+				GCC_GENERATE_DEBUGGING_SYMBOLS = "YES";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				EXCLUDED_SOURCE_FILE_NAMES = "*.xcassets";
+				CURRENT_PROJECT_VERSION = "1";
+				MARKETING_VERSION = "1.0";
+				CODE_SIGNING_ALLOWED = "NO";
+				OTHER_SWIFT_FLAGS = (
+					"$(inherited)",
+					"-Xfrontend",
+					"-enable-private-imports",
+					"-Xfrontend",
+					"-enable-implicit-dynamic",
+					"-Xfrontend",
+					"-enable-dynamic-replacement-chaining",
+				);
+			};
+		};
+		BB85281EDF56F0D556C1694B = {
+			isa = "XCBuildConfiguration";
+			name = "Release";
+			buildSettings = {
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_MODULE_NAME = "MixedOnboarding";
+				PRODUCT_BUNDLE_IDENTIFIER = "dev.helix.mixed-onboarding";
+				SDKROOT = "iphoneos";
+				IPHONEOS_DEPLOYMENT_TARGET = "15.0";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				TARGETED_DEVICE_FAMILY = "1,2";
+				SWIFT_VERSION = "6.0";
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_STRICT_CONCURRENCY = "complete";
+				SWIFT_ENABLE_EXPLICIT_MODULES = "YES";
+				SWIFT_OBJC_INTEROP_MODE = "objcxx";
+				SWIFT_OBJC_BRIDGING_HEADER = "Headers/MixedFixture.Bridging.h";
+				CLANG_ENABLE_MODULES = "YES";
+				CLANG_ENABLE_OBJC_ARC = "YES";
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_CXX_LIBRARY = "libc++";
+				GENERATE_INFOPLIST_FILE = "YES";
+				INFOPLIST_KEY_UILaunchScreen_Generation = "YES";
+				DEBUG_INFORMATION_FORMAT = "dwarf";
+				GCC_GENERATE_DEBUGGING_SYMBOLS = "YES";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				EXCLUDED_SOURCE_FILE_NAMES = "*.xcassets";
+				CURRENT_PROJECT_VERSION = "1";
+				MARKETING_VERSION = "1.0";
+				CODE_SIGNING_ALLOWED = "NO";
+				OTHER_SWIFT_FLAGS = (
+					"$(inherited)",
+					"-Xfrontend",
+					"-enable-private-imports",
+					"-Xfrontend",
+					"-enable-implicit-dynamic",
+					"-Xfrontend",
+					"-enable-dynamic-replacement-chaining",
+				);
+			};
+		};
+		A3D6D71D290BA7819064201E = {
+			isa = "XCConfigurationList";
+			buildConfigurations = (
+				"7427CFE9D4F826124A731511",
+				"BB85281EDF56F0D556C1694B",
+			);
+			defaultConfigurationIsVisible = "0";
+			defaultConfigurationName = "Debug";
+		};
+		17FFACDB45726D776E945ECE = {
+			isa = "XCBuildConfiguration";
+			name = "Debug";
+			buildSettings = {
+			};
+		};
+		BCB5BB77EFCE6D792B971C0D = {
+			isa = "XCBuildConfiguration";
+			name = "Release";
+			buildSettings = {
+			};
+		};
+		F8D416C6E53D8B27665D4FFF = {
+			isa = "XCConfigurationList";
+			buildConfigurations = (
+				"17FFACDB45726D776E945ECE",
+				"BCB5BB77EFCE6D792B971C0D",
+			);
+			defaultConfigurationIsVisible = "0";
+			defaultConfigurationName = "Debug";
+		};
+		B9F48C76A2828AF0D4500C2F = {
+			isa = "PBXNativeTarget";
+			buildConfigurationList = "A3D6D71D290BA7819064201E";
+			buildPhases = (
+				"C5F5C4F1F2717E4D150D2F28",
+				"58E684D2C7500190DE1E6846",
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = "MixedApp";
+			productName = "MixedApp";
+			productReference = "87817DB8A53E4BAF4B7A2322";
+			productType = "com.apple.product-type.application";
+		};
+		9DF5040983A9EB6D518F8DBE = {
+			isa = "XCLocalSwiftPackageReference";
+			relativePath = "../../..";
+		};
+		54415870E4DCC4FCE5563BAB = {
+			isa = "PBXProject";
+			attributes = {
+				LastUpgradeCheck = "2600";
+			};
+			buildConfigurationList = "F8D416C6E53D8B27665D4FFF";
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = "en";
+			knownRegions = (
+				"en",
+				"Base",
+			);
+			mainGroup = "73BE0F300C7CA7E643525976";
+			productRefGroup = "54203753FCB91CE20BAD3F9A";
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				"B9F48C76A2828AF0D4500C2F",
+			);
+			packageReferences = (
+				"9DF5040983A9EB6D518F8DBE",
+			);
+		};
+	};
+	rootObject = "54415870E4DCC4FCE5563BAB";
+}

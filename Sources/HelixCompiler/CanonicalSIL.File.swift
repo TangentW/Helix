@@ -175,7 +175,10 @@ public struct Function: Hashable, Sendable {
 }
 
 public struct File: Sendable {
-    public var functions: [CanonicalSIL.Function]
+    public var functions: [CanonicalSIL.Function] {
+        didSet { uniqueFunctionIndices = Self.indexFunctions(functions) }
+    }
+    private var uniqueFunctionIndices: [String: Int] = [:]
     public var typeEnvironment: CanonicalSIL.TypeEnvironment
     let protocolConformances: CanonicalSIL.ProtocolConformance.Environment
     private let protocolDispatchInventory: CanonicalSIL.ProtocolConformance
@@ -188,21 +191,28 @@ public struct File: Sendable {
         let scopeLocations = Dictionary(
             uniqueKeysWithValues: scopes.map { ($0.id, $0.location) }
         )
-        var declarationLocations: [String: Core.SourceLocation] = [:]
+        var extractedFunctions = try Self.extractFunctions(text, scopeLocations: scopeLocations)
+        let definedSymbols = Set(extractedFunctions.map(\.mangledName))
+        var declarationScopes: [String: CanonicalSIL.DebugScope] = [:]
         for scope in scopes {
-            guard let symbol = scope.parentSymbol else { continue }
-            if let existing = declarationLocations[symbol], existing != scope.location {
+            // A debug parent spelling is not a declaration. In particular,
+            // __unknown_macro__ can name unrelated scopes in several files.
+            // Only a concrete SIL definition can give this map its identity.
+            guard let symbol = scope.parentSymbol, definedSymbols.contains(symbol) else { continue }
+            if let existing = declarationScopes[symbol], existing.location != scope.location {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "function @\(symbol) has conflicting declaration locations"
+                    "function @\(symbol) has conflicting declaration locations: "
+                    + "scope \(existing.id) at \(existing.location.file):\(existing.location.line):\(existing.location.column); "
+                    + "scope \(scope.id) at \(scope.location.file):\(scope.location.line):\(scope.location.column)"
                 )
             }
-            declarationLocations[symbol] = scope.location
+            declarationScopes[symbol] = scope
         }
-        let extractedFunctions = try Self.extractFunctions(
-            text,
-            scopeLocations: scopeLocations,
-            declarationLocations: declarationLocations
-        )
+        for index in extractedFunctions.indices {
+            extractedFunctions[index].declarationLocation = declarationScopes[
+                extractedFunctions[index].mangledName
+            ]?.location
+        }
         let parsedFunctions = extractedFunctions.map(
             CanonicalSIL.OpaqueResult.concretize
         )
@@ -230,10 +240,26 @@ public struct File: Sendable {
         protocolConformances = parsedConformances
         protocolDispatchInventory = dispatchInventory
         sourceModuleByFile = sourceModules
+        uniqueFunctionIndices = Self.indexFunctions(functions)
     }
 
     public func function(mangledName: String) -> CanonicalSIL.Function? {
-        functions.first { $0.mangledName == mangledName }
+        guard let index = uniqueFunctionIndices[mangledName] else { return nil }
+        return functions[index]
+    }
+
+    private static func indexFunctions(_ functions: [CanonicalSIL.Function]) -> [String: Int] {
+        var indices: [String: Int] = [:]
+        var ambiguous = Set<String>()
+        for (index, function) in functions.enumerated() {
+            let name = function.mangledName
+            if indices[name] != nil { ambiguous.insert(name) }
+            indices[name] = index
+        }
+        // The public function array is mutable. Rebuild its derived index on
+        // mutation and omit duplicates instead of reviving first-match lookup.
+        for name in ambiguous { indices.removeValue(forKey: name) }
+        return indices
     }
 
     public func uniqueFunction(mangledNameContaining fragment: String) throws -> CanonicalSIL.Function {
@@ -334,14 +360,14 @@ public struct File: Sendable {
 
     private static func extractFunctions(
         _ text: String,
-        scopeLocations: [UInt32: Core.SourceLocation],
-        declarationLocations: [String: Core.SourceLocation]
+        scopeLocations: [UInt32: Core.SourceLocation]
     ) throws -> [CanonicalSIL.Function] {
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         let headerRegex = try NSRegularExpression(
             pattern: #"^sil(?:(?:\s+\[[^\]]+\])|(?:\s+(?:public|public_external|hidden|shared|private|package|package_external|non_abi|public_non_abi|serialized)))*\s+@([^\s:]+)\s*:\s*\$(.+)\s*\{$"#
         )
         var result: [CanonicalSIL.Function] = []
+        var definitionHeaders: [String: (line: Int, type: String)] = [:]
         var index = 0
         while index < lines.count {
             let line = lines[index].trimmingCharacters(in: .whitespaces)
@@ -355,6 +381,14 @@ public struct File: Sendable {
             }
             let name = String(line[nameRange])
             let type = String(line[typeRange])
+            if let existing = definitionHeaders[name] {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "function @\(name) is defined more than once: "
+                    + "SIL line \(existing.line), type \(existing.type); "
+                    + "SIL line \(index + 1), type \(type)"
+                )
+            }
+            definitionHeaders[name] = (index + 1, type)
             let prefix = line[..<nameRange.lowerBound]
             let isExternalDefinition = prefix.contains("public_external")
                 || prefix.contains("package_external")
@@ -404,7 +438,7 @@ public struct File: Sendable {
                     loweredType: type,
                     body: normalizedBody,
                     isolation: isolation,
-                    declarationLocation: declarationLocations[name],
+                    declarationLocation: nil,
                     debugLineLocations: debugLineLocations,
                     isExternalDefinition: isExternalDefinition
                 )

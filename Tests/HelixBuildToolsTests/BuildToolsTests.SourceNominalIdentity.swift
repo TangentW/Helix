@@ -27,8 +27,14 @@ struct SourceNominalIdentity {
         var conflicting = second
         conflicting.declarationIdentity = first.declarationIdentity
         var declarations = [first.declarationIdentity: first]
-        #expect(throws: FrontendReceipt.Error.self) {
+        do {
             try FrontendReceipt.Adapter.insertSourceNominal(conflicting, into: &declarations)
+            Issue.record("Expected conflicting source nominal identity")
+        } catch {
+            let text = String(describing: error)
+            for fact in ["s:first", "Fixture.Owner.Key", "A.swift", "B.swift", "UTF-8 offset=0", "kind=structure", "fileScoped=true", "ambiguousName=false", "fileScopeNameable=false", "availabilityConstrained=false"] {
+                #expect(text.contains(fact), "\(text)")
+            }
         }
         conflicting.declarationIdentity = ""
         #expect(throws: FrontendReceipt.Error.self) {
@@ -136,6 +142,34 @@ struct SourceNominalIdentity {
             .write(to: edited, atomically: true, encoding: .utf8)
         let fourth = try FrontendReceipt.Adapter().generate(request).receipt
         #expect(Set(fourth.roots.compactMap(\.nominalType).map(\.id)) == Set(first.roots.compactMap(\.nominalType).map(\.id)))
+    }
+
+    @Test("Mutable SIL inventories cannot turn duplicate symbols into a first-match lookup")
+    func ambiguousSILInventory() throws {
+        let symbol = "$s7Fixture3fooyyF"
+        var file = try CanonicalSIL.File(text: "")
+        file.functions = [
+            .init(mangledName: symbol, loweredType: "@convention(thin) () -> ()", body: "unreachable"),
+            .init(mangledName: symbol, loweredType: "@convention(thin) (Builtin.Int64) -> ()", body: "unreachable"),
+        ]
+        #expect(file.function(mangledName: symbol) == nil)
+        let source = FrontendReceipt.Adapter.SourceState(logicalPath: "Sources/A.swift",
+            url: URL(fileURLWithPath: "/tmp/A.swift"), contents: Data(), contentHash: .sha256(""))
+        do {
+            _ = try FrontendReceipt.SILFunctionResolver(file: file).function(
+                for: ["usr": "s:7Fixture3fooyyF"], source: source)
+            Issue.record("Expected ambiguous exact SIL symbol")
+        } catch {
+            let text = String(describing: error)
+            #expect(text.contains(symbol))
+            #expect(text.contains("Builtin.Int64"))
+            #expect(text.contains("() -> ()"))
+        }
+        file.functions.removeLast()
+        #expect(file.function(mangledName: symbol)?.loweredType == "@convention(thin) () -> ()")
+        file.functions[0].mangledName = "renamed"
+        #expect(file.function(mangledName: symbol) == nil)
+        #expect(file.function(mangledName: "renamed") != nil)
     }
 
     private func nominal(_ usr: String, file: String) -> FrontendReceipt.Adapter.SourceNominal {

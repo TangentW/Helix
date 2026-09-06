@@ -35,7 +35,7 @@ open Hub/.build/Helix.app
 
 ## Helix 自动修改什么
 
-所有修改会在一次可回滚事务中完成；任一步失败都不会留下半套工程状态。
+所有修改使用同一个可回滚文件事务。PBX 编辑保留未变化的 token 与注释，通过独立的系统 property-list 校验，并在提交前读回复核。失败会回滚工程及生成文件；若回滚自身失败，会明确报告。
 
 | 区域 | 自动行为 |
 | --- | --- |
@@ -52,6 +52,12 @@ open Hub/.build/Helix.app
 Helix 不改业务 Swift 文件，不要求业务代码 import 或初始化 Runtime，也不要求维护 target 源码清单、Native API 清单、host、port、配对 secret、LLDB 脚本或 shell `PATH`。
 
 ## 随时修改或移除接入
+
+所选源码 configuration 使用 `SWIFT_USE_INTEGRATED_DRIVER=NO`，无法使用 Xcode
+自带 Swift 编译缓存；Helix 构建事实缓存是独立的。Doctor 会提示该代价并识别过期的
+生成模板。升级后重新应用接入，才能获得当前设置，包括额外 linker response file
+的兼容设置。完整设置影响、compiler launcher 链式调用和 `post-compile --diagnose`
+见[大型工程接入](Large-Project-Integration.zh-CN.md)。
 
 首次识别出的映射不会被锁定。随时在 Helix 中重新打开工程，修改 App target、源码 target、Scheme 或 configuration，再点击 **Apply Changes**。Hub 会按原 PBX identity 恢复已不再使用的 Base Configuration 引用，移除旧 compiler trigger、product、phase、Patch target 与 Scheme action，然后幂等应用当前映射。已有 Scheme 的 Run/Archive configuration 和所有非 Helix action 都不会被改写。
 

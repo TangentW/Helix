@@ -23,6 +23,8 @@ enum DebugMetadata {
         var location: Core.SourceLocation?
         var parentID: UInt32?
         var parentSymbol: String?
+        var line: Int
+        var text: String
     }
 
     private static let scopeHeaderRegex = makeRegex(#"^sil_scope ([0-9]+) \{"#)
@@ -63,7 +65,8 @@ enum DebugMetadata {
             let moduleName = String(fileID[..<separator])
             if let existing = modulesByFile[path], existing != moduleName {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "debug file path is mapped to conflicting modules"
+                    "debug file path \(String(reflecting: path)) is mapped to conflicting modules "
+                    + "\(String(reflecting: existing)) and \(String(reflecting: moduleName)) (file ID \(String(reflecting: fileID)))"
                 )
             }
             modulesByFile[path] = moduleName
@@ -73,7 +76,7 @@ enum DebugMetadata {
 
     static func scopes(in text: String) throws -> [CanonicalSIL.DebugScope] {
         var rawScopes: [UInt32: RawScope] = [:]
-        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        for (lineIndex, rawLine) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
             let line = String(rawLine).trimmingCharacters(in: .whitespaces)
             guard line.hasPrefix("sil_scope ") else { continue }
             guard let id = firstCapture(in: line, regex: scopeHeaderRegex)
@@ -83,16 +86,18 @@ enum DebugMetadata {
                     "debug scope has an invalid identifier"
                 )
             }
-            guard rawScopes[id] == nil else {
+            if let existing = rawScopes[id] {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "debug scope \(id) is defined more than once"
+                    "debug scope \(id) is defined more than once: "
+                    + "SIL line \(existing.line): \(existing.text); SIL line \(lineIndex + 1): \(line)"
                 )
             }
             rawScopes[id] = .init(
                 location: try sourceLocation(in: line),
                 parentID: firstCapture(in: line, regex: scopeParentRegex)
                     .flatMap(UInt32.init),
-                parentSymbol: firstCapture(in: line, regex: scopeParentSymbolRegex)
+                parentSymbol: firstCapture(in: line, regex: scopeParentSymbolRegex),
+                line: lineIndex + 1, text: line
             )
         }
 
@@ -103,7 +108,7 @@ enum DebugMetadata {
             guard let scope = rawScopes[id] else { return nil }
             guard visiting.insert(id).inserted else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
-                    "debug scope inheritance contains a cycle"
+                    "debug scope inheritance contains a cycle at scope \(id), SIL line \(scope.line): \(scope.text)"
                 )
             }
             defer { visiting.remove(id) }

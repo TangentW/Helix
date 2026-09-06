@@ -361,6 +361,7 @@ struct Application {
             from: Data(doctor.standardOutput.dropLast().utf8)
         )
         #expect(doctorReport.passed)
+        #expect(doctorReport.checks.contains { $0.code == "HLXXC015" && $0.severity == .warning && $0.detail.contains("compilation cache") })
         #expect(!doctorReport.checks.contains { $0.severity == .error })
 
         let installedDoctor = application.run([
@@ -374,6 +375,48 @@ struct Application {
         )
         #expect(installedDoctorReport.passed)
         #expect(!installedDoctorReport.checks.contains { $0.severity == .error })
+
+        // A self-consistent old manifest must not hide an obsolete compiler setting.
+        let featurePath = "Profiles/live/Feature.xcconfig"
+        let featureURL = output.appendingPathComponent(featurePath)
+        let oldFeature = Data(try String(contentsOf: featureURL, encoding: .utf8)
+            .replacingOccurrences(of: "SWIFT_GENERATE_ADDITIONAL_LINKER_ARGS = NO", with: "SWIFT_GENERATE_ADDITIONAL_LINKER_ARGS = YES").utf8)
+        try oldFeature.write(to: featureURL)
+        let manifestURL = output.appendingPathComponent("IntegrationManifest.json")
+        var oldManifest = try JSONDecoder().decode(XcodeIntegration.KitManifest.self, from: Data(contentsOf: manifestURL))
+        let featureIndex = try #require(oldManifest.artifacts.firstIndex { $0.path == featurePath })
+        oldManifest.artifacts[featureIndex] = .init(path: featurePath, data: oldFeature)
+        try Core.CanonicalJSON.encode(oldManifest).write(to: manifestURL)
+        let stale = application.run(["xcode", "doctor", "--plan", installedPlanURL.path,
+            "--profile", "live", "--static", "--json"])
+        #expect(stale.exitCode == 1)
+        #expect(stale.standardOutput.contains("active Helix tool"))
+        #expect(stale.standardOutput.contains(featurePath))
+        #expect(application.run(["xcode", "generate", "--plan", installedPlanURL.path, "--force"]).exitCode == 0)
+        #expect(application.run(["xcode", "doctor", "--plan", installedPlanURL.path,
+            "--profile", "live", "--static"]).exitCode == 0)
+    }
+
+    @Test("Post-compile diagnosis returns structured failures for invalid inputs")
+    func xcodeDiagnosisInputFailure() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let app = CLI.Application(currentDirectoryURL: directory)
+        let result = await app.runAsync(["xcode", "post-compile", "--plan", "MissingPlan.json",
+            "--profile", "live", "--capture", "MissingCapture", "--diagnose", "--json"])
+        #expect(result.exitCode == 1)
+        let report = try JSONDecoder().decode(FrontendReceipt.DiagnosticReport.self, from: Data(result.standardOutput.utf8))
+        #expect(!report.passed)
+        #expect(report.checks.contains { $0.stage == "xcode.context" && $0.status == .failed })
+        #expect(report.checks.contains { $0.status == .blocked })
+        let human = await app.runAsync(["xcode", "post-compile", "--plan", "MissingPlan.json",
+            "--profile", "live", "--capture", "MissingCapture", "--diagnose"])
+        #expect(human.exitCode == 1)
+        #expect(human.standardOutput.contains("[failed] xcode.context"))
+        #expect(human.standardOutput.contains("Scope: frontend receipt analysis"))
+        let invalid = await app.runAsync(["xcode", "post-compile", "--json"])
+        #expect(invalid.exitCode != 0)
+        #expect(invalid.standardError.contains("--diagnose"))
     }
 
     @Test("Xcode prepare discovers all source entries and manages the Debug SDK surface")

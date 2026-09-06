@@ -271,6 +271,9 @@ public struct KitGenerator: Sendable {
         HELIX_REAL_SWIFT_EXEC = $(TOOLCHAIN_DIR)/usr/bin/swiftc
         SWIFT_EXEC = $(HELIX_INTEGRATION_ROOT)/\(XcodeIntegration.CompilerCapture.integrationProxyPath)
         SWIFT_USE_INTEGRATED_DRIVER = NO
+        // XCBuild's supplemental linker response is emitted by its integrated driver.
+        // Swift object autolinking remains responsible for framework/library imports.
+        SWIFT_GENERATE_ADDITIONAL_LINKER_ARGS = NO
 
         """.trimmingCharacters(in: .newlines) + "\n"
     }

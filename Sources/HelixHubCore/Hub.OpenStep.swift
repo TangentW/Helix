@@ -38,9 +38,27 @@ enum OpenStep {
         case comma
     }
 
+    struct Syntax {
+        struct Entry {
+            var range: Range<Int>
+            var value: Syntax
+        }
+        struct Element {
+            var range: Range<Int>
+            var hasComma: Bool
+            var value: Syntax
+        }
+        var value: Value
+        // Offsets count Unicode scalars in the original text, not UTF-16 units.
+        var range: Range<Int>
+        var entries: [String: Entry] = [:]
+        var elements: [Element] = []
+    }
+
     struct Parser {
         private var lexer: Lexer
-        private var lookahead: Token?
+        private var lookahead: (Token, Range<Int>)?
+        private var currentRange = 0..<0
         private var valueCount = 0
 
         init(data: Data) throws {
@@ -52,7 +70,9 @@ enum OpenStep {
             lexer = Lexer(text: text)
         }
 
-        mutating func parse() throws -> Value {
+        mutating func parse() throws -> Value { try parseSyntax().value }
+
+        mutating func parseSyntax() throws -> Syntax {
             let result = try parseValue(depth: 0)
             guard try next() == nil else {
                 throw Hub.Error.invalidProject("project.pbxproj has trailing tokens")
@@ -60,7 +80,7 @@ enum OpenStep {
             return result
         }
 
-        private mutating func parseValue(depth: Int) throws -> Value {
+        private mutating func parseValue(depth: Int) throws -> Syntax {
             guard depth <= OpenStep.maximumNestingDepth else {
                 throw Hub.Error.invalidProject("project.pbxproj nesting is too deep")
             }
@@ -73,54 +93,67 @@ enum OpenStep {
             }
             switch token {
             case let .word(value):
-                return .string(value)
+                return .init(value: .string(value), range: currentRange)
             case .leftBrace:
-                return try parseDictionary(depth: depth + 1)
+                return try parseDictionary(depth: depth + 1, start: currentRange.lowerBound)
             case .leftParenthesis:
-                return try parseArray(depth: depth + 1)
+                return try parseArray(depth: depth + 1, start: currentRange.lowerBound)
             default:
                 throw Hub.Error.invalidProject("project.pbxproj contains an unexpected token")
             }
         }
 
-        private mutating func parseDictionary(depth: Int) throws -> Value {
-            var result: [String: Value] = [:]
+        private mutating func parseDictionary(depth: Int, start: Int) throws -> Syntax {
+            var entries: [String: Syntax.Entry] = [:]
             while true {
                 guard let token = try next() else {
                     throw Hub.Error.invalidProject("project.pbxproj ended inside a dictionary")
                 }
-                if token == .rightBrace { return .dictionary(result) }
-                guard case let .word(key) = token, result[key] == nil,
-                      try next() == .equals
-                else {
-                    throw Hub.Error.invalidProject(
-                        "project.pbxproj has a malformed or duplicate dictionary entry"
-                    )
+                if token == .rightBrace {
+                    return .init(value: .dictionary(entries.mapValues { $0.value.value }),
+                                 range: start..<currentRange.upperBound, entries: entries)
                 }
-                result[key] = try parseValue(depth: depth)
+                let keyStart = currentRange.lowerBound
+                guard case let .word(key) = token else {
+                    throw Hub.Error.invalidProject("project.pbxproj has a malformed dictionary key")
+                }
+                guard entries[key] == nil else {
+                    throw Hub.Error.invalidProject("project.pbxproj repeats dictionary key \(String(reflecting: key)) at scalar \(keyStart)")
+                }
+                guard try next() == .equals else {
+                    throw Hub.Error.invalidProject("project.pbxproj dictionary key \(String(reflecting: key)) lacks '='")
+                }
+                let value = try parseValue(depth: depth)
                 guard try next() == .semicolon else {
-                    throw Hub.Error.invalidProject("project.pbxproj dictionary entry lacks ';'")
+                    throw Hub.Error.invalidProject("project.pbxproj dictionary entry \(String(reflecting: key)) lacks ';'")
                 }
+                entries[key] = .init(range: keyStart..<currentRange.upperBound, value: value)
             }
         }
 
-        private mutating func parseArray(depth: Int) throws -> Value {
-            var result: [Value] = []
+        private mutating func parseArray(depth: Int, start: Int) throws -> Syntax {
+            var elements: [Syntax.Element] = []
             while true {
                 guard let token = try next() else {
                     throw Hub.Error.invalidProject("project.pbxproj ended inside an array")
                 }
-                if token == .rightParenthesis { return .array(result) }
-                lookahead = token
-                result.append(try parseValue(depth: depth))
+                if token == .rightParenthesis {
+                    return .init(value: .array(elements.map { $0.value.value }),
+                                 range: start..<currentRange.upperBound, elements: elements)
+                }
+                lookahead = (token, currentRange)
+                let value = try parseValue(depth: depth)
                 guard let separator = try next() else {
                     throw Hub.Error.invalidProject("project.pbxproj ended inside an array")
                 }
                 switch separator {
                 case .comma:
-                    continue
+                    elements.append(.init(range: value.range.lowerBound..<currentRange.upperBound,
+                                          hasComma: true, value: value))
                 case .rightParenthesis:
-                    return .array(result)
+                    elements.append(.init(range: value.range, hasComma: false, value: value))
+                    return .init(value: .array(elements.map { $0.value.value }),
+                                 range: start..<currentRange.upperBound, elements: elements)
                 default:
                     throw Hub.Error.invalidProject("project.pbxproj array is malformed")
                 }
@@ -130,15 +163,19 @@ enum OpenStep {
         private mutating func next() throws -> Token? {
             if let lookahead {
                 self.lookahead = nil
-                return lookahead
+                currentRange = lookahead.1
+                return lookahead.0
             }
-            return try lexer.next()
+            let result = try lexer.next()
+            currentRange = lexer.tokenRange
+            return result
         }
     }
 
     struct Lexer {
         private let scalars: [Unicode.Scalar]
         private var index = 0
+        private(set) var tokenRange = 0..<0
 
         init(text: String) {
             scalars = Array(text.unicodeScalars)
@@ -147,6 +184,8 @@ enum OpenStep {
         mutating func next() throws -> Token? {
             try skipTrivia()
             guard index < scalars.count else { return nil }
+            let start = index
+            defer { tokenRange = start..<index }
             let scalar = scalars[index]
             index += 1
             switch scalar {
@@ -200,30 +239,30 @@ enum OpenStep {
         }
 
         private mutating func quotedWord() throws -> String {
-            var result = String.UnicodeScalarView()
+            let start = index - 1
+            var hasEscape = false
             while index < scalars.count {
                 let scalar = scalars[index]
                 index += 1
-                if scalar == "\"" { return String(result) }
-                guard scalar == "\\" else {
-                    result.append(scalar)
-                    continue
+                if scalar == "\"" {
+                    if !hasEscape {
+                        return String(String.UnicodeScalarView(scalars[(start + 1)..<(index - 1)]))
+                    }
+                    // Foundation owns OpenStep escape semantics, including octal
+                    // and UTF-16 \U escapes. Never silently change a project's value.
+                    let literal = String(String.UnicodeScalarView(scalars[start..<index]))
+                    let decoded = try PropertyListSerialization.propertyList(
+                        from: Data(("(" + literal + ")").utf8), options: [], format: nil
+                    ) as? [String]
+                    guard let value = decoded?.first else {
+                        throw Hub.Error.invalidProject("project.pbxproj has an invalid string escape")
+                    }
+                    return value
                 }
-                guard index < scalars.count else {
-                    throw Hub.Error.invalidProject("project.pbxproj has an invalid string escape")
-                }
-                let escaped = scalars[index]
-                index += 1
-                switch escaped {
-                case "n": result.append("\n")
-                case "r": result.append("\r")
-                case "t": result.append("\t")
-                case "\"": result.append("\"")
-                case "\\": result.append("\\")
-                default:
-                    // Xcode occasionally emits nonstandard escapes. Retaining the
-                    // escaped scalar is sufficient for semantic inspection.
-                    result.append(escaped)
+                if scalar == "\\" {
+                    hasEscape = true
+                    guard index < scalars.count else { break }
+                    index += 1
                 }
             }
             throw Hub.Error.invalidProject("project.pbxproj has an unterminated string")

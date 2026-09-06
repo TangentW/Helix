@@ -8,16 +8,16 @@ struct PBXProjectDocument {
     let projectObjectID: String
 
     private let originalText: String
-    private var replacements: [String: Hub.OpenStep.Value] = [:]
-    private var additions: [String: Hub.OpenStep.Value] = [:]
-    private var removals: Set<String> = []
+    private let originalSyntax: Hub.OpenStep.Syntax
 
     init(data: Data) throws {
         guard let text = String(data: data, encoding: .utf8) else {
             throw Hub.Error.invalidProject("project.pbxproj is not UTF-8")
         }
         var parser = try Hub.OpenStep.Parser(data: data)
-        guard case let .dictionary(root) = try parser.parse(),
+        let syntax = try parser.parseSyntax()
+        try Hub.OpenStepValidation.validate(data, expected: syntax.value)
+        guard case let .dictionary(root) = syntax.value,
               let parsedObjects = root["objects"]?.dictionary,
               let rootID = root["rootObject"]?.string,
               parsedObjects[rootID]?.dictionary?["isa"]?.string == "PBXProject"
@@ -25,6 +25,7 @@ struct PBXProjectDocument {
             throw Hub.Error.invalidProject("PBXProject root object is missing")
         }
         originalText = text
+        originalSyntax = syntax
         objects = parsedObjects
         projectObjectID = rootID
     }
@@ -44,11 +45,6 @@ struct PBXProjectDocument {
         try transform(&dictionary)
         let value = Hub.OpenStep.Value.dictionary(dictionary)
         objects[identifier] = value
-        if additions[identifier] != nil {
-            additions[identifier] = value
-        } else {
-            replacements[identifier] = value
-        }
     }
 
     mutating func addObject(
@@ -65,24 +61,12 @@ struct PBXProjectDocument {
                     "deterministic PBX identifier \(identifier) collides with an existing object"
                 )
             }
-            objects[identifier] = value
-            if additions[identifier] != nil {
-                additions[identifier] = value
-            } else {
-                replacements[identifier] = value
-            }
-            return
         }
         objects[identifier] = value
-        additions[identifier] = value
     }
 
     mutating func removeObject(_ identifier: String) {
-        guard objects.removeValue(forKey: identifier) != nil else { return }
-        replacements.removeValue(forKey: identifier)
-        if additions.removeValue(forKey: identifier) == nil {
-            removals.insert(identifier)
-        }
+        objects.removeValue(forKey: identifier)
     }
 
     func configurationID(targetID: String, named name: String) throws -> String {
@@ -105,327 +89,20 @@ struct PBXProjectDocument {
     }
 
     func serialized() throws -> Data {
-        var text = originalText
-        for identifier in removals.sorted() {
-            text = try Self.removingRecord(identifier: identifier, in: text)
+        guard var root = originalSyntax.value.dictionary else {
+            throw Hub.Error.invalidProject("PBX root dictionary disappeared")
         }
-        for identifier in replacements.keys.sorted() {
-            guard let value = replacements[identifier] else { continue }
-            text = try Self.replacingRecord(
-                identifier: identifier,
-                value: value,
-                in: text
-            )
+        root["objects"] = .dictionary(objects)
+        let expected = Hub.OpenStep.Value.dictionary(root)
+        var editor = Hub.OpenStepEditor(text: originalText)
+        editor.replace(originalSyntax, with: expected)
+        let data = try editor.serialized()
+        var parser = try Hub.OpenStep.Parser(data: data)
+        guard try parser.parse() == expected else {
+            throw Hub.Error.invalidProject("generated PBX text changed unintended values")
         }
-        let grouped = Dictionary(grouping: additions.keys) { identifier in
-            additions[identifier]?.dictionary?["isa"]?.string ?? ""
-        }
-        for isa in grouped.keys.sorted() {
-            guard !isa.isEmpty else {
-                throw Hub.Error.invalidProject("new PBX object has no isa")
-            }
-            let records = try grouped[isa, default: []].sorted().map { identifier in
-                guard let value = additions[identifier] else {
-                    throw Hub.Error.invalidProject("new PBX object disappeared")
-                }
-                return "\t\t\(identifier) = \(Self.render(value));"
-            }.joined(separator: "\n")
-            text = try Self.inserting(records: records, section: isa, into: text)
-        }
-        let data = Data(text.utf8)
-        do {
-            var parser = try Hub.OpenStep.Parser(data: data)
-            _ = try parser.parse()
-        } catch {
-            throw Hub.Error.invalidProject(
-                "generated PBX text failed validation: \(error)"
-            )
-        }
+        try Hub.OpenStepValidation.validate(data, expected: expected)
         return data
-    }
-
-    private static func replacingRecord(
-        identifier: String,
-        value: Hub.OpenStep.Value,
-        in text: String
-    ) throws -> String {
-        let range = try recordRange(identifier: identifier, in: text)
-        return text.replacingCharacters(
-            in: range,
-            with: "\t\t\(identifier) = \(render(value));"
-        )
-    }
-
-    private static func removingRecord(
-        identifier: String,
-        in text: String
-    ) throws -> String {
-        var range = try recordRange(identifier: identifier, in: text)
-        if range.upperBound < text.endIndex, text[range.upperBound] == "\r" {
-            range = range.lowerBound..<text.index(after: range.upperBound)
-        }
-        if range.upperBound < text.endIndex, text[range.upperBound] == "\n" {
-            range = range.lowerBound..<text.index(after: range.upperBound)
-        }
-        return text.replacingCharacters(in: range, with: "")
-    }
-
-    private static func recordRange(
-        identifier: String,
-        in text: String
-    ) throws -> Range<String.Index> {
-        let objects = try objectsDictionaryBounds(in: text)
-        let escaped = NSRegularExpression.escapedPattern(for: identifier)
-        let expression = try NSRegularExpression(
-            pattern: "(?m)^[\\t ]*\(escaped)(?:[\\t ]*/\\*[^\\r\\n]*?\\*/)?[\\t ]*=[\\t ]*"
-        )
-        let searchRange = text.index(after: objects.openingBrace)..<objects.closingBrace
-        let matches = expression.matches(
-            in: text,
-            range: NSRange(searchRange, in: text)
-        ).compactMap { match -> Range<String.Index>? in
-            guard let range = Range(match.range, in: text),
-                  lexicalCurlyDepth(
-                    in: text,
-                    from: objects.openingBrace,
-                    to: range.lowerBound
-                  ) == 1
-            else { return nil }
-            return range
-        }
-        guard matches.count == 1, let prefixRange = matches.first
-        else {
-            throw Hub.Error.invalidProject(
-                "cannot uniquely locate PBX object \(identifier) for editing"
-            )
-        }
-        let brace = prefixRange.upperBound
-        guard brace < text.endIndex, text[brace] == "{" else {
-            throw Hub.Error.invalidProject("PBX object \(identifier) is malformed")
-        }
-        let end = try dictionaryRecordEnd(from: brace, in: text)
-        let start = prefixRange.lowerBound
-        return start..<end
-    }
-
-    private static func objectsDictionaryBounds(
-        in text: String
-    ) throws -> (openingBrace: String.Index, closingBrace: String.Index) {
-        let expression = try NSRegularExpression(
-            pattern: "(?m)^[\\t ]*objects[\\t ]*=[\\t ]*"
-        )
-        let full = NSRange(text.startIndex..<text.endIndex, in: text)
-        let candidates = expression.matches(in: text, range: full).compactMap {
-            match -> String.Index? in
-            guard let range = Range(match.range, in: text),
-                  lexicalCurlyDepth(
-                    in: text,
-                    from: text.startIndex,
-                    to: range.lowerBound
-                  ) == 1,
-                  range.upperBound < text.endIndex,
-                  text[range.upperBound] == "{"
-            else { return nil }
-            return range.upperBound
-        }
-        guard candidates.count == 1, let openingBrace = candidates.first else {
-            throw Hub.Error.invalidProject(
-                "cannot uniquely locate the PBX objects dictionary"
-            )
-        }
-        let end = try dictionaryRecordEnd(from: openingBrace, in: text)
-        let semicolon = text.index(before: end)
-        guard text[semicolon] == ";" else {
-            throw Hub.Error.invalidProject("PBX objects dictionary lacks a semicolon")
-        }
-        var closingBrace = text.index(before: semicolon)
-        while closingBrace > openingBrace, text[closingBrace].isWhitespace {
-            closingBrace = text.index(before: closingBrace)
-        }
-        guard text[closingBrace] == "}" else {
-            throw Hub.Error.invalidProject("PBX objects dictionary is malformed")
-        }
-        return (openingBrace, closingBrace)
-    }
-
-    /// Returns the dictionary nesting depth at `limit` only when that point is
-    /// ordinary OpenStep syntax rather than a string or comment.
-    private static func lexicalCurlyDepth(
-        in text: String,
-        from start: String.Index,
-        to limit: String.Index
-    ) -> Int? {
-        var index = start
-        var depth = 0
-        var quoted = false
-        var escaped = false
-        var lineComment = false
-        var blockComment = false
-        while index < limit {
-            let next = text.index(after: index)
-            let character = text[index]
-            let following = next < limit ? text[next] : "\0"
-            if lineComment {
-                if character == "\n" { lineComment = false }
-            } else if blockComment {
-                if character == "*", following == "/" {
-                    blockComment = false
-                    index = next
-                }
-            } else if quoted {
-                if escaped {
-                    escaped = false
-                } else if character == "\\" {
-                    escaped = true
-                } else if character == "\"" {
-                    quoted = false
-                }
-            } else if character == "/", following == "/" {
-                lineComment = true
-                index = next
-            } else if character == "/", following == "*" {
-                blockComment = true
-                index = next
-            } else if character == "\"" {
-                quoted = true
-            } else if character == "{" {
-                depth += 1
-            } else if character == "}" {
-                depth -= 1
-                if depth < 0 { return nil }
-            }
-            index = text.index(after: index)
-        }
-        return quoted || escaped || lineComment || blockComment ? nil : depth
-    }
-
-    private static func dictionaryRecordEnd(
-        from openingBrace: String.Index,
-        in text: String
-    ) throws -> String.Index {
-        var index = openingBrace
-        var depth = 0
-        var quoted = false
-        var escaped = false
-        var lineComment = false
-        var blockComment = false
-        while index < text.endIndex {
-            let next = text.index(after: index)
-            let character = text[index]
-            let following = next < text.endIndex ? text[next] : "\0"
-            if lineComment {
-                if character == "\n" { lineComment = false }
-            } else if blockComment {
-                if character == "*", following == "/" {
-                    blockComment = false
-                    index = next
-                }
-            } else if quoted {
-                if escaped {
-                    escaped = false
-                } else if character == "\\" {
-                    escaped = true
-                } else if character == "\"" {
-                    quoted = false
-                }
-            } else if character == "/", following == "/" {
-                lineComment = true
-                index = next
-            } else if character == "/", following == "*" {
-                blockComment = true
-                index = next
-            } else if character == "\"" {
-                quoted = true
-            } else if character == "{" {
-                depth += 1
-            } else if character == "}" {
-                depth -= 1
-                if depth == 0 {
-                    var end = text.index(after: index)
-                    while end < text.endIndex, text[end].isWhitespace, text[end] != "\n" {
-                        end = text.index(after: end)
-                    }
-                    guard end < text.endIndex, text[end] == ";" else {
-                        throw Hub.Error.invalidProject("PBX object record lacks a semicolon")
-                    }
-                    return text.index(after: end)
-                }
-            }
-            index = text.index(after: index)
-        }
-        throw Hub.Error.invalidProject("PBX object dictionary is unterminated")
-    }
-
-    private static func inserting(
-        records: String,
-        section: String,
-        into text: String
-    ) throws -> String {
-        let marker = "/* End \(section) section */"
-        if let range = text.range(of: marker) {
-            return text.replacingCharacters(
-                in: range.lowerBound..<range.lowerBound,
-                with: records + "\n"
-            )
-        }
-        let expression = try NSRegularExpression(
-            pattern: "(?m)^[\\t ]*\\};[\\t ]*\\r?\\n[\\t ]*rootObject[\\t ]*="
-        )
-        let full = NSRange(text.startIndex..<text.endIndex, in: text)
-        guard let match = expression.matches(in: text, range: full).last,
-              let objectsEnd = Range(match.range, in: text)
-        else {
-            let objects = try objectsDictionaryBounds(in: text)
-            let block = "\n/* Begin \(section) section */\n\(records)\n/* End \(section) section */\n"
-            return text.replacingCharacters(
-                in: objects.closingBrace..<objects.closingBrace,
-                with: block
-            )
-        }
-        let block = "\n/* Begin \(section) section */\n\(records)\n/* End \(section) section */\n"
-        return text.replacingCharacters(
-            in: objectsEnd.lowerBound..<objectsEnd.lowerBound,
-            with: block
-        )
-    }
-
-    private static func render(_ value: Hub.OpenStep.Value) -> String {
-        switch value {
-        case let .string(value):
-            return renderString(value)
-        case let .array(values):
-            guard !values.isEmpty else { return "()" }
-            return "(" + values.map { render($0) + "," }.joined(separator: " ") + " )"
-        case let .dictionary(values):
-            guard !values.isEmpty else { return "{}" }
-            let body = values.keys.sorted().map { key in
-                "\(renderString(key)) = \(render(values[key]!));"
-            }.joined(separator: " ")
-            return "{ \(body) }"
-        }
-    }
-
-    private static func renderString(_ value: String) -> String {
-        let safe = CharacterSet.alphanumerics.union(
-            CharacterSet(charactersIn: "_.$/<>+-*[]@")
-        )
-        if !value.isEmpty,
-           value.unicodeScalars.allSatisfy({ safe.contains($0) }),
-           !value.contains("//"), !value.contains("/*") {
-            return value
-        }
-        var result = "\""
-        for character in value {
-            switch character {
-            case "\\": result += "\\\\"
-            case "\"": result += "\\\""
-            case "\n": result += "\\n"
-            case "\r": result += "\\r"
-            case "\t": result += "\\t"
-            default: result.append(character)
-            }
-        }
-        return result + "\""
     }
 }
 }

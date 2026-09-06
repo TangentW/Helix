@@ -14,7 +14,7 @@ struct SILFunctionResolver: Sendable {
     }
 
     let file: CanonicalSIL.File
-    private let functionsByMangledName: [String: CanonicalSIL.Function]
+    private let functionsByMangledName: [String: [CanonicalSIL.Function]]
     private let functionsByDeclarationLocation: [
         DeclarationLocationKey: [CanonicalSIL.Function]
     ]
@@ -27,7 +27,7 @@ struct SILFunctionResolver: Sendable {
         functionsByMangledName = Dictionary(
             grouping: file.functions,
             by: \.mangledName
-        ).compactMapValues(\.first)
+        )
         functionsByDeclarationLocation = Dictionary(grouping: file.functions.compactMap {
             function -> (DeclarationLocationKey, CanonicalSIL.Function)? in
             guard let location = function.declarationLocation else { return nil }
@@ -53,7 +53,13 @@ struct SILFunctionResolver: Sendable {
             return nil
         }
         let astSymbol = "$s" + usr.dropFirst(2)
-        if let exact = functionsByMangledName[astSymbol] { return exact }
+        if let exact = functionsByMangledName[astSymbol] {
+            guard exact.count == 1 else {
+                throw FrontendReceipt.Error.ambiguousSILFunction(astSymbol,
+                    exact.map { "\($0.mangledName): \($0.loweredType) at \(String(describing: $0.declarationLocation))" }.sorted())
+            }
+            return exact.first
+        }
         guard let location = declarationLocation(
             for: item,
             source: source,
@@ -68,7 +74,7 @@ struct SILFunctionResolver: Sendable {
         let matches = functionsByDeclarationLocation[key] ?? []
         guard matches.count <= 1 else {
             throw FrontendReceipt.Error.ambiguousSILFunction(
-                astSymbol,
+                "\(astSymbol) at \(location.file):\(location.line):\(location.column)",
                 matches.map(\.mangledName).sorted()
             )
         }

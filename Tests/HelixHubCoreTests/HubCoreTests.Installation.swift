@@ -11,11 +11,50 @@ import Testing
 
 @Suite("Helix Hub project installation", .serialized)
 struct ProjectInstallationTests {
+    @Test("Checked-in integration kits retain current artifacts and ownership")
+    func checkedInKitOwnership() throws {
+        let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        for path in ["Demo", "Tests/Fixtures/LiveReloadE2E"] {
+            let root = repository.appendingPathComponent(path)
+            let planURL = root.appendingPathComponent(".helix/xcode/HostPlan.json")
+            let plan = try XcodeIntegration.HostPlanCodec.decode(Data(contentsOf: planURL))
+            let generated = try XcodeIntegration.KitGenerator().generate(plan: plan)
+            let integrationRoot = root.appendingPathComponent(plan.integrationRoot)
+            let ownership = try Hub.GeneratedFileManifest.decode(
+                Data(contentsOf: integrationRoot.appendingPathComponent(Hub.GeneratedFileManifest.fileName)), for: plan)
+            let expectedPaths = Set(generated.artifacts.keys.map { plan.integrationRoot + "/" + $0 })
+            #expect(expectedPaths.isSubset(of: Set(ownership.files.map(\.path))))
+            for (relativePath, data) in generated.artifacts {
+                #expect(try Data(contentsOf: integrationRoot.appendingPathComponent(relativePath)) == data,
+                        "Generated fixture drift: \(path)/\(relativePath)")
+            }
+            for file in ownership.files {
+                let url = root.appendingPathComponent(file.path)
+                let data = try Data(contentsOf: url)
+                #expect(UInt64(data.count) == file.byteCount, "\(path)/\(file.path)")
+                #expect(Core.Digest.sha256(data) == file.sha256, "\(path)/\(file.path)")
+                let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+                #expect((attributes[.posixPermissions] as? NSNumber)?.uint16Value == file.permissions)
+            }
+        }
+    }
+
     @Test("Headless inspection and installation use the transactional Hub path")
     func installsThroughCLI() throws {
         let root = try fixture()
         defer { try? FileManager.default.removeItem(at: root) }
         let projectURL = root.appendingPathComponent("Example.xcodeproj")
+        let projectFile = projectURL.appendingPathComponent("project.pbxproj")
+        let settings = #"CLANG_CXX_LIBRARY = "libc++"; LD_RUNPATH_SEARCH_PATHS = ("@executable_path/Frameworks", ); EXCLUDED_SOURCE_FILE_NAMES = "*.xcassets";"#
+        let untouched = (0..<100).map {
+            "    UNTOUCHED\($0) = {\n      isa = XCBuildConfiguration;\n      buildSettings = { \(settings) };\n      name = Other\($0);\n    };"
+        }.joined(separator: "\n")
+        var originalText = try String(contentsOf: projectFile, encoding: .utf8)
+        originalText = originalText.replacingOccurrences(of: "CLF = {isa = XCBuildConfiguration; buildSettings = {};",
+            with: "CLF = {isa = XCBuildConfiguration; buildSettings = { \(settings) };")
+        originalText = originalText.replacingOccurrences(of: "objects = {", with: "objects = {\n" + untouched)
+        try Data(originalText.utf8).write(to: projectFile)
         let project = try Hub.ProjectFileParser().parse(projectURL: projectURL)
         let planned = try Hub.OnboardingPlanner().plan(.init(project: project,
             capabilities: try .init([.liveReload]), profiles: [.init(id: "live", capability: .liveReload,
@@ -36,6 +75,13 @@ struct ProjectInstallationTests {
         let report = try JSONDecoder().decode(CLI.XcodeInstallationReport.self, from: Data(first.standardOutput.utf8))
         #expect(report.writtenRelativePaths.contains("Example.xcodeproj/project.pbxproj"))
         let projectData = try Data(contentsOf: projectURL.appendingPathComponent("project.pbxproj"))
+        let installedText = String(decoding: projectData, as: UTF8.self)
+        #expect(installedText.contains(untouched))
+        #expect(installedText.contains(settings))
+        _ = try PropertyListSerialization.propertyList(from: projectData, format: nil)
+        let lint = try ProcessExecution.Runner().run(executable: URL(fileURLWithPath: "/usr/bin/plutil"),
+            arguments: ["-lint", projectFile.path])
+        #expect(lint.status == 0, "\(lint.standardError)")
         #expect(app.run(arguments).exitCode == 0)
         #expect(try Data(contentsOf: projectURL.appendingPathComponent("project.pbxproj")) == projectData)
         #expect(try XcodeIntegration.HostPlanCodec.decode(Data(contentsOf: URL(fileURLWithPath: report.hostPlanPath))) == plan)
@@ -1356,6 +1402,24 @@ struct ProjectInstallationTests {
             targetAttributes?["TARGET"]?.dictionary?["CreatedOnToolsVersion"]?.string
                 == "26.0"
         )
+    }
+
+    @Test("Repeated configuration names report object identities instead of trapping")
+    func duplicateConfigurationNames() throws {
+        let root = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let project = root.appendingPathComponent("Example.xcodeproj")
+        let pbx = project.appendingPathComponent("project.pbxproj")
+        let text = try String(contentsOf: pbx, encoding: .utf8)
+            .replacingOccurrences(of: "buildConfigurations = (CLF, );", with: "buildConfigurations = (CLF, CLA, );")
+        try Data(text.utf8).write(to: pbx)
+        do {
+            _ = try Hub.ProjectFileParser().parse(projectURL: project)
+            Issue.record("Expected duplicate configuration rejection")
+        } catch {
+            let message = String(describing: error)
+            for fact in ["CLLF", "Debug", "CLF", "CLA"] { #expect(message.contains(fact), "\(message)") }
+        }
     }
 
     @Test("Failed write restores earlier files")

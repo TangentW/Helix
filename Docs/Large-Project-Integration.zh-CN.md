@@ -55,6 +55,14 @@ CLI 不自动创建签名身份，私钥由后续签名步骤使用。Live Reloa
 及运行中的 Helix 服务。`generate` 继续用于单独生成 kit，`install` 则同时修改工程。
 静态 Doctor 不能替代真实 Xcode 构建。
 
+PBX 安装、重配置和移除按原始语法坐标修改变化的值与数组成员。未变化的对象、字段、
+引号、注释和源文件条目保留原始字节，追加 trigger 不会重排大型 Sources phase。
+新值遵守 OpenStep 的 ASCII 裸 token 规则，`libc++`、`@executable_path/Frameworks`、
+`*.xcassets` 和条件 build setting key 都会正确加引号；转义字符串保持解码后的值。
+系统 property-list parser 独立校验输入和输出；所有 PBX 修改在写入前校验，并在共享
+文件事务提交前重新读回，发现内容变化或格式错误即回滚。该校验确认语法和预期字段值，
+完整 Xcode 构建图仍需通过 `xcodebuild -list` 和实际构建验证。
+
 ## 与现有编译基础设施共存
 
 所选源码 target/configuration 的有效 `SWIFT_EXEC` 必须指向生成的 Helix proxy。
@@ -91,7 +99,35 @@ XCBuild 不会把任意自定义 xcconfig 设置导出给编译器进程。因�
 `HELIX_REAL_SWIFT_EXEC`，它必须指向真实 Swift 编译器，不能指向另一个 launcher；
 否则 proxy 通过 `xcrun` 解析所选编译器。
 
+### 构建设置与接入代价
+
+| 设置 | Helix 的行为与影响 |
+| --- | --- |
+| `PRODUCT_MODULE_NAME` | 使用 Host Plan 选择的源码 module |
+| `SWIFT_EXEC` | 接管源码 target 的编译入口；既有 launcher 通过上述合同链式调用 |
+| `SWIFT_USE_INTEGRATED_DRIVER` | 设为 `NO`，用于完整 target 捕获与 post-compile hook；所选 configuration 无法使用 Xcode 自带 Swift 编译缓存 |
+| `SWIFT_GENERATE_ADDITIONAL_LINKER_ARGS` | 设为 `NO`；当前 driver 路径不会生成 XCBuild 所需的额外 linker response file。导入 framework/library 仍由 Swift object autolinking 提供链接输入 |
+| `OTHER_SWIFT_FLAGS` | 在继承值后追加 private-import、implicit-dynamic、replacement-chaining 与 user-module-version 参数 |
+| `LD_DYLIB_INSTALL_NAME` | 源码 target 使用 `@rpath/$(EXECUTABLE_PATH)` |
+| `OTHER_LDFLAGS` | 追加生成的 Bridge/bootstrap object 及所选工作流的 runtime 链接输入 |
+| `ENABLE_USER_SCRIPT_SANDBOXING` | 设为 `NO`，供生成 phase 发现编译输入、写入 DerivedData 产物 |
+
+Doctor 用 `HLXXC015` 提示 driver 与缓存代价，用 `HLXXC016` 拒绝实际观察到的源码
+target driver 覆盖，并同时检查安装 manifest 和当前工具的生成模板。升级 Helix 后，
+在 Hub 重新应用接入，或对工程和既有 Host Plan 执行 `xcode install`，一起更新设置
+和生成文件所有权记录。`generate` 只负责独立 kit，已安装工程应通过 `install` 刷新。
+Helix 自身的构建事实缓存及合格的下游 launcher 均不能恢复 Xcode 内建 Swift 缓存。
+
+Xcode 26.6 混合样板在开启 explicit modules、保留旧 driver 设置时，复现了缺少
+`*-linker-args.resp` 的链接错误；增加生成的 `SWIFT_GENERATE_ADDITIONAL_LINKER_ARGS=NO`
+后，同一 Swift/ObjC++ App 编译链接通过。直接打开 integrated driver 仍不可行：仅有
+proxy 时工具查找失败；补充相邻的真实 `swift` 后虽然构建成功，却没有生成 Helix target
+捕获。因此 integrated driver 下的捕获和 post-compile 调度仍未取得支持证据。这些结果
+不能用于比较两种 driver 的性能，也不代表所有定制 linker 配置均已验证。
+
 ## 编译身份与失败重试
+
+[身份来源清单](Compiler-Identity.zh-CN.md)列出前端链路的键、作用域、拒绝规则及冲突诊断必须包含的依据。
 
 | 事实 | 归一入口与依据 |
 | --- | --- |
@@ -116,6 +152,46 @@ Bridging header、C++ interoperability 和工具链宏使用同一重放路径�
 explicit-module 调度不直接复制进 AST 分析；捕获到的 module-loading 输入仍经过重放校验。
 Canonical SIL 改从单独的私有输出文件读取，因为包含 bridging PCH 的 driver job 可能把
 `-o -` 的 SIL 写到 stderr。诊断输出不会作为 SIL 解析。
+
+## 一次收集独立的 frontend 问题
+
+用真实 target 成功编译后生成的捕获文件诊断 receipt：
+
+```sh
+helix xcode post-compile --plan .helix/xcode/HostPlan.json --profile live \
+  --capture /absolute/DerivedData/path/FrontendInvocation.hlxswiftc \
+  --diagnose --json
+```
+
+不加 `--json` 时输出可读文本。报告包含 `passed`、带 `passed`/`failed`/`blocked`
+状态和判定依据的 `checks`、声明资格诊断，以及分析启动后的性能 trace。退出码 0
+表示本次检查的 frontend receipt 分析通过；单个声明的资格诊断本身不代表分析失败。
+
+正常生成与诊断共用同一套有明确依赖关系的分析。诊断汇总独立的请求和源文件错误，
+分别运行 typed AST、identity SIL、semantic SIL，并在前置事实有效时继续检查源码
+nominal、imported type、operation 和 Catalog 一致性。失败事实不会被当作有效输入，
+依赖它的检查标为 blocked。捕获或上下文无效时无法继续编译。独立检查之后的最终
+receipt 组装仍在首个错误处停止；该模式不承诺从无效输入中枚举所有可能问题。
+
+诊断只读取已有且验证通过的 Catalog，报告缺失的生产覆盖，不启动冷编目或后台预热。
+它绕过完整模块 receipt 缓存，确保执行当前检查，但复用并保留逐阶段验证的 compiler
+checkpoint。不发布模块 receipt、Shell、Bridge、Prepare state 或 Hub reservation。
+链接、服务连接及 runtime 激活仍须通过正常 Build/Run 验证。
+
+## 混合配置回归
+
+[`Tests/Fixtures/MixedOnboarding`](../Tests/Fixtures/MixedOnboarding/README.md)
+是真实的小型 Xcode App，包含两个 `@TaskLocal` 展开、文件私有类型、带与不带 module
+前缀的 SDK 名称、Foundation/UIKit/AVFoundation/Photos、Objective-C bridging header、
+C++ interop、`-g`，并在工程设置中开启 explicit modules。可选集成测试实际编译链接，
+捕获全部 5 个 Swift 文件，连续安装两次，用 `plutil` 校验 PBX、用 `xcodebuild -list`
+读取安装后的工程，再执行 receipt 诊断。driver 探测分别记录构建结果与捕获是否存在。
+直接编译的 `SystemFrameworkIntegration` 测试另外执行 `-explicit-module-build`，
+并核对输出确实包含 debug scope。
+
+样板验证配置之间的相互作用，不代表 100-module Catalog 基准或物理设备激活验收。
+debug 占位符身份另有 SIL 语法回归；小型 Swift 宏样板不声称复现商业工程编译器输出的
+`__unknown_macro__` 拼写。
 
 ## 安排 Catalog 冷编目
 

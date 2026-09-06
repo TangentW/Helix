@@ -23,6 +23,9 @@ public enum CompilerArguments {
             "-enable-library-evolution", "-enable-testing", "-warnings-as-errors",
             "-suppress-warnings", "-enable-bare-slash-regex",
             "-application-extension",
+            // Debug scope provenance participates in declaration resolution.
+            // Preserve the selected level, including an explicit later -gnone.
+            "-g", "-gline-tables-only", "-gnone",
         ]
         let frontend: Set<String> = [
             "-disable-availability-checking", "-warn-concurrency",
@@ -68,12 +71,13 @@ public enum CompilerArguments {
             }
             index += 1
         }
-        for required in [
+        let missing = [
             "-enable-private-imports",
             "-enable-implicit-dynamic",
             "-enable-dynamic-replacement-chaining",
-        ] where !containsFrontend(required, in: result) {
-            throw XcodeIntegration.CompilerArgumentError.missing(required)
+        ].filter { !containsFrontend($0, in: result) }
+        if !missing.isEmpty {
+            throw XcodeIntegration.CompilerArgumentError.missing(missing.joined(separator: ", "))
         }
         return result
     }

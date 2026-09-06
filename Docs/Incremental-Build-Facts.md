@@ -37,7 +37,11 @@ The persistent keys use canonical JSON and a versioned hash domain. Inputs do
 not depend on modification times. Source content, compiler-capture content,
 the compiler executable fingerprint, SDK build, target, minimum OS,
 optimization and semantic frontend arguments are represented at the layer
-where they can alter a result.
+where they can alter a result. Captured debug levels (`-g`, `-gline-tables-only`,
+`-gnone`) remain ordered replay inputs because SIL scope provenance is used in
+declaration resolution. The definition-backed SIL identity revision changes the
+transform hash, invalidating older Shell/module facts without changing a wire
+schema. See [Compiler identity](Compiler-Identity.md).
 
 Helix lexes the source's actual Swift `import` declarations and checks that
 result against the compiler's imported-module receipt. It fingerprints only
@@ -143,6 +147,14 @@ continues to use the fine-grained probe cache because ordinary source edits can
 reuse those candidates even when the broader module receipt changes.
 
 ## Validation and failure behavior
+
+`xcode post-compile --diagnose` runs current frontend checks even when a complete
+module receipt is cached. It shares normal generation's dependency-aware analysis,
+reparses validated compiler checkpoints, and retains them on success or failure.
+It never publishes a module receipt or retires checkpoints, so a corrected normal
+build can reuse compilation and perform ordinary publication. Existing Catalogs
+can be read; cold generation and prewarm are excluded. See the
+[diagnosis scope](Large-Project-Integration.md#collect-independent-frontend-failures).
 
 Every cached value is decoded and semantically validated by its consumer:
 

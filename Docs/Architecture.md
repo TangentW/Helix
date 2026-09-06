@@ -1053,3 +1053,10 @@ completed stages available for the same compiler inputs. This changes local
 build-fact storage only, not the public Shell or patch format. The validation,
 retention, and failure boundaries are specified in
 [Incremental Build Facts](Incremental-Build-Facts.md#reuse-layers).
+
+Normal receipt generation and explicit frontend diagnosis share one analysis
+dependency graph. Diagnosis records independent failures and blocks consumers of
+invalid facts, without publishing runtime artifacts or a complete module cache
+entry. SIL declaration identity requires an actual function definition; debug-only
+parents remain scope-local metadata. See the [identity authority inventory](Compiler-Identity.md)
+and [diagnosis boundaries](Large-Project-Integration.md#collect-independent-frontend-failures).

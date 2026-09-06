@@ -70,7 +70,7 @@ public struct ProjectFileParser: Sendable {
         let buildableName = productReference.flatMap {
             resolver.fileName(id: $0)
         }
-        let configurations = configurationDetails(
+        let configurations = try configurationDetails(
             listID: object["buildConfigurationList"]?.string,
             objects: objects,
             resolver: resolver
@@ -107,9 +107,17 @@ public struct ProjectFileParser: Sendable {
         listID: String?,
         objects: [String: Hub.OpenStep.Value],
         resolver: ProjectPathResolver
-    ) -> [(name: String, baseConfigurationPath: String?)] {
+    ) throws -> [(name: String, baseConfigurationPath: String?)] {
         guard let listID, let list = objects[listID]?.dictionary else { return [] }
-        return stringArray(list["buildConfigurations"]).compactMap { identifier in
+        let identifiers = stringArray(list["buildConfigurations"])
+        let byName = Dictionary(grouping: identifiers) { objects[$0]?.dictionary?["name"]?.string ?? "" }
+        for name in byName.keys.sorted() where byName[name]!.count > 1 {
+            let evidence = byName[name]!.map { id in
+                "\(id) (base=\(objects[id]?.dictionary?["baseConfigurationReference"]?.string ?? "none"))"
+            }.joined(separator: "; ")
+            throw Hub.Error.invalidProject("configuration list \(listID) repeats name \(String(reflecting: name)): \(evidence)")
+        }
+        return identifiers.compactMap { identifier in
             guard let configuration = objects[identifier]?.dictionary,
                   let name = configuration["name"]?.string
             else { return nil }

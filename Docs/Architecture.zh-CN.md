@@ -196,3 +196,9 @@ Transform identity 同步更新，使旧本地 receipt/projection 失效；已�
 继续执行。完整 receipt 成功保存后清理对应中间产物；失败时保留已经完成的阶段，
 供编译输入相同的重试使用。这只改变本地构建事实的存储，不改变公开 Shell 或补丁格式。
 具体校验、保留和失效边界见[增量构建事实](Incremental-Build-Facts.zh-CN.md#分层复用什么)。
+
+正常 receipt 生成与显式 frontend 诊断共用一个分析依赖图。诊断记录独立失败，阻止
+无效事实进入后续检查，不发布 runtime 产物或完整模块缓存。SIL 声明身份必须有实际
+function definition 支持；仅用于 debug 的 parent 保留为 scope 局部元数据。身份来源
+见[编译身份清单](Compiler-Identity.zh-CN.md)，诊断范围见
+[大型工程接入](Large-Project-Integration.zh-CN.md#一次收集独立的-frontend-问题)。

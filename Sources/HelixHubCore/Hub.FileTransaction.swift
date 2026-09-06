@@ -56,6 +56,10 @@ struct FileTransaction {
         let orderedDeletions = try deletions.sorted().map { relativePath in
             (relativePath, try safeURL(relativePath: relativePath, root: root))
         }
+        let projects = ordered.filter { $0.url.lastPathComponent == "project.pbxproj" }
+        for item in projects {
+            try Hub.OpenStepValidation.validate(item.mutation.data)
+        }
         var directorySnapshots: [DirectorySnapshot] = []
         var written: [Snapshot] = []
         do {
@@ -85,6 +89,14 @@ struct FileTransaction {
                 guard try entryStatus(at: url) != nil else { continue }
                 written.append(snapshot)
                 try fileManager.removeItem(at: url)
+            }
+            // Keep read-back inside the rollback boundary, after all mutations.
+            for item in projects {
+                try ensureSafeParents(of: item.url, beneath: root)
+                guard let actual = try snapshot(item.url).data, actual == item.mutation.data else {
+                    throw Hub.Error.transactionFailed("PBX read-back differs at \(item.mutation.relativePath)")
+                }
+                try Hub.OpenStepValidation.validate(actual)
             }
             return ordered.map { $0.mutation.relativePath }
         } catch {

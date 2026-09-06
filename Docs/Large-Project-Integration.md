@@ -51,7 +51,19 @@ scheme, configuration, and bundle identifiers with the inspected project values:
 
 `inspect` is read-only and lists targets, their configurations, and shared
 schemes. `install --json` returns the installed plan and written relative paths.
-It preserves the supplied plan, including an explicitly qualified
+PBX installation, reconfiguration, and removal edit changed value tokens and
+array members using the original syntax coordinates. Unchanged objects, fields,
+quotes, comments, and source-list entries retain their original bytes; adding a
+trigger does not reformat a large Sources phase. New values use OpenStep's ASCII
+bare-token rules, so `libc++`, `@executable_path/Frameworks`, `*.xcassets`, and
+conditional setting keys are quoted. Escaped strings retain their decoded values.
+The system property-list parser checks input and output independently of Helix's
+editor. Every PBX mutation is validated before writing and read back before the
+shared file transaction commits; mismatched or invalid output rolls back the
+transaction. This validates PBX syntax and intended values, not Xcode's complete
+build graph: use `xcodebuild -list` and a real build for that separate check.
+
+`install` preserves the supplied plan, including an explicitly qualified
 `deviceNativeMatrixQualified` value. Omitting that field retains the existing
 device backend policy; installation does not qualify a physical device.
 
@@ -69,6 +81,38 @@ generated Helix proxy. A target-level or command-line override can supersede
 the generated xcconfig and must be reconciled. Helix appends its required
 `OTHER_SWIFT_FLAGS`, Bridge link inputs, and relevant runtime configuration while
 preserving inherited settings. It does not take over `CC` or `LD`.
+
+The selected configurations have these integration costs and setting owners:
+
+| Setting | Helix behavior and consequence |
+| --- | --- |
+| `PRODUCT_MODULE_NAME` | Uses the source module selected in the Host Plan |
+| `SWIFT_EXEC` | Owns the source target's compiler entry point; another launcher must use the chaining contract below |
+| `SWIFT_USE_INTEGRATED_DRIVER` | Sets `NO` for whole-target capture and the post-compile hook; Xcode's built-in Swift compilation cache is unavailable for this configuration |
+| `SWIFT_GENERATE_ADDITIONAL_LINKER_ARGS` | Sets `NO`; XCBuild's supplemental linker response file is not produced by this driver path. Swift object autolinking continues to supply imported framework/library inputs |
+| `OTHER_SWIFT_FLAGS` | Appends private-import, implicit-dynamic, replacement-chaining, and user-module-version arguments to inherited flags |
+| `LD_DYLIB_INSTALL_NAME` | Sets `@rpath/$(EXECUTABLE_PATH)` for the source target |
+| `OTHER_LDFLAGS` | Appends generated Bridge/bootstrap objects and the selected workflow's runtime link inputs |
+| `ENABLE_USER_SCRIPT_SANDBOXING` | Sets `NO` for generated phases that discover compiler inputs and write DerivedData artifacts |
+
+Doctor reports the driver/cache tradeoff as `HLXXC015`, rejects an observed
+source-target driver override as `HLXXC016`, and compares generated files with
+the active tool's templates as well as their installed manifest. After updating
+Helix, reapply integration in Hub or run `xcode install` with the project and
+existing Host Plan to update settings and generated-file ownership together.
+`generate` produces a standalone kit; use `install` to refresh an installed project.
+Helix's own build-fact caches and a
+qualified downstream launcher do not restore Xcode's built-in Swift cache.
+
+The mixed-project regression on Xcode 26.6 reproduced a missing
+`*-linker-args.resp` with explicit modules enabled and the old driver settings;
+the generated `SWIFT_GENERATE_ADDITIONAL_LINKER_ARGS=NO` setting allowed the
+same mixed Swift/ObjC++ application to link. Simply enabling the integrated
+driver is insufficient: the proxy alone failed tool lookup; providing a sibling
+real `swift` made the build succeed but produced no Helix target capture.
+Integrated-driver capture and post-compile scheduling therefore remain
+unqualified. These observations do not establish a timing advantage for either
+driver or compatibility with every linker customization.
 
 To chain an existing compiler launcher, export an absolute executable path in
 the environment that starts the build:
@@ -109,6 +153,9 @@ the selected compiler with `xcrun`.
 
 ## Compiler identity and retry behavior
 
+See the [identity authority inventory](Compiler-Identity.md) for the keys, scopes,
+rejection rules, and required conflict evidence across the frontend pipeline.
+
 | Fact | Normalization and authority |
 | --- | --- |
 | Source nominal | Compiler declaration USR plus logical file scope distinguish file-private duplicates; a display name alone is not identity |
@@ -139,6 +186,56 @@ replay path. Driver-only explicit-module scheduling is not copied into direct
 AST analysis; captured module-loading inputs remain subject to replay validation.
 Canonical SIL is read from a dedicated private output file because bridging-PCH
 driver jobs can write `-o -` SIL to stderr. Diagnostics are never parsed as SIL.
+
+## Collect independent frontend failures
+
+Use the successful target's captured invocation to diagnose receipt generation:
+
+```sh
+helix xcode post-compile --plan .helix/xcode/HostPlan.json --profile live \
+  --capture /absolute/DerivedData/path/FrontendInvocation.hlxswiftc \
+  --diagnose --json
+```
+
+Omit `--json` for readable text. The report contains `passed`, a `checks` array
+with `passed`/`failed`/`blocked` statuses and evidence, eligibility diagnostics,
+and a performance trace when analysis starts. Exit zero means the checked
+frontend receipt analysis passed. Eligibility diagnostics describe individual
+declarations and do not by themselves mean the analysis failed.
+
+Normal generation and diagnosis share the same dependency-aware analysis.
+Diagnosis aggregates independent request/source-file errors, runs typed AST and
+both SIL checks independently, then checks source nominals, imported types,
+operations and Catalog consistency wherever their prerequisites succeeded.
+Failed facts are never substituted as valid input; their consumers are marked
+blocked. Invalid capture/context prevents dependent compiler work. After these
+independent checks, final receipt assembly still stops at its first failure;
+this mode does not promise every possible violation from malformed input.
+
+Diagnosis reads existing validated Catalogs and reports missing production
+coverage without starting cold Catalog generation or background prewarm. It
+bypasses complete module-receipt cache hits so current checks run, but can reuse
+and retain individually validated compiler checkpoints. It does not publish a
+module receipt, Shell, Bridge, prepared state, or Hub reservation. Linking,
+service connection, and runtime activation require normal Build/Run.
+
+## Mixed configuration regression
+
+[`Tests/Fixtures/MixedOnboarding`](../Tests/Fixtures/MixedOnboarding/README.md)
+contains a small real Xcode App with two `@TaskLocal` expansions, file-private
+types, qualified/unqualified SDK names, Foundation/UIKit/AVFoundation/Photos,
+an Objective-C bridging header, C++ interop, `-g`, and explicit modules enabled
+in project settings. Its opt-in test performs a native Xcode compile/link,
+captures all five Swift files, installs twice, checks PBX syntax with `plutil`,
+loads the installed project with `xcodebuild -list`, and diagnoses the receipt.
+Driver probes record build status separately from capture availability.
+The direct `SystemFrameworkIntegration` test additionally invokes the compiler
+with `-explicit-module-build` and verifies emitted debug scopes.
+
+This fixture checks configuration interactions; it is not a 100-module Catalog
+benchmark or a physical-device activation test. Debug-only placeholder identity
+also has a SIL grammar regression: the small Swift macro fixture does not claim
+to reproduce the commercial compiler's `__unknown_macro__` spelling.
 
 ## Plan for cold Catalog work
 

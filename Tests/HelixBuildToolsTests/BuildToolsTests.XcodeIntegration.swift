@@ -7,6 +7,16 @@ import Testing
 extension BuildToolsTests {
 @Suite("Xcode host integration contract")
 struct XcodeIntegrationContract {
+    @Test("Captured debug levels survive replay in their original order")
+    func preservesDebugInformationLevel() throws {
+        let required = ["-Xfrontend", "-enable-private-imports", "-Xfrontend", "-enable-implicit-dynamic",
+                        "-Xfrontend", "-enable-dynamic-replacement-chaining"]
+        for levels in [["-g"], ["-g", "-gnone"], ["-gline-tables-only", "-g"]] {
+            let result = try XcodeIntegration.CompilerArguments.semanticArguments(from: required + levels)
+            #expect(Array(result.suffix(levels.count)) == levels)
+        }
+    }
+
     @Test("Prepare state is canonical and rejects unsafe manifests")
     func prepareStateCodec() throws {
         let state = XcodeIntegration.PrepareState(
@@ -160,12 +170,14 @@ struct XcodeIntegrationContract {
             "SWIFT_EXEC = $(HELIX_INTEGRATION_ROOT)/Scripts/Compiler/swiftc"
         ))
         #expect(liveFeature.contains("SWIFT_USE_INTEGRATED_DRIVER = NO"))
+        #expect(liveFeature.contains("SWIFT_GENERATE_ADDITIONAL_LINKER_ARGS = NO"))
         #expect(liveFeature.contains("LD_DYLIB_INSTALL_NAME = @rpath/$(EXECUTABLE_PATH)"))
         #expect(patchFeature.contains("LD_DYLIB_INSTALL_NAME = @rpath/$(EXECUTABLE_PATH)"))
         #expect(patchFeature.contains("-enable-implicit-dynamic"))
         #expect(patchFeature.contains("-enable-dynamic-replacement-chaining"))
         #expect(patchFeature.contains("HELIX_REAL_SWIFT_EXEC"))
         #expect(patchFeature.contains("SWIFT_USE_INTEGRATED_DRIVER = NO"))
+        #expect(patchFeature.contains("SWIFT_GENERATE_ADDITIONAL_LINKER_ARGS = NO"))
         let liveApplication = text(
             try #require(first.artifacts[live.applicationConfiguration])
         )

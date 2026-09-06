@@ -27,214 +27,37 @@ public struct Adapter: Sendable {
         compilerInputHash: Core.Digest?,
         expectedImports: FrontendReceipt.SourceImports.Result? = nil,
         expectedSources: [ShellBuildReceipt.Source]? = nil,
-        checkpoints: FrontendReceipt.CompilerCheckpoints.Context? = nil
+        checkpoints: FrontendReceipt.CompilerCheckpoints.Context? = nil,
+        diagnostics: FrontendReceipt.DiagnosticSession? = nil
     ) throws -> FrontendReceipt.Output {
-        let performance = BuildPerformance.Recorder()
-        try performance.measure("frontend.validate_request") {
-            try validate(request)
-        }
-        let orderedSources = request.sources.sorted { $0.logicalPath < $1.logicalPath }
-        performance.setCounter("frontend.source_count", value: UInt64(orderedSources.count))
-        let sourceStates = try performance.measure("frontend.load_sources") {
-            try loadSources(orderedSources)
-        }
-        if let expectedSources {
-            let observed = sourceStates.map {
-                ShellBuildReceipt.Source(
-                    logicalPath: $0.logicalPath,
-                    contentHash: $0.contentHash
-                )
-            }
-            guard observed == expectedSources else {
-                throw FrontendReceipt.SourceImports.ValidationError.sourceChanged
-            }
-        }
-        performance.setCounter(
-            "frontend.source_bytes",
-            value: sourceStates.reduce(0) { $0 + UInt64($1.contents.count) }
-        )
-        let toolchain = try suppliedToolchain
-            ?? performance.measure("frontend.toolchain_identity") {
-                try ReleaseCompiler.Driver().toolchainIdentity(
-                    compilerURL: request.compilerURL,
-                    invocationObserver: performance.subprocessObserver
-                )
-            }
-        let frontend = SwiftFrontend.Driver(
-            compilerURL: request.compilerURL,
-            invocationObserver: performance.subprocessObserver
-        )
-        let ast = try FrontendReceipt.CompilerCheckpoints.read(
-            .typedAST, context: checkpoints, performance: performance,
-            produce: {
-                try performance.measure("frontend.emit_typed_ast") {
-                    try frontend.emitTypedAST(sourceFiles: orderedSources.map(\.url),
-                                             invocation: request.metadata.frontendInvocation)
-                }
-            },
-            parse: { text in
-                performance.setCounter("frontend.typed_ast_bytes", value: UInt64(text.utf8.count))
-                let documents = try performance.measure("frontend.parse_typed_ast") {
-                    try FrontendReceipt.TypedAST.parseDocuments(text)
-                }
-                let expectedPaths = Set(sourceStates.map { $0.url.path })
-                let actualPaths = documents.compactMap { $0["filename"] as? String }.map {
-                    URL(fileURLWithPath: $0).resolvingSymlinksInPath().standardizedFileURL.path
-                }
-                guard actualPaths.count == expectedPaths.count, Set(actualPaths) == expectedPaths else {
-                    throw FrontendReceipt.Error.malformedAST("typed AST source documents do not match the requested source set")
-                }
-                let modules = try performance.measure("frontend.collect_imports") {
-                    Array(Set(try documents.flatMap {
-                        imports(in: try FrontendReceipt.TypedAST.items(in: $0))
-                    })).filter { $0 != request.metadata.frontendInvocation.moduleName }.sorted()
-                }
-                if let expectedImports, !expectedImports.covers(compilerModules: modules) {
-                    throw FrontendReceipt.SourceImports.ValidationError.compilerImportMismatch
-                }
-                try validateCompilerVersion(documents, toolchain: toolchain)
-                return (documents: documents, modules: modules)
-            }
-        )
-        let documents = ast.documents
-        let importedModules = ast.modules
-        let demangled = try performance.measure("frontend.demangle_types") {
-            try FrontendReceipt.Demangler(
-                compilerURL: request.compilerURL,
-                invocationObserver: performance.subprocessObserver
-            ).demangle(FrontendReceipt.TypedAST.mangledTypes(in: documents))
-        }
-        let silFile = try FrontendReceipt.CompilerCheckpoints.read(
-            .identitySIL, context: checkpoints, performance: performance,
-            produce: {
-                try performance.measure("frontend.emit_identity_sil") {
-                    try frontend.emitCanonicalSIL(sourceFiles: orderedSources.map(\.url),
-                                                 invocation: request.metadata.frontendInvocation)
-                }
-            },
-            parse: { text in
-                performance.setCounter("frontend.identity_sil_bytes", value: UInt64(text.utf8.count))
-                return try performance.measure("frontend.parse_identity_sil") { try CanonicalSIL.File(text: text) }
-            }
-        )
-        // Native-call discovery needs source-level default-argument
-        // provenance. Even at -Onone, mandatory SIL transforms may inline an
-        // imported default generator once nearby call shapes change.
-        let operationSILFile = try FrontendReceipt.CompilerCheckpoints.read(
-            .semanticSIL, context: checkpoints, performance: performance,
-            produce: {
-                try performance.measure("frontend.emit_semantic_sil") {
-                    try frontend.emitCanonicalSIL(sourceFiles: orderedSources.map(\.url),
-                        invocation: request.metadata.frontendInvocation, purpose: .semanticLowering)
-                }
-            },
-            parse: { text in
-                performance.setCounter("frontend.semantic_sil_bytes", value: UInt64(text.utf8.count))
-                return try performance.measure("frontend.parse_semantic_sil") { try CanonicalSIL.File(text: text) }
-            }
-        )
+        let session = diagnostics ?? FrontendReceipt.DiagnosticSession(collectFailures: false)
+        let performance = session.performance
+        let analysis = try analyze(request, toolchain: suppliedToolchain, expectedImports: expectedImports,
+                                   expectedSources: expectedSources, checkpoints: checkpoints, session: session)
+        let sourceStates = analysis.sourceStates
+        let toolchain = analysis.toolchain
+        let frontend = SwiftFrontend.Driver(compilerURL: request.compilerURL, invocationObserver: performance.subprocessObserver)
+        let documents = analysis.documents
+        let importedModules = analysis.importedModules
+        let demangled = analysis.demangled
+        let silFile = analysis.silFile
+        let operationSILFile = analysis.operationSILFile
         let moduleName = request.metadata.frontendInvocation.moduleName
-        let effectiveConfiguration = try performance.measure(
-            "frontend.resolve_calling_surface"
-        ) {
-            let configured = try callingSurfaceConfiguration(
-                request.configuration,
-                policy: request.callingSurfacePolicy,
-                moduleName: moduleName,
-                sources: orderedSources
-            )
-            let effective = configuration(
-                configured,
-                allowing: Array(NativeImportCatalog.Builtins.automaticCallees),
-                moduleName: moduleName
-            )
-            try effective.validate()
-            return effective
-        }
-        let sourceByPhysicalPath = Dictionary(
-            uniqueKeysWithValues: sourceStates.map {
-                ($0.url.resolvingSymlinksInPath().standardizedFileURL.path, $0)
-            }
-        )
-        let sourceNominals = try performance.measure(
-            "frontend.discover_source_nominals"
-        ) {
-            try discoverSourceNominals(
-                documents: documents,
-                sourcesByPhysicalPath: sourceByPhysicalPath,
-                moduleName: moduleName,
-                demangled: demangled
-            )
-        }
+        let effectiveConfiguration = analysis.effectiveConfiguration
+        let sourceByPhysicalPath = Dictionary(uniqueKeysWithValues: sourceStates.map { ($0.url.path, $0) })
+        let sourceNominals = analysis.sourceNominals
         let sourceNominalsByName = SourceNominalIndex(sourceNominals)
-        let sourceNominalAliasIndex = SourceNominalAliasIndex(
-            sourceNominals: sourceNominals,
-            moduleName: moduleName
-        )
-        let discoveredImportedTypes = try performance.measure(
-            "frontend.discover_imported_types"
-        ) {
-            try discoverImportedNativeTypes(
-                documents: documents,
-                sourcesByPhysicalPath: sourceByPhysicalPath,
-                moduleName: moduleName,
-                demangled: demangled
-            )
-        }
-        var importedOperationSurface = try performance.measure(
-            "frontend.discover_imported_operations"
-        ) {
-            try discoverImportedOperationSurface(
-                documents: documents,
-                sourcesByPhysicalPath: sourceByPhysicalPath,
-                moduleName: moduleName,
-                demangled: demangled,
-                silFile: operationSILFile,
-                performance: performance
-            )
-        }
-        let sourceObservedImportedTypeNames = Set(
-            (discoveredImportedTypes + importedOperationSurface.types)
-                .flatMap { type in
-                    [type.canonicalName, type.swiftType] + type.aliases
-                }
-        )
+        let sourceNominalAliasIndex = SourceNominalAliasIndex(sourceNominals: sourceNominals, moduleName: moduleName)
+        let discoveredImportedTypes = analysis.discoveredImportedTypes
+        var importedOperationSurface = analysis.importedOperationSurface
+        let sourceObservedImportedTypeNames = Set((discoveredImportedTypes + importedOperationSurface.types)
+            .flatMap { [$0.canonicalName, $0.swiftType] + $0.aliases })
         var requiredImportedOperationSourceIDs = Set<String>()
-        let catalogSurface = try performance.measure(
-            "frontend.resolve_native_api_catalogs"
-        ) {
-            try FrontendReceipt.CatalogSurface.resolve(
-                snapshots: request.nativeAPICatalogs,
-                request: request,
-                importedModules: importedModules,
-                toolchain: toolchain
-            )
-        }
-        performance.setCounter(
-            "native_api_catalog.hit_module_count",
-            value: UInt64(catalogSurface.hitModules.count)
-        )
-        performance.setCounter(
-            "native_api_catalog.miss_module_count",
-            value: UInt64(catalogSurface.missingModules.count)
-        )
-        performance.setCounter(
-            "native_api_catalog.entry_count",
-            value: UInt64(catalogSurface.documents.reduce(0) {
-                $0 + $1.entries.count
-            })
-        )
-        var importedTypes = try performance.measure(
-            "frontend.merge_imported_types"
-        ) {
-            try mergeImportedNativeTypes(
-                discoveredTypes: discoveredImportedTypes,
-                operationTypes: importedOperationSurface.types
-                    + (request.callingSurfacePolicy.expandsImportedModules
-                        ? catalogSurface.importedTypes
-                        : [])
-            )
-        }
+        let catalogSurface = analysis.catalogSurface
+        performance.setCounter("native_api_catalog.hit_module_count", value: UInt64(catalogSurface.hitModules.count))
+        performance.setCounter("native_api_catalog.miss_module_count", value: UInt64(catalogSurface.missingModules.count))
+        performance.setCounter("native_api_catalog.entry_count", value: UInt64(catalogSurface.documents.reduce(0) { $0 + $1.entries.count }))
+        var importedTypes = analysis.importedTypes
         try performance.measure("frontend.bind_native_api_catalogs") {
             if request.callingSurfacePolicy.expandsImportedModules {
                 // Consumer ASTs may spell one imported nominal through a
@@ -852,71 +675,59 @@ public struct Adapter: Sendable {
     }
 
     func validate(_ request: FrontendReceipt.Request) throws {
-        do {
-            try request.configuration.validate()
-        } catch {
-            throw FrontendReceipt.Error.invalidRequest(String(describing: error))
+        var failures: [String] = []
+        func check(_ label: String, _ operation: () throws -> Void) {
+            do { try operation() } catch { failures.append("\(label): \(error)") }
         }
-        guard !request.sources.isEmpty,
-              Set(request.sources.map(\.logicalPath)).count == request.sources.count,
-              Set(request.sources.map {
-                  $0.url.resolvingSymlinksInPath().standardizedFileURL.path
-              }).count == request.sources.count,
-              request.metadata.machOUUIDs.isEmpty,
-              request.metadata.transformPipelineHash == ShellBuild.transformPipelineHash,
-              request.configuration.modules[
-                  request.metadata.frontendInvocation.moduleName
-              ] != nil
-        else {
-            throw FrontendReceipt.Error.invalidRequest(
-                "sources, pre-link identity, transform version, or module configuration is invalid"
-            )
+        check("configuration") { try request.configuration.validate() }
+        if request.sources.isEmpty { failures.append("source set is empty") }
+        let logical = Dictionary(grouping: request.sources, by: \.logicalPath)
+        for path in logical.keys.sorted() where logical[path]!.count > 1 {
+            failures.append("duplicate logical source \(String(reflecting: path)): \(logical[path]!.map { $0.url.path }.sorted())")
         }
-        try request.metadata.frontendInvocation.validate()
-        try request.nativeImportCatalog.validate()
+        let physical = Dictionary(grouping: request.sources) {
+            $0.url.resolvingSymlinksInPath().standardizedFileURL.path
+        }
+        for path in physical.keys.sorted() where physical[path]!.count > 1 {
+            failures.append("duplicate physical source \(String(reflecting: path)): \(physical[path]!.map(\.logicalPath).sorted())")
+        }
+        if !request.metadata.machOUUIDs.isEmpty {
+            failures.append("pre-link metadata must have no Mach-O UUIDs; observed \(request.metadata.machOUUIDs)")
+        }
+        if request.metadata.transformPipelineHash != ShellBuild.transformPipelineHash {
+            failures.append("transform identity mismatch: expected \(ShellBuild.transformPipelineHash.hex), observed \(request.metadata.transformPipelineHash.hex)")
+        }
+        let module = request.metadata.frontendInvocation.moduleName
+        if request.configuration.modules[module] == nil {
+            failures.append("module \(String(reflecting: module)) is absent from configuration modules \(request.configuration.modules.keys.sorted())")
+        }
+        check("frontend invocation") { try request.metadata.frontendInvocation.validate() }
+        check("native import catalog") { try request.nativeImportCatalog.validate() }
         let catalogOrder = request.nativeAPICatalogs.map {
-            $0.document.identity.moduleName + "\u{0}"
-                + $0.document.identity.cacheKey.hex
+            $0.document.identity.moduleName + "\u{0}" + $0.document.identity.cacheKey.hex
         }
-        guard request.nativeAPICatalogs.count <= 256,
-              catalogOrder == catalogOrder.sorted(by: <),
-              Set(request.nativeAPICatalogs.map {
-                  $0.document.identity.moduleName
-              }).count == catalogOrder.count,
-              request.callingSurfacePolicy.expandsImportedModules
-                || request.nativeAPICatalogs.isEmpty
-        else {
-            throw FrontendReceipt.Error.invalidRequest(
-                "Native API Catalog snapshots are duplicated, noncanonical, or incompatible with the calling-surface policy"
-            )
+        if request.nativeAPICatalogs.count > 256 || catalogOrder != catalogOrder.sorted()
+            || Set(request.nativeAPICatalogs.map { $0.document.identity.moduleName }).count != catalogOrder.count {
+            failures.append("Native API Catalog snapshots are duplicated, noncanonical, or exceed 256: \(catalogOrder)")
+        }
+        if !request.callingSurfacePolicy.expandsImportedModules && !request.nativeAPICatalogs.isEmpty {
+            failures.append("Native API Catalog snapshots are incompatible with calling-surface policy \(request.callingSurfacePolicy.rawValue)")
         }
         for snapshot in request.nativeAPICatalogs {
-            do {
-                try snapshot.validateIfNeeded()
-            } catch {
-                throw FrontendReceipt.Error.invalidRequest(
-                    "Native API Catalog \(snapshot.document.identity.moduleName) is invalid: \(error)"
-                )
-            }
+            check("Native API Catalog \(snapshot.document.identity.moduleName)") { try snapshot.validateIfNeeded() }
         }
         for source in request.sources {
-            let components = source.logicalPath.split(
-                separator: "/",
-                omittingEmptySubsequences: false
-            )
-            guard !source.logicalPath.isEmpty, !source.logicalPath.hasPrefix("/"),
-                  !components.contains(""), !components.contains(".."),
-                  source.url.pathExtension == "swift",
-                  !source.url.path.contains("\n"), !source.url.path.contains("\r")
-            else {
-                throw FrontendReceipt.Error.invalidRequest(
-                    "unsafe logical Swift source path \(source.logicalPath)"
-                )
+            let components = source.logicalPath.split(separator: "/", omittingEmptySubsequences: false)
+            if source.logicalPath.isEmpty || source.logicalPath.hasPrefix("/") || components.contains("")
+                || components.contains("..") || source.url.pathExtension != "swift"
+                || source.url.path.contains("\n") || source.url.path.contains("\r") {
+                failures.append("unsafe logical Swift source path \(String(reflecting: source.logicalPath)), physical=\(String(reflecting: source.url.path))")
             }
         }
+        guard failures.isEmpty else { throw FrontendReceipt.Error.invalidRequest(failures.joined(separator: "\n")) }
     }
 
-    private func validateCompilerVersion(
+    func validateCompilerVersion(
         _ documents: [FrontendReceipt.TypedAST.Object],
         toolchain: ReleaseCompiler.ToolchainIdentity
     ) throws {
@@ -2193,8 +2004,18 @@ extension FrontendReceipt.Adapter {
         return result
     }
 
-    func loadSources(_ sources: [FrontendReceipt.Source]) throws -> [SourceState] {
-        try sources.map { source in
+    func loadSources(_ sources: [FrontendReceipt.Source], collectFailures: Bool = false) throws -> [SourceState] {
+        if collectFailures {
+            var loaded: [SourceState] = []
+            var failures: [String] = []
+            for source in sources {
+                do { loaded.append(contentsOf: try loadSources([source])) }
+                catch { failures.append("\(source.logicalPath) (\(source.url.path)): \(error)") }
+            }
+            guard failures.isEmpty else { throw FrontendReceipt.Error.invalidRequest(failures.joined(separator: "\n")) }
+            return loaded
+        }
+        return try sources.map { source in
             let url = source.url.resolvingSymlinksInPath().standardizedFileURL
             let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
             guard values.isRegularFile == true, let size = values.fileSize else {

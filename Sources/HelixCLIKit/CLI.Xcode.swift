@@ -171,6 +171,15 @@ private func doctorXcodeIntegration(_ arguments: [String]) throws -> CLI.Result 
             )
         }
     }
+    checks.append(.init(code: "HLXXC015", severity: .warning,
+        summary: "Selected source configuration requires the non-integrated Swift driver",
+        detail: "Helix sets SWIFT_USE_INTEGRATED_DRIVER=NO for whole-target capture and post-compile work. Xcode's built-in Swift compilation cache requires the integrated driver and is unavailable in this configuration. Helix build-fact caches are separate; use HELIX_SWIFT_COMPILER_WRAPPER only with a qualified transparent launcher."))
+    if let feature = try? plan.feature(id: profile.featureID), environment["TARGET_NAME"] == feature.targetName,
+       let driver = environment["SWIFT_USE_INTEGRATED_DRIVER"], driver.uppercased() != "NO" {
+        checks.append(.init(code: "HLXXC016", severity: .error,
+            summary: "Source target overrides the required compiler driver mode",
+            detail: "target=\(feature.targetName), configuration=\(profile.configurationName), SWIFT_USE_INTEGRATED_DRIVER=\(driver); expected NO"))
+    }
     let conventionalConfiguration = profile.workflow == .hotPatch ? "Release" : "Debug"
     if profile.configurationName != conventionalConfiguration {
         checks.append(
@@ -234,6 +243,17 @@ private func inspectGeneratedKit(
         else {
             throw CLI.Error.input("integration manifest identity is stale")
         }
+        let expectedManifest = try XcodeIntegration.KitGenerator().generate(plan: plan).manifest
+        guard manifest == expectedManifest else {
+            let changedPaths = Set(manifest.artifacts).symmetricDifference(Set(expectedManifest.artifacts))
+                .map(\.path).sorted()
+            throw CLI.Error.input(
+                "generated kit template differs from the active Helix tool: installed manifest SHA256=\(Core.Digest.sha256(bytes)), "
+                    + "expected SHA256=\(Core.Digest.sha256(try Core.CanonicalJSON.encode(expectedManifest))); "
+                    + "changed artifacts=\(Array(Set(changedPaths)).sorted().joined(separator: ", ")). "
+                    + "Reapply integration or run xcode install with this project and Host Plan."
+            )
+        }
         for artifact in manifest.artifacts {
             let url = root.appendingPathComponent(artifact.path).standardizedFileURL
             guard Self.contains(url, in: root) else {
@@ -259,7 +279,7 @@ private func inspectGeneratedKit(
             .init(
                 code: "HLXXC002",
                 severity: .information,
-                summary: "Generated Xcode kit matches the Host Plan",
+                summary: "Generated Xcode kit matches the Host Plan and active Helix tool",
                 detail: "Verified \(manifest.artifacts.count) generated artifacts."
             ),
         ]
@@ -456,42 +476,38 @@ func executeXcodePhase(_ arguments: [String]) async throws -> CLI.Result {
 }
 
 func executeXcodePostCompile(_ arguments: [String]) async throws -> CLI.Result {
-    if arguments == ["--help"] {
-        return .init(exitCode: 0, standardOutput: Self.xcodePostCompileHelp)
-    }
-    let options = try CLI.Arguments(
-        arguments,
-        valueOptions: ["plan", "profile", "capture"],
-        flagOptions: []
-    )
+    if arguments == ["--help"] { return .init(exitCode: 0, standardOutput: Self.xcodePostCompileHelp) }
+    let options = try CLI.Arguments(arguments, valueOptions: ["plan", "profile", "capture"], flagOptions: ["diagnose", "json"])
     try requireNoXcodePositionals(options, command: "xcode post-compile")
-    let planURL = files.resolve(try options.require("plan"))
-    let plan = try loadHostPlan(at: planURL)
-    let captureURL = files.resolve(try options.require("capture"))
+    guard !options.hasFlag("json") || options.hasFlag("diagnose") else {
+        throw CLI.Error.usage("post-compile --json requires --diagnose")
+    }
     let context: XcodeIntegration.BuildContext
     do {
-        context = try CLI.XcodePostCompileResolver().resolve(
-            plan: plan,
-            planURL: planURL,
-            profileID: try options.require("profile"),
-            captureURL: captureURL,
-            environment: environment
-        )
-    } catch let error as CLI.XcodePostCompileError {
-        throw CLI.Error.input(error.description)
-    } catch let error as BuildCapture.Error {
-        throw CLI.Error.input(error.description)
+        let planURL = files.resolve(try options.require("plan"))
+        context = try CLI.XcodePostCompileResolver().resolve(plan: loadHostPlan(at: planURL), planURL: planURL,
+            profileID: options.require("profile"), captureURL: files.resolve(options.require("capture")), environment: environment)
+    } catch {
+        if options.hasFlag("diagnose") {
+            return try formatXcodeDiagnosis(.failure(stage: "xcode.context", reason: String(describing: error)), json: options.hasFlag("json"))
+        }
+        if let error = error as? CLI.XcodePostCompileError { throw CLI.Error.input(error.description) }
+        if let error = error as? BuildCapture.Error { throw CLI.Error.input(error.description) }
+        throw error
     }
-    let phaseLock = try XcodePhaseLock(
-        directoryURL: context.environment.profileOutputURL
-    )
+    let phaseLock = try XcodePhaseLock(directoryURL: context.environment.profileOutputURL)
     defer { phaseLock.unlock() }
+    if options.hasFlag("diagnose") {
+        do {
+            return try await performPrepareXcodeShell(context, performance: .init(), diagnosticJSON: options.hasFlag("json"))
+        } catch {
+            if error is CancellationError { throw error }
+            return try formatXcodeDiagnosis(.failure(stage: "xcode.prepare_context", reason: String(describing: error)), json: options.hasFlag("json"))
+        }
+    }
     let prepared = try await prepareXcodeShell(context)
     let bridge = try compileXcodeBridge(context)
-    return .init(
-        exitCode: 0,
-        standardOutput: prepared.standardOutput + bridge.standardOutput
-    )
+    return .init(exitCode: 0, standardOutput: prepared.standardOutput + bridge.standardOutput)
 }
 
 private func auditXcodeProduct(
@@ -1299,7 +1315,8 @@ private func prepareXcodeShell(
 
 private func performPrepareXcodeShell(
     _ context: XcodeIntegration.BuildContext,
-    performance: BuildPerformance.Recorder
+    performance: BuildPerformance.Recorder,
+    diagnosticJSON: Bool? = nil
 ) async throws -> CLI.Result {
     let manager = FileManager.default
     try performance.measure("prepare.validate_environment") {
@@ -1399,6 +1416,32 @@ private func performPrepareXcodeShell(
         context.profile.workflow == .liveReload
             ? .managedDevelopmentModule
             : .managedProductionModule
+    if let diagnosticJSON {
+        let resolved: XcodeNativeAPICatalogResolution?
+        var catalogFailure: String?
+        do {
+            resolved = try await resolveXcodeNativeAPICatalogs(context: context, metadata: metadata,
+                importedModules: sourceImports.modules, compilerArguments: capture.analysisJob.arguments,
+                compilerInputs: compilerInputs, toolchain: toolchain, cache: buildCache, performance: performance,
+                cachedOnly: true)
+        } catch {
+            if error is CancellationError { throw error }
+            resolved = nil
+            catalogFailure = String(describing: error)
+        }
+        let request = FrontendReceipt.Request(metadata: metadata, configuration: configuration,
+            sources: capture.frontendSources, compilerURL: context.environment.compilerURL,
+            nativeImportCatalog: .empty, nativeAPICatalogs: resolved?.snapshots ?? [], callingSurfacePolicy: callingSurfacePolicy)
+        var report = try FrontendReceipt.CachedAdapter(cache: buildCache).diagnose(request,
+            compilerCapture: capture.recordBytes, compilerArguments: capture.analysisJob.arguments,
+            workingDirectory: context.environment.sourceRootURL, precomputedToolchain: toolchain,
+            precomputedCompilerInputs: compilerInputs, catalogFailure: catalogFailure)
+        if let resolved {
+            report.checks.insert(.init(stage: "xcode.catalog_availability", status: .passed,
+                detail: "\(resolved.snapshots.count) cached module Catalog(s), \(resolved.prewarmRequests.count) missing, unresolved=\(resolved.unresolvedModules). Diagnosis reads cached Catalogs; normal Prepare manages prewarm."), at: 0)
+        }
+        return try formatXcodeDiagnosis(report, json: diagnosticJSON)
+    }
     if compilerInputs.isComplete {
         let identity = try performance.measure("prepare.make_fast_path_identity") {
             try makeXcodePrepareIdentity(
@@ -3076,7 +3119,12 @@ generated integration uses automatic selection by default.
 """ + "\n"
 
 static let xcodePostCompileHelp = """
-Usage: helix xcode post-compile --plan HostPlan.json --profile ID --capture FILE
+Usage: helix xcode post-compile --plan HostPlan.json --profile ID --capture FILE [--diagnose [--json]]
+
+--diagnose collects independent frontend failures, marks blocked checks, and
+validates the receipt pipeline without publishing a Shell, Bridge, or receipt.
+It reuses validated compiler checkpoints and reads existing Catalogs. Link,
+service registration, and runtime activation still require normal Build/Run.
 
 This internal command is invoked by the generated Swift compiler proxy after a
 successful same-target compile. It derives the active Xcode identity from the

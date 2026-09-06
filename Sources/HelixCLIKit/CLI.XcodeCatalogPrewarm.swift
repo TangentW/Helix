@@ -83,7 +83,8 @@ extension CLI.Application {
         compilerInputs: BuildCache.CompilerInputs.Snapshot,
         toolchain: ReleaseCompiler.ToolchainIdentity,
         cache: BuildCache.Store,
-        performance: BuildPerformance.Recorder
+        performance: BuildPerformance.Recorder,
+        cachedOnly: Bool = false
     ) async throws -> XcodeNativeAPICatalogResolution {
         let sdk = SwiftFrontend.Driver.SDKIdentity(
             name: context.environment.sdkName,
@@ -131,7 +132,7 @@ extension CLI.Application {
             }
             guard !pending.isEmpty else { break }
             var discoveredModules = Set<String>()
-            let isLiveReload = context.profile.workflow == .liveReload
+            let isLiveReload = cachedOnly || context.profile.workflow == .liveReload
             let parallelism = isLiveReload ? 4 : 2
             var resolved: [(NativeAPICatalog.BuildRequest,
                             NativeAPICatalog.BuildOutput?)] = []
@@ -187,7 +188,7 @@ extension CLI.Application {
             if requestedModules.count == previousCount { break }
         }
         let unresolved = unresolvedModules.sorted()
-        if context.profile.workflow == .hotPatch, !unresolved.isEmpty {
+        if !cachedOnly, context.profile.workflow == .hotPatch, !unresolved.isEmpty {
             throw CLI.Error.input(
                 "Hot Patch Native API Catalog planning is incomplete for modules: "
                     + unresolved.joined(separator: ", ")
