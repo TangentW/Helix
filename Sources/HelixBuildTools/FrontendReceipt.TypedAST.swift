@@ -32,7 +32,7 @@ enum TypedAST {
     }
 }
 
-struct Demangler {
+struct Demangler: Sendable {
     var compilerURL: URL
     var invocationObserver: SwiftFrontend.InvocationObserver? = nil
 

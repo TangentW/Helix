@@ -419,3 +419,40 @@ The regular suite uses eight sources; measurements accept 2 through 2,500.
 The JSON retains SDK/toolchain identity, target, timings and the cold trace.
 See [Large-project integration](Large-Project-Integration.md) for the installation
 and compiler-wrapper contracts and the current resource bounds.
+
+## SIL debug metadata scanning
+
+On 2026-09-07, a fixed synthetic SIL text (14,211,961 UTF-8 bytes, 120,000
+instruction lines, 30,000 located scopes, 2,500 file mappings) was measured with
+Swift 6.3.3 using `swiftc -O` on an Apple M4 (10 logical CPUs, 16 GiB RAM). A standalone harness compiles the actual
+`CanonicalSIL.DebugMetadata` source with minimal location/error type stubs.
+It runs each operation five times in one process; the table shows medians.
+Output counts/checksums matched in every sample. Raw inputs, harness, source
+snapshots and samples are external acceptance evidence, not repository artifacts.
+
+| Operation | Before | After | Reduction |
+| --- | ---: | ---: | ---: |
+| Source module mappings | 221.229 ms | 177.750 ms | 19.7% |
+| Debug scopes | 278.743 ms | 266.322 ms | 4.5% |
+| Instruction metadata | 447.516 ms | 272.310 ms | 39.1% |
+
+The changes filter metadata prefixes before string allocation and regex work,
+use UTF-8 comment delimiters, avoid decoding unescaped paths, and use anchored
+single-match regex queries. Scope inheritance also uses iterative traversal
+with memoized missing locations; a separate 30,000-link regression covers both
+located and unlocated chains and cycle diagnostics. The table measures located
+scopes, not the improvement for formerly quadratic unlocated chains.
+
+This isolates parser operations, excluding compiler emission, AST discovery,
+Catalog generation, Bridge compilation, transfer and activation. It is not a
+commercial-project cold-build or save-to-activation benchmark. Shared module
+facts still require complete compiler input invalidation; no per-file WMO cache
+or parallel frontend emission is implied.
+
+The existing 2,500-file integration benchmarks were also rerun on the same
+Swift/SDK pair. The scalar fixture (147,780 bytes) measured 9.240 s cold receipt,
+0.804 s unchanged hit and 9.256 s after one body edit. The mixed system-framework
+fixture (280,761 bytes) measured 7.509 s explicit-module compilation, 30.155 s
+cold receipt and 0.944 s unchanged hit. Every source remained in the receipt;
+warm runs emitted no AST/SIL. These are current regression observations, not
+an isolated comparison with earlier runs whose source/configuration differs.

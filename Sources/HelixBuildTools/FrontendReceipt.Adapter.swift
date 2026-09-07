@@ -34,6 +34,8 @@ public struct Adapter: Sendable {
         let performance = session.performance
         let analysis = try analyze(request, toolchain: suppliedToolchain, expectedImports: expectedImports,
                                    expectedSources: expectedSources, checkpoints: checkpoints, session: session)
+        var selection = analysis.selection
+        defer { session.indexingDiagnostics = selection.diagnostics }
         let sourceStates = analysis.sourceStates
         let toolchain = analysis.toolchain
         let frontend = SwiftFrontend.Driver(compilerURL: request.compilerURL, invocationObserver: performance.subprocessObserver)
@@ -41,7 +43,6 @@ public struct Adapter: Sendable {
         let importedModules = analysis.importedModules
         let demangled = analysis.demangled
         let silFile = analysis.silFile
-        let operationSILFile = analysis.operationSILFile
         let moduleName = request.metadata.frontendInvocation.moduleName
         let effectiveConfiguration = analysis.effectiveConfiguration
         let sourceByPhysicalPath = Dictionary(uniqueKeysWithValues: sourceStates.map { ($0.url.path, $0) })
@@ -326,10 +327,7 @@ public struct Adapter: Sendable {
         }
         // Build location and symbol indexes once for this immutable SIL module.
         // Recreating them for every declaration makes large modules quadratic.
-        let silResolver = try performance.measure("frontend.index_sil_functions") {
-            try FrontendReceipt.SILFunctionResolver(file: silFile).resolvingCollisions(using: .init(
-                compilerURL: request.compilerURL, invocationObserver: performance.subprocessObserver))
-        }
+        let silResolver = analysis.identityResolver
         var drafts: [Draft] = []
         try performance.measure("frontend.index_source_declarations") {
         for document in documents {
@@ -362,7 +360,8 @@ public struct Adapter: Sendable {
                 importedSwiftTypeAliases: importedSwiftTypeAliases,
                 sourceNominals: sourceNominalsByName,
                 sourceNominalAliasIndex: sourceNominalAliasIndex,
-                drafts: &drafts
+                drafts: &drafts,
+                selection: &selection
             )
         }
         }
@@ -651,6 +650,7 @@ public struct Adapter: Sendable {
             "frontend.declaration_count",
             value: UInt64(receipt.declarations.count)
         )
+        performance.setCounter("frontend.excluded_declaration_count", value: UInt64(selection.exclusions.count))
         performance.setCounter(
             "frontend.root_count",
             value: UInt64(receipt.roots.count)
@@ -665,7 +665,7 @@ public struct Adapter: Sendable {
         )
         return .init(
             receipt: receipt,
-            diagnostics: (indexed.diagnostics + discovery.diagnostics).sorted {
+            diagnostics: (indexed.diagnostics + discovery.diagnostics + selection.diagnostics).sorted {
                 ($0.location?.file ?? "", $0.location?.line ?? 0, $0.code, $0.message)
                     < ($1.location?.file ?? "", $1.location?.line ?? 0, $1.code, $1.message)
             },
@@ -681,7 +681,11 @@ public struct Adapter: Sendable {
             do { try operation() } catch { failures.append("\(label): \(error)") }
         }
         check("configuration") { try request.configuration.validate() }
+        check("indexing") { try request.indexing?.validate() }
         if request.sources.isEmpty { failures.append("source set is empty") }
+        if let indexing = request.indexing, !request.sources.contains(where: { indexing.includes(logicalPath: $0.logicalPath) }) {
+            failures.append("indexing scope matches no captured source: include=\(indexing.include), exclude=\(indexing.exclude), sources=\(request.sources.map(\.logicalPath).sorted())")
+        }
         let logical = Dictionary(grouping: request.sources, by: \.logicalPath)
         for path in logical.keys.sorted() where logical[path]!.count > 1 {
             failures.append("duplicate logical source \(String(reflecting: path)): \(logical[path]!.map { $0.url.path }.sorted())")
@@ -2100,50 +2104,37 @@ extension FrontendReceipt.Adapter {
         importedSwiftTypeAliases: [String: String],
         sourceNominals: SourceNominalIndex,
         sourceNominalAliasIndex: SourceNominalAliasIndex,
-        drafts: inout [Draft]
+        drafts: inout [Draft],
+        selection: inout FrontendReceipt.DeclarationSelection
     ) throws {
         for value in items {
             guard let item = value as? [String: Any],
                   let kind = item["_kind"] as? String
             else { continue }
-            switch kind {
-            case "func_decl":
-                if let draft = try makeDraft(
-                    item,
-                    context: context,
-                    source: source,
-                    locationMap: locationMap,
-                    imports: imports,
-                    moduleName: moduleName,
-                    configuration: configuration,
-                    demangled: demangled,
-                    silResolver: silResolver,
-                    typeEnvironment: typeEnvironment,
-                    nativeTypes: nativeTypes,
-                    localValueTypes: localValueTypes,
-                    importedSwiftTypeAliases: importedSwiftTypeAliases,
-                    sourceNominalAliasIndex: sourceNominalAliasIndex
-                ) {
-                    drafts.append(draft)
-                }
-            case "var_decl":
-                if let accessorDrafts = try makeReloadableAccessorDrafts(
-                    item,
-                    context: context,
-                    source: source,
-                    importedModules: imports,
-                    moduleName: moduleName,
-                    configuration: configuration,
-                    demangled: demangled,
-                    silResolver: silResolver,
-                    typeEnvironment: typeEnvironment,
-                    nativeTypes: nativeTypes,
-                    localValueTypes: localValueTypes,
-                    importedSwiftTypeAliases: importedSwiftTypeAliases
-                ) {
-                    drafts.append(contentsOf: accessorDrafts)
-                } else {
-                    if let observerDrafts = try makeReloadableObserverDrafts(
+            let draftStart = drafts.count
+            do {
+                switch kind {
+                case "func_decl":
+                    if let draft = try makeDraft(
+                        item,
+                        context: context,
+                        source: source,
+                        locationMap: locationMap,
+                        imports: imports,
+                        moduleName: moduleName,
+                        configuration: configuration,
+                        demangled: demangled,
+                        silResolver: silResolver,
+                        typeEnvironment: typeEnvironment,
+                        nativeTypes: nativeTypes,
+                        localValueTypes: localValueTypes,
+                        importedSwiftTypeAliases: importedSwiftTypeAliases,
+                        sourceNominalAliasIndex: sourceNominalAliasIndex
+                    ) {
+                        drafts.append(draft)
+                    }
+                case "var_decl":
+                    if let accessorDrafts = try makeReloadableAccessorDrafts(
                         item,
                         context: context,
                         source: source,
@@ -2157,9 +2148,39 @@ extension FrontendReceipt.Adapter {
                         localValueTypes: localValueTypes,
                         importedSwiftTypeAliases: importedSwiftTypeAliases
                     ) {
-                        drafts.append(contentsOf: observerDrafts)
+                        drafts.append(contentsOf: accessorDrafts)
+                    } else {
+                        if let observerDrafts = try makeReloadableObserverDrafts(
+                            item,
+                            context: context,
+                            source: source,
+                            importedModules: imports,
+                            moduleName: moduleName,
+                            configuration: configuration,
+                            demangled: demangled,
+                            silResolver: silResolver,
+                            typeEnvironment: typeEnvironment,
+                            nativeTypes: nativeTypes,
+                            localValueTypes: localValueTypes,
+                            importedSwiftTypeAliases: importedSwiftTypeAliases
+                        ) {
+                            drafts.append(contentsOf: observerDrafts)
+                        }
+                        drafts.append(contentsOf: try makeSourcePropertyDrafts(
+                            item,
+                            context: context,
+                            source: source,
+                            importedModules: imports,
+                            moduleName: moduleName,
+                            configuration: configuration,
+                            demangled: demangled,
+                            silResolver: silResolver,
+                            nativeTypes: nativeTypes,
+                            importedSwiftTypeAliases: importedSwiftTypeAliases
+                        ))
                     }
-                    drafts.append(contentsOf: try makeSourcePropertyDrafts(
+                case "subscript_decl":
+                    if let accessorDrafts = try makeReloadableAccessorDrafts(
                         item,
                         context: context,
                         source: source,
@@ -2168,117 +2189,115 @@ extension FrontendReceipt.Adapter {
                         configuration: configuration,
                         demangled: demangled,
                         silResolver: silResolver,
+                        typeEnvironment: typeEnvironment,
                         nativeTypes: nativeTypes,
+                        localValueTypes: localValueTypes,
                         importedSwiftTypeAliases: importedSwiftTypeAliases
-                    ))
+                    ) {
+                        drafts.append(contentsOf: accessorDrafts)
+                    }
+                case "class_decl", "struct_decl", "enum_decl", "actor_decl":
+                    guard let name = baseName(in: item),
+                          let members = item["members"] as? [Any]
+                    else { continue }
+                    let canonicalName = [context?.canonicalName, name]
+                        .compactMap { $0 }.joined(separator: ".")
+                    let moduleQualifiedName = "\(moduleName).\(canonicalName)"
+                    let nominal = sourceNominals.resolve(moduleQualifiedName, in: source.logicalPath)
+                    try walk(
+                        items: members,
+                        context: .init(
+                            canonicalName: canonicalName,
+                            moduleQualifiedName: moduleQualifiedName,
+                            kind: nominal?.kind,
+                            referenceTypeID: nominal?.kind == .reference
+                                ? nativeTypes[moduleQualifiedName] : nil,
+                            localValueTypeKey: nominal?.kind.isValue == true && nominal?.hasAmbiguousName != true
+                                ? nominal?.localTypeKey : nil,
+                            isFileScopeNameable:
+                                nominal?.isFileScopeNameable != false && nominal?.hasAmbiguousName != true,
+                            isAvailabilityConstrained:
+                                nominal?.isAvailabilityConstrained == true,
+                            isGenericContext: context?.isGenericContext == true
+                                || Self.hasGenericSignature(item),
+                            sourceFileLogicalID: nominal?.isFileScoped == true ? source.logicalPath : nil
+                        ),
+                        source: source,
+                        locationMap: locationMap,
+                        imports: imports,
+                        moduleName: moduleName,
+                        configuration: configuration,
+                        demangled: demangled,
+                        silResolver: silResolver,
+                        typeEnvironment: typeEnvironment,
+                        nativeTypes: nativeTypes,
+                        localValueTypes: localValueTypes,
+                        importedSwiftTypeAliases: importedSwiftTypeAliases,
+                        sourceNominals: sourceNominals,
+                        sourceNominalAliasIndex: sourceNominalAliasIndex,
+                        drafts: &drafts,
+                        selection: &selection
+                    )
+                case "extension_decl":
+                    guard let mangled = item["extended_type"] as? String,
+                          let fullName = demangled[mangled],
+                          let members = item["members"] as? [Any]
+                    else { continue }
+                    let prefix = moduleName + "."
+                    let sourceName = Self.sourceNominalSpelling(fullName)
+                    let canonicalName = sourceName.hasPrefix(prefix)
+                        ? String(sourceName.dropFirst(prefix.count))
+                        : sourceName
+                    let moduleQualifiedName = sourceName.hasPrefix(prefix)
+                        ? sourceName : "\(moduleName).\(sourceName)"
+                    let nominal = sourceNominals.resolve(moduleQualifiedName, in: source.logicalPath)
+                    try walk(
+                        items: members,
+                        context: .init(
+                            canonicalName: canonicalName,
+                            moduleQualifiedName: moduleQualifiedName,
+                            kind: nominal?.kind,
+                            referenceTypeID: nominal?.kind == .reference
+                                ? nativeTypes[moduleQualifiedName] : nil,
+                            localValueTypeKey: nominal?.kind.isValue == true && nominal?.hasAmbiguousName != true
+                                ? nominal?.localTypeKey : nil,
+                            isFileScopeNameable:
+                                nominal?.isFileScopeNameable != false && nominal?.hasAmbiguousName != true,
+                            isAvailabilityConstrained:
+                                nominal?.isAvailabilityConstrained == true
+                                    || Self.hasAvailabilityAttribute(item),
+                            isGenericContext: Self.hasGenericSignature(item)
+                                || fullName.contains("<"),
+                            sourceFileLogicalID: nominal?.isFileScoped == true ? source.logicalPath : nil
+                        ),
+                        source: source,
+                        locationMap: locationMap,
+                        imports: imports,
+                        moduleName: moduleName,
+                        configuration: configuration,
+                        demangled: demangled,
+                        silResolver: silResolver,
+                        typeEnvironment: typeEnvironment,
+                        nativeTypes: nativeTypes,
+                        localValueTypes: localValueTypes,
+                        importedSwiftTypeAliases: importedSwiftTypeAliases,
+                        sourceNominals: sourceNominals,
+                        sourceNominalAliasIndex: sourceNominalAliasIndex,
+                        drafts: &drafts,
+                        selection: &selection
+                    )
+                default:
+                    continue
                 }
-            case "subscript_decl":
-                if let accessorDrafts = try makeReloadableAccessorDrafts(
-                    item,
-                    context: context,
-                    source: source,
-                    importedModules: imports,
-                    moduleName: moduleName,
-                    configuration: configuration,
-                    demangled: demangled,
-                    silResolver: silResolver,
-                    typeEnvironment: typeEnvironment,
-                    nativeTypes: nativeTypes,
-                    localValueTypes: localValueTypes,
-                    importedSwiftTypeAliases: importedSwiftTypeAliases
-                ) {
-                    drafts.append(contentsOf: accessorDrafts)
-                }
-            case "class_decl", "struct_decl", "enum_decl", "actor_decl":
-                guard let name = baseName(in: item),
-                      let members = item["members"] as? [Any]
-                else { continue }
-                let canonicalName = [context?.canonicalName, name]
-                    .compactMap { $0 }.joined(separator: ".")
-                let moduleQualifiedName = "\(moduleName).\(canonicalName)"
-                let nominal = sourceNominals.resolve(moduleQualifiedName, in: source.logicalPath)
-                try walk(
-                    items: members,
-                    context: .init(
-                        canonicalName: canonicalName,
-                        moduleQualifiedName: moduleQualifiedName,
-                        kind: nominal?.kind,
-                        referenceTypeID: nominal?.kind == .reference
-                            ? nativeTypes[moduleQualifiedName] : nil,
-                        localValueTypeKey: nominal?.kind.isValue == true && nominal?.hasAmbiguousName != true
-                            ? nominal?.localTypeKey : nil,
-                        isFileScopeNameable:
-                            nominal?.isFileScopeNameable != false && nominal?.hasAmbiguousName != true,
-                        isAvailabilityConstrained:
-                            nominal?.isAvailabilityConstrained == true,
-                        isGenericContext: context?.isGenericContext == true
-                            || Self.hasGenericSignature(item),
-                        sourceFileLogicalID: nominal?.isFileScoped == true ? source.logicalPath : nil
-                    ),
-                    source: source,
-                    locationMap: locationMap,
-                    imports: imports,
-                    moduleName: moduleName,
-                    configuration: configuration,
-                    demangled: demangled,
-                    silResolver: silResolver,
-                    typeEnvironment: typeEnvironment,
-                    nativeTypes: nativeTypes,
-                    localValueTypes: localValueTypes,
-                    importedSwiftTypeAliases: importedSwiftTypeAliases,
-                    sourceNominals: sourceNominals,
-                    sourceNominalAliasIndex: sourceNominalAliasIndex,
-                    drafts: &drafts
-                )
-            case "extension_decl":
-                guard let mangled = item["extended_type"] as? String,
-                      let fullName = demangled[mangled],
-                      let members = item["members"] as? [Any]
-                else { continue }
-                let prefix = moduleName + "."
-                let sourceName = Self.sourceNominalSpelling(fullName)
-                let canonicalName = sourceName.hasPrefix(prefix)
-                    ? String(sourceName.dropFirst(prefix.count))
-                    : sourceName
-                let moduleQualifiedName = sourceName.hasPrefix(prefix)
-                    ? sourceName : "\(moduleName).\(sourceName)"
-                let nominal = sourceNominals.resolve(moduleQualifiedName, in: source.logicalPath)
-                try walk(
-                    items: members,
-                    context: .init(
-                        canonicalName: canonicalName,
-                        moduleQualifiedName: moduleQualifiedName,
-                        kind: nominal?.kind,
-                        referenceTypeID: nominal?.kind == .reference
-                            ? nativeTypes[moduleQualifiedName] : nil,
-                        localValueTypeKey: nominal?.kind.isValue == true && nominal?.hasAmbiguousName != true
-                            ? nominal?.localTypeKey : nil,
-                        isFileScopeNameable:
-                            nominal?.isFileScopeNameable != false && nominal?.hasAmbiguousName != true,
-                        isAvailabilityConstrained:
-                            nominal?.isAvailabilityConstrained == true
-                                || Self.hasAvailabilityAttribute(item),
-                        isGenericContext: Self.hasGenericSignature(item)
-                            || fullName.contains("<"),
-                        sourceFileLogicalID: nominal?.isFileScoped == true ? source.logicalPath : nil
-                    ),
-                    source: source,
-                    locationMap: locationMap,
-                    imports: imports,
-                    moduleName: moduleName,
-                    configuration: configuration,
-                    demangled: demangled,
-                    silResolver: silResolver,
-                    typeEnvironment: typeEnvironment,
-                    nativeTypes: nativeTypes,
-                    localValueTypes: localValueTypes,
-                    importedSwiftTypeAliases: importedSwiftTypeAliases,
-                    sourceNominals: sourceNominals,
-                    sourceNominalAliasIndex: sourceNominalAliasIndex,
-                    drafts: &drafts
-                )
-            default:
-                continue
+            } catch {
+                guard selection.failurePolicy == .excludeUnresolved,
+                      FrontendReceipt.DeclarationSelection.isMappingFailure(error),
+                      ["func_decl", "var_decl", "subscript_decl"].contains(kind),
+                      let declaration = FrontendReceipt.DeclarationSelection.declaration(in: item, source: source)
+                else { throw error }
+                // A property/observer group publishes all of its members or none.
+                drafts.removeSubrange(draftStart..<drafts.count)
+                selection.exclude(declaration, reason: "frontend.index_source_declarations: \(error)")
             }
         }
     }

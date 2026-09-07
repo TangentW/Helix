@@ -102,6 +102,33 @@ struct OnboardingPlannerTests {
         try plan.validate()
     }
 
+    @Test("Shared source targets preserve one authored indexing policy and reject conflicting policies")
+    func preservesFeatureIndexing() throws {
+        var live = liveProfile()
+        live.indexing = .init(include: ["Sources/Feature/**"], failurePolicy: .excludeUnresolved)
+        var hot = liveProfile(capability: .hotPatch)
+        hot.id = "hot"
+        hot.configurationName = "Release"
+        hot.patch = .init()
+        var draft = Hub.OnboardingDraft(project: try demoProject(), capabilities: try .init([.hotPatch, .liveReload]),
+            profiles: [hot, live])
+        let plan = try Hub.OnboardingPlanner().plan(draft).hostPlan
+        #expect(plan.features.count == 1 && plan.features[0].indexing == live.indexing)
+        draft.profiles.reverse()
+        #expect(try Hub.OnboardingPlanner().plan(draft).hostPlan == plan)
+        draft.profiles[0].indexing = .init(include: ["Sources/Other/**"])
+        draft.profiles[1].indexing = live.indexing
+        do {
+            _ = try Hub.OnboardingPlanner().plan(draft)
+            Issue.record("conflicting feature policies must fail")
+        } catch {
+            let message = String(describing: error)
+            #expect(message.contains("profile hot") && message.contains("profile live"))
+            #expect(message.contains("Sources/Feature/**") && message.contains("Sources/Other/**"))
+            #expect(message.contains(draft.project.projectURL.path))
+        }
+    }
+
     @Test("A missing shared scheme is generated during installation")
     func acceptsAutomaticScheme() throws {
         var project = try demoProject()
@@ -197,6 +224,19 @@ struct OnboardingPlannerTests {
         #expect(try plan.hostPlan.feature(id: "hotpatchfeature").targetName
             == "HotPatchFeature")
         #expect(plan.developmentIdentityProfiles == ["hot-patch"])
+    }
+
+    @Test("GUI resolution retains authored source scope and device qualification")
+    func resolvesAuthoredIndexing() throws {
+        var selection = Hub.WorkflowSelection(capability: .liveReload,
+            applicationTargetName: "LiveReloadDemo", featureTargetName: "LiveReloadFeature",
+            schemeName: "Helix Live Reload Demo", configurationName: "Debug")
+        selection.indexing = .init(include: ["Sources/Feature/**"], failurePolicy: .excludeUnresolved)
+        selection.deviceNativeMatrixQualified = true
+        let draft = try Hub.DraftResolver(inspector: .init(runner: SettingsRunner()))
+            .resolve(project: demoProject(), selections: [selection])
+        #expect(draft.profiles[0].indexing == selection.indexing)
+        #expect(draft.profiles[0].deviceNativeMatrixQualified == true)
     }
 
     @Test("GUI resolution queries each target configuration once per resolution")

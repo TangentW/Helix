@@ -2,6 +2,7 @@ import Foundation
 import UIKit
 import AVFoundation
 import Photos
+import CoreGraphics
 
 extension MixedFixture {
     static func progress(_ value: Progress) -> Int64 { value.completedUnitCount }
@@ -16,5 +17,19 @@ extension MixedFixture {
     @MainActor static func mapped(_ value: UIPencilInteraction.Tap) -> UIPencilInteraction.Tap { value }
     @MainActor static func qualifiedTap(_ value: UIKit.UIPencilInteraction.Tap?) -> UIPencilInteraction.Tap? {
         value ?? { nil }()
+    }
+    static func metric() -> CGFloat { Metrics.computed }
+    static func callC(_ callback: @convention(c) (Int32) -> Int32) -> Int32 { callback(1) }
+    static func callback() -> Int32 { callC { $0 + 1 } }
+    static func generic<T>(_ callback: @escaping (T) -> T, _ value: T) -> T { callback(value) }
+    static func adapted() -> Int { generic({ (value: Int) in value + 1 }, 1) }
+    static func erased(_ callback: @escaping () -> Int) -> () -> Any { callback }
+}
+
+fileprivate extension MixedFixture {
+    enum Metrics {
+        static let first: CGFloat = 8
+        static let second: CGFloat = 9
+        static var computed: CGFloat { first + second }
     }
 }

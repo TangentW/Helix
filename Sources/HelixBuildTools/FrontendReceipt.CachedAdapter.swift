@@ -23,6 +23,7 @@ public struct CachedAdapter: Sendable {
         var nativeImportCatalog: NativeImportCatalog.Document
         var nativeAPICatalogs: [CatalogIdentity]
         var callingSurfacePolicy: FrontendReceipt.CallingSurfacePolicy
+        var indexing: FrontendReceipt.IndexingOptions?
         var sources: [SourceIdentity]
     }
 
@@ -80,6 +81,11 @@ public struct CachedAdapter: Sendable {
         stages: [FrontendReceipt.DiagnosticStage]?
     ) throws -> FrontendReceipt.DiagnosticReport {
         guard stages?.isEmpty != true else { throw FrontendReceipt.Error.invalidRequest("diagnostic stage selection is empty") }
+        if stages.map(Set.init) == Set([DiagnosticStage.inputs]) {
+            // Input preflight has no compiler output to cache or dependency
+            // inventory to fingerprint. Validate source bytes and toolchain only.
+            return try Adapter().diagnose(request, stages: stages)
+        }
         let session = FrontendReceipt.DiagnosticSession(collectFailures: true, catalogFailure: catalogFailure, stages: stages)
         do {
             let output = try generate(
@@ -243,6 +249,7 @@ public struct CachedAdapter: Sendable {
                     nativeImportCatalog: request.nativeImportCatalog,
                     nativeAPICatalogs: catalogIdentities,
                     callingSurfacePolicy: request.callingSurfacePolicy,
+                    indexing: request.indexing,
                     sources: states.map {
                         SourceIdentity(
                             logicalPath: $0.logicalPath,

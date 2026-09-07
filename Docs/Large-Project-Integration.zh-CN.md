@@ -25,7 +25,7 @@ helix xcode doctor --plan .helix/xcode/HostPlan.json --profile live --static
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "projectPath": "Example.xcodeproj",
   "integrationRoot": ".helix/xcode",
   "features": [
@@ -160,11 +160,63 @@ Canonical SIL 改从单独的私有输出文件读取，因为包含 bridging PC
 | 不同函数内的同名协议 conformer | 保留各条 witness table，不用类型/协议打印名做全局唯一断言；无法证明唯一性的类型及后代不提供布局、泛型或 dispatch 事实 |
 | `private` / `fileprivate extension` 内省略访问修饰符的 class/struct | 继承 extension 默认级别；显式成员修饰符与私有父类型限制分别处理，重名私有布局保持隔离 |
 | `optional ?? { ... }()` 的同位置闭包 | 用编译器符号角色区分 autoclosure 与显式闭包，再结合 discriminator；剩余歧义报告完整候选 |
+| private static SDK overlay 属性 | 根据 `Static`/getter 结构证据匹配 AST `CoreFoundation.CGFloat` 与 SIL `CoreGraphics.CGFloat`，不误选共用坐标的 addressor |
+| C callback 与 reabstraction thunk | 根据编译器适配属性和 thunk 角色排除生成入口；未知形态保留完整冲突证据 |
 | `NS_SWIFT_NAME` 嵌套类与 Clang 扁平名称 | 以已证实的 Objective-C runtime 身份归一，保留泛型参数，不合并无关嵌套类型 |
+
+## 声明范围与局部排除
+
+Live Reload 默认采用 `excludeUnresolved`：被消费的 AST/SIL 映射存在歧义或缺失时，
+排除对应源码声明，让其他已验证入口继续接入。Hot Patch 和原有 headless receipt API
+默认保持 `strict`。headless 调用方可通过可选的 `FrontendReceipt.Request.indexing`
+显式选择同一策略。这不会放开不支持的 Swift ABI，也不会容忍无效的编译器、类型或
+Catalog 事实。
+
+外层函数拥有其闭包和局部函数，属性/下标拥有其 accessor。排除身份绑定编译器声明
+USR 与逻辑源码路径，同时保留位置和全部候选证据。函数体发现遇到内部映射失败时，
+回滚此前收集的 operation；属性生成按整组 accessor 回滚。未被消费的合成 backing
+声明不属于源码入口候选，实际消费者仍须验证 SIL。没有可信源码归属、源码集合不符、
+SIL 损坏，以及类型、ABI 或 Catalog 冲突仍会阻止发布。
+
+首次可先限定较小范围：把 Host Plan 升为 schema 2，在 feature 中加入 `indexing`，
+然后重新执行 `xcode install`：
+
+```json
+{
+  "id": "app",
+  "targetName": "Example",
+  "moduleName": "Example",
+  "indexing": {
+    "include": ["Sources/Feature/**"],
+    "exclude": ["Sources/Feature/Generated/**"],
+    "failurePolicy": "excludeUnresolved"
+  }
+}
+```
+
+模式匹配捕获到的逻辑源码路径，沿用 patch configuration 的 `*`、`**`、`?` 规则。
+显式提供 options 对象但省略字段时，默认值是 `include: ["**"]`、`exclude: []`、
+`failurePolicy: "strict"`。没有任何捕获源码匹配时，在 compiler replay 前拒绝。
+所有捕获源码仍参与编译、源码/依赖 hash、nominal 和 imported-type 事实验证。
+范围只缩小 Helix 的声明和源码 operation 发现，不代表整模块 Swift emission 会更便宜，
+也不会屏蔽全局冲突或移除显式 Catalog 的权威能力。
+
+`HLXIDX024` 会把每个排除声明及完整原因写入 `FrontendDiagnostics.json` 和诊断报告。
+CLI 会显示排除数量与诊断路径，未变化的 Prepare 快路径也保留这些信息。模块 receipt
+和 Prepare identity 包含 indexing 配置，切换策略或范围不会错误复用结果；修改范围外
+源码仍会使整模块编译事实失效。原始 compiler checkpoint 只有在全部编译输入一致时，
+才可跨策略变更复用。
+
+不带 indexing 或 runtime package 配置的 Host Plan schema 1 继续可读，并保持原 canonical bytes 的往返。
+indexing 配置要求 schema 2，让旧工具明确拒绝，而不是忽略范围。新建计划默认 schema 2。
+原有公开 request/feature initializer 继续保留，新 overload 是增量 API。receipt 和设备
+wire format 不变。PrepareState schema 1 增加可选的信息字段 `excludedDeclarationCount`；
+旧文件缺省表示没有这项历史计数，复用仍由独立的 input hash 控制。
 
 ## 一次收集独立的 frontend 问题
 
-用真实 target 成功编译后生成的捕获文件诊断 receipt：
+可以使用 target 的编译器记录诊断 receipt。成功记录继续使用原有命令，
+失败编译的 attempt 入口见下方预检说明：
 
 ```sh
 helix xcode post-compile --plan .helix/xcode/HostPlan.json --profile live \
@@ -188,6 +240,7 @@ helix xcode post-compile --plan .helix/xcode/HostPlan.json --profile live \
 
 | 选择项 | 所需工作 |
 | --- | --- |
+| `inputs` | 请求、源字节和工具链检查；不生成 AST/SIL、不读取 Catalog 或依赖缓存清单 |
 | `typed-ast` | 请求、源码、工具链校验及 typed AST 生成/解析 |
 | `identity-sil`、`semantic-sil` | 对应 SIL 重放及其组件检查，不生成 typed AST |
 | `source-nominals`、`imported-types` | Typed AST 和类型 demangling，不读取 SIL 或 Catalog |
@@ -283,3 +336,83 @@ module cache 放进源码头文件目录下，会扩大扫描输入并可能禁�
 4 workers 是每个 producer 的边界，不是整机信号量。失败 checkpoint 可能保留磁盘空间，
 重置私有缓存前应停止使用它的构建进程。真机原生激活、商业工程保存到屏幕延迟，以及其
 完整冷 Catalog 成本，仍须对应工程实测；宿主交叉编译不能证明这些路径。
+
+Hub 读取并重新应用接入时保留已配置的 feature 索引范围及现有真机资格标记。共享源 target 的工作流可继承尚未指定的策略；两个显式策略冲突时，诊断会列出 profile、target、工程路径和冲突值。
+
+## 成功构建前的预检
+
+proxy 在调用编译器**之前**，将私有 `FrontendAttempt.hlxswiftc` 原子写入
+`FrontendInvocation.hlxswiftc` 所在目录。编译器发现查询不生成 attempt。编译失败保留
+上一份成功记录，不运行 post-compile hook。每次调用保留自己的私有记录直至退出，
+不会把并发调用的 attempt 当作自己的成功记录。字节格式仍为 `HLX.SwiftInvocation.v1`；
+新增文件名明确表示诊断输入，不构成成功构建证据。
+
+```sh
+helix xcode preflight --plan .helix/xcode/HostPlan.json --profile live \
+  --capture /absolute/DerivedData/Build/Intermediates.noindex/Example.build/Debug-iphonesimulator/Example.build/Helix/FrontendAttempt.hlxswiftc \
+  --stages inputs --json
+```
+
+省略 `--stages` 执行 `inputs,typed-ast`；选择 `source-mappings` 可进一步检查 SIL
+身份映射并汇总声明排除。`inputs` 校验所选 compiler/SDK、调用参数、源码集合及字节，
+不指纹化依赖缓存、不生成 AST/SIL。通过只代表输入检查成功，不代表类型检查或运行时
+覆盖。typed 检查仍需要生成的依赖模块、头文件和插件。Xcode 至少需要运行到 target
+compiler proxy 一次，预检不会凭空生成完整的构建参数。
+
+`post-compile --diagnose` 也接受 attempt，正常 `post-compile` 拒绝使用它。预检不发布
+receipt、Shell、Bridge、Prepare state 或 Hub reservation。混合样板用真实捕获参数
+触发编译错误，再验证输入预检通过、typed 预检报告错误、成功记录保持原样。
+
+SIL 元数据扫描先按记录前缀筛选，再分配字符串和执行正则；注释边界按 UTF-8 分隔符
+扫描，未转义路径不再逐字节解码。scope 继承改为迭代遍历，并记忆没有位置的结果。
+两种 SIL 重用选定的 AST 成员清单进行有界符号分类。具体测量边界见
+[解析器对照](Build-Performance-Baseline.zh-CN.md#sil-调试元数据扫描)。完整模块编译输入
+仍参与失效判断，不声称支持按文件 WMO 复用或并行 Swift frontend 发射。
+
+## 团队 runtime 版本与卸载
+
+Host Plan schema 2 可在顶层设置 `runtimePackageRequirement`：
+
+```json
+"runtimePackageRequirement": {
+  "kind": "revision",
+  "value": "<经过验证的 40 位小写十六进制 commit>"
+}
+```
+
+将占位符替换为实际 commit。`kind: "exactVersion"` 接受规范的 `major.minor.patch`
+发布版本；预发布或其他 tag 可使用其完整 commit。Xcode 负责解析引用。Helix 校验字段
+并写入 requirement，不保证给定 revision 已存在，也不替团队验证工具/runtime 组合。
+团队需在发布流程中选择并验证这组版本。
+
+安装器复用已经匹配的远端引用，允许更新 Helix 自己创建的引用；用户自有引用与显式
+pin 冲突、显式远端 pin 遇到本地包，或出现多个 runtime package authority 时，在发布
+工程改动前拒绝，并列出 package ID、仓库/路径及 requirement。Hub 读取、编辑和重新
+应用时保留该字段。schema 1 不允许携带此字段，旧计划字节及缺省行为保持兼容。
+
+缺省保留现有 package requirement；不存在可复用引用时，兼容缺省仍为 canonical
+仓库的 `main` 分支，不虚构已发布的默认 tag。团队计划应显式固定经过验证的 revision
+或版本，并继续按正常流程把 Xcode package resolution 文件纳入版本控制。
+
+无需 Hub GUI 即可卸载：
+
+```sh
+cp .helix/xcode/HostPlan.json HelixRemovalPlan.json
+helix xcode uninstall --project Example.xcodeproj --plan HelixRemovalPlan.json --json
+```
+
+安装计划仍存在时，备份必须与其一致；生成文件已经移除后，可用备份重复执行或恢复
+卸载。CLI 复用 Hub 的事务 ownership 清理和最小 PBX 修改，恢复原有 configuration
+引用，保留业务源码、用户 package 引用、开发者文件和签名材料。不需要成功构建、
+Catalog、recipe 或私钥。ownership 清单损坏时仍禁止扩大删除范围，未知文件保留。
+该命令修改选定工程，不改动 GUI 注册记录。混合 Xcode 样板在移除后检查工程可读取且
+真实构建成功，此项不包括物理设备 runtime 行为。
+
+可移植 Catalog 导入/导出及共享可写缓存协议仍未实现。未来的 bundle 需要将 Catalog
+和 compiler projection 与精确 compiler、SDK、依赖及 artifact identity 一并验证；
+不能把当前 owner-private 缓存直接复制后就宣称支持跨机器兼容。
+
+安装及两条卸载 API 在完整的读取、验证、写入期间持有 canonical `.xcodeproj` 目录的
+非阻塞 advisory lock。同一工程上的其他 Helix 操作会在修改前拒绝，不同工程互不影响。
+目录锁不受 PBX 文件原子替换影响，也不生成额外 lock 文件。它只协调 Helix 操作，
+不协调未持有该锁的外部编辑器或 Git 命令。

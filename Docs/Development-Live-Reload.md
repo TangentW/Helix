@@ -932,6 +932,19 @@ with production HLBC.
 
 ## Debugging and diagnostics
 
+Declaration discovery can be scoped by logical file and can exclude a proven
+source declaration when a consumed AST/SIL mapping is ambiguous or absent.
+The compiler USR plus logical file owns the entire accessor/closure group; no
+candidate is guessed and partial body operations are rolled back. Global compiler,
+source, type, ABI and Catalog checks remain mandatory. Live Reload defaults to
+local exclusion; Hot Patch/headless default to strict, with explicit overrides.
+The optional policy is bound to receipt/Prepare cache identities; all compiler
+inputs, including files outside scope, retain whole-module invalidation authority.
+Host Plan v2 carries the scope; v1 remains readable without new options. See
+[large-project integration](Large-Project-Integration.md#declaration-scope-and-local-rejection)
+for defaults, diagnostics, and migration boundaries.
+
+
 HLBC has no native dSYM because it is verified bytecode rather than a Mach-O
 image. Compiler debug metadata is lowered to a verified map from
 function/block/instruction coordinates to logical Swift file, line, and column.
@@ -962,3 +975,10 @@ let environment = DevRuntime.LiveReloadEnvironment(
     )
 )
 ```
+
+The compiler proxy now retains `FrontendAttempt.hlxswiftc` before compilation
+for `helix xcode preflight` (default `inputs,typed-ast`). Only a successful compile
+updates `FrontendInvocation.hlxswiftc` and invokes post-compile work. Input-only
+preflight does not emit AST/SIL or scan the dependency cache. Typed checks still
+require available compiler dependencies, and selected-check success does not
+prove full receipt or runtime support. See [preflight](Large-Project-Integration.md#preflight-before-a-successful-build).

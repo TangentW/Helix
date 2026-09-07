@@ -8,6 +8,155 @@ import Testing
 extension BuildToolsTests {
 @Suite("Compiler-backed SIL location disambiguation")
 struct ScopedSILResolutionTests {
+    @Test("Symbol trees distinguish static declarations, adapter attributes and unknown wrappers")
+    func parsesStructuredRoles() throws {
+        func parse(_ tree: String) throws -> FrontendReceipt.SILSymbolIdentity {
+            try #require(try FrontendReceipt.SILSymbolIdentity.parse("Demangling for fixture\n" + tree,
+                symbols: ["fixture"])["fixture"])
+        }
+        let getter = try parse("kind=Global\n  kind=Static\n    kind=Getter\n      kind=Variable\n")
+        #expect(getter.kind == "Getter")
+        #expect(getter.isStatic && !getter.isAdapter)
+        #expect(getter.roots == ["Static"])
+        let closure = "  kind=ExplicitClosure\n    kind=Function\n      kind=Number, index=77\n    kind=Number, index=2\n"
+        #expect(try parse("kind=Global\n" + closure).discriminator == 2)
+        for attribute in ["ObjCAttribute", "NonObjCAttribute", "MergedFunction"] {
+            let value = try parse("kind=Global\n  kind=\(attribute)\n" + closure)
+            #expect(value.kind == "ExplicitClosure" && value.isAdapter && value.discriminator == 2)
+        }
+        for tree in [
+            "kind=Global\n  kind=FutureAttribute\n" + closure,
+            "kind=Global\n  kind=Static\n    kind=Getter\n    kind=Setter\n",
+            "kind=Global\n    kind=Getter\n",
+            "kind=Global\n  kind=ObjCAttribute\n    kind=UnexpectedChild\n" + closure,
+        ] {
+            let value = try parse(tree)
+            #expect(value.kind == nil && !value.isAdapter)
+            #expect(value.evidence.contains("unresolved"))
+        }
+        let duplicateIndex = try parse("kind=Global\n" + closure + "    kind=Number, index=3\n")
+        #expect(duplicateIndex.discriminator == nil)
+        #expect(throws: FrontendReceipt.Error.self) {
+            try FrontendReceipt.SILSymbolIdentity.parse("Demangling for fixture\nkind=Global\nDemangling for fixture\nkind=Global\n",
+                symbols: ["fixture", "fixture"])
+        }
+    }
+
+    @Test("Private static CGFloat accessors map across the measured SDK overlay spelling")
+    func resolvesRealStaticOverlayAccessors() throws {
+        try withFixture("""
+        import Foundation
+        import CoreGraphics
+        enum Fixture {}
+        fileprivate extension Fixture {
+            enum Metrics {
+                static let first: CGFloat = 8
+                static let second: CGFloat = 9
+                static var computed: CGFloat { first + second }
+            }
+        }
+        extension Fixture { static func value() -> CGFloat { Metrics.computed } }
+        public func independent() -> Int { 4 }
+        """) { request, documents, semanticFile, source in
+            let accessors = objects(in: documents).filter {
+                $0["_kind"] as? String == "accessor_decl" && $0["get"] as? Bool == true
+            }
+            #expect(accessors.count == 3)
+            let identityFile = try CanonicalSIL.File(text: SwiftFrontend.Driver().emitCanonicalSIL(
+                sourceFiles: [source.url], invocation: request.metadata.frontendInvocation, purpose: .implementationIdentity))
+            for file in [identityFile, semanticFile] {
+                let resolver = try FrontendReceipt.SILFunctionResolver(file: file).resolvingSourceMappings(
+                    in: documents, sourcesByPhysicalPath: [source.url.path: source], using: .init(compilerURL: request.compilerURL))
+                for accessor in accessors {
+                    let function = try #require(try resolver.function(for: accessor, source: source))
+                    let identity = try #require(try FrontendReceipt.Demangler(compilerURL: request.compilerURL)
+                        .symbolIdentities([function.mangledName])[function.mangledName])
+                    #expect(identity.kind == "Getter" && identity.isStatic && !identity.isAdapter)
+                    #expect((accessor["usr"] as? String)?.contains("CoreFoundation") == true)
+                    #expect(function.mangledName.contains("CoreGraphics"))
+                }
+                let identities = try FrontendReceipt.Demangler(compilerURL: request.compilerURL)
+                    .symbolIdentities(Set(file.functions.map(\.mangledName)))
+                let addressors = file.functions.filter { identities[$0.mangledName]?.kind == "UnsafeMutableAddressor" }
+                #expect(!addressors.isEmpty)
+                let addressorOnly = try FrontendReceipt.SILFunctionResolver(functions: addressors).resolvingSourceMappings(
+                    in: documents, sourcesByPhysicalPath: [source.url.path: source], using: .init(compilerURL: request.compilerURL))
+                for accessor in accessors {
+                    #expect(try addressorOnly.function(for: accessor, source: source) == nil)
+                }
+            }
+            let receipt = try FrontendReceipt.Adapter().generate(request)
+            #expect(receipt.receipt.roots.contains { $0.declarationMangledName.contains("independent") })
+        }
+    }
+
+    @Test("Real C callbacks and reabstraction helpers cannot replace the Swift closure identity")
+    func resolvesRealCallbackThunks() throws {
+        try withFixture("""
+        import Foundation
+        enum Fixture {
+            static func callC(_ callback: @convention(c) (Int32) -> Int32) -> Int32 { callback(1) }
+            static func callback() -> Int32 { callC { $0 + 1 } }
+            static func generic<T>(_ callback: @escaping (T) -> T, _ value: T) -> T { callback(value) }
+            static func adapted() -> Int { generic({ (value: Int) in value + 1 }, 1) }
+            static func erased(_ callback: @escaping () -> Int) -> () -> Any { callback }
+        }
+        public func independent() -> Int { 4 }
+        """) { request, documents, semanticFile, source in
+            let closures = objects(in: documents).filter { $0["_kind"] as? String == "closure_expr" }
+            #expect(closures.count == 2)
+            let identityFile = try CanonicalSIL.File(text: SwiftFrontend.Driver().emitCanonicalSIL(
+                sourceFiles: [source.url], invocation: request.metadata.frontendInvocation, purpose: .implementationIdentity))
+            for original in [identityFile, semanticFile] {
+                let demangler = FrontendReceipt.Demangler(compilerURL: request.compilerURL)
+                let identities = try demangler.symbolIdentities(Set(original.functions.map(\.mangledName)))
+                #expect(identities.values.contains { $0.wrappers.contains("ObjCAttribute") && $0.isAdapter })
+                let helper = try #require(original.functions.first { identities[$0.mangledName]?.kind == "ReabstractionThunkHelper" })
+                var file = original
+                let resolver = try FrontendReceipt.SILFunctionResolver(file: file).resolvingSourceMappings(
+                    in: documents, sourcesByPhysicalPath: [source.url.path: source], using: demangler)
+                for closure in closures {
+                    let selected = try #require(try resolver.function(forClosure: closure, source: source))
+                    #expect(identities[selected.mangledName]?.kind == "ExplicitClosure")
+                    #expect(identities[selected.mangledName]?.isAdapter == false)
+                    // Use real compiler symbols with an injected shared debug
+                    // coordinate; helper coordinates differ across optimizers.
+                    var collidingHelper = helper
+                    collidingHelper.declarationLocation = selected.declarationLocation
+                    file.functions = [selected, collidingHelper]
+                    let collision = try FrontendReceipt.SILFunctionResolver(file: file).resolvingCollisions(using: demangler)
+                    #expect(try collision.function(forClosure: closure, source: source)?.mangledName == selected.mangledName)
+                }
+            }
+            #expect(try FrontendReceipt.Adapter().generate(request).receipt.roots.contains { $0.declarationMangledName.contains("independent") })
+        }
+    }
+
+    @Test("Unique closure fallbacks are batched across a demangler batch boundary")
+    func batchesUniqueFallbacks() throws {
+        let count = 257
+        let data = Data(String(repeating: "{}\n", count: count).utf8)
+        let source = FrontendReceipt.Adapter.SourceState(logicalPath: "Sources/Closures.swift",
+            url: URL(fileURLWithPath: "/tmp/HelixBatchedClosures.swift"), contents: data, contentHash: .sha256(data))
+        let symbols = (0..<count).map { "$s7Fixture3fooyyFSiyXEfU" + ($0 == 0 ? "_" : "\($0 - 1)_") }
+        let functions = symbols.enumerated().map { index, symbol in
+            var function = CanonicalSIL.Function(mangledName: symbol, loweredType: "$@convention(thin) () -> Int", body: "")
+            function.declarationLocation = .init(file: source.url.path, line: index + 1, column: 1)
+            return function
+        }
+        let items: [FrontendReceipt.TypedAST.Object] = (0..<count).map {
+            ["_kind": "closure_expr", "discriminator": String($0), "range": ["start": $0 * 3, "end": $0 * 3 + 1]]
+        }
+        let performance = BuildPerformance.Recorder()
+        let resolver = try FrontendReceipt.SILFunctionResolver(functions: functions).resolvingSourceMappings(
+            in: [["filename": source.url.path, "items": items]], sourcesByPhysicalPath: [source.url.path: source],
+            using: .init(compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc"), invocationObserver: performance.subprocessObserver))
+        for index in items.indices {
+            #expect(try resolver.function(forClosure: items[index], source: source)?.mangledName == symbols[index])
+        }
+        #expect(performance.trace().subprocesses.reduce(0) { $0 + $1.invocationCount } == 2)
+    }
+
     @Test("Compiler closure discriminators distinguish equal roles at one coordinate")
     func matchesDiscriminators() throws {
         let symbols = ["$s7Fixture3fooyyFSiyXEfU_", "$s7Fixture3fooyyFSiyXEfU0_"]
@@ -76,7 +225,8 @@ struct ScopedSILResolutionTests {
                 .resolvingCollisions(using: .init(compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc")))
         }
         #expect(try resolver([witness, first]).function(for: item, source: source, baseName: "number")?.mangledName == first)
-        for candidates in [[first, second, witness], [first, "future_unknown_symbol", witness], ["future_unknown_symbol", witness]] {
+        #expect(try resolver([witness]).function(for: item, source: source, baseName: "number") == nil)
+        for candidates in [[first, second, witness], [first, "future_unknown_symbol", witness], ["future_unknown_symbol", witness], ["future_unknown_symbol"]] {
             do {
                 _ = try resolver(candidates).function(for: item, source: source, baseName: "number")
                 Issue.record("Unproven source identity was selected")

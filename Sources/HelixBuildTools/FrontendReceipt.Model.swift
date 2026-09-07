@@ -47,6 +47,7 @@ public struct Request: Sendable {
     /// these automatically; applications never enumerate native APIs.
     public var nativeAPICatalogs: [NativeAPICatalog.Snapshot]
     public var callingSurfacePolicy: FrontendReceipt.CallingSurfacePolicy
+    public var indexing: FrontendReceipt.IndexingOptions?
 
     public init(
         metadata: InterfaceArchive.ReleaseMetadata,
@@ -67,6 +68,23 @@ public struct Request: Sendable {
                 < ($1.document.identity.moduleName, $1.document.identity.cacheKey)
         }
         self.callingSurfacePolicy = callingSurfacePolicy
+        self.indexing = nil
+    }
+
+    public init(
+        metadata: InterfaceArchive.ReleaseMetadata,
+        configuration: PatchConfiguration.Document,
+        sources: [FrontendReceipt.Source],
+        compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
+        nativeImportCatalog: NativeImportCatalog.Document = .empty,
+        nativeAPICatalogs: [NativeAPICatalog.Snapshot] = [],
+        callingSurfacePolicy: FrontendReceipt.CallingSurfacePolicy = .configured,
+        indexing: FrontendReceipt.IndexingOptions
+    ) {
+        self.init(metadata: metadata, configuration: configuration, sources: sources,
+            compilerURL: compilerURL, nativeImportCatalog: nativeImportCatalog,
+            nativeAPICatalogs: nativeAPICatalogs, callingSurfacePolicy: callingSurfacePolicy)
+        self.indexing = indexing
     }
 }
 
@@ -76,6 +94,8 @@ public struct Output: Sendable {
     public var toolchain: ReleaseCompiler.ToolchainIdentity
     public var importedModules: [String]
     public var performance: BuildPerformance.Trace
+
+    public var excludedDeclarationCount: Int { diagnostics.filter { $0.code == "HLXIDX024" }.count }
 
     public init(
         receipt: ShellBuildReceipt.Document,

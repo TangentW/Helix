@@ -105,9 +105,12 @@ public struct Application: Sendable {
     ) async -> CLI.Result {
         #if os(macOS)
         if arguments.first == "xcode",
-           ["phase", "post-compile"].contains(arguments.dropFirst().first ?? "") {
+           ["phase", "post-compile", "preflight"].contains(arguments.dropFirst().first ?? "") {
             do {
                 let tail = Array(arguments.dropFirst(2))
+                if arguments.dropFirst().first == "preflight" {
+                    return try await executeXcodePreflight(tail)
+                }
                 if arguments.dropFirst().first == "post-compile" {
                     return try await executeXcodePostCompile(tail)
                 }
@@ -686,11 +689,13 @@ Usage: helix xcode <command>
 Commands:
   inspect       List Xcode targets, configurations, and shared schemes
   install       Install a Host Plan into the Xcode project without the Hub GUI
+  uninstall     Remove owned Xcode integration using its Host Plan or backup
   generate      Generate deterministic xcconfig, file-list, and Scheme scripts
   validate      Validate the checked-in Host Plan and every referenced input
   doctor        Inspect the active Xcode build environment for one profile
   phase         Run one versioned Xcode prepare/finalize/audit/session phase
   post-compile  Complete an automatically captured same-target Swift build
+  preflight     Check captured compiler inputs before a successful build
   catalog-prewarm
                 Resume validated module Catalog generation in bounded batches
 """ + "\n"

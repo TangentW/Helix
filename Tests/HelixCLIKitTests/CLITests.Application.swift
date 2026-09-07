@@ -397,6 +397,20 @@ struct Application {
             "--profile", "live", "--static"]).exitCode == 0)
     }
 
+    @Test("Preflight defaults to input and AST checks and preserves explicit stage selection")
+    func preflightCommand() async throws {
+        let app = CLI.Application(currentDirectoryURL: URL(fileURLWithPath: "/tmp"))
+        let base = ["xcode", "preflight", "--plan", "MissingPlan.json", "--profile", "live",
+            "--capture", "FrontendAttempt.hlxswiftc", "--json"]
+        let result = await app.runAsync(base)
+        let report = try JSONDecoder().decode(FrontendReceipt.DiagnosticReport.self, from: Data(result.standardOutput.utf8))
+        #expect(!report.passed && report.requestedStages == [.inputs, .typedAST])
+        let selected = await app.runAsync(base + ["--stages", "inputs"])
+        let selectedReport = try JSONDecoder().decode(FrontendReceipt.DiagnosticReport.self, from: Data(selected.standardOutput.utf8))
+        #expect(selectedReport.requestedStages == [.inputs])
+        #expect(app.run(["xcode", "preflight", "--help"]).standardOutput.contains("FrontendAttempt.hlxswiftc"))
+    }
+
     @Test("Post-compile diagnosis returns structured failures for invalid inputs")
     func xcodeDiagnosisInputFailure() async throws {
         let directory = try temporaryDirectory()

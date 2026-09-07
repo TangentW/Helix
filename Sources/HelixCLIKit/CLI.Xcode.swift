@@ -68,7 +68,13 @@ func executeXcode(_ arguments: [String]) throws -> CLI.Result {
     let tail = Array(arguments.dropFirst())
     switch command {
     case "install": return try installXcodeProject(tail)
+    case "uninstall": return try uninstallXcodeProject(tail)
     case "inspect": return try inspectXcodeProjectTargets(tail)
+    case "preflight":
+        guard tail == ["--help"] else {
+            throw CLI.Error.usage("xcode preflight must run through the asynchronous CLI entry point")
+        }
+        return .init(exitCode: 0, standardOutput: Self.xcodePreflightHelp)
     case "generate": return try generateXcodeIntegration(tail)
     case "validate": return try validateXcodeIntegration(tail)
     case "phase":
@@ -475,6 +481,16 @@ func executeXcodePhase(_ arguments: [String]) async throws -> CLI.Result {
     }
 }
 
+func executeXcodePreflight(_ arguments: [String]) async throws -> CLI.Result {
+    if arguments == ["--help"] { return .init(exitCode: 0, standardOutput: Self.xcodePreflightHelp) }
+    let options = try CLI.Arguments(arguments, valueOptions: ["plan", "profile", "capture", "stages"], flagOptions: ["json"])
+    try requireNoXcodePositionals(options, command: "xcode preflight")
+    var delegated = ["--plan", try options.require("plan"), "--profile", try options.require("profile"),
+        "--capture", try options.require("capture"), "--diagnose", "--stages", try options.value("stages") ?? "inputs,typed-ast"]
+    if options.hasFlag("json") { delegated.append("--json") }
+    return try await executeXcodePostCompile(delegated)
+}
+
 func executeXcodePostCompile(_ arguments: [String]) async throws -> CLI.Result {
     if arguments == ["--help"] { return .init(exitCode: 0, standardOutput: Self.xcodePostCompileHelp) }
     let options = try CLI.Arguments(arguments, valueOptions: ["plan", "profile", "capture", "stages"], flagOptions: ["diagnose", "json"])
@@ -499,7 +515,8 @@ func executeXcodePostCompile(_ arguments: [String]) async throws -> CLI.Result {
     do {
         let planURL = files.resolve(try options.require("plan"))
         context = try CLI.XcodePostCompileResolver().resolve(plan: loadHostPlan(at: planURL), planURL: planURL,
-            profileID: options.require("profile"), captureURL: files.resolve(options.require("capture")), environment: environment)
+            profileID: options.require("profile"), captureURL: files.resolve(options.require("capture")), environment: environment,
+            allowAttempt: options.hasFlag("diagnose"))
     } catch {
         if options.hasFlag("diagnose") {
             return try formatXcodeDiagnosis(.failure(stage: "xcode.context", reason: String(describing: error), stages: diagnosticStages), json: options.hasFlag("json"))
@@ -1353,27 +1370,6 @@ private func performPrepareXcodeShell(
         arguments: capture.analysisJob.arguments,
         workingDirectory: context.environment.sourceRootURL
     ).joined()
-    let sourceImports = try performance.measure("prepare.scan_imports") {
-        try FrontendReceipt.SourceImports.scan(sources: capture.frontendSources)
-    }
-    var compilerInputs = performance.measure("prepare.compiler_inputs") {
-        BuildCache.CompilerInputs.capture(
-            arguments: capture.analysisJob.arguments,
-            currentModuleName: context.feature.moduleName,
-            workingDirectory: context.environment.sourceRootURL,
-            importedModules: Set(sourceImports.modules)
-        )
-    }
-    compilerInputs.isComplete = compilerInputs.isComplete
-        && sourceImports.isComplete
-    performance.setCounter(
-        "prepare.compiler_input_file_count",
-        value: compilerInputs.fileCount
-    )
-    performance.setCounter(
-        "prepare.compiler_input_bytes",
-        value: compilerInputs.byteCount
-    )
     let minimumOS: Core.SemanticVersion
     do {
         minimumOS = try Core.SemanticVersion(
@@ -1404,6 +1400,36 @@ private func performPrepareXcodeShell(
             )
         )
     }
+    if let diagnosticJSON, diagnosticStages.map(Set.init) == Set([FrontendReceipt.DiagnosticStage.inputs]) {
+        let request = FrontendReceipt.Request(metadata: metadata, configuration: configuration,
+            sources: capture.frontendSources, compilerURL: context.environment.compilerURL,
+            indexing: context.indexingOptions)
+        var report = try FrontendReceipt.Adapter().diagnose(request, stages: diagnosticStages)
+        if let trace = report.performance { performance.merge(trace) }
+        report.performance = performance.trace()
+        return try formatXcodeDiagnosis(report, json: diagnosticJSON)
+    }
+    let sourceImports = try performance.measure("prepare.scan_imports") {
+        try FrontendReceipt.SourceImports.scan(sources: capture.frontendSources)
+    }
+    var compilerInputs = performance.measure("prepare.compiler_inputs") {
+        BuildCache.CompilerInputs.capture(
+            arguments: capture.analysisJob.arguments,
+            currentModuleName: context.feature.moduleName,
+            workingDirectory: context.environment.sourceRootURL,
+            importedModules: Set(sourceImports.modules)
+        )
+    }
+    compilerInputs.isComplete = compilerInputs.isComplete
+        && sourceImports.isComplete
+    performance.setCounter(
+        "prepare.compiler_input_file_count",
+        value: compilerInputs.fileCount
+    )
+    performance.setCounter(
+        "prepare.compiler_input_bytes",
+        value: compilerInputs.byteCount
+    )
     let buildCache: BuildCache.Store
     if let shared = xcodeBuildCacheStore() {
         buildCache = shared
@@ -1446,7 +1472,8 @@ private func performPrepareXcodeShell(
         }
         let request = FrontendReceipt.Request(metadata: metadata, configuration: configuration,
             sources: capture.frontendSources, compilerURL: context.environment.compilerURL,
-            nativeImportCatalog: .empty, nativeAPICatalogs: resolved?.snapshots ?? [], callingSurfacePolicy: callingSurfacePolicy)
+            nativeImportCatalog: .empty, nativeAPICatalogs: resolved?.snapshots ?? [], callingSurfacePolicy: callingSurfacePolicy,
+            indexing: context.indexingOptions)
         var report = try FrontendReceipt.CachedAdapter(cache: buildCache).diagnose(request,
             compilerCapture: capture.recordBytes, compilerArguments: capture.analysisJob.arguments,
             workingDirectory: context.environment.sourceRootURL, precomputedToolchain: toolchain,
@@ -1496,7 +1523,8 @@ private func performPrepareXcodeShell(
                     standardOutput: "Prepared \(context.profile.id) Helix Shell at "
                         + "\(context.environment.shellOutputURL.path)\n"
                         + "Functions: \(state.eligibleFunctionCount) eligible, "
-                        + "\(state.rejectedFunctionCount) rejected\n",
+                        + "\(state.rejectedFunctionCount) rejected\n"
+                        + xcodeExclusionSummary(count: Int(state.excludedDeclarationCount ?? 0), context: context),
                     standardError: searchWarnings
                 )
             } else {
@@ -1532,7 +1560,8 @@ private func performPrepareXcodeShell(
                             "Prepared \(context.profile.id) Helix Shell at "
                             + "\(context.environment.shellOutputURL.path)\n"
                             + "Functions: \(state.eligibleFunctionCount) eligible, "
-                            + "\(state.rejectedFunctionCount) rejected\n",
+                            + "\(state.rejectedFunctionCount) rejected\n"
+                            + xcodeExclusionSummary(count: Int(state.excludedDeclarationCount ?? 0), context: context),
                         standardError: searchWarnings
                     )
                 }
@@ -1578,7 +1607,8 @@ private func performPrepareXcodeShell(
             compilerURL: context.environment.compilerURL,
             nativeImportCatalog: .empty,
             nativeAPICatalogs: resolved.snapshots,
-            callingSurfacePolicy: callingSurfacePolicy
+            callingSurfacePolicy: callingSurfacePolicy,
+            indexing: context.indexingOptions
         )
         indexed = try performance.measure("prepare.frontend_receipt") {
             try FrontendReceipt.CachedAdapter(cache: buildCache).generate(
@@ -1731,7 +1761,7 @@ private func performPrepareXcodeShell(
         value: publication.wasNoOp ? 1 : 0
     )
     if let prepareInputHash {
-        let state = XcodeIntegration.PrepareState(
+        var state = XcodeIntegration.PrepareState(
             inputHash: prepareInputHash,
             artifacts: artifacts.map { path, data in
                 .init(
@@ -1746,6 +1776,7 @@ private func performPrepareXcodeShell(
             requiresNativeAPICatalogRefresh:
                 nativeAPICatalogs?.prewarmRequests.isEmpty == false
         )
+        state.excludedDeclarationCount = UInt32(clamping: indexed.excludedDeclarationCount)
         try performance.measure("prepare.publish_state") {
             try files.write(
                 try XcodeIntegration.PrepareStateCodec.encode(state),
@@ -1801,6 +1832,7 @@ private func performPrepareXcodeShell(
             + "\(context.environment.shellOutputURL.path)\n"
             + "Functions: \(materialized.report.eligibleFunctionCount) eligible, "
             + "\(materialized.report.rejectedFunctionCount) rejected\n"
+            + xcodeExclusionSummary(count: indexed.excludedDeclarationCount, context: context)
             + catalogPrewarmStatus,
         standardError: searchWarnings
     )
@@ -3135,12 +3167,22 @@ the active Xcode environment. --backend is a live-register diagnostic override;
 generated integration uses automatic selection by default.
 """ + "\n"
 
+static let xcodePreflightHelp = """
+Usage: helix xcode preflight --plan HostPlan.json --profile ID --capture FILE [--stages STAGE,STAGE] [--json]
+
+Accepts FrontendAttempt.hlxswiftc recorded before compilation, or a successful
+FrontendInvocation.hlxswiftc. Defaults to inputs,typed-ast; --stages inputs only
+validates the invocation, source inventory and toolchain without AST/SIL emission.
+Typed checks still require available generated modules, headers and plugins.
+This command reports selected checks and never publishes a Shell or Bridge.
+""" + "\n"
+
 static let xcodePostCompileHelp = """
 Usage: helix xcode post-compile --plan HostPlan.json --profile ID --capture FILE [--diagnose [--stages STAGE,STAGE] [--json]]
 
 --diagnose collects independent frontend failures, marks blocked checks, and
 validates the receipt pipeline without publishing a Shell, Bridge, or receipt.
---stages runs only the requested checks and necessary dependencies: typed-ast,
+--stages runs only the requested checks and necessary dependencies: inputs, typed-ast,
 identity-sil, semantic-sil, source-nominals, imported-types, source-mappings,
 imported-operations, catalogs, receipt. A selected-check pass is not full receipt
 validation unless receipt is requested. JSON schema 2 records requestedStages.

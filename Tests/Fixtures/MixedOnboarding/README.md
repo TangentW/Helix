@@ -4,7 +4,10 @@ This five-file Swift App exercises Foundation, UIKit, AVFoundation, Photos, two
 `@TaskLocal` expansions, same-named local protocol conformers, duplicate classes
 and structs inheriting `fileprivate extension` access, `?? { ... }()` closure
 coordinates, qualified SDK names, and UIKit's `NS_SWIFT_NAME` mapping from
-`UIPencilInteractionTap` to `UIPencilInteraction.Tap`. Its deployment target is
+`UIPencilInteractionTap` to `UIPencilInteraction.Tap`. Private nested static
+`CGFloat` properties exercise AST/SIL overlay differences, and C callbacks plus
+generic higher-order calls exercise generated adapter and reabstraction thunks.
+Its deployment target is
 iOS 17.5 for that mapped API. It also includes an Objective-C bridging header
 and a compiled Objective-C++ implementation.
 Debug enables debug information, C++ interop, and explicit modules in Xcode
@@ -42,3 +45,15 @@ complete production Catalog closure, or qualify device runtime activation.
 The CLI/Hub tests cover generated phases and publication separately. Compiler
 placeholder identity is also covered by synthetic SIL grammar tests because
 these small macro sources do not reproduce every commercial compiler spelling.
+
+The test also replays the captured arguments through the real proxy with a
+conditional compiler error. It verifies the private attempt record, unchanged
+successful capture, input-only preflight without AST/SIL/dependency inventory,
+typed preflight failure, and rejection of an attempt by normal post-compile.
+`attempt-input-preflight.json`, `attempt-typed-preflight.json`, and the compiler
+failure log are retained in the external report directory.
+
+Finally it runs CLI uninstall using the authoring plan backup, checks that the
+original user package linkage survives, validates the removed project with
+`plutil` and `xcodebuild -list`, restores the deliberate source error and runs a
+real build again. The external report includes uninstall JSON, PBX and build logs.

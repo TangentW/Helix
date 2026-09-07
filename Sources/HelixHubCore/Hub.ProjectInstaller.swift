@@ -43,6 +43,8 @@ public struct ProjectInstaller: Sendable {
     public func install(_ onboarding: Hub.OnboardingPlan) throws -> Hub.InstallationResult {
         try onboarding.hostPlan.validate()
         let expectedProject = onboarding.project
+        let operationLock = try Hub.ProjectOperationLock(projectURL: expectedProject.projectURL)
+        defer { operationLock.unlock() }
         let project = try Hub.ProjectFileParser().parse(projectURL: expectedProject.projectURL)
         guard project.sourceRootURL == expectedProject.sourceRootURL,
               try relative(project.projectURL, to: project.sourceRootURL)
@@ -292,11 +294,31 @@ public struct ProjectInstaller: Sendable {
                 "the selected project no longer matches its Hub registration"
             )
         }
+        let operationLock = try Hub.ProjectOperationLock(projectURL: expectedProject.projectURL)
+        defer { operationLock.unlock() }
+        try remove(project: expectedProject, plan: record.removalPlan)
+    }
+
+    /// Headless removal accepts a matching backup when the installed plan is
+    /// absent. Comparing the current plan stays inside the project lock.
+    public func uninstall(project: Hub.XcodeProject, plan: XcodeIntegration.HostPlan) throws {
+        try plan.validate()
+        let operationLock = try Hub.ProjectOperationLock(projectURL: project.projectURL)
+        defer { operationLock.unlock() }
+        if let installed = try existingHostPlan(currentPlan: plan, sourceRoot: project.sourceRootURL), installed != plan {
+            let suppliedFacts = String(decoding: try Core.CanonicalJSON.encode(plan), as: UTF8.self)
+            let installedFacts = String(decoding: try Core.CanonicalJSON.encode(installed), as: UTF8.self)
+            let path = project.sourceRootURL.appendingPathComponent(plan.integrationRoot).appendingPathComponent("HostPlan.json").path
+            throw Hub.Error.integrationConflict("removal plan differs from the last applied Host Plan: supplied=\(suppliedFacts); installed \(path)=\(installedFacts)")
+        }
+        try remove(project: project, plan: plan)
+    }
+
+    private func remove(project expectedProject: Hub.XcodeProject, plan: XcodeIntegration.HostPlan) throws {
         let project = try Hub.ProjectFileParser().parse(
             projectURL: expectedProject.projectURL
         )
         let sourceRoot = project.sourceRootURL
-        let plan = record.removalPlan
         try plan.validate()
         guard sourceRoot.appendingPathComponent(plan.projectPath)
                 .standardizedFileURL == project.projectURL

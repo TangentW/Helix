@@ -17,6 +17,8 @@ public struct ProfileDraft: Hashable, Sendable, Identifiable {
     public var bundleIdentifier: String
     public var namespaceSeed: String
     public var patch: Hub.PatchDraft?
+    public var indexing: FrontendReceipt.IndexingOptions?
+    public var deviceNativeMatrixQualified: Bool?
 
     public init(
         id: String,
@@ -40,6 +42,8 @@ public struct ProfileDraft: Hashable, Sendable, Identifiable {
         self.bundleIdentifier = bundleIdentifier
         self.namespaceSeed = namespaceSeed
         self.patch = patch
+        self.indexing = nil
+        self.deviceNativeMatrixQualified = nil
     }
 }
 
@@ -84,6 +88,7 @@ public struct OnboardingDraft: Hashable, Sendable {
     public var capabilities: Hub.CapabilitySelection
     public var profiles: [Hub.ProfileDraft]
     public var integrationRoot: String
+    public var runtimePackageRequirement: XcodeIntegration.RuntimePackageRequirement?
 
     public init(
         project: Hub.XcodeProject,
@@ -95,6 +100,7 @@ public struct OnboardingDraft: Hashable, Sendable {
         self.capabilities = capabilities
         self.profiles = profiles
         self.integrationRoot = integrationRoot
+        self.runtimePackageRequirement = nil
     }
 }
 
@@ -190,15 +196,26 @@ public struct OnboardingPlanner: Sendable {
                 )
             }
             let featureID = Self.slug(featureTarget.name)
-            let feature = XcodeIntegration.Feature(
+            var feature = XcodeIntegration.Feature(
                 id: featureID,
                 targetName: featureTarget.name,
                 moduleName: profile.featureModuleName
             )
-            if let existing = featuresByTarget[featureTarget.id], existing != feature {
-                throw Hub.Error.invalidOnboarding(
-                    "source target \(featureTarget.name) has conflicting module settings"
-                )
+            feature.indexing = profile.indexing
+            if let existing = featuresByTarget[featureTarget.id] {
+                guard existing.moduleName == feature.moduleName,
+                      existing.indexing == nil || feature.indexing == nil || existing.indexing == feature.indexing
+                else {
+                    let facts = draft.profiles.filter { $0.featureTargetName == featureTarget.name }
+                        .sorted { $0.id < $1.id }.map {
+                            "profile \($0.id): module=\($0.featureModuleName), indexing=\(String(describing: $0.indexing))"
+                        }.joined(separator: "; ")
+                    throw Hub.Error.invalidOnboarding(
+                        "source target \(featureTarget.name) [\(featureTarget.id)] in \(draft.project.projectURL.path) has conflicting settings: \(facts)"
+                    )
+                }
+                // A newly enabled workflow has no authored feature policy yet.
+                feature.indexing = feature.indexing ?? existing.indexing
             }
             featuresByTarget[featureTarget.id] = feature
             if let existing = featureTargetNames[featureID], existing != featureTarget.name {
@@ -254,17 +271,19 @@ public struct OnboardingPlanner: Sendable {
                 featureID: featureID,
                 patch: patchSettings
             ))
+            profiles[profiles.count - 1].deviceNativeMatrixQualified = profile.deviceNativeMatrixQualified
         }
         let relativeProject = try Self.relative(
             draft.project.projectURL,
             to: draft.project.sourceRootURL
         )
-        let hostPlan = XcodeIntegration.HostPlan(
+        var hostPlan = XcodeIntegration.HostPlan(
             projectPath: relativeProject,
             integrationRoot: draft.integrationRoot,
             features: Array(featuresByTarget.values),
             profiles: profiles
         )
+        hostPlan.runtimePackageRequirement = draft.runtimePackageRequirement
         do {
             try hostPlan.validate()
         } catch {

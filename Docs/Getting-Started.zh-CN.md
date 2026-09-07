@@ -123,6 +123,15 @@ HLBC 仍不是“在设备上执行任意 Swift”。无法证明的 ABI、运�
 
 ## 可选诊断
 
+声明发现可按逻辑文件限定范围，并在被消费的 AST/SIL 映射有歧义或缺失时排除有明确
+源码归属的声明。编译器 USR 与逻辑文件绑定整组 accessor/closure，不猜测候选，已收集
+的局部 body operation 会回滚。编译器、源码、类型、ABI、Catalog 的全局校验仍须通过。
+Live Reload 默认局部排除，Hot Patch/headless 默认严格，均可显式覆盖。策略进入
+receipt/Prepare 缓存 identity，范围外源码仍保留整模块失效权威。Host Plan v2 承载范围，
+不带新配置的 v1 继续可读。默认值、诊断与迁移边界见
+[大型工程接入](Large-Project-Integration.zh-CN.md#声明范围与局部排除)。
+
+
 CI 和脚本接入可使用 `helix xcode inspect` 与
 `helix xcode install --project PATH --plan PATH`，安装复用 Hub 的事务工程修改引擎。
 完整 plan 示例、编译器包装器串联、重试行为及规模边界见[大型工程接入](Large-Project-Integration.zh-CN.md)。
@@ -149,3 +158,10 @@ swift run helix xcode doctor \
 本地协议、schema、ABI 与产品版本目前统一保持为 1。项目仍处于发布前开发阶段，不保留废弃接入方案的兼容层。
 
 继续阅读[总体架构](Architecture.zh-CN.md)、[开发期热重载](Development-Live-Reload.zh-CN.md)和[生产热补丁](Production-Hot-Patching.zh-CN.md)。
+
+compiler proxy 现在在编译前保存 `FrontendAttempt.hlxswiftc`，供 `helix xcode preflight`
+使用（默认 `inputs,typed-ast`）。只有成功编译才更新 `FrontendInvocation.hlxswiftc` 并运行
+post-compile。仅输入预检不生成 AST/SIL，也不扫描依赖缓存；typed 检查仍需要可用的编译
+依赖，局部检查通过不代表完整 receipt 或 runtime 支持。见[预检说明](Large-Project-Integration.zh-CN.md#成功构建前的预检)。
+
+Host Plan schema 2 还支持显式 runtime package revision 或精确发布版本。Hub 重新配置时保留该字段，package authority 冲突会在写入前拒绝。`helix xcode uninstall --project … --plan …` 无需 GUI 即可复用事务卸载。版本缺省、ownership 和备份要求见[团队接入](Large-Project-Integration.zh-CN.md#团队-runtime-版本与卸载)。

@@ -2020,6 +2020,7 @@ struct FrontendReceiptPipeline {
             contentHash: .sha256(contents)
         )
         let item: FrontendReceipt.TypedAST.Object = [
+            "_kind": "func_decl",
             "usr": "s:7Fixture5probeyyFQO",
             "range": [
                 "start": NSNumber(value: 0),
@@ -2032,7 +2033,8 @@ struct FrontendReceiptPipeline {
                 ],
             ],
         ]
-        return (.init(file: file), state, item)
+        return (try FrontendReceipt.SILFunctionResolver(file: file)
+            .resolvingCollisions(using: .init(compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc"))), state, item)
     }
 }
 }

@@ -33,6 +33,9 @@ public struct PrepareState: Codable, Hashable, Sendable {
     public var artifacts: [Artifact]
     public var eligibleFunctionCount: UInt32
     public var rejectedFunctionCount: UInt32
+    /// Additive informational field; older states omit it. Input hashes bind
+    /// the indexing policy independently of these display counts.
+    public var excludedDeclarationCount: UInt32?
     /// A background Catalog was missing when these artifacts were published.
     /// The next Prepare must recheck the cache instead of treating this Shell
     /// as the final no-op result for otherwise identical inputs.
@@ -51,6 +54,7 @@ public struct PrepareState: Codable, Hashable, Sendable {
         self.artifacts = artifacts.sorted { $0.path < $1.path }
         self.eligibleFunctionCount = eligibleFunctionCount
         self.rejectedFunctionCount = rejectedFunctionCount
+        self.excludedDeclarationCount = nil
         self.requiresNativeAPICatalogRefresh =
             requiresNativeAPICatalogRefresh
     }

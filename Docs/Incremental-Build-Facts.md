@@ -15,6 +15,19 @@ required. `HELIX_BUILD_CACHE_DIR` exists only as an optional diagnostic/test
 override; the normal owner-local location is
 `~/Library/Caches/Helix/BuildFacts`.
 
+
+Declaration discovery can be scoped by logical file and can exclude a proven
+source declaration when a consumed AST/SIL mapping is ambiguous or absent.
+The compiler USR plus logical file owns the entire accessor/closure group; no
+candidate is guessed and partial body operations are rolled back. Global compiler,
+source, type, ABI and Catalog checks remain mandatory. Live Reload defaults to
+local exclusion; Hot Patch/headless default to strict, with explicit overrides.
+The optional policy is bound to receipt/Prepare cache identities; all compiler
+inputs, including files outside scope, retain whole-module invalidation authority.
+Host Plan v2 carries the scope; v1 remains readable without new options. See
+[large-project integration](Large-Project-Integration.md#declaration-scope-and-local-rejection)
+for defaults, diagnostics, and migration boundaries.
+
 ## Reuse layers
 
 | Layer | Reused value | Exact invalidation boundary |
@@ -392,3 +405,10 @@ an unchecked cross-machine Catalog import. Toolchain, SDK, target, semantic
 arguments, module bytes, and transform identity must still match. Cold cost
 depends on each module's actual API surface: multiplying UIKit's historical
 230-second measurement by the number of imports is not a measured estimate.
+
+The compiler proxy now retains `FrontendAttempt.hlxswiftc` before compilation
+for `helix xcode preflight` (default `inputs,typed-ast`). Only a successful compile
+updates `FrontendInvocation.hlxswiftc` and invokes post-compile work. Input-only
+preflight does not emit AST/SIL or scan the dependency cache. Typed checks still
+require available compiler dependencies, and selected-check success does not
+prove full receipt or runtime support. See [preflight](Large-Project-Integration.md#preflight-before-a-successful-build).

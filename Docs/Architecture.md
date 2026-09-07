@@ -1046,6 +1046,19 @@ nested scopes and generic arguments remain significant. Distinct qualified Swift
 overlays, unrelated short aliases, and different runtime classes are not unified.
 Catalog declaring-module evidence also recognizes reexported module prefixes.
 
+
+Declaration discovery can be scoped by logical file and can exclude a proven
+source declaration when a consumed AST/SIL mapping is ambiguous or absent.
+The compiler USR plus logical file owns the entire accessor/closure group; no
+candidate is guessed and partial body operations are rolled back. Global compiler,
+source, type, ABI and Catalog checks remain mandatory. Live Reload defaults to
+local exclusion; Hot Patch/headless default to strict, with explicit overrides.
+The optional policy is bound to receipt/Prepare cache identities; all compiler
+inputs, including files outside scope, retain whole-module invalidation authority.
+Host Plan v2 carries the scope; v1 remains readable without new options. See
+[large-project integration](Large-Project-Integration.md#declaration-scope-and-local-rejection)
+for defaults, diagnostics, and migration boundaries.
+
 A flat Objective-C runtime spelling, including its observed-module or `__C` /
 `__ObjC` qualification, is an ABI spelling only with exact reference/runtime
 evidence. It does not compete with an observed `NS_SWIFT_NAME` nested overlay.
@@ -1064,12 +1077,17 @@ existing persisted type-ID derivations and archive schemas are unchanged.
 
 ### Compiler symbol roles
 
-At colliding source coordinates, receipt analysis batches structural trees from
-the captured toolchain's `swift-demangle --expand --tree-only`. Explicit closures,
-autoclosures, ordinary functions, accessors, and witness thunks remain distinct
-roles. AST closure discriminators further constrain a match. Unknown roles and
-remaining same-role collisions fail closed with each symbol, ABI, role and
-location. No additional symbol-tree process is needed when locations are unique.
+Exact AST USR/SIL symbol matches remain the fast path. For source-coordinate
+fallbacks, receipt analysis batches structural trees from the captured toolchain's
+`swift-demangle --expand --tree-only`, including unique candidates. The `Static`
+wrapper preserves the underlying getter/function role; addressors, witness and
+reabstraction helpers, partial-apply forwarders, and Objective-C/C adapter
+attributes cannot stand in for a Swift source declaration. Explicit closures and
+autoclosures remain distinct, and only the closure entity's own discriminator
+constrains its match. Unknown wrappers/roles and remaining same-role collisions
+fail closed with every symbol, ABI, wrapper, role and location. Analysis gathers
+fallback candidates before lookup so unique closures also use bounded batches;
+exact USR matches require no symbol-tree subprocess.
 
 ### Recoverable compiler stages
 
@@ -1104,3 +1122,14 @@ cache inputs and retains only fully validated compiler checkpoints; it does not
 publish a module receipt. Diagnostic JSON schema 2 adds `requestedStages` so a
 partial pass cannot be mistaken for full receipt validation. Missing selection
 in legacy schema 1 reports retains full scope. Shell/patch schemas are unchanged.
+
+The compiler proxy now retains `FrontendAttempt.hlxswiftc` before compilation
+for `helix xcode preflight` (default `inputs,typed-ast`). Only a successful compile
+updates `FrontendInvocation.hlxswiftc` and invokes post-compile work. Input-only
+preflight does not emit AST/SIL or scan the dependency cache. Typed checks still
+require available compiler dependencies, and selected-check success does not
+prove full receipt or runtime support. See [preflight](Large-Project-Integration.md#preflight-before-a-successful-build).
+
+Semantic SIL is released after operation discovery; receipt assembly retains only the identity SIL needed for fingerprints.
+
+Host Plan schema 2 also supports an explicit runtime package revision or exact release version. Hub preserves it during reconfiguration; conflicting package authorities fail before writing. `helix xcode uninstall --project … --plan …` reuses transactional removal without the GUI. See [team integration](Large-Project-Integration.md#team-runtime-selection-and-removal) for pin defaults, ownership and backup requirements.

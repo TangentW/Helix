@@ -161,7 +161,61 @@ struct MixedOnboarding {
             }
         }
         #expect(report.performance?.stages.contains { $0.name == "prepare.validate_environment" } == true)
+        // Replay exact Xcode arguments through the real compiler proxy with a
+        // deliberate compiler error. Dependencies already exist; no successful
+        // Helix Prepare or Shell is needed to diagnose this attempt.
+        let swiftSource = sourceRoot.appendingPathComponent("Sources/MixedFixture.swift")
+        let originalSwift = try Data(contentsOf: swiftSource)
+        try (originalSwift + Data("\n#if HELIX_PREFLIGHT_FAILURE\n#error(\"preflight fixture failure\")\n#endif\n".utf8)).write(to: swiftSource)
+        let successBytes = try Data(contentsOf: capture)
+        let rawJob = try BuildCapture.SwiftInvocationRecord.decode(successBytes)
+        let failure = try ProcessExecution.Runner().run(executable: proxy,
+            arguments: rawJob.arguments + ["-D", "HELIX_PREFLIGHT_FAILURE"],
+            environment: ["HELIX_REAL_SWIFT_EXEC": rawJob.executable], workingDirectory: sourceRoot)
+        try save("compiler-attempt-failure.log", Data((failure.standardOutput + failure.standardError).utf8))
+        try #require(failure.status != 0)
+        #expect(try Data(contentsOf: capture) == successBytes)
+        let attempt = capture.deletingLastPathComponent().appendingPathComponent(XcodeIntegration.CompilerCapture.attemptFileName)
+        let preflightArguments = ["xcode", "preflight", "--plan", sourceRoot.appendingPathComponent(".helix/xcode/HostPlan.json").path,
+            "--profile", "live", "--capture", attempt.path, "--json"]
+        let inputOnly = await app.runAsync(preflightArguments + ["--stages", "inputs"])
+        try save("attempt-input-preflight.json", Data(inputOnly.standardOutput.utf8))
+        #expect(inputOnly.exitCode == 0, "\(inputOnly.standardOutput)\n\(inputOnly.standardError)")
+        let inputReport = try JSONDecoder().decode(FrontendReceipt.DiagnosticReport.self, from: Data(inputOnly.standardOutput.utf8))
+        #expect(inputReport.performance?.stages.contains { $0.name.contains("compiler_inputs") } == false)
+        #expect(inputReport.performance?.subprocesses.allSatisfy { $0.kind != .typedAST && $0.kind != .canonicalSIL } == true)
+        let typedFailure = await app.runAsync(preflightArguments)
+        try save("attempt-typed-preflight.json", Data(typedFailure.standardOutput.utf8))
+        #expect(typedFailure.exitCode != 0)
+        let typedReport = try JSONDecoder().decode(FrontendReceipt.DiagnosticReport.self, from: Data(typedFailure.standardOutput.utf8))
+        #expect(typedReport.checks.contains { $0.stage == "frontend.typed_ast" && $0.status == .failed })
+        let forbidden = await app.runAsync(["xcode", "post-compile", "--plan", sourceRoot.appendingPathComponent(".helix/xcode/HostPlan.json").path,
+            "--profile", "live", "--capture", attempt.path])
+        #expect(forbidden.exitCode != 0 && forbidden.standardError.contains("capture path"))
         #expect(!(manager.subpaths(atPath: root.path) ?? []).contains { $0.hasSuffix("/ShellBuildReceipt.json") })
+        let removed = app.run(["xcode", "uninstall", "--project", project.path, "--plan", inputPlan.path, "--json"])
+        try save("uninstall.json", Data(removed.standardOutput.utf8))
+        try #require(removed.exitCode == 0, "\(removed.standardError)")
+        let removal = try JSONDecoder().decode(CLI.XcodeUninstallationReport.self, from: Data(removed.standardOutput.utf8))
+        #expect(removal.projectPath == project.path)
+        #expect(!manager.fileExists(atPath: removal.hostPlanPath))
+        let afterRemoval = try Data(contentsOf: pbx)
+        try save("project-uninstalled.pbxproj", afterRemoval)
+        let uninstalledText = String(decoding: afterRemoval, as: UTF8.self)
+        #expect(!uninstalledText.contains("Helix Prepare (Generated)") && !uninstalledText.contains("HelixBuildTrigger_"))
+        let uninstalledProject = try Hub.ProjectFileParser().parse(projectURL: project)
+        for target in parsed.targets {
+            #expect(uninstalledProject.target(named: target.name)?.packageProducts == target.packageProducts)
+        }
+        #expect(uninstalledText.contains("XCLocalSwiftPackageReference"))
+        let uninstalledLint = try run("uninstalled-plutil", executable: "/usr/bin/plutil", arguments: ["-lint", pbx.path])
+        #expect(uninstalledLint.status == 0)
+        let uninstalledList = try run("uninstalled-xcode-list", arguments: ["-list", "-project", project.path, "-json"])
+        #expect(uninstalledList.status == 0)
+        try originalSwift.write(to: swiftSource)
+        let uninstalledBuild = try run("uninstalled-build", arguments: arguments(driver: "NO", derived: legacy))
+        #expect(uninstalledBuild.status == 0, "\(uninstalledBuild.standardError)\n\(uninstalledBuild.standardOutput.suffix(12_000))")
+
     }
 }
 }

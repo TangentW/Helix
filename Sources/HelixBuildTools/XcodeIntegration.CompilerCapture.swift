@@ -9,6 +9,8 @@ public enum CompilerCapture {
     public static let proxyFileName = "swiftc"
     public static let integrationProxyPath = "Scripts/Compiler/\(proxyFileName)"
     public static let invocationFileName = "FrontendInvocation.hlxswiftc"
+    /// Diagnostic input only; its presence does not prove compilation succeeded.
+    public static let attemptFileName = "FrontendAttempt.hlxswiftc"
     public static let shellRelativeInvocationPath =
         "Compiler/\(invocationFileName)"
     public static let targetTriggerDirectory = "Compiler/Targets"
@@ -108,10 +110,14 @@ public enum CompilerCapture {
                 fi
             fi
             temporary=
+            attempt_temporary=
 
             cleanup() {
                 if [ -n "$temporary" ]; then
                     /bin/rm -f "$temporary"
+                fi
+                if [ -n "$attempt_temporary" ]; then
+                    /bin/rm -f "$attempt_temporary"
                 fi
             }
             trap cleanup 0 1 2 15
@@ -165,6 +171,19 @@ public enum CompilerCapture {
                 proxy_directory="$(/usr/bin/dirname "$objects_directory")/Helix"
                 capture_file="$proxy_directory/\(invocationFileName)"
                 /bin/mkdir -p "$proxy_directory"
+                temporary=$(/usr/bin/mktemp "$proxy_directory/.FrontendInvocation.XXXXXX")
+                {
+                    /usr/bin/printf '%s\\0' '\(recordMarker)' "$real_compiler"
+                    for argument in "$@"; do
+                        /usr/bin/printf '%s\\0' "$argument"
+                    done
+                } > "$temporary"
+                # Keep this invocation's private record until its compiler exits.
+                # A concurrent attempt must never become our successful capture.
+                attempt_temporary=$(/usr/bin/mktemp "$proxy_directory/.FrontendAttempt.XXXXXX")
+                /bin/cp "$temporary" "$attempt_temporary"
+                /bin/mv -f "$attempt_temporary" "$proxy_directory/\(attemptFileName)"
+                attempt_temporary=
             fi
             set +e
             if [ -n "$compiler_wrapper" ]; then
@@ -179,14 +198,8 @@ public enum CompilerCapture {
             fi
 
             if [ "$should_capture" = true ]; then
-                temporary=$(/usr/bin/mktemp "$proxy_directory/.FrontendInvocation.XXXXXX")
-                {
-                    /usr/bin/printf '%s\\0' '\(recordMarker)' "$real_compiler"
-                    for argument in "$@"; do
-                        /usr/bin/printf '%s\\0' "$argument"
-                    done
-                } > "$temporary"
                 /bin/mv -f "$temporary" "$capture_file"
+                temporary=
             \(postCompile)
             fi
             temporary=

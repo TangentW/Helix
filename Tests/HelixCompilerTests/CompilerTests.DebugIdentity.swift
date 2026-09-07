@@ -66,6 +66,42 @@ struct DebugIdentity {
         """, containing: ["/tmp/A.swift", "First", "Second"])
     }
 
+    @Test("Debug metadata preserves Unicode, quoted comments and escaped paths")
+    func lexicalBoundaries() throws {
+        let line = #"  %0 = string_literal utf8 "a\"//中😀", loc "/tmp/\E4\B8\AD.swift":7:9, scope 1 // comment"#
+        let parsed = try CanonicalSIL.DebugMetadata.parse(line, scopes: [:])
+        #expect(parsed.instruction == #"%0 = string_literal utf8 "a\"//中😀""#)
+        #expect(parsed.location?.file == "/tmp/中.swift")
+        #expect(parsed.location?.line == 7 && parsed.location?.column == 9)
+        #expect(CanonicalSIL.DebugMetadata.strippingComment(from: "注释😀 // 尾部") == "注释😀 ")
+        let records = "\u{200B}\t// 'Feature/中.swift' => '/tmp/中.swift'\n"
+            + "\u{200B}sil_scope 1 { loc \"/tmp/中.swift\":2:3 parent @f : $@convention(thin) () -> () }"
+        #expect(try CanonicalSIL.DebugMetadata.sourceModules(in: records) == ["/tmp/中.swift": "Feature"])
+        #expect(try CanonicalSIL.DebugMetadata.scopes(in: records).first?.location.file == "/tmp/中.swift")
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            try CanonicalSIL.DebugMetadata.parse(#"unreachable, loc "/tmp/\FF.swift":1:1"#, scopes: [:])
+        }
+    }
+
+    @Test("Long scope chains memoize missing locations and resolve without recursive stack growth")
+    func longScopeChains() throws {
+        let count = 30_000
+        let chain = (1..<count).map { "sil_scope \($0) { parent \($0 + 1) }" }.joined(separator: "\n")
+        #expect(try CanonicalSIL.DebugMetadata.scopes(in: chain).isEmpty)
+        let located = chain + "\nsil_scope \(count) { loc \"Feature.swift\":4:5 parent @f : $@convention(thin) () -> () }"
+        let scopes = try CanonicalSIL.DebugMetadata.scopes(in: located)
+        #expect(scopes.count == count)
+        #expect(scopes.allSatisfy { $0.location.file == "Feature.swift" && $0.location.line == 4 })
+        do {
+            _ = try CanonicalSIL.DebugMetadata.scopes(in: "sil_scope 1 { parent 2 }\nsil_scope 2 { parent 1 }")
+            Issue.record("Cycle must fail")
+        } catch {
+            let message = String(describing: error)
+            #expect(message.contains("cycle") && message.contains("scope 1") && message.contains("scope 2"))
+            #expect(message.contains("SIL line 1") && message.contains("SIL line 2"))
+        }
+    }
+
     private func function(_ name: String, scope: Int) -> String {
         """
         sil hidden @\(name) : $@convention(thin) () -> () {

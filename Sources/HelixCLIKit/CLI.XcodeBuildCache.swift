@@ -25,6 +25,7 @@ struct XcodePrepareInput: Codable, Sendable {
     var nativeAPICatalogRulesVersion: UInt16
     var nativeAPICatalogPipelineIdentity: Core.Digest
     var callingSurfacePolicy: FrontendReceipt.CallingSurfacePolicy
+    var indexing: FrontendReceipt.IndexingOptions
     var sources: [Source]
 }
 
@@ -133,6 +134,7 @@ func makeXcodePrepareIdentity(
         nativeAPICatalogPipelineIdentity:
             NativeAPICatalog.currentPipelineIdentity,
         callingSurfacePolicy: callingSurfacePolicy,
+        indexing: context.indexingOptions,
         sources: sources
     )
     return (

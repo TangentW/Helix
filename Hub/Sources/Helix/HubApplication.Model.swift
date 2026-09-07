@@ -262,11 +262,12 @@ final class Model: ObservableObject {
             defer { isWorking = false }
             do {
                 let result = try await Task.detached(priority: .userInitiated) {
-                    let draft = try Hub.DraftResolver().resolve(
+                    var draft = try Hub.DraftResolver().resolve(
                         project: editor.project,
                         selections: selections,
                         integrationRoot: editor.integrationRoot
                     )
+                    draft.runtimePackageRequirement = editor.runtimePackageRequirement
                     let plan = try Hub.OnboardingPlanner().plan(draft)
                     let installation = try Hub.ProjectInstaller().install(plan)
                     return (draft, installation)

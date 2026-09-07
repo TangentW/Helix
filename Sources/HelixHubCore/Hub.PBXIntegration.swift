@@ -66,12 +66,12 @@ struct PBXIntegration {
                     "application target \(targetName) no longer exists"
                 )
             }
-            try ensureRuntimeProduct(target: target, document: &document)
+            try ensureRuntimeProduct(target: target, requirement: plan.runtimePackageRequirement, document: &document)
             if plan.profiles.contains(where: {
                 $0.applicationTargetName == targetName && $0.workflow == .liveReload
             }) {
                 try ensureDevelopmentSupportProduct(
-                    target: target,
+                    target: target, requirement: plan.runtimePackageRequirement,
                     document: &document
                 )
             }
@@ -526,10 +526,11 @@ struct PBXIntegration {
     /// is required to expose the runtime to the hidden Bridge.
     private func ensureRuntimeProduct(
         target: Hub.XcodeTarget,
+        requirement: XcodeIntegration.RuntimePackageRequirement?,
         document: inout Hub.PBXProjectDocument
     ) throws {
         let packageID = try runtimePackageReference(
-            targetID: target.id,
+            targetID: target.id, requirement: requirement,
             document: &document
         )
         let runtimeDependencyIDs = Set(document.objects.compactMap {
@@ -678,10 +679,11 @@ struct PBXIntegration {
     /// that configuration.
     private func ensureDevelopmentSupportProduct(
         target: Hub.XcodeTarget,
+        requirement: XcodeIntegration.RuntimePackageRequirement?,
         document: inout Hub.PBXProjectDocument
     ) throws {
         let packageID = try runtimePackageReference(
-            targetID: target.id,
+            targetID: target.id, requirement: requirement,
             document: &document
         )
         let currentTarget = try document.object(target.id)
@@ -770,52 +772,71 @@ struct PBXIntegration {
 
     private func runtimePackageReference(
         targetID: String,
+        requirement: XcodeIntegration.RuntimePackageRequirement?,
         document: inout Hub.PBXProjectDocument
     ) throws -> String {
-        let target = try document.object(targetID)
-        let targetDependencies = target["packageProductDependencies"]?
-            .array?.compactMap(\.string) ?? []
-        let orderedDependencies = targetDependencies + document.objects.keys.sorted()
-        for identifier in orderedDependencies {
-            guard let dependency = document.objects[identifier]?.dictionary,
+        let linkedPackages = Set(document.objects.values.compactMap { value -> String? in
+            guard let dependency = value.dictionary,
                   dependency["isa"]?.string == "XCSwiftPackageProductDependency",
                   let name = dependency["productName"]?.string,
                   Self.runtimeProductNames.contains(name),
                   let packageID = dependency["package"]?.string,
                   let package = document.objects[packageID]?.dictionary,
-                  ["XCLocalSwiftPackageReference", "XCRemoteSwiftPackageReference"]
-                    .contains(package["isa"]?.string ?? "")
-            else { continue }
+                  ["XCLocalSwiftPackageReference", "XCRemoteSwiftPackageReference"].contains(package["isa"]?.string ?? "")
+            else { return nil }
             return packageID
-        }
-        if let existing = document.objects.keys.sorted().first(where: { identifier in
+        })
+        let candidates = linkedPackages.isEmpty ? Set(document.objects.keys.filter { identifier in
             guard let package = document.objects[identifier]?.dictionary,
                   package["isa"]?.string == "XCRemoteSwiftPackageReference",
                   let repository = package["repositoryURL"]?.string
             else { return false }
             return Self.isCanonicalRepository(repository)
-        }) {
+        }) : linkedPackages
+        func evidence(_ ids: Set<String>) -> String {
+            ids.sorted().map { id in
+                let package = document.objects[id]!.dictionary!
+                return "package \(id): isa=\(package["isa"]?.string ?? "missing"), "
+                    + "repository=\(package["repositoryURL"]?.string ?? package["relativePath"]?.string ?? "missing"), "
+                    + "requirement=\(String(describing: package["requirement"]))"
+            }.joined(separator: "; ")
+        }
+        guard candidates.count <= 1 else {
+            throw Hub.Error.integrationConflict("runtime package authority is ambiguous for target \(targetID), HostPlan.runtimePackageRequirement=\(String(describing: requirement)): \(evidence(candidates))")
+        }
+        let requested: Hub.OpenStep.Value? = requirement.map { value in
+            .dictionary(["kind": .string(value.kind.rawValue),
+                value.kind == .revision ? "revision" : "version": .string(value.value)])
+        }
+        let ownedID = identifier(component: "runtime-package")
+        if let existing = candidates.first {
+            if let requested {
+                let package = document.objects[existing]!.dictionary!
+                guard package["isa"]?.string == "XCRemoteSwiftPackageReference",
+                      package["repositoryURL"]?.string.map(Self.isCanonicalRepository) == true,
+                      package["requirement"] == requested || existing == ownedID
+                else {
+                    throw Hub.Error.integrationConflict(
+                        "HostPlan.runtimePackageRequirement=\(String(describing: requirement)) conflicts for target \(targetID): \(evidence(candidates))")
+                }
+                // Only the Helix-owned reference may be changed by a new plan.
+                // A user-owned reference must already match the explicit policy.
+                if package["requirement"] != requested {
+                    try document.updateObject(existing) { $0["requirement"] = requested }
+                }
+            }
             return existing
         }
-
-        let packageID = identifier(component: "runtime-package")
-        try document.addObject(
-            packageID,
-            isa: "XCRemoteSwiftPackageReference",
-            fields: [
-                "repositoryURL": .string(Self.runtimeRepositoryURL),
-                "requirement": .dictionary([
-                    "branch": .string("main"),
-                    "kind": .string("branch"),
-                ]),
-            ]
-        )
+        try document.addObject(ownedID, isa: "XCRemoteSwiftPackageReference", fields: [
+            "repositoryURL": .string(Self.runtimeRepositoryURL),
+            "requirement": requested ?? .dictionary(["branch": .string("main"), "kind": .string("branch")]),
+        ])
         try document.updateObject(document.projectObjectID) { project in
             var references = project["packageReferences"]?.array?.compactMap(\.string) ?? []
-            if !references.contains(packageID) { references.append(packageID) }
+            if !references.contains(ownedID) { references.append(ownedID) }
             project["packageReferences"] = .strings(references)
         }
-        return packageID
+        return ownedID
     }
 
     private func pruneUnreferencedRuntimeProducts(

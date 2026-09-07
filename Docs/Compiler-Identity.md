@@ -54,12 +54,30 @@ existential case through a printed-name lookup. Unrelated declarations remain
 available; exact witness-symbol membership is indexed per module. This does not
 claim support for lowering the ambiguous local types themselves.
 
-At colliding source coordinates, receipt analysis batches structural trees from
-the captured toolchain's `swift-demangle --expand --tree-only`. Explicit closures,
-autoclosures, ordinary functions, accessors, and witness thunks remain distinct
-roles. AST closure discriminators further constrain a match. Unknown roles and
-remaining same-role collisions fail closed with each symbol, ABI, role and
-location. No additional symbol-tree process is needed when locations are unique.
+Exact AST USR/SIL symbol matches remain the fast path. For source-coordinate
+fallbacks, receipt analysis batches structural trees from the captured toolchain's
+`swift-demangle --expand --tree-only`, including unique candidates. The `Static`
+wrapper preserves the underlying getter/function role; addressors, witness and
+reabstraction helpers, partial-apply forwarders, and Objective-C/C adapter
+attributes cannot stand in for a Swift source declaration. Explicit closures and
+autoclosures remain distinct, and only the closure entity's own discriminator
+constrains its match. Unknown wrappers/roles and remaining same-role collisions
+fail closed with every symbol, ABI, wrapper, role and location. Analysis gathers
+fallback candidates before lookup so unique closures also use bounded batches;
+exact USR matches require no symbol-tree subprocess.
+
+
+Declaration discovery can be scoped by logical file and can exclude a proven
+source declaration when a consumed AST/SIL mapping is ambiguous or absent.
+The compiler USR plus logical file owns the entire accessor/closure group; no
+candidate is guessed and partial body operations are rolled back. Global compiler,
+source, type, ABI and Catalog checks remain mandatory. Live Reload defaults to
+local exclusion; Hot Patch/headless default to strict, with explicit overrides.
+The optional policy is bound to receipt/Prepare cache identities; all compiler
+inputs, including files outside scope, retain whole-module invalidation authority.
+Host Plan v2 carries the scope; v1 remains readable without new options. See
+[large-project integration](Large-Project-Integration.md#declaration-scope-and-local-rejection)
+for defaults, diagnostics, and migration boundaries.
 
 A flat Objective-C runtime spelling, including its observed-module or `__C` /
 `__ObjC` qualification, is an ABI spelling only with exact reference/runtime
@@ -77,3 +95,10 @@ share the normal parser's implementation and never create a partial File.
 Diagnostic JSON separately migrates to schema 2 with optional `requestedStages`;
 legacy absence means full receipt scope. Selected passes qualify only their
 checks and dependencies, as specified in [the diagnosis guide](Large-Project-Integration.md#collect-independent-frontend-failures).
+
+The compiler proxy now retains `FrontendAttempt.hlxswiftc` before compilation
+for `helix xcode preflight` (default `inputs,typed-ast`). Only a successful compile
+updates `FrontendInvocation.hlxswiftc` and invokes post-compile work. Input-only
+preflight does not emit AST/SIL or scan the dependency cache. Typed checks still
+require available compiler dependencies, and selected-check success does not
+prove full receipt or runtime support. See [preflight](Large-Project-Integration.md#preflight-before-a-successful-build).

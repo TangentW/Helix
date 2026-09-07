@@ -28,7 +28,7 @@ scheme, configuration, and bundle identifiers with the inspected project values:
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "projectPath": "Example.xcodeproj",
   "integrationRoot": ".helix/xcode",
   "features": [
@@ -195,11 +195,73 @@ Common source forms have the following identity boundaries. See the detailed
 | Same-named protocol conformers local to different functions | Retain every witness-table occurrence; printed type/protocol names do not establish global uniqueness. Ambiguous types and descendants cannot supply layout, generic or dispatch facts |
 | Unmarked classes/structs in `private` / `fileprivate extension` | Inherit extension defaults, respecting explicit member access and private parent limits separately; ambiguous private layouts remain isolated |
 | Closures at one coordinate in `optional ?? { ... }()` | Compiler symbol roles distinguish autoclosures from explicit closures; closure discriminators further constrain matching. Remaining ambiguity reports all candidates |
+| Private static SDK overlay properties | Structural `Static`/getter evidence distinguishes a `CoreFoundation.CGFloat` AST USR from the `CoreGraphics.CGFloat` SIL getter without selecting a shared-coordinate addressor |
+| C callback and reabstraction thunks | Compiler adapter attributes and thunk roles exclude generated entries; unknown shapes retain all conflict evidence |
 | `NS_SWIFT_NAME` nested classes and flat Clang names | Normalize using proven Objective-C runtime identity, preserve generic arguments, and do not equate unrelated nested types |
+
+## Declaration scope and local rejection
+
+Live Reload defaults to `excludeUnresolved`: an ambiguous or missing consumed
+AST/SIL mapping excludes its source declaration while independently valid entries
+continue. Hot Patch and the existing headless receipt API default to `strict`.
+The optional `FrontendReceipt.Request.indexing` value allows headless callers to
+select the same policy explicitly. These options do not make unsupported Swift
+ABIs or invalid compiler/type/Catalog facts acceptable.
+
+A function owns its nested closures and local functions; a property/subscript owns
+its accessors. Exclusion identity is the compiler declaration USR plus logical
+source file, with source location and every rejected candidate retained as evidence.
+Body discovery rolls back operations collected before a nested mapping failure;
+property generation rolls back the entire accessor group. Unconsumed synthesized
+backing declarations are not source entry candidates; their consumers still require
+SIL evidence. A failure without a proven source owner, invalid source membership,
+malformed SIL, or a conflicting type/ABI/Catalog remains fatal.
+
+For a smaller initial scope, use Host Plan schema 2 and add `indexing` to the
+feature, then reapply `xcode install`:
+
+```json
+{
+  "id": "app",
+  "targetName": "Example",
+  "moduleName": "Example",
+  "indexing": {
+    "include": ["Sources/Feature/**"],
+    "exclude": ["Sources/Feature/Generated/**"],
+    "failurePolicy": "excludeUnresolved"
+  }
+}
+```
+
+Patterns match captured logical source paths using the patch configuration's
+`*`, `**`, and `?` rules. An explicitly supplied options object defaults to
+`include: ["**"]`, `exclude: []`, and `failurePolicy: "strict"` when fields are
+omitted. A scope matching no captured source rejects before compiler replay.
+All captured files still compile and contribute source/dependency hashes, nominal
+and imported-type facts. Scope narrows Helix declaration and source-operation
+discovery; it does not promise cheaper whole-module Swift emission, suppress global
+conflicts, or remove explicitly supplied Catalog authority.
+
+`HLXIDX024` records each excluded declaration and its complete reasons in
+`FrontendDiagnostics.json` and the diagnostic report. The CLI reports the excluded
+count and diagnostic path, including unchanged Prepare hits. Module-receipt and
+Prepare identities include the indexing options; changing policy or scope cannot
+reuse a result with different authority. A change to an excluded source still
+invalidates whole-module compiler facts. Raw compiler checkpoints remain reusable
+across policy changes only when all compilation inputs match.
+
+Host Plan schema 1 remains readable without indexing or runtime package options and round-trips its
+original canonical bytes. Indexing options require schema 2, so older tools reject
+the plan instead of silently ignoring its scope. New plans use schema 2. Existing
+public request/feature initializers remain available; indexed overloads are additive.
+The receipt and device wire formats are unchanged. PrepareState schema 1 adds an
+optional informational `excludedDeclarationCount`; omission means a legacy count
+is unavailable, while independently bound input hashes still control reuse.
 
 ## Collect independent frontend failures
 
-Use the successful target's captured invocation to diagnose receipt generation:
+Use the target compiler record to diagnose receipt generation. The successful
+record remains available for the existing command:
 
 ```sh
 helix xcode post-compile --plan .helix/xcode/HostPlan.json --profile live \
@@ -225,6 +287,7 @@ unselected branches. Empty or unknown selections are errors.
 
 | Selection | Work required |
 | --- | --- |
+| `inputs` | Request, source bytes and toolchain checks; no AST/SIL, Catalog or dependency-cache inventory |
 | `typed-ast` | Request, source and toolchain validation; typed AST emission/parsing |
 | `identity-sil`, `semantic-sil` | The selected SIL replay and its component checks; no typed AST |
 | `source-nominals`, `imported-types` | Typed AST and type demangling; no SIL or Catalogs |
@@ -344,3 +407,104 @@ can retain disk space; stop users of a private cache before resetting it.
 Physical-device native activation, the commercial project's save-to-screen
 latency, and its complete cold Catalog cost still need corresponding project
 measurements. Host cross-compilation alone does not qualify those paths.
+
+Hub preserves an authored feature indexing policy and the existing device qualification flag when loading and reapplying a project. Workflows sharing a source target inherit an unspecified policy; conflicting explicit policies are rejected with profile, target, project, and value evidence.
+
+## Preflight before a successful build
+
+The proxy atomically writes a private `FrontendAttempt.hlxswiftc` beside
+`FrontendInvocation.hlxswiftc` **before** invoking the compiler. Discovery calls
+do not create an attempt. Failure preserves the last successful record and
+never invokes the post-compile hook. Each invocation retains its own private
+record until it exits, so a concurrent attempt cannot be promoted as its success.
+The capture byte format remains `HLX.SwiftInvocation.v1`; the new filename is
+explicitly diagnostic input, not proof of a successful build.
+
+```sh
+helix xcode preflight --plan .helix/xcode/HostPlan.json --profile live \
+  --capture /absolute/DerivedData/Build/Intermediates.noindex/Example.build/Debug-iphonesimulator/Example.build/Helix/FrontendAttempt.hlxswiftc \
+  --stages inputs --json
+```
+
+Omitting `--stages` runs `inputs,typed-ast`. Use `source-mappings` to include SIL
+identity diagnosis and declaration exclusions. `inputs` validates the selected
+compiler/SDK, invocation, source inventory and source bytes; it does not
+fingerprint the dependency cache or emit AST/SIL. A pass is not type-check or
+runtime coverage. Typed checks still require generated dependency modules,
+headers and plugins. Xcode must have reached the target compiler proxy at least
+once; this is not a replacement for generating its build arguments.
+
+`post-compile --diagnose` also accepts attempt records; normal `post-compile`
+rejects them. Preflight publishes no receipt, Shell, Bridge, Prepare state or
+Hub reservation. The mixed fixture replays real captured arguments with a
+compiler error, then verifies that input preflight passes, typed preflight
+reports the error, and the successful record is unchanged.
+
+SIL metadata scans now filter record prefixes before allocation, scan comment
+boundaries by UTF-8 delimiters, and avoid decoding unescaped paths. Scope
+inheritance uses iterative traversal and memoizes absent locations. Both SIL
+purposes reuse the selected AST member inventory for bounded symbol classification.
+See [the measured parser comparison](Build-Performance-Baseline.md#sil-debug-metadata-scanning)
+for its limited measurement scope. Whole-module compiler input invalidation
+remains required; per-file WMO reuse and parallel Swift frontend emission are
+not claimed.
+
+## Team runtime selection and removal
+
+Host Plan schema 2 accepts an optional top-level `runtimePackageRequirement`:
+
+```json
+"runtimePackageRequirement": {
+  "kind": "revision",
+  "value": "<your tested 40-character lowercase commit>"
+}
+```
+
+Replace the placeholder with a verified commit. `kind: "exactVersion"` accepts
+a canonical `major.minor.patch` release version; use a full commit for a
+prerelease or other tag. Xcode resolves the reference. Helix validates the shape
+and writes the requirement but does not assert the revision exists or certify
+the tool/runtime pair. Select and qualify that pair in the team's release process.
+
+The installer reuses a matching existing remote reference and may update a
+Helix-owned reference. A conflicting user-owned reference, local package under
+an explicit remote pin, or multiple runtime package authorities rejects before
+publication and includes package IDs, repository/path and requirement facts.
+Hub preserves the requirement through load, edit and reapply. Schema 1 plans
+cannot carry this field; their old bytes and defaults remain compatible.
+
+Omitting the field preserves an existing package requirement. If no reference
+exists, the compatibility default remains the canonical repository's `main`
+branch. A released default tag is not invented. Team plans should specify their
+qualified revision/version explicitly and retain their normal Xcode package
+resolution file in version control.
+
+Remove an installation without the Hub GUI:
+
+```sh
+cp .helix/xcode/HostPlan.json HelixRemovalPlan.json
+helix xcode uninstall --project Example.xcodeproj --plan HelixRemovalPlan.json --json
+```
+
+A backup must match the current installed plan when that file exists. The
+backup also supports repeated removal/recovery after generated files are gone.
+The CLI uses Hub's existing transactional ownership cleanup and minimal PBX
+edits, restores original configuration references, and preserves application
+source, user-owned package references, developer files and signing material.
+Removal does not need a successful build, Catalog, recipe or signing key.
+A damaged ownership manifest still prevents broad generated-file deletion;
+unknown files remain. This command changes the selected project, not GUI
+registration records. The mixed Xcode fixture validates project loading and a
+real build after removal; physical-device runtime behavior is outside that check.
+
+Portable Catalog import/export and a shared writable cache protocol are still
+unsupported. A future bundle must validate both Catalog and compiler projection
+against exact compiler, SDK, dependency and artifact identities. The current
+owner-private cache must not be advertised as cross-machine-compatible by copying it.
+
+Installation and both removal APIs hold a nonblocking advisory lock on the
+canonical `.xcodeproj` directory for the complete read/validate/write operation.
+Competing Helix operations on the same project reject before mutation; different
+projects remain independent. Locking the directory survives atomic PBX file
+replacement and creates no generated lock artifact. This coordinates Helix
+operations, not external editors or Git commands that do not take the lock.

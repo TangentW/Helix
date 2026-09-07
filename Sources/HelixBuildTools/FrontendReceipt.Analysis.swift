@@ -11,7 +11,8 @@ extension FrontendReceipt.Adapter {
         var importedModules: [String]
         var demangled: [String: String]
         var silFile: CanonicalSIL.File
-        var operationSILFile: CanonicalSIL.File
+        var identityResolver: FrontendReceipt.SILFunctionResolver
+        var selection: FrontendReceipt.DeclarationSelection
         var effectiveConfiguration: PatchConfiguration.Document
         var sourceNominals: [SourceNominal]
         var discoveredImportedTypes: [ImportedNativeType]
@@ -83,7 +84,11 @@ extension FrontendReceipt.Adapter {
                 .demangle(FrontendReceipt.TypedAST.mangledTypes(in: ast!.documents))
         }
         let byPath = states.map { Dictionary(uniqueKeysWithValues: $0.map { ($0.url.path, $0) }) }
-        func sil(_ stage: FrontendReceipt.CompilerCheckpoints.Stage, purpose: SwiftFrontend.CanonicalSILPurpose) throws -> CanonicalSIL.File? {
+        var selection = try session.run("frontend.select_declarations") {
+            try FrontendReceipt.DeclarationSelection(documents: ast!.documents, sourcesByPhysicalPath: byPath!, options: request.indexing)
+        }
+        func sil(_ stage: FrontendReceipt.CompilerCheckpoints.Stage, purpose: SwiftFrontend.CanonicalSILPurpose) throws ->
+            (file: CanonicalSIL.File?, resolver: FrontendReceipt.SILFunctionResolver?) {
             let prefix = "frontend." + stage.rawValue
             var inspection: CanonicalSIL.Inspection?
             let file = try session.run(prefix) {
@@ -130,20 +135,36 @@ extension FrontendReceipt.Adapter {
                             detail: "Requires compiler output from " + prefix)
                     }
                 }
-                _ = try session.run(prefix + ".ast_mapping") {
-                    try validateSILSourceMappings(documents: ast!.documents, sourcesByPhysicalPath: byPath!,
-                        functions: inspection!.functions!, compilerURL: request.compilerURL, performance: performance)
-                }
+            } else if session.includes(prefix + ".ast_mapping") {
+                session.record(prefix + ".function_locations", status: file == nil ? .blocked : .passed,
+                    detail: file == nil ? "Requires valid " + prefix : "")
             }
-            return file
+            defer { session.indexingDiagnostics = selection?.diagnostics ?? [] }
+            let resolver = try session.run(prefix + ".ast_mapping") {
+                try analyzeSILSourceMappings(selection: &selection!, sourcesByPhysicalPath: byPath!,
+                    functions: (inspection?.functions ?? file?.functions)!, compilerURL: request.compilerURL,
+                    performance: performance, stage: prefix)
+            }
+            return (file, resolver)
         }
         let identitySIL = try sil(.identitySIL, purpose: .implementationIdentity)
         // Source-level default-argument provenance needs pre-mandatory SIL.
         let semanticSIL = try sil(.semanticSIL, purpose: .semanticLowering)
         let moduleName = request.metadata.frontendInvocation.moduleName
         let effectiveConfiguration = try session.run("frontend.resolve_calling_surface") {
-            let configured = try callingSurfaceConfiguration(request.configuration, policy: request.callingSurfacePolicy,
-                                                            moduleName: moduleName, sources: orderedSources)
+            var scoped = request.configuration
+            let indexedSources = orderedSources.filter { request.indexing?.includes(logicalPath: $0.logicalPath) != false }
+            if request.indexing != nil, var module = scoped.modules[moduleName] {
+                let selectedPaths = indexedSources.map(\.logicalPath).filter { module.includes(logicalPath: $0) }
+                guard !selectedPaths.isEmpty else {
+                    throw FrontendReceipt.Error.invalidRequest("indexing scope and configured module \(moduleName) share no captured source")
+                }
+                module.include = selectedPaths
+                module.exclude = []
+                scoped.modules[moduleName] = module
+            }
+            let configured = try callingSurfaceConfiguration(scoped, policy: request.callingSurfacePolicy,
+                                                            moduleName: moduleName, sources: indexedSources)
             let effective = configuration(configured, allowing: Array(NativeImportCatalog.Builtins.automaticCallees), moduleName: moduleName)
             try effective.validate()
             return effective
@@ -155,8 +176,14 @@ extension FrontendReceipt.Adapter {
             try discoverImportedNativeTypes(documents: ast!.documents, sourcesByPhysicalPath: byPath!, moduleName: moduleName, demangled: demangled!)
         }
         let operations = try session.run("frontend.discover_imported_operations") {
-            try discoverImportedOperationSurface(documents: ast!.documents, sourcesByPhysicalPath: byPath!, moduleName: moduleName,
-                demangled: demangled!, silFile: semanticSIL!, compilerURL: request.compilerURL, performance: performance)
+            let surface = try discoverImportedOperationSurface(documents: selection!.availableDocuments(sourcesByPhysicalPath: byPath!),
+                sourcesByPhysicalPath: byPath!, moduleName: moduleName, demangled: demangled!, silFile: semanticSIL.file!,
+                compilerURL: request.compilerURL, performance: performance, silResolver: semanticSIL.resolver,
+                failurePolicy: selection!.failurePolicy, onExclusions: { exclusions in
+                    selection!.merge(exclusions)
+                    session.indexingDiagnostics = selection!.diagnostics
+                })
+            return surface
         }
         let catalog: FrontendReceipt.CatalogSurface.Resolution?
         if let failure = session.catalogFailure {
@@ -178,8 +205,10 @@ extension FrontendReceipt.Adapter {
         }
         try session.requireSuccess()
         guard session.includes("frontend.receipt") else { throw FrontendReceipt.DiagnosticSelectionComplete() }
-        return .init(sourceStates: states!, toolchain: toolchain!, documents: ast!.documents, importedModules: ast!.modules,
-                     demangled: demangled!, silFile: identitySIL!, operationSILFile: semanticSIL!, effectiveConfiguration: effectiveConfiguration!,
+        performance.setCounter("frontend.excluded_declaration_count", value: UInt64(selection!.exclusions.count))
+        return .init(sourceStates: states!, toolchain: toolchain!, documents: try selection!.availableDocuments(sourcesByPhysicalPath: byPath!), importedModules: ast!.modules,
+                     demangled: demangled!, silFile: identitySIL.file!,
+                     identityResolver: identitySIL.resolver!, selection: selection!, effectiveConfiguration: effectiveConfiguration!,
                      sourceNominals: sourceNominals!, discoveredImportedTypes: discoveredTypes!, importedOperationSurface: operations!,
                      catalogSurface: catalog!, importedTypes: importedTypes!)
     }

@@ -45,10 +45,14 @@ if [ -n "$compiler_wrapper" ]; then
     fi
 fi
 temporary=
+attempt_temporary=
 
 cleanup() {
     if [ -n "$temporary" ]; then
         /bin/rm -f "$temporary"
+    fi
+    if [ -n "$attempt_temporary" ]; then
+        /bin/rm -f "$attempt_temporary"
     fi
 }
 trap cleanup 0 1 2 15
@@ -102,6 +106,19 @@ if [ "$has_module" = true ] && [ "$has_target" = true ] && [ "$has_sdk" = true ]
     proxy_directory="$(/usr/bin/dirname "$objects_directory")/Helix"
     capture_file="$proxy_directory/FrontendInvocation.hlxswiftc"
     /bin/mkdir -p "$proxy_directory"
+    temporary=$(/usr/bin/mktemp "$proxy_directory/.FrontendInvocation.XXXXXX")
+    {
+        /usr/bin/printf '%s\0' 'HLX.SwiftInvocation.v1' "$real_compiler"
+        for argument in "$@"; do
+            /usr/bin/printf '%s\0' "$argument"
+        done
+    } > "$temporary"
+    # Keep this invocation's private record until its compiler exits.
+    # A concurrent attempt must never become our successful capture.
+    attempt_temporary=$(/usr/bin/mktemp "$proxy_directory/.FrontendAttempt.XXXXXX")
+    /bin/cp "$temporary" "$attempt_temporary"
+    /bin/mv -f "$attempt_temporary" "$proxy_directory/FrontendAttempt.hlxswiftc"
+    attempt_temporary=
 fi
 set +e
 if [ -n "$compiler_wrapper" ]; then
@@ -116,14 +133,8 @@ if [ "$compiler_status" -ne 0 ]; then
 fi
 
 if [ "$should_capture" = true ]; then
-    temporary=$(/usr/bin/mktemp "$proxy_directory/.FrontendInvocation.XXXXXX")
-    {
-        /usr/bin/printf '%s\0' 'HLX.SwiftInvocation.v1' "$real_compiler"
-        for argument in "$@"; do
-            /usr/bin/printf '%s\0' "$argument"
-        done
-    } > "$temporary"
     /bin/mv -f "$temporary" "$capture_file"
+    temporary=
     script_directory=$(CDPATH= cd -- "$(/usr/bin/dirname -- "$0")" && pwd -P)
     /bin/sh "$script_directory/post-compile.sh" "$capture_file"
 fi

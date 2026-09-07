@@ -196,6 +196,19 @@ API coverage.
 
 ## Optional diagnostics
 
+Declaration discovery can be scoped by logical file and can exclude a proven
+source declaration when a consumed AST/SIL mapping is ambiguous or absent.
+The compiler USR plus logical file owns the entire accessor/closure group; no
+candidate is guessed and partial body operations are rolled back. Global compiler,
+source, type, ABI and Catalog checks remain mandatory. Live Reload defaults to
+local exclusion; Hot Patch/headless default to strict, with explicit overrides.
+The optional policy is bound to receipt/Prepare cache identities; all compiler
+inputs, including files outside scope, retain whole-module invalidation authority.
+Host Plan v2 carries the scope; v1 remains readable without new options. See
+[large-project integration](Large-Project-Integration.md#declaration-scope-and-local-rejection)
+for defaults, diagnostics, and migration boundaries.
+
+
 CI and scripted project onboarding can use `helix xcode inspect` and
 `helix xcode install --project PATH --plan PATH`. Installation uses the same
 transactional project engine as Hub. See [Large-project integration](Large-Project-Integration.md)
@@ -225,3 +238,12 @@ obsolete integration designs.
 Continue with [Architecture](Architecture.md),
 [Development Live Reload](Development-Live-Reload.md), and
 [Production Hot Patching](Production-Hot-Patching.md).
+
+The compiler proxy now retains `FrontendAttempt.hlxswiftc` before compilation
+for `helix xcode preflight` (default `inputs,typed-ast`). Only a successful compile
+updates `FrontendInvocation.hlxswiftc` and invokes post-compile work. Input-only
+preflight does not emit AST/SIL or scan the dependency cache. Typed checks still
+require available compiler dependencies, and selected-check success does not
+prove full receipt or runtime support. See [preflight](Large-Project-Integration.md#preflight-before-a-successful-build).
+
+Host Plan schema 2 also supports an explicit runtime package revision or exact release version. Hub preserves it during reconfiguration; conflicting package authorities fail before writing. `helix xcode uninstall --project … --plan …` reuses transactional removal without the GUI. See [team integration](Large-Project-Integration.md#team-runtime-selection-and-removal) for pin defaults, ownership and backup requirements.

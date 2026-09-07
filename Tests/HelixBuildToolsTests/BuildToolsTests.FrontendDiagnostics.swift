@@ -218,7 +218,7 @@ struct FrontendDiagnostics {
     }
 
     @Test("Every diagnostic root includes its prerequisites and skips full receipt publication", arguments:
-        [FrontendReceipt.DiagnosticStage.typedAST, .identitySIL, .semanticSIL, .sourceMappings, .importedOperations, .catalogs])
+        [FrontendReceipt.DiagnosticStage.inputs, .typedAST, .identitySIL, .semanticSIL, .sourceMappings, .importedOperations, .catalogs])
     func individualRoots(stage: FrontendReceipt.DiagnosticStage) throws {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -227,12 +227,29 @@ struct FrontendDiagnostics {
         #expect(report.requestedStages == [stage])
         #expect(report.checks.contains { $0.stage == "frontend.receipt" } == false)
         for root in stage.roots { #expect(report.checks.contains { $0.stage == root && $0.status == .passed }) }
-        if [.typedAST, .catalogs].contains(stage) {
+        if [.inputs, .typedAST, .catalogs].contains(stage) {
             #expect(report.performance?.subprocesses.contains { $0.kind == .canonicalSIL } == false)
         }
-        if [.identitySIL, .semanticSIL].contains(stage) {
+        if [.inputs, .identitySIL, .semanticSIL].contains(stage) {
             #expect(report.performance?.subprocesses.contains { $0.kind == .typedAST } == false)
         }
+    }
+
+    @Test("Input preflight does not compile invalid Swift or fingerprint dependencies")
+    func inputPreflight() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        try Data("this is not Swift {".utf8).write(to: fixture.request.sources[0].url)
+        let adapter = FrontendReceipt.CachedAdapter(cache: try .init(rootURL: fixture.root.appendingPathComponent("InputCache")))
+        let report = try adapter.diagnose(fixture.request, compilerCapture: Data(), stages: [.inputs])
+        #expect(report.passed)
+        #expect(report.checks.count == 3)
+        #expect(report.performance?.subprocesses.allSatisfy { $0.kind != .typedAST && $0.kind != .canonicalSIL } == true)
+        #expect(report.performance?.stages.contains { $0.name.contains("compiler_inputs") } == false)
+        try FileManager.default.removeItem(at: fixture.request.sources[0].url)
+        let missing = try adapter.diagnose(fixture.request, compilerCapture: Data(), stages: [.inputs])
+        #expect(!missing.passed)
+        #expect(missing.checks.contains { $0.stage == "frontend.load_sources" && $0.status == .failed })
     }
 
     private func makeFixture(source: String = "public func value(_ value: Int) -> Int { value }\n") throws -> (root: URL, request: FrontendReceipt.Request) {

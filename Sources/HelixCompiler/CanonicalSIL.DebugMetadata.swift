@@ -47,6 +47,7 @@ enum DebugMetadata {
             separator: "\n",
             omittingEmptySubsequences: false
         ) {
+            guard hasRecordPrefix("//", in: rawLine) else { continue }
             let line = String(rawLine).trimmingCharacters(in: .whitespaces)
             guard let match = firstMatch(in: line, regex: fileIDMappingRegex),
                   let encodedFileID = capture(match, at: 1, in: line),
@@ -77,8 +78,8 @@ enum DebugMetadata {
     static func scopes(in text: String) throws -> [CanonicalSIL.DebugScope] {
         var rawScopes: [UInt32: RawScope] = [:]
         for (lineIndex, rawLine) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+            guard hasRecordPrefix("sil_scope ", in: rawLine) else { continue }
             let line = String(rawLine).trimmingCharacters(in: .whitespaces)
-            guard line.hasPrefix("sil_scope ") else { continue }
             guard let id = firstCapture(in: line, regex: scopeHeaderRegex)
                 .flatMap(UInt32.init)
             else {
@@ -102,21 +103,40 @@ enum DebugMetadata {
         }
 
         var resolved: [UInt32: Core.SourceLocation] = [:]
-        var visiting = Set<UInt32>()
-        func resolve(_ id: UInt32) throws -> Core.SourceLocation? {
-            if let location = resolved[id] { return location }
-            guard let scope = rawScopes[id] else { return nil }
-            guard visiting.insert(id).inserted else {
-                throw CanonicalSIL.LoweringError.malformedSIL(
-                    "debug scope inheritance contains a cycle at scope \(id), SIL line \(scope.line): \(scope.text)"
-                )
+        var finished = Set<UInt32>()
+        // Iterative traversal bounds stack usage and memoizes absent locations,
+        // so a long chain of scopes without a location is still linear work.
+        for start in rawScopes.keys.sorted() where !finished.contains(start) {
+            try Task.checkCancellation()
+            if let location = rawScopes[start]?.location {
+                resolved[start] = location
+                finished.insert(start)
+                continue
             }
-            defer { visiting.remove(id) }
-            let location = try scope.location ?? scope.parentID.flatMap { try resolve($0) }
-            if let location { resolved[id] = location }
-            return location
+            var path: [UInt32] = []
+            var pathIndices: [UInt32: Int] = [:]
+            var current = start
+            var location: Core.SourceLocation?
+            while !finished.contains(current), let scope = rawScopes[current] {
+                if let cycleStart = pathIndices[current] {
+                    let facts = path[cycleStart...].map {
+                        "scope \($0), SIL line \(rawScopes[$0]!.line): \(rawScopes[$0]!.text)"
+                    }.joined(separator: "; ")
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "debug scope inheritance contains a cycle: " + facts)
+                }
+                pathIndices[current] = path.count
+                path.append(current)
+                if let ownLocation = scope.location { location = ownLocation; break }
+                guard let parent = scope.parentID else { break }
+                current = parent
+            }
+            location = location ?? resolved[current]
+            for id in path {
+                finished.insert(id)
+                if let location { resolved[id] = location }
+            }
         }
-        for id in rawScopes.keys { _ = try resolve(id) }
         return resolved.map {
             .init(
                 id: $0.key,
@@ -133,7 +153,7 @@ enum DebugMetadata {
     ) throws -> ParsedLine {
         var instruction = strippingComment(from: line).trimmingCharacters(in: .whitespaces)
         var scopeLocation: Core.SourceLocation?
-        if let match = lastMatch(in: instruction, regex: instructionScopeRegex) {
+        if let match = firstMatch(in: instruction, regex: instructionScopeRegex) {
             let idText = capture(match, at: 1, in: instruction)
             guard let idText, let id = UInt32(idText) else {
                 throw CanonicalSIL.LoweringError.malformedSIL(
@@ -171,7 +191,8 @@ enum DebugMetadata {
         anchored: Bool = true
     ) throws -> Core.SourceLocation? {
         let regex = anchored ? anchoredLocationRegex : locationRegex
-        guard let match = lastMatch(in: text, regex: regex) else { return nil }
+        let match = anchored ? firstMatch(in: text, regex: regex) : lastMatch(in: text, regex: regex)
+        guard let match else { return nil }
         guard let encodedFile = capture(match, at: 1, in: text),
               let lineText = capture(match, at: 2, in: text),
               let columnText = capture(match, at: 3, in: text),
@@ -243,6 +264,8 @@ enum DebugMetadata {
     }
 
     private static func decodeSILUTF8Literal(_ encoded: String) throws -> String {
+        // An unescaped Swift String is already valid UTF-8.
+        guard encoded.utf8.contains(0x5C) else { return encoded }
         let input = Array(encoded.utf8)
         var output: [UInt8] = []
         output.reserveCapacity(input.count)
@@ -294,28 +317,37 @@ enum DebugMetadata {
     static func strippingComment(from line: String) -> String {
         var inString = false
         var escaped = false
-        var index = line.startIndex
-        while index < line.endIndex {
-            let character = line[index]
+        let bytes = line.utf8
+        var index = bytes.startIndex
+        while index < bytes.endIndex {
+            let byte = bytes[index]
             if inString {
                 if escaped {
                     escaped = false
-                } else if character == "\\" {
+                } else if byte == 0x5C {
                     escaped = true
-                } else if character == "\"" {
+                } else if byte == 0x22 {
                     inString = false
                 }
-            } else if character == "\"" {
+            } else if byte == 0x22 {
                 inString = true
-            } else if character == "/" {
-                let next = line.index(after: index)
-                if next < line.endIndex, line[next] == "/" {
+            } else if byte == 0x2F {
+                let next = bytes.index(after: index)
+                if next < bytes.endIndex, bytes[next] == 0x2F {
+                    // ASCII quote/comment delimiters cannot occur inside a
+                    // multibyte UTF-8 scalar; this is a valid String boundary.
                     return String(line[..<index])
                 }
             }
-            index = line.index(after: index)
+            index = bytes.index(after: index)
         }
         return line
+    }
+
+    /// Reject unrelated instruction lines before allocating strings or running regexes.
+    private static func hasRecordPrefix(_ prefix: String, in line: Substring) -> Bool {
+        line.unicodeScalars.drop { CharacterSet.whitespaces.contains($0) }
+            .starts(with: prefix.unicodeScalars)
     }
 
     private static func hexValue(_ byte: UInt8) -> UInt8? {

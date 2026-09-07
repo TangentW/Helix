@@ -4,6 +4,11 @@ import HelixBuildTools
 import HelixCore
 
 extension CLI.Application {
+    func xcodeExclusionSummary(count: Int, context: XcodeIntegration.BuildContext) -> String {
+        guard count > 0 else { return "" }
+        return "Declarations: \(count) excluded; details: \(context.environment.shellOutputURL.appendingPathComponent("FrontendDiagnostics.json").path)\n"
+    }
+
     func formatXcodeDiagnosis(_ report: FrontendReceipt.DiagnosticReport, json: Bool) throws -> CLI.Result {
         if json {
             return .init(exitCode: report.passed ? 0 : 1,

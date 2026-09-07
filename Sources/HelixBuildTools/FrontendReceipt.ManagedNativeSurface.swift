@@ -2772,7 +2772,8 @@ extension FrontendReceipt.ManagedNativeSurface {
             contents: contents,
             contentHash: .sha256(contents)
         )
-        let resolver = try FrontendReceipt.SILFunctionResolver(file: silFile).resolvingCollisions(using: .init(
+        let resolver = try FrontendReceipt.SILFunctionResolver(file: silFile).resolvingSourceMappings(
+            in: documents, sourcesByPhysicalPath: [state.url.path: state], using: .init(
             compilerURL: frontend.compilerURL, invocationObserver: frontend.invocationObserver))
         var candidatesByWitness: [String: Candidate] = [:]
         var propertySelectorsByCandidate: [

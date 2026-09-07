@@ -108,7 +108,7 @@ struct ProjectInstallationTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let projectURL = root.appendingPathComponent("Example.xcodeproj")
         let project = try Hub.ProjectFileParser().parse(projectURL: projectURL)
-        let draft = Hub.OnboardingDraft(
+        var draft = Hub.OnboardingDraft(
             project: project,
             capabilities: try .init([.hotPatch, .liveReload]),
             profiles: [
@@ -137,6 +137,9 @@ struct ProjectInstallationTests {
                 ),
             ]
         )
+        draft.profiles[1].indexing = .init(include: ["Sources/Feature/**"], failurePolicy: .excludeUnresolved)
+        draft.profiles[1].deviceNativeMatrixQualified = true
+        draft.runtimePackageRequirement = .init(kind: .revision, value: String(repeating: "a", count: 40))
         let plan = try Hub.OnboardingPlanner().plan(draft)
         let installer = Hub.ProjectInstaller()
         let first = try installer.install(plan)
@@ -157,10 +160,14 @@ struct ProjectInstallationTests {
         )
         let restored = try Hub.DraftLoader().load(project: installed, record: record)
         #expect(restored.capabilities == draft.capabilities)
+        #expect(restored.runtimePackageRequirement == draft.runtimePackageRequirement)
         #expect(restored.integrationRoot == draft.integrationRoot)
         #expect(restored.profiles.map(\.id) == ["hot", "live"])
         #expect(restored.profiles.map(\.featureTargetName) == ["HotFeature", "LiveFeature"])
         #expect(restored.profiles.first?.patch?.createDevelopmentIdentity == true)
+        #expect(restored.profiles[1].indexing == draft.profiles[1].indexing)
+        #expect(restored.profiles[1].deviceNativeMatrixQualified == true)
+        #expect(try Hub.OnboardingPlanner().plan(restored).hostPlan == plan.hostPlan)
         #expect(installed.target(named: "HelixPatchAction")?.kind == .aggregate)
         #expect(
             installed.target(named: "HotFeature")?
@@ -1525,6 +1532,157 @@ struct ProjectInstallationTests {
         #expect(try FileManager.default.destinationOfSymbolicLink(
             atPath: link.path
         ).hasSuffix("missing.txt"))
+    }
+
+    @Test("Runtime pins update only owned references and reject conflicting package authority")
+    func pinsRuntimePackage() throws {
+        let root = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let projectURL = root.appendingPathComponent("Example.xcodeproj")
+        let projectFile = projectURL.appendingPathComponent("project.pbxproj")
+        let original = try Data(contentsOf: projectFile)
+        let project = try Hub.ProjectFileParser().parse(projectURL: projectURL)
+        var onboarding = try Hub.OnboardingPlanner().plan(.init(project: project, capabilities: .init([.liveReload]),
+            profiles: [.init(id: "live", capability: .liveReload, applicationTargetName: "LiveApp",
+                featureTargetName: "LiveFeature", featureModuleName: "LiveFeature", schemeName: "Live",
+                configurationName: "Debug", bundleIdentifier: "dev.example.live", namespaceSeed: "pin-fixture")]))
+        let revision = String(repeating: "a", count: 40)
+        onboarding.hostPlan.runtimePackageRequirement = .init(kind: .revision, value: revision)
+        let extra = "EXTRA_PRODUCT = {isa = XCSwiftPackageProductDependency; package = HELIXPACKAGE; productName = HelixAppIntegration; };"
+        try Data(String(decoding: original, as: UTF8.self).replacingOccurrences(of: "objects = {", with: "objects = {\n" + extra).utf8).write(to: projectFile)
+        let localBytes = try Data(contentsOf: projectFile)
+        do {
+            _ = try Hub.ProjectInstaller().install(onboarding)
+            Issue.record("An explicit remote pin cannot silently use a local package")
+        } catch {
+            let text = String(describing: error)
+            #expect(text.contains("HELIXPACKAGE") && text.contains("XCLocalSwiftPackageReference"))
+            #expect(text.contains(revision) && text.contains("HostPlan.runtimePackageRequirement"))
+        }
+        #expect(try Data(contentsOf: projectFile) == localBytes)
+        try original.write(to: projectFile)
+        let installer = Hub.ProjectInstaller()
+        _ = try installer.install(onboarding)
+        var parser = try Hub.OpenStep.Parser(data: Data(contentsOf: projectFile))
+        let objects = try #require(try parser.parse().dictionary?["objects"]?.dictionary)
+        let remotes = objects.filter { $0.value.dictionary?["isa"]?.string == "XCRemoteSwiftPackageReference" }
+        try #require(remotes.count == 1)
+        let ownedID = try #require(remotes.keys.first)
+        #expect(remotes[ownedID]?.dictionary?["requirement"]?.dictionary?["revision"]?.string == revision)
+        onboarding.hostPlan.runtimePackageRequirement = .init(kind: .exactVersion, value: "1.2.3")
+        let installed = try installer.install(onboarding)
+        let versionBytes = try Data(contentsOf: projectFile)
+        #expect(String(decoding: versionBytes, as: UTF8.self).contains("exactVersion"))
+        // Existing user-owned references are reusable only when already equal.
+        try Data(String(decoding: versionBytes, as: UTF8.self).replacingOccurrences(of: ownedID, with: "USER_RUNTIME_REFERENCE").utf8).write(to: projectFile)
+        _ = try installer.install(onboarding)
+        let userBytes = try Data(contentsOf: projectFile)
+        let planBytes = try Data(contentsOf: installed.hostPlanURL)
+        onboarding.hostPlan.runtimePackageRequirement = .init(kind: .revision, value: revision)
+        do {
+            _ = try installer.install(onboarding)
+            Issue.record("Conflicting user package policy must fail before publication")
+        } catch {
+            let text = String(describing: error)
+            #expect(text.contains("USER_RUNTIME_REFERENCE") && text.contains("1.2.3") && text.contains(revision))
+        }
+        #expect(try Data(contentsOf: projectFile) == userBytes)
+        #expect(try Data(contentsOf: installed.hostPlanURL) == planBytes)
+        onboarding.hostPlan.runtimePackageRequirement = .init(kind: .exactVersion, value: "1.2.3")
+        try Data(String(decoding: userBytes, as: UTF8.self).replacingOccurrences(of: "objects = {", with: "objects = {\n" + extra).utf8).write(to: projectFile)
+        let ambiguousBytes = try Data(contentsOf: projectFile)
+        do {
+            _ = try installer.install(onboarding)
+            Issue.record("Multiple runtime authorities must not choose the first")
+        } catch {
+            let text = String(describing: error)
+            #expect(text.contains("ambiguous") && text.contains("USER_RUNTIME_REFERENCE") && text.contains("HELIXPACKAGE"))
+        }
+        #expect(try Data(contentsOf: projectFile) == ambiguousBytes)
+    }
+
+    @Test("Headless uninstall validates the applied plan and preserves source, private keys and developer files")
+    func uninstallsThroughCLI() throws {
+        let root = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let projectURL = root.appendingPathComponent("Example.xcodeproj")
+        let projectFile = projectURL.appendingPathComponent("project.pbxproj")
+        let project = try Hub.ProjectFileParser().parse(projectURL: projectURL)
+        let onboarding = try Hub.OnboardingPlanner().plan(.init(project: project, capabilities: .init([.liveReload]),
+            profiles: [.init(id: "live", capability: .liveReload, applicationTargetName: "LiveApp",
+                featureTargetName: "LiveFeature", featureModuleName: "LiveFeature", schemeName: "Live",
+                configurationName: "Debug", bundleIdentifier: "dev.example.live", namespaceSeed: "uninstall-fixture")]))
+        let installed = try Hub.ProjectInstaller().install(onboarding)
+        let backup = root.appendingPathComponent("RemovalPlan.json")
+        try XcodeIntegration.HostPlanCodec.encode(onboarding.hostPlan).write(to: backup)
+        let note = root.appendingPathComponent(".helix/xcode/developer-note.txt")
+        try Data("preserve note".utf8).write(to: note)
+        let key = root.appendingPathComponent("SigningKey.json")
+        try Data("preserve key".utf8).write(to: key)
+        let source = root.appendingPathComponent("Live/Sources/Live.swift")
+        try FileManager.default.createDirectory(at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let sourceBytes = Data("public func live() -> Int { 42 }\n".utf8)
+        try sourceBytes.write(to: source)
+        let installedPBX = try Data(contentsOf: projectFile)
+        var wrong = onboarding.hostPlan
+        wrong.profiles[0].namespaceSeed = "wrong-backup"
+        try XcodeIntegration.HostPlanCodec.encode(wrong).write(to: backup)
+        let app = CLI.Application(currentDirectoryURL: root)
+        let arguments = ["xcode", "uninstall", "--project", projectURL.path, "--plan", backup.path, "--json"]
+        let rejected = app.run(arguments)
+        #expect(rejected.exitCode != 0)
+        #expect(rejected.standardError.contains("wrong-backup") && rejected.standardError.contains("uninstall-fixture"))
+        #expect(try Data(contentsOf: projectFile) == installedPBX)
+        try XcodeIntegration.HostPlanCodec.encode(onboarding.hostPlan).write(to: backup)
+        let removed = app.run(arguments)
+        #expect(removed.exitCode == 0, "\(removed.standardError)")
+        let report = try JSONDecoder().decode(CLI.XcodeUninstallationReport.self, from: Data(removed.standardOutput.utf8))
+        #expect(report.projectPath == projectURL.path && report.hostPlanPath == installed.hostPlanURL.path)
+        #expect(!FileManager.default.fileExists(atPath: installed.hostPlanURL.path))
+        #expect(app.run(arguments).exitCode == 0)
+        #expect(try Data(contentsOf: source) == sourceBytes)
+        #expect(try Data(contentsOf: note) == Data("preserve note".utf8))
+        #expect(try Data(contentsOf: key) == Data("preserve key".utf8))
+        #expect(!String(decoding: try Data(contentsOf: projectFile), as: UTF8.self).contains("Helix Prepare"))
+    }
+
+    @Test("Install and both removal entry points reject a competing project operation without writes")
+    func coordinatesProjectOperations() throws {
+        let root = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let projectURL = root.appendingPathComponent("Example.xcodeproj")
+        let projectFile = projectURL.appendingPathComponent("project.pbxproj")
+        let project = try Hub.ProjectFileParser().parse(projectURL: projectURL)
+        let onboarding = try Hub.OnboardingPlanner().plan(.init(project: project, capabilities: .init([.liveReload]),
+            profiles: [.init(id: "live", capability: .liveReload, applicationTargetName: "LiveApp",
+                featureTargetName: "LiveFeature", featureModuleName: "LiveFeature", schemeName: "Live",
+                configurationName: "Debug", bundleIdentifier: "dev.example.live", namespaceSeed: "lock-fixture")]))
+        let installer = Hub.ProjectInstaller()
+        let lock = try Hub.ProjectOperationLock(projectURL: projectURL)
+        defer { lock.unlock() }
+        let original = try Data(contentsOf: projectFile)
+        #expect(throws: Hub.Error.self) { try installer.install(onboarding) }
+        #expect(throws: Hub.Error.self) { try installer.uninstall(project: project, plan: onboarding.hostPlan) }
+        #expect(try Data(contentsOf: projectFile) == original)
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent(".helix/xcode/HostPlan.json").path))
+        let alias = root.appendingPathComponent("Alias.xcodeproj")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: projectURL)
+        #expect(throws: Hub.Error.self) { try Hub.ProjectOperationLock(projectURL: alias) }
+        let independent = root.appendingPathComponent("Other.xcodeproj")
+        try FileManager.default.createDirectory(at: independent, withIntermediateDirectories: false)
+        let independentLock = try Hub.ProjectOperationLock(projectURL: independent)
+        independentLock.unlock()
+        lock.unlock()
+        let installed = try installer.install(onboarding)
+        let held = try Hub.ProjectOperationLock(projectURL: projectURL)
+        defer { held.unlock() }
+        let record = try Hub.ProjectRecord(name: project.name, projectURL: projectURL, hostPlanURL: installed.hostPlanURL,
+            removalPlan: installed.hostPlan, capabilities: installed.capabilities, requirements: [], developmentIdentityProfiles: [])
+        let installedBytes = try Data(contentsOf: projectFile)
+        #expect(throws: Hub.Error.self) { try installer.uninstall(project: project, record: record) }
+        #expect(try Data(contentsOf: projectFile) == installedBytes)
+        held.unlock()
+        try installer.uninstall(project: project, plan: onboarding.hostPlan)
     }
 
     private func fixture() throws -> URL {

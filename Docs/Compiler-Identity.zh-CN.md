@@ -43,11 +43,23 @@ conformance；有歧义的类型及其后代不能通过打印名提供布局、
 existential 分支。其他声明仍可分析，精确 witness 符号按 module 建立成员索引。
 这不代表已支持降低这些有歧义的局部类型本身。
 
-源码位置冲突时，receipt 分析批量调用捕获工具链的
-`swift-demangle --expand --tree-only`，区分显式 closure、autoclosure、普通函数、
-accessor 和 witness thunk；AST 闭包 discriminator 进一步约束匹配。未知角色和仍有
-歧义的同角色候选保持 fail closed，错误包含每个符号、ABI、角色及位置。没有位置冲突
-时，不额外启动 symbol-tree demangler。
+精确 AST USR/SIL 符号命中保留快速路径。按源码坐标回退时，receipt 分析批量调用
+捕获工具链的 `swift-demangle --expand --tree-only`，单候选也必须通过角色验证。
+`Static` 包装层保留底层 getter/function 角色；addressor、witness/reabstraction helper、
+partial-apply forwarder 和 Objective-C/C 适配属性不能替代 Swift 源码声明。显式 closure
+与 autoclosure 保持独立，只用闭包实体自己的 discriminator 约束匹配。未知包装层、
+未知角色及仍有歧义的同角色候选保持 fail closed，错误包含全部符号、ABI、包装层、
+角色和位置。分析先集中收集回退候选，单独出现的闭包也使用有界批次；精确 USR
+命中不需要 symbol-tree 子进程。
+
+声明发现可按逻辑文件限定范围，并在被消费的 AST/SIL 映射有歧义或缺失时排除有明确
+源码归属的声明。编译器 USR 与逻辑文件绑定整组 accessor/closure，不猜测候选，已收集
+的局部 body operation 会回滚。编译器、源码、类型、ABI、Catalog 的全局校验仍须通过。
+Live Reload 默认局部排除，Hot Patch/headless 默认严格，均可显式覆盖。策略进入
+receipt/Prepare 缓存 identity，范围外源码仍保留整模块失效权威。Host Plan v2 承载范围，
+不带新配置的 v1 继续可读。默认值、诊断与迁移边界见
+[大型工程接入](Large-Project-Integration.zh-CN.md#声明范围与局部排除)。
+
 
 Objective-C 扁平 runtime 名及其已知 module、`__C` / `__ObjC` 限定形式，只有在
 reference/runtime 证据明确时才视为 ABI 拼写，不再与 `NS_SWIFT_NAME` 嵌套 overlay
@@ -60,3 +72,8 @@ scope；无效的类型摘要或 conformance 不提供类型及 operation 事实
 一起汇总，共用正常 parser 的实现，不构造部分有效的 File。诊断 JSON 单独迁移到
 schema 2，增加可选 `requestedStages`；旧报告字段缺省表示完整 receipt 范围。
 局部通过只证明所选检查及其依赖通过，具体见[诊断指南](Large-Project-Integration.zh-CN.md#一次收集独立的-frontend-问题)。
+
+compiler proxy 现在在编译前保存 `FrontendAttempt.hlxswiftc`，供 `helix xcode preflight`
+使用（默认 `inputs,typed-ast`）。只有成功编译才更新 `FrontendInvocation.hlxswiftc` 并运行
+post-compile。仅输入预检不生成 AST/SIL，也不扫描依赖缓存；typed 检查仍需要可用的编译
+依赖，局部检查通过不代表完整 receipt 或 runtime 支持。见[预检说明](Large-Project-Integration.zh-CN.md#成功构建前的预检)。

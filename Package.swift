@@ -154,7 +154,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "HelixHubApp",
-            dependencies: ["HelixHubCore"],
+            dependencies: ["HelixHubCore", "HelixBuildTools"],
             path: "Hub/Sources/Helix"
         ),
         .executableTarget(

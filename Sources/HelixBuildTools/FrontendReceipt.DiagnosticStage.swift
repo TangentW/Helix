@@ -4,6 +4,7 @@ extension FrontendReceipt {
 /// Selectable diagnostic roots. Their necessary compiler/input checks are
 /// included automatically; only `receipt` validates the complete receipt.
 public enum DiagnosticStage: String, Codable, CaseIterable, Sendable {
+    case inputs
     case typedAST = "typed-ast"
     case identitySIL = "identity-sil"
     case semanticSIL = "semantic-sil"
@@ -16,6 +17,7 @@ public enum DiagnosticStage: String, Codable, CaseIterable, Sendable {
 
     var roots: [String] {
         switch self {
+        case .inputs: ["frontend.validate_request", "frontend.load_sources", "frontend.toolchain_identity"]
         case .typedAST: ["frontend.typed_ast"]
         case .identitySIL: ["frontend.identity_sil"]
         case .semanticSIL: ["frontend.semantic_sil"]
@@ -39,10 +41,11 @@ enum DiagnosticPlan {
             "frontend.toolchain_identity": ["frontend.validate_request"],
             "frontend.typed_ast": compiler,
             "frontend.demangle_types": ["frontend.typed_ast"],
+            "frontend.select_declarations": ["frontend.typed_ast", "frontend.load_sources"],
             "frontend.resolve_calling_surface": ["frontend.validate_request"],
             "frontend.discover_source_nominals": nominals,
             "frontend.discover_imported_types": nominals,
-            "frontend.discover_imported_operations": nominals + ["frontend.semantic_sil"],
+            "frontend.discover_imported_operations": nominals + ["frontend.semantic_sil", "frontend.semantic_sil.ast_mapping"],
             "frontend.resolve_native_api_catalogs": ["frontend.typed_ast", "frontend.toolchain_identity"],
             "frontend.merge_imported_types": ["frontend.discover_imported_types", "frontend.discover_imported_operations", "frontend.resolve_native_api_catalogs"],
             "frontend.receipt": ["frontend.identity_sil", "frontend.semantic_sil", "frontend.resolve_calling_surface",
@@ -52,7 +55,7 @@ enum DiagnosticPlan {
         for prefix in ["frontend.identity_sil", "frontend.semantic_sil"] {
             graph[prefix] = compiler
             graph[prefix + ".function_locations"] = [prefix]
-            graph[prefix + ".ast_mapping"] = ["frontend.typed_ast", "frontend.load_sources", prefix + ".function_locations"]
+            graph[prefix + ".ast_mapping"] = ["frontend.select_declarations", prefix + ".function_locations"]
         }
         return graph
     }()

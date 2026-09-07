@@ -91,7 +91,7 @@ struct HubApplicationEditorTests {
     @Test("Configured workflows can be changed or removed from the active plan")
     func preservesInstalledCapability() throws {
         let value = project()
-        let live = Hub.ProfileDraft(
+        var live = Hub.ProfileDraft(
             id: "live-reload",
             capability: .liveReload,
             applicationTargetName: "ReloadApp",
@@ -102,11 +102,14 @@ struct HubApplicationEditorTests {
             bundleIdentifier: "dev.example.reload",
             namespaceSeed: "example-live"
         )
-        let draft = Hub.OnboardingDraft(
+        live.indexing = .init(include: ["Sources/Feature/**"], failurePolicy: .excludeUnresolved)
+        live.deviceNativeMatrixQualified = true
+        var draft = Hub.OnboardingDraft(
             project: value,
             capabilities: try .init([.liveReload]),
             profiles: [live]
         )
+        draft.runtimePackageRequirement = .init(kind: .exactVersion, value: "1.2.3")
         var editor = HubApplication.Editor(
             project: value,
             draft: draft,
@@ -114,6 +117,9 @@ struct HubApplicationEditorTests {
         )
 
         #expect(editor.forms.first { $0.capability == .liveReload }?.isInstalled == true)
+        #expect(try editor.selections().first?.indexing == live.indexing)
+        #expect(try editor.selections().first?.deviceNativeMatrixQualified == true)
+        #expect(editor.runtimePackageRequirement == draft.runtimePackageRequirement)
         #expect(editor.hasInstalledCapabilities)
         #expect(editor.forms.first { $0.capability == .hotPatch }?.isEnabled == false)
         editor.setEnabled(false, capability: .liveReload)

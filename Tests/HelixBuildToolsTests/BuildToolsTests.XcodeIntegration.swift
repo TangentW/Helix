@@ -379,6 +379,13 @@ struct XcodeIntegrationContract {
             "Intermediates/Demo.build/Debug/Feature.build/Helix/FrontendInvocation.hlxswiftc"
         )
         #expect(!FileManager.default.fileExists(atPath: recordURL.path))
+        let attemptURL = recordURL.deletingLastPathComponent()
+            .appendingPathComponent(XcodeIntegration.CompilerCapture.attemptFileName)
+        let attempt = try BuildCapture.SwiftInvocationReader().readFrontendJob(at: attemptURL)
+        #expect(attempt.executable == realCompiler.path)
+        #expect(attempt.arguments == (failedCompilation.arguments ?? []))
+        let attemptAttributes = try FileManager.default.attributesOfItem(atPath: attemptURL.path)
+        #expect((attemptAttributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
 
         compilation.environment = [
             "HELIX_REAL_SWIFT_EXEC": realCompiler.path,
@@ -407,6 +414,66 @@ struct XcodeIntegrationContract {
             atPath: recordURL.path
         )
         #expect((attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+        let successfulBytes = try Data(contentsOf: recordURL)
+        try FileManager.default.removeItem(at: callbackCapture)
+        let laterFailure = Process()
+        laterFailure.executableURL = proxy
+        laterFailure.arguments = (compilation.arguments ?? []) + ["-D", "LATER_ATTEMPT"]
+        laterFailure.environment = failedCompilation.environment
+        laterFailure.standardOutput = Pipe()
+        laterFailure.standardError = Pipe()
+        try laterFailure.run()
+        laterFailure.waitUntilExit()
+        #expect(laterFailure.terminationStatus == 23)
+        #expect(try Data(contentsOf: recordURL) == successfulBytes)
+        #expect(try BuildCapture.SwiftInvocationReader().readFrontendJob(at: attemptURL).arguments == laterFailure.arguments)
+        #expect(!FileManager.default.fileExists(atPath: callbackCapture.path))
+        #expect(try FileManager.default.contentsOfDirectory(atPath: recordURL.deletingLastPathComponent().path)
+            .allSatisfy { !$0.hasPrefix(".Frontend") })
+        // The later failed attempt must not replace an earlier invocation's
+        // private bytes when that earlier compiler eventually succeeds.
+        let ready = root.appendingPathComponent("Ready")
+        let release = root.appendingPathComponent("Release")
+        try Data("""
+        #!/bin/sh
+        if [ "${HELIX_FIXTURE_SLOW:-}" = 1 ]; then
+            touch "$HELIX_FIXTURE_READY"
+            while [ ! -f "$HELIX_FIXTURE_RELEASE" ]; do sleep 0.01; done
+        else
+            exit 23
+        fi
+        """.utf8).write(to: realCompiler)
+        let slow = Process()
+        slow.executableURL = proxy
+        slow.arguments = (compilation.arguments ?? []) + ["-D", "SLOW_SUCCESS"]
+        slow.environment = ["HELIX_REAL_SWIFT_EXEC": realCompiler.path, "HELIX_FIXTURE_SLOW": "1",
+            "HELIX_FIXTURE_READY": ready.path, "HELIX_FIXTURE_RELEASE": release.path,
+            "HELIX_POST_CAPTURE": callbackCapture.path]
+        slow.standardOutput = Pipe()
+        slow.standardError = Pipe()
+        try slow.run()
+        defer {
+            try? Data().write(to: release)
+            if slow.isRunning { slow.terminate(); slow.waitUntilExit() }
+        }
+        let deadline = Date().addingTimeInterval(5)
+        while !FileManager.default.fileExists(atPath: ready.path), Date() < deadline { Thread.sleep(forTimeInterval: 0.01) }
+        try #require(FileManager.default.fileExists(atPath: ready.path))
+        let fast = Process()
+        fast.executableURL = proxy
+        fast.arguments = (compilation.arguments ?? []) + ["-D", "FAST_FAILURE"]
+        fast.environment = compilation.environment
+        fast.standardOutput = Pipe()
+        fast.standardError = Pipe()
+        try fast.run()
+        fast.waitUntilExit()
+        #expect(fast.terminationStatus == 23)
+        try Data().write(to: release)
+        slow.waitUntilExit()
+        #expect(slow.terminationStatus == 0)
+        #expect(try BuildCapture.SwiftInvocationReader().readFrontendJob(at: recordURL).arguments == slow.arguments)
+        #expect(try BuildCapture.SwiftInvocationReader().readFrontendJob(at: attemptURL).arguments == fast.arguments)
+
     }
 
     @Test("Compiler scheduling uses one stable target-owned source")

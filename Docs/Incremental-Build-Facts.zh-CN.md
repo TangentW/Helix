@@ -12,6 +12,15 @@ specialization。任何缓存事实在使用前都要重新匹配当前语义输
 `~/Library/Caches/Helix/BuildFacts`；`HELIX_BUILD_CACHE_DIR` 只是测试和排障时可选的
 覆盖入口。
 
+
+声明发现可按逻辑文件限定范围，并在被消费的 AST/SIL 映射有歧义或缺失时排除有明确
+源码归属的声明。编译器 USR 与逻辑文件绑定整组 accessor/closure，不猜测候选，已收集
+的局部 body operation 会回滚。编译器、源码、类型、ABI、Catalog 的全局校验仍须通过。
+Live Reload 默认局部排除，Hot Patch/headless 默认严格，均可显式覆盖。策略进入
+receipt/Prepare 缓存 identity，范围外源码仍保留整模块失效权威。Host Plan v2 承载范围，
+不带新配置的 v1 继续可读。默认值、诊断与迁移边界见
+[大型工程接入](Large-Project-Integration.zh-CN.md#声明范围与局部排除)。
+
 ## 分层复用什么
 
 | 层级 | 复用内容 | 什么变化会让它失效 |
@@ -297,3 +306,8 @@ helix xcode catalog-prewarm --job "/absolute/path/to/job.json" --max-modules 1
 跳过校验的跨机器 Catalog 导入。工具链、SDK、target、语义参数、模块字节和 transform
 身份仍须匹配。冷生成成本取决于各模块实际 API 面，不能把 UIKit 历史约 230 秒的单点
 数据乘以 import 数量，当成已经测得的大工程预热时间。
+
+compiler proxy 现在在编译前保存 `FrontendAttempt.hlxswiftc`，供 `helix xcode preflight`
+使用（默认 `inputs,typed-ast`）。只有成功编译才更新 `FrontendInvocation.hlxswiftc` 并运行
+post-compile。仅输入预检不生成 AST/SIL，也不扫描依赖缓存；typed 检查仍需要可用的编译
+依赖，局部检查通过不代表完整 receipt 或 runtime 支持。见[预检说明](Large-Project-Integration.zh-CN.md#成功构建前的预检)。

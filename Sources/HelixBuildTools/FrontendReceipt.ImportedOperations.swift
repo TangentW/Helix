@@ -8,6 +8,7 @@ extension FrontendReceipt.Adapter {
     struct ImportedOperationSurface: Sendable {
         var types: [ImportedNativeType]
         var operations: [ImportedOperation]
+        var exclusions: [FrontendReceipt.DeclarationSelection.Exclusion] = []
     }
 
     struct ImportedOperation: Codable, Hashable, Sendable {
@@ -215,7 +216,10 @@ extension FrontendReceipt.Adapter {
         demangled: [String: String],
         silFile: CanonicalSIL.File,
         compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
-        performance: BuildPerformance.Recorder? = nil
+        performance: BuildPerformance.Recorder? = nil,
+        silResolver suppliedResolver: FrontendReceipt.SILFunctionResolver? = nil,
+        failurePolicy: FrontendReceipt.DeclarationFailurePolicy = .strict,
+        onExclusions: (([FrontendReceipt.DeclarationSelection.Exclusion]) -> Void)? = nil
     ) throws -> ImportedOperationSurface {
         func measure<Value>(
             _ name: String,
@@ -231,7 +235,11 @@ extension FrontendReceipt.Adapter {
         }
         var types: [ImportedNativeType] = []
         var operations: [ImportedOperation] = []
-        let silResolver = try FrontendReceipt.SILFunctionResolver(file: silFile).resolvingCollisions(using: .init(
+        var exclusions: [FrontendReceipt.DeclarationSelection.Exclusion] = []
+        // Retain local diagnostics even if a later global type/ABI merge fails.
+        defer { onExclusions?(exclusions) }
+        let silResolver = try suppliedResolver ?? FrontendReceipt.SILFunctionResolver(file: silFile).resolvingSourceMappings(
+            in: documents, sourcesByPhysicalPath: sourcesByPhysicalPath, using: .init(
             compilerURL: compilerURL, invocationObserver: performance?.subprocessObserver))
 
         try measure("collect") {
@@ -266,7 +274,9 @@ extension FrontendReceipt.Adapter {
                     demangled: demangled,
                     silResolver: silResolver,
                     types: &types,
-                    operations: &operations
+                    operations: &operations,
+                    exclusions: &exclusions,
+                    failurePolicy: failurePolicy
                 )
             }
         }
@@ -285,7 +295,8 @@ extension FrontendReceipt.Adapter {
                     in: mergedOperations,
                     types: mergedTypes
                 )
-            }
+            },
+            exclusions: exclusions
         )
     }
 
@@ -861,7 +872,9 @@ extension FrontendReceipt.Adapter {
         demangled: [String: String],
         silResolver: FrontendReceipt.SILFunctionResolver,
         types: inout [ImportedNativeType],
-        operations: inout [ImportedOperation]
+        operations: inout [ImportedOperation],
+        exclusions: inout [FrontendReceipt.DeclarationSelection.Exclusion],
+        failurePolicy: FrontendReceipt.DeclarationFailurePolicy
     ) throws {
         for value in items {
             guard let item = value as? [String: Any],
@@ -874,42 +887,56 @@ extension FrontendReceipt.Adapter {
                let usr = item["usr"] as? String,
                usr.hasPrefix("s:"),
                let body = item["body"] as? [String: Any] {
-                let astSymbol = "$s" + usr.dropFirst(2)
-                guard let sil = try silResolver.function(
-                    for: item,
-                    source: source,
-                    baseName: baseName(in: item)
-                )
-                else {
-                    throw FrontendReceipt.Error.missingSILFunction(astSymbol)
-                }
-                // Swift compiler operations do not require an explicit module
-                // import; framework expression discovery does.
-                recordAnyObjectBridge(
-                    function: sil,
-                    source: source,
-                    types: &types,
-                    operations: &operations
-                )
-                if !importedModules.isEmpty {
-                    let callbackActorBindings = callbackActorBindings(
-                        in: body,
-                        demangled: demangled
-                    )
-                    try visitImportedExpression(
-                        body,
-                        role: .value,
-                        function: sil,
-                        requiresMainActor: requiresMainActor,
+                let typeStart = types.count
+                let operationStart = operations.count
+                do {
+                    let astSymbol = "$s" + usr.dropFirst(2)
+                    guard let sil = try silResolver.function(
+                        for: item,
                         source: source,
-                        importedModules: importedModules,
-                        moduleName: moduleName,
-                        demangled: demangled,
-                        silResolver: silResolver,
-                        callbackActorBindings: callbackActorBindings,
+                        baseName: baseName(in: item)
+                    )
+                    else {
+                        throw FrontendReceipt.Error.missingSILFunction(astSymbol)
+                    }
+                    // Swift compiler operations do not require an explicit module
+                    // import; framework expression discovery does.
+                    recordAnyObjectBridge(
+                        function: sil,
+                        source: source,
                         types: &types,
                         operations: &operations
                     )
+                    if !importedModules.isEmpty {
+                        let callbackActorBindings = callbackActorBindings(
+                            in: body,
+                            demangled: demangled
+                        )
+                        try visitImportedExpression(
+                            body,
+                            role: .value,
+                            function: sil,
+                            requiresMainActor: requiresMainActor,
+                            source: source,
+                            importedModules: importedModules,
+                            moduleName: moduleName,
+                            demangled: demangled,
+                            silResolver: silResolver,
+                            callbackActorBindings: callbackActorBindings,
+                            types: &types,
+                            operations: &operations
+                        )
+                    }
+                } catch {
+                    guard failurePolicy == .excludeUnresolved,
+                          FrontendReceipt.DeclarationSelection.isMappingFailure(error),
+                          let declaration = FrontendReceipt.DeclarationSelection.declaration(in: item, source: source)
+                    else { throw error }
+                    // Body collectors only append. Roll back both suffixes if a
+                    // nested closure cannot be mapped; no partial capability survives.
+                    types.removeSubrange(typeStart..<types.count)
+                    operations.removeSubrange(operationStart..<operations.count)
+                    exclusions.append(.init(declaration: declaration, reasons: ["frontend.discover_imported_operations: \(error)"]))
                 }
             }
 
@@ -923,7 +950,9 @@ extension FrontendReceipt.Adapter {
                     demangled: demangled,
                     silResolver: silResolver,
                     types: &types,
-                    operations: &operations
+                    operations: &operations,
+                    exclusions: &exclusions,
+                    failurePolicy: failurePolicy
                 )
             }
         }

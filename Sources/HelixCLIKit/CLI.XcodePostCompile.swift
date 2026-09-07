@@ -14,7 +14,8 @@ struct XcodePostCompileResolver {
         planURL: URL,
         profileID: String,
         captureURL: URL,
-        environment: [String: String]
+        environment: [String: String],
+        allowAttempt: Bool = false
     ) throws -> XcodeIntegration.BuildContext {
         try plan.validate()
         let profile = try plan.profile(id: profileID)
@@ -34,7 +35,8 @@ struct XcodePostCompileResolver {
 
         let layout = try derivedDataLayout(
             captureURL: captureURL,
-            configurationName: profile.configurationName
+            configurationName: profile.configurationName,
+            allowAttempt: allowAttempt
         )
         let target = try targetIdentity(job.targetTriple)
         guard target.platformName == layout.platformName else {
@@ -177,11 +179,13 @@ struct XcodePostCompileResolver {
 
     private func derivedDataLayout(
         captureURL: URL,
-        configurationName: String
+        configurationName: String,
+        allowAttempt: Bool
     ) throws -> DerivedDataLayout {
         let capture = captureURL.standardizedFileURL
-        guard capture.lastPathComponent
-                == XcodeIntegration.CompilerCapture.invocationFileName,
+        let validNames = [XcodeIntegration.CompilerCapture.invocationFileName]
+            + (allowAttempt ? [XcodeIntegration.CompilerCapture.attemptFileName] : [])
+        guard validNames.contains(capture.lastPathComponent),
               capture.deletingLastPathComponent().lastPathComponent == "Helix"
         else {
             throw XcodePostCompileError.invalid("Swift compiler capture path")

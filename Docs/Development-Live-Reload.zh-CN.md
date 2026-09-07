@@ -257,6 +257,15 @@ Tuple label 同样只属于编译期结构：frontend 若用 Array 或 Dictionar
 
 ## 调试与诊断
 
+声明发现可按逻辑文件限定范围，并在被消费的 AST/SIL 映射有歧义或缺失时排除有明确
+源码归属的声明。编译器 USR 与逻辑文件绑定整组 accessor/closure，不猜测候选，已收集
+的局部 body operation 会回滚。编译器、源码、类型、ABI、Catalog 的全局校验仍须通过。
+Live Reload 默认局部排除，Hot Patch/headless 默认严格，均可显式覆盖。策略进入
+receipt/Prepare 缓存 identity，范围外源码仍保留整模块失效权威。Host Plan v2 承载范围，
+不带新配置的 v1 继续可读。默认值、诊断与迁移边界见
+[大型工程接入](Large-Project-Integration.zh-CN.md#声明范围与局部排除)。
+
+
 HLBC 是验证后字节码而不是 Mach-O image，因此没有原生 dSYM。编译器 debug metadata 会降低成经过 Verifier 检查的 function/block/instruction → 逻辑 Swift 文件、行、列映射；生产 artifact 会移除构建机绝对路径。反汇编使用该映射标注指令；发生 trap 时 VM 给出精确 program counter，Runtime 再补充固定的 generation、Shell entry、函数名与逻辑源码位置。
 
 终端与 Debug Overlay 会报告 source revision、generation、backend、激活结果、UI 刷新结果、旧代码是否仍然有效以及下一步动作。失败的保存不会被展示成成功热重载。HLBC 的交互式 breakpoint、单步和表达式求值仍是后续工作；原生开发 generation 会生成并注册自己的 dSYM artifact。
@@ -271,3 +280,8 @@ let environment = DevRuntime.LiveReloadEnvironment(
     )
 )
 ```
+
+compiler proxy 现在在编译前保存 `FrontendAttempt.hlxswiftc`，供 `helix xcode preflight`
+使用（默认 `inputs,typed-ast`）。只有成功编译才更新 `FrontendInvocation.hlxswiftc` 并运行
+post-compile。仅输入预检不生成 AST/SIL，也不扫描依赖缓存；typed 检查仍需要可用的编译
+依赖，局部检查通过不代表完整 receipt 或 runtime 支持。见[预检说明](Large-Project-Integration.zh-CN.md#成功构建前的预检)。

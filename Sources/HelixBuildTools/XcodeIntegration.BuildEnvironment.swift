@@ -110,6 +110,10 @@ public struct BuildContext: Sendable {
     public var feature: XcodeIntegration.Feature
     public var environment: XcodeIntegration.BuildEnvironment
 
+    public var indexingOptions: FrontendReceipt.IndexingOptions {
+        feature.indexing ?? .init(failurePolicy: profile.workflow == .liveReload ? .excludeUnresolved : .strict)
+    }
+
     public init(
         planURL: URL,
         plan: XcodeIntegration.HostPlan,

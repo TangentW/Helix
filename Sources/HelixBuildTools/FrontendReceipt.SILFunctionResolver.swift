@@ -18,6 +18,7 @@ struct SILFunctionResolver: Sendable {
         DeclarationLocationKey: [CanonicalSIL.Function]
     ]
     private var symbolIdentities: [String: FrontendReceipt.SILSymbolIdentity] = [:]
+    private var demangler: FrontendReceipt.Demangler?
 
     init(file: CanonicalSIL.File) {
         self.init(functions: file.functions)
@@ -52,6 +53,44 @@ struct SILFunctionResolver: Sendable {
         let symbols = Set(functionsByDeclarationLocation.values.filter { $0.count > 1 }
             .flatMap { $0.map(\.mangledName) })
         result.symbolIdentities = try demangler.symbolIdentities(symbols)
+        result.demangler = demangler
+        return result
+    }
+
+    /// Only location fallbacks need role evidence. Collect them before walking
+    /// declarations so thousands of unique closures still use bounded batches.
+    func resolvingSourceMappings(
+        in documents: [FrontendReceipt.TypedAST.Object],
+        sourcesByPhysicalPath: [String: FrontendReceipt.Adapter.SourceState],
+        using demangler: FrontendReceipt.Demangler
+    ) throws -> Self {
+        let selection = try FrontendReceipt.DeclarationSelection(documents: documents,
+            sourcesByPhysicalPath: sourcesByPhysicalPath, options: nil)
+        return try resolvingSourceMappings(members: selection.members, using: demangler)
+    }
+
+    /// Reuse the validated declaration inventory for both SIL purposes.
+    func resolvingSourceMappings(
+        members: [FrontendReceipt.DeclarationSelection.Member],
+        using demangler: FrontendReceipt.Demangler
+    ) throws -> Self {
+        var symbols = Set<String>()
+        for member in members {
+            try Task.checkCancellation()
+            let item = member.item
+            let kind = item["_kind"] as? String
+            let symbol = (item["usr"] as? String).flatMap { $0.hasPrefix("s:") ? "$s" + $0.dropFirst(2) : nil }
+            if (kind == "closure_expr" || symbol != nil), symbol.flatMap({ functionsByMangledName[$0] }) == nil,
+               let location = declarationLocation(for: item, source: member.source,
+                   baseName: kind == "func_decl" ? FrontendReceipt.Adapter().baseName(in: item) : nil) {
+                let key = DeclarationLocationKey(file: Self.canonicalPath(member.source.url.path),
+                    line: location.line, column: location.column)
+                symbols.formUnion((functionsByDeclarationLocation[key] ?? []).map(\.mangledName))
+            }
+        }
+        var result = self
+        result.symbolIdentities = try demangler.symbolIdentities(symbols)
+        result.demangler = demangler
         return result
     }
 
@@ -83,14 +122,8 @@ struct SILFunctionResolver: Sendable {
             column: location.column
         )
         let candidates = functionsByDeclarationLocation[key] ?? []
-        let matches = disambiguate(candidates, item: item)
-        guard matches.count <= 1 else {
-            throw FrontendReceipt.Error.ambiguousSILFunction(
-                "\(astSymbol) at \(location.file):\(location.line):\(location.column)",
-                candidates.map(evidence).sorted()
-            )
-        }
-        return matches.first
+        return try resolve(candidates, item: item,
+            declaration: "\(astSymbol) at \(location.file):\(location.line):\(location.column)")
     }
 
     func function(
@@ -110,25 +143,26 @@ struct SILFunctionResolver: Sendable {
             column: location.column
         )
         let candidates = functionsByDeclarationLocation[key] ?? []
-        let matches = disambiguate(candidates, item: item)
-        guard matches.count <= 1 else {
-            throw FrontendReceipt.Error.ambiguousSILFunction(
-                "closure@\(location.file):\(location.line):\(location.column), AST discriminator=\(item["discriminator"] ?? "unavailable")",
-                candidates.map(evidence).sorted()
-            )
-        }
-        return matches.first
+        return try resolve(candidates, item: item,
+            declaration: "closure@\(location.file):\(location.line):\(location.column), AST discriminator=\(item["discriminator"] ?? "unavailable")")
     }
 
-    private func evidence(_ function: CanonicalSIL.Function) -> String {
-        "\(function.mangledName): \(function.loweredType), \(symbolIdentities[function.mangledName]?.evidence ?? "symbol tree unavailable"), location=\(String(describing: function.declarationLocation))"
-    }
-
-    private func disambiguate(
+    private func resolve(
         _ candidates: [CanonicalSIL.Function],
-        item: FrontendReceipt.TypedAST.Object
-    ) -> [CanonicalSIL.Function] {
-        guard candidates.count > 1 else { return candidates }
+        item: FrontendReceipt.TypedAST.Object,
+        declaration: String
+    ) throws -> CanonicalSIL.Function? {
+        guard !candidates.isEmpty else { return nil }
+        let missing = Set(candidates.compactMap { symbolIdentities[$0.mangledName] == nil ? $0.mangledName : nil })
+        let additional = try demangler?.symbolIdentities(missing) ?? [:]
+        func identity(for symbol: String) -> FrontendReceipt.SILSymbolIdentity? {
+            symbolIdentities[symbol] ?? additional[symbol]
+        }
+        func ambiguous() -> FrontendReceipt.Error {
+            .ambiguousSILFunction(declaration, candidates.map {
+                "\($0.mangledName): \($0.loweredType), \(identity(for: $0.mangledName)?.evidence ?? "symbol tree unavailable"), location=\(String(describing: $0.declarationLocation))"
+            }.sorted())
+        }
         let expected: String?
         switch item["_kind"] as? String {
         case "closure_expr": expected = "ExplicitClosure"
@@ -140,30 +174,28 @@ struct SILFunctionResolver: Sendable {
             expected = kinds.count == 1 ? kinds[0] : nil
         default: expected = nil
         }
-        guard let expected else { return candidates }
+        guard let expected else { throw ambiguous() }
         let discriminator = (item["discriminator"] as? String).flatMap(Int.init)
-        let knownRoles: Set<String> = ["Function", "Getter", "Setter", "ReadAccessor", "ModifyAccessor",
-            "WillSet", "DidSet", "ExplicitClosure", "ImplicitClosure", "ProtocolWitness",
-            "ReabstractionThunk", "ReabstractionThunkHelper", "CurryThunk", "DispatchThunk"]
         let matches = candidates.filter { function in
-            guard let identity = symbolIdentities[function.mangledName],
-                  let kind = identity.kind, knownRoles.contains(kind) else {
+            guard let identity = identity(for: function.mangledName) else { return true }
+            if identity.isAdapter { return false }
+            guard let kind = identity.kind, FrontendReceipt.SILSymbolIdentity.sourceRoles.contains(kind) else {
                 // Unknown compiler roles cannot be discarded to manufacture a
                 // unique candidate. They remain in the fail-closed diagnostic.
                 return true
             }
             guard kind == expected else { return false }
+            if item["static"] as? Bool == true, !identity.isStatic { return false }
             if expected == "ExplicitClosure", let discriminator,
                let actual = identity.discriminator { return actual == discriminator }
             return true
         }
-        if matches.count == 1, let selected = matches.first {
-            let identity = symbolIdentities[selected.mangledName]
-            guard identity?.kind == expected,
-                  expected != "ExplicitClosure" || discriminator == nil
-                    || identity?.discriminator == discriminator else { return candidates }
-        }
-        return matches
+        guard !matches.isEmpty else { return nil }
+        guard matches.count == 1, let selected = matches.first,
+              let identity = identity(for: selected.mangledName), identity.kind == expected,
+              expected != "ExplicitClosure" || discriminator == nil || identity.discriminator == discriminator
+        else { throw ambiguous() }
+        return selected
     }
 
     private func declarationLocation(

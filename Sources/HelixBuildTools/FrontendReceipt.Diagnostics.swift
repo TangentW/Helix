@@ -50,6 +50,7 @@ final class DiagnosticSession {
     let performance: BuildPerformance.Recorder
     private(set) var checks: [DiagnosticCheck] = []
     private var statuses: [String: DiagnosticCheck.Status] = [:]
+    var indexingDiagnostics: [Core.Diagnostic] = []
     let requestedStages: [DiagnosticStage]?
     private let requiredStages: Set<String>?
 
@@ -112,7 +113,7 @@ final class DiagnosticSession {
             record("frontend.receipt", status: .passed)
         }
         return .init(passed: (output != nil || selectedComplete) && !checks.isEmpty && checks.allSatisfy { $0.status == .passed },
-                     checks: checks, diagnostics: output?.diagnostics ?? [], performance: performance.trace(), requestedStages: requestedStages)
+                     checks: checks, diagnostics: output?.diagnostics ?? indexingDiagnostics, performance: performance.trace(), requestedStages: requestedStages)
     }
 }
 }

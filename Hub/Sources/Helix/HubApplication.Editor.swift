@@ -1,5 +1,6 @@
 #if os(macOS)
 import Foundation
+import HelixBuildTools
 import HelixHubCore
 
 enum HubApplication {}
@@ -18,6 +19,8 @@ struct WorkflowForm: Hashable, Sendable, Identifiable {
     var bundleIdentifier: String
     var namespaceSeed: String
     var patch: Hub.PatchDraft?
+    var indexing: FrontendReceipt.IndexingOptions? = nil
+    var deviceNativeMatrixQualified: Bool? = nil
 
     var id: Hub.Capability { capability }
 
@@ -26,7 +29,7 @@ struct WorkflowForm: Hashable, Sendable, Identifiable {
     }
 
     func selection() -> Hub.WorkflowSelection {
-        .init(
+        var result = Hub.WorkflowSelection(
             capability: capability,
             profileID: profileID,
             applicationTargetName: applicationTargetName,
@@ -38,6 +41,9 @@ struct WorkflowForm: Hashable, Sendable, Identifiable {
             namespaceSeed: namespaceSeed,
             patch: patch
         )
+        result.indexing = indexing
+        result.deviceNativeMatrixQualified = deviceNativeMatrixQualified
+        return result
     }
 }
 
@@ -45,12 +51,14 @@ struct Editor: Hashable, Sendable, Identifiable {
     var project: Hub.XcodeProject
     var forms: [WorkflowForm]
     var integrationRoot: String
+    var runtimePackageRequirement: XcodeIntegration.RuntimePackageRequirement?
     var requirements: [Hub.Requirement]
     var id: String { project.projectURL.path }
 
     init(project: Hub.XcodeProject) {
         self.project = project
         integrationRoot = ".helix/xcode"
+        runtimePackageRequirement = nil
         requirements = []
         forms = Self.recommendedForms(project: project, enabled: Set(Hub.Capability.allCases))
     }
@@ -58,6 +66,7 @@ struct Editor: Hashable, Sendable, Identifiable {
     init(project: Hub.XcodeProject, draft: Hub.OnboardingDraft, requirements: [Hub.Requirement]) {
         self.project = project
         integrationRoot = draft.integrationRoot
+        runtimePackageRequirement = draft.runtimePackageRequirement
         self.requirements = requirements
         let installed = Dictionary(uniqueKeysWithValues: draft.profiles.map { profile in
             (profile.capability, WorkflowForm(
@@ -72,7 +81,9 @@ struct Editor: Hashable, Sendable, Identifiable {
                 featureModuleName: profile.featureModuleName,
                 bundleIdentifier: profile.bundleIdentifier,
                 namespaceSeed: profile.namespaceSeed,
-                patch: profile.patch
+                patch: profile.patch,
+                indexing: profile.indexing,
+                deviceNativeMatrixQualified: profile.deviceNativeMatrixQualified
             ))
         })
         let missing = Self.recommendedForms(

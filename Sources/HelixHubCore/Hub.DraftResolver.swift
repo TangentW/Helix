@@ -15,6 +15,8 @@ public struct WorkflowSelection: Hashable, Sendable, Identifiable {
     public var bundleIdentifier: String?
     public var namespaceSeed: String?
     public var patch: Hub.PatchDraft?
+    public var indexing: FrontendReceipt.IndexingOptions?
+    public var deviceNativeMatrixQualified: Bool?
     public var id: Hub.Capability { capability }
 
     public init(
@@ -39,6 +41,8 @@ public struct WorkflowSelection: Hashable, Sendable, Identifiable {
         self.bundleIdentifier = bundleIdentifier
         self.namespaceSeed = namespaceSeed
         self.patch = patch
+        self.indexing = nil
+        self.deviceNativeMatrixQualified = nil
     }
 }
 
@@ -135,6 +139,8 @@ public struct DraftResolver: Sendable {
                     ?? "\(project.name)-\(selection.profileID)",
                 patch: patch
             ))
+            profiles[profiles.count - 1].indexing = selection.indexing
+            profiles[profiles.count - 1].deviceNativeMatrixQualified = selection.deviceNativeMatrixQualified
         }
         return .init(
             project: project,
@@ -211,13 +217,17 @@ public struct DraftLoader: Sendable {
                 namespaceSeed: profile.namespaceSeed,
                 patch: patch
             ))
+            profiles[profiles.count - 1].indexing = feature.indexing
+            profiles[profiles.count - 1].deviceNativeMatrixQualified = profile.deviceNativeMatrixQualified
         }
-        return .init(
+        var draft = Hub.OnboardingDraft(
             project: project,
             capabilities: try .init(profiles.map(\.capability)),
             profiles: profiles,
             integrationRoot: plan.integrationRoot
         )
+        draft.runtimePackageRequirement = plan.runtimePackageRequirement
+        return draft
     }
 
     private func boundedFile(_ url: URL, constrainedTo root: URL) throws -> Data {

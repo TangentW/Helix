@@ -15,6 +15,7 @@ public struct Feature: Codable, Hashable, Sendable {
     public var id: String
     public var targetName: String
     public var moduleName: String
+    public var indexing: FrontendReceipt.IndexingOptions?
 
     public init(
         id: String,
@@ -24,6 +25,12 @@ public struct Feature: Codable, Hashable, Sendable {
         self.id = id
         self.targetName = targetName
         self.moduleName = moduleName
+        self.indexing = nil
+    }
+
+    public init(id: String, targetName: String, moduleName: String, indexing: FrontendReceipt.IndexingOptions) {
+        self.init(id: id, targetName: targetName, moduleName: moduleName)
+        self.indexing = indexing
     }
 
     public var bridgeTypeName: String { "\(moduleName)Bridge" }
@@ -130,14 +137,15 @@ public struct Profile: Codable, Hashable, Sendable {
     }
 }
 
-/// Hub-owned routing for one Xcode host. It records only the selected targets
-/// and workflows; source membership, DerivedData paths, and compiler identities
-/// are measured from the active Xcode build environment.
+/// Hub-owned routing and indexing policy for one Xcode host. Actual compiler
+/// source membership, DerivedData paths, and compiler identities are measured
+/// from the active Xcode build environment.
 public struct HostPlan: Codable, Hashable, Sendable {
-    public static let currentSchemaVersion: UInt16 = 1
+    public static let currentSchemaVersion: UInt16 = 2
     public static let defaultFileName = "HostPlan.json"
 
     public var schemaVersion: UInt16
+    public var runtimePackageRequirement: XcodeIntegration.RuntimePackageRequirement?
     public var projectPath: String
     public var integrationRoot: String
     public var features: [XcodeIntegration.Feature]
@@ -162,17 +170,22 @@ public struct HostPlan: Codable, Hashable, Sendable {
     ) {
         self.schemaVersion = schemaVersion
         self.projectPath = projectPath
+        self.runtimePackageRequirement = nil
         self.integrationRoot = integrationRoot
         self.features = features.sorted { $0.id < $1.id }
         self.profiles = profiles.sorted { $0.id < $1.id }
     }
 
     public func validate() throws {
-        guard schemaVersion == Self.currentSchemaVersion else {
+        guard schemaVersion == 1 || schemaVersion == Self.currentSchemaVersion else {
             throw XcodeIntegration.Error.invalidHostPlan(
                 "unsupported schema version \(schemaVersion)"
             )
         }
+        guard schemaVersion >= 2 || (runtimePackageRequirement == nil && features.allSatisfy({ $0.indexing == nil })) else {
+            throw XcodeIntegration.Error.invalidHostPlan("declaration indexing and runtime package requirements need Host Plan schemaVersion 2")
+        }
+        try runtimePackageRequirement?.validate()
         guard Self.isSafeRelativePath(projectPath),
               ["xcodeproj", "xcworkspace"].contains(
                   URL(fileURLWithPath: projectPath).pathExtension.lowercased()
@@ -200,7 +213,11 @@ public struct HostPlan: Codable, Hashable, Sendable {
                 "features must be nonempty, sorted, and uniquely named"
             )
         }
-        for feature in features { try Self.validate(feature) }
+        for feature in features {
+            try Self.validate(feature)
+            do { try feature.indexing?.validate() }
+            catch { throw XcodeIntegration.Error.invalidHostPlan("feature \(feature.id) indexing: \(error)") }
+        }
 
         guard (1...256).contains(profiles.count),
               profiles == profiles.sorted(by: { $0.id < $1.id }),
