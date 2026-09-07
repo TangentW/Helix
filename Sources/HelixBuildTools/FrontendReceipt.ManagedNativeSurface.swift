@@ -2772,7 +2772,8 @@ extension FrontendReceipt.ManagedNativeSurface {
             contents: contents,
             contentHash: .sha256(contents)
         )
-        let resolver = FrontendReceipt.SILFunctionResolver(file: silFile)
+        let resolver = try FrontendReceipt.SILFunctionResolver(file: silFile).resolvingCollisions(using: .init(
+            compilerURL: frontend.compilerURL, invocationObserver: frontend.invocationObserver))
         var candidatesByWitness: [String: Candidate] = [:]
         var propertySelectorsByCandidate: [
             Candidate: Set<FrontendReceipt.ObjectiveCABI.PropertySelector>
@@ -2842,7 +2843,8 @@ extension FrontendReceipt.ManagedNativeSurface {
             ],
             moduleName: invocation.moduleName,
             demangled: demangled,
-            silFile: silFile
+            silFile: silFile,
+            compilerURL: frontend.compilerURL
         )
         let measuredImportedTypes = try FrontendReceipt.Adapter()
             .mergeImportedNativeTypes(

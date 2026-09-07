@@ -11,7 +11,9 @@ extension CLI.Application {
         }
         var text = "Frontend diagnosis: \(report.passed ? "passed" : "failed")\n"
         for check in report.checks {
-            text += "[\(check.status.rawValue)] \(check.stage)\n"
+            let elapsed = report.performance?.stages.first { $0.name == check.stage }
+                .map { String(format: " (%.3fs)", Double($0.durationMicroseconds) / 1_000_000) } ?? ""
+            text += "[\(check.status.rawValue)] \(check.stage)\(elapsed)\n"
             if !check.detail.isEmpty { text += "  " + check.detail.replacingOccurrences(of: "\n", with: "\n  ") + "\n" }
         }
         if !report.diagnostics.isEmpty {
@@ -21,7 +23,11 @@ extension CLI.Application {
                 for note in diagnostic.notes { text += "    \(note)\n" }
             }
         }
-        text += "Scope: frontend receipt analysis. Shell/Bridge generation, linking and runtime activation require normal Build/Run.\n"
+        if let stages = report.requestedStages, !stages.contains(.receipt) {
+            text += "Scope: selected checks (" + stages.map(\.rawValue).joined(separator: ", ") + "); full receipt validation was not requested.\n"
+        } else {
+            text += "Scope: frontend receipt analysis. Shell/Bridge generation, linking and runtime activation require normal Build/Run.\n"
+        }
         return .init(exitCode: report.passed ? 0 : 1, standardOutput: text)
     }
 }

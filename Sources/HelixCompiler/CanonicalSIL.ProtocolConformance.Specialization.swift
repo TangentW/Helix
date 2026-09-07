@@ -40,7 +40,7 @@ extension CanonicalSIL.ProtocolConformance.Environment {
         conformingType: String,
         protocolName: String?
     ) -> [CanonicalSIL.ProtocolConformance.SpecializedRecord] {
-        records.compactMap { record in
+        unambiguousRecords.compactMap { record in
             if let protocolName {
                 guard protocolNamesEquivalent(
                     protocolName,

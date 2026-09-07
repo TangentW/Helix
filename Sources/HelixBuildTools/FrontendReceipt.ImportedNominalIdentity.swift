@@ -8,10 +8,31 @@ enum ImportedNominalIdentity {
         canonicalName: String,
         uses: [Adapter.ImportedNativeType]
     ) throws -> String? {
-        let spellings = Set(uses.map(\.swiftType)).subtracting([canonicalName])
-        guard !spellings.isEmpty else { return nil }
-        if spellings.count == 1 { return spellings.first }
         let modules = moduleRoots(in: uses)
+        let runtimes = Set(uses.compactMap(\.objectiveCRuntimeName))
+        guard runtimes.count <= 1 else {
+            throw conflict("imported nominal \(canonicalName) has conflicting Objective-C runtime identities", uses: uses)
+        }
+        // Clang's flat ABI name is not a competing Swift overlay. Its qualified
+        // spelling is equivalent only when the runtime identity is proven and
+        // the prefix is an observed module or the compiler's Clang namespace.
+        let runtime = runtimes.first
+        let hasReferenceEvidence = uses.allSatisfy { $0.kind == .reference && $0.representation == .reference }
+        let runtimeModules = modules.union(["__C", "__ObjC"])
+        let spellings = Set(uses.map(\.swiftType)).filter { spelling in
+            if spelling == canonicalName { return false }
+            guard let runtime, hasReferenceEvidence
+            else { return true }
+            if spelling == runtime { return false }
+            guard let separator = spelling.firstIndex(of: "."),
+                  runtimeModules.contains(String(spelling[..<separator]))
+            else { return true }
+            return String(spelling[spelling.index(after: separator)...]) != runtime
+        }
+        guard !spellings.isEmpty else {
+            return uses.contains { $0.swiftType != canonicalName } ? canonicalName : nil
+        }
+        if spellings.count == 1 { return spellings.first }
         // Strip exactly one observed module qualifier. Nested nominal scopes
         // and qualifications inside generic arguments must remain intact.
         let candidates = spellings.filter { spelling in

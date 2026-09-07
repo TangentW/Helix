@@ -128,7 +128,7 @@
 				PRODUCT_MODULE_NAME = "MixedOnboarding";
 				PRODUCT_BUNDLE_IDENTIFIER = "dev.helix.mixed-onboarding";
 				SDKROOT = "iphoneos";
-				IPHONEOS_DEPLOYMENT_TARGET = "15.0";
+				IPHONEOS_DEPLOYMENT_TARGET = "17.5";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				TARGETED_DEVICE_FAMILY = "1,2";
 				SWIFT_VERSION = "6.0";
@@ -172,7 +172,7 @@
 				PRODUCT_MODULE_NAME = "MixedOnboarding";
 				PRODUCT_BUNDLE_IDENTIFIER = "dev.helix.mixed-onboarding";
 				SDKROOT = "iphoneos";
-				IPHONEOS_DEPLOYMENT_TARGET = "15.0";
+				IPHONEOS_DEPLOYMENT_TARGET = "17.5";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				TARGETED_DEVICE_FAMILY = "1,2";
 				SWIFT_VERSION = "6.0";

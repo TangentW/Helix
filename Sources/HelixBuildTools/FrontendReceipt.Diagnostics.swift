@@ -16,17 +16,25 @@ public struct DiagnosticCheck: Codable, Hashable, Sendable {
 }
 
 public struct DiagnosticReport: Codable, Sendable {
-    public var schemaVersion: UInt16 = 1
+    // Schema 2 distinguishes selected checks from full receipt validation.
+    // Schema 1 decodes with a nil selection, preserving its full-scope meaning.
+    public var schemaVersion: UInt16 = 2
     public var passed: Bool
     public var checks: [DiagnosticCheck]
     public var diagnostics: [Core.Diagnostic]
     public var performance: BuildPerformance.Trace?
+    public var requestedStages: [DiagnosticStage]? = nil
 
     public static func failure(stage: String, reason: String) -> Self {
-        .init(passed: false, checks: [
-            .init(stage: stage, status: .failed, detail: reason),
-            .init(stage: "frontend.receipt", status: .blocked, detail: "Requires valid \(stage) inputs"),
-        ], diagnostics: [], performance: nil)
+        failure(stage: stage, reason: reason, stages: nil)
+    }
+
+    public static func failure(stage: String, reason: String, stages: [DiagnosticStage]?) -> Self {
+        let selection = stages.map { Array(Set($0)).sorted { $0.rawValue < $1.rawValue } }
+        let roots = Set(selection?.flatMap(\.roots) ?? ["frontend.receipt"]).subtracting([stage]).sorted()
+        return .init(passed: false, checks: [.init(stage: stage, status: .failed, detail: reason)]
+            + roots.map { .init(stage: $0, status: .blocked, detail: "Requires valid \(stage) inputs") },
+            diagnostics: [], performance: nil, requestedStages: selection)
     }
 }
 
@@ -42,18 +50,26 @@ final class DiagnosticSession {
     let performance: BuildPerformance.Recorder
     private(set) var checks: [DiagnosticCheck] = []
     private var statuses: [String: DiagnosticCheck.Status] = [:]
+    let requestedStages: [DiagnosticStage]?
+    private let requiredStages: Set<String>?
 
-    init(collectFailures: Bool, catalogFailure: String? = nil, performance: BuildPerformance.Recorder = .init()) {
+    init(collectFailures: Bool, catalogFailure: String? = nil, performance: BuildPerformance.Recorder = .init(),
+         stages: [DiagnosticStage]? = nil) {
         self.collectFailures = collectFailures
         self.catalogFailure = catalogFailure
         self.performance = performance
+        requestedStages = stages.map { Array(Set($0)).sorted { $0.rawValue < $1.rawValue } }
+        requiredStages = stages.map(DiagnosticPlan.requiredStages)
     }
 
-    func run<T>(_ stage: String, dependencies: [String] = [], _ operation: () throws -> T) throws -> T? {
+    func includes(_ stage: String) -> Bool { requiredStages?.contains(stage) ?? true }
+
+    func run<T>(_ stage: String, dependencies: [String]? = nil, _ operation: () throws -> T) throws -> T? {
+        guard includes(stage) else { return nil }
         guard statuses[stage] == nil else {
             throw FrontendReceipt.Error.invalidRequest("diagnostic stage repeats: \(stage)")
         }
-        let blocked = dependencies.filter { statuses[$0] != .passed }
+        let blocked = (dependencies ?? DiagnosticPlan.dependencies[stage, default: []]).filter { statuses[$0] != .passed }
         guard blocked.isEmpty else {
             record(stage, status: .blocked, detail: "Requires successful checks: " + blocked.joined(separator: ", "))
             return nil
@@ -83,17 +99,20 @@ final class DiagnosticSession {
     }
 
     func report(output: FrontendReceipt.Output?, error: Swift.Error? = nil) -> DiagnosticReport {
-        if let error {
+        let selectedComplete = error is DiagnosticSelectionComplete
+        if let error, !selectedComplete {
             if error is DiagnosticFailure {
-                record("frontend.receipt", status: .blocked, detail: "Independent analysis checks failed; no receipt was published")
+                if includes("frontend.receipt") {
+                    record("frontend.receipt", status: .blocked, detail: "Independent analysis checks failed; no receipt was published")
+                }
             } else {
-                record("frontend.receipt", status: .failed, detail: String(describing: error))
+                record(includes("frontend.receipt") ? "frontend.receipt" : "frontend.analysis", status: .failed, detail: String(describing: error))
             }
         } else if output != nil {
             record("frontend.receipt", status: .passed)
         }
-        return .init(passed: output != nil && checks.allSatisfy { $0.status == .passed },
-                     checks: checks, diagnostics: output?.diagnostics ?? [], performance: performance.trace())
+        return .init(passed: (output != nil || selectedComplete) && !checks.isEmpty && checks.allSatisfy { $0.status == .passed },
+                     checks: checks, diagnostics: output?.diagnostics ?? [], performance: performance.trace(), requestedStages: requestedStages)
     }
 }
 }
@@ -102,7 +121,12 @@ extension FrontendReceipt.Adapter {
     /// Evaluates independent branches and the complete receipt pipeline without
     /// publishing a receipt. A failed dependency explicitly blocks its consumers.
     public func diagnose(_ request: FrontendReceipt.Request) throws -> FrontendReceipt.DiagnosticReport {
-        let session = FrontendReceipt.DiagnosticSession(collectFailures: true)
+        try diagnose(request, stages: nil)
+    }
+
+    public func diagnose(_ request: FrontendReceipt.Request, stages: [FrontendReceipt.DiagnosticStage]?) throws -> FrontendReceipt.DiagnosticReport {
+        guard stages?.isEmpty != true else { throw FrontendReceipt.Error.invalidRequest("diagnostic stage selection is empty") }
+        let session = FrontendReceipt.DiagnosticSession(collectFailures: true, stages: stages)
         do {
             let output = try generate(request, cache: nil, toolchain: nil, compilerInputHash: nil, diagnostics: session)
             return session.report(output: output)

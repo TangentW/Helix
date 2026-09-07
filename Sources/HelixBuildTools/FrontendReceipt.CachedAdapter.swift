@@ -68,7 +68,19 @@ public struct CachedAdapter: Sendable {
         precomputedCompilerInputs: BuildCache.CompilerInputs.Snapshot? = nil,
         catalogFailure: String? = nil
     ) throws -> FrontendReceipt.DiagnosticReport {
-        let session = FrontendReceipt.DiagnosticSession(collectFailures: true, catalogFailure: catalogFailure)
+        try diagnose(request, compilerCapture: compilerCapture, compilerArguments: compilerArguments,
+            workingDirectory: workingDirectory, precomputedToolchain: precomputedToolchain,
+            precomputedCompilerInputs: precomputedCompilerInputs, catalogFailure: catalogFailure, stages: nil)
+    }
+
+    public func diagnose(
+        _ request: FrontendReceipt.Request, compilerCapture: Data, compilerArguments: [String] = [],
+        workingDirectory: URL? = nil, precomputedToolchain: ReleaseCompiler.ToolchainIdentity? = nil,
+        precomputedCompilerInputs: BuildCache.CompilerInputs.Snapshot? = nil, catalogFailure: String? = nil,
+        stages: [FrontendReceipt.DiagnosticStage]?
+    ) throws -> FrontendReceipt.DiagnosticReport {
+        guard stages?.isEmpty != true else { throw FrontendReceipt.Error.invalidRequest("diagnostic stage selection is empty") }
+        let session = FrontendReceipt.DiagnosticSession(collectFailures: true, catalogFailure: catalogFailure, stages: stages)
         do {
             let output = try generate(
             request, compilerCapture: compilerCapture, compilerArguments: compilerArguments,
@@ -78,7 +90,10 @@ public struct CachedAdapter: Sendable {
         } catch {
             if error is CancellationError { throw error }
             if session.checks.isEmpty {
-                return .failure(stage: "frontend.setup", reason: String(describing: error))
+                var report = FrontendReceipt.DiagnosticReport.failure(stage: "frontend.setup", reason: String(describing: error),
+                    stages: session.requestedStages)
+                report.performance = session.performance.trace()
+                return report
             }
             return session.report(output: nil, error: error)
         }
@@ -195,9 +210,15 @@ public struct CachedAdapter: Sendable {
         if let diagnostics {
             // Diagnosis rechecks compiler facts, bypasses the complete receipt
             // cache, and retains validated checkpoints for the next correction.
-            let output = try adapter.generate(request, cache: cache, toolchain: toolchain,
-                compilerInputHash: compilerInputHash, expectedImports: sourceImports,
-                expectedSources: expectedSources, checkpoints: checkpoints, diagnostics: diagnostics)
+            let output: FrontendReceipt.Output
+            do {
+                output = try adapter.generate(request, cache: cache, toolchain: toolchain,
+                    compilerInputHash: compilerInputHash, expectedImports: sourceImports,
+                    expectedSources: expectedSources, checkpoints: checkpoints, diagnostics: diagnostics)
+            } catch is FrontendReceipt.DiagnosticSelectionComplete {
+                try performance.measure("frontend_checkpoint.confirm_inputs") { try checkpoints.confirmInputs() }
+                throw FrontendReceipt.DiagnosticSelectionComplete()
+            }
             try checkpoints.confirmInputs()
             guard output.receipt.sources == expectedSources else {
                 throw FrontendReceipt.SourceImports.ValidationError.sourceChanged

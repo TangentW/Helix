@@ -39,9 +39,10 @@ the compiler executable fingerprint, SDK build, target, minimum OS,
 optimization and semantic frontend arguments are represented at the layer
 where they can alter a result. Captured debug levels (`-g`, `-gline-tables-only`,
 `-gnone`) remain ordered replay inputs because SIL scope provenance is used in
-declaration resolution. The definition-backed SIL identity revision changes the
-transform hash, invalidating older Shell/module facts without changing a wire
-schema. See [Compiler identity](Compiler-Identity.md).
+declaration resolution. Revisions to definition-backed SIL identity, scoped
+conformances, extension access defaults, structural symbol roles, Clang runtime
+spellings and independent inspection change the transform hash. Older Shell/module
+facts are invalidated without changing Shell or patch artifact schemas. See [Compiler identity](Compiler-Identity.md).
 
 Helix lexes the source's actual Swift `import` declarations and checks that
 result against the compiler's imported-module receipt. It fingerprints only
@@ -153,7 +154,13 @@ module receipt is cached. It shares normal generation's dependency-aware analysi
 reparses validated compiler checkpoints, and retains them on success or failure.
 It never publishes a module receipt or retires checkpoints, so a corrected normal
 build can reuse compilation and perform ordinary publication. Existing Catalogs
-can be read; cold generation and prewarm are excluded. See the
+are read only for selections that require them; cold generation and prewarm are
+excluded. `--stages` skips unrelated compiler replays, and selected checks can
+reuse their successful intermediates in a later full run. Input confirmation
+still precedes a successful cached diagnostic result. Independent SIL inspection
+can retain validated function locations for diagnostic mapping, but a malformed
+SIL output never becomes a successful whole-stage checkpoint. JSON schema 2
+records the selected scope; a partial pass is not a full receipt pass. See the
 [diagnosis scope](Large-Project-Integration.md#collect-independent-frontend-failures).
 
 Every cached value is decoded and semantically validated by its consumer:

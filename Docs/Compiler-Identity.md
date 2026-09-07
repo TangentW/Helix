@@ -11,18 +11,19 @@ new compiler output and integration evidence can require narrower rules.
 | --- | --- | --- |
 | Source membership | Canonical physical path identifies a compiler input within one invocation; logical path plus content hash identifies a source in the receipt | Request validation rejects duplicate logical paths and physical aliases; typed AST must cover exactly the requested files |
 | Source nominal declaration | Compiler USR, with logical file scope for private declarations; qualified spelling is a scoped lookup | `SourceNominalIndex` resolves file-local names separately. Conflicting USRs and same-scope names report both declarations. Ambiguous printed private layouts cannot become frozen value layouts |
-| Imported nominal | Established runtime/ABI identity precedes normalization of qualified/relative Swift spelling using proven module roots | `ImportedNominalIdentity` is shared by discovery, merge, aliases and bindings. Conflicting module, representation or isolation facts remain errors; normalization does not merge unrelated nested names |
+| Imported nominal | Established runtime/ABI identity precedes normalization of qualified/relative Swift spelling using proven module roots | `ImportedNominalIdentity` is shared by discovery, merge, aliases and bindings. Conflicting module, representation or isolation facts remain errors; proven flat Clang runtime spellings are not competing Swift overlays; normalization does not merge unrelated nested names |
 | Imported operation and selector | Declaration USR/descriptor, signature, owner, dispatch, accessor and measured ABI; selector probes also include their imported-module context | A common implementation symbol does not equate API declarations. Candidate sets are deduplicated before disjoint probe batches; generated probe indices only identify members of that exact batch |
-| SIL function | A concrete `sil @symbol : $type { ... }` definition establishes symbol identity within that SIL file | Repeated definitions reject with both SIL lines and types. The derived function index refreshes on public array mutation and excludes duplicates. Typed-AST resolution uses exact symbols or a unique source location; ambiguous candidates are never selected by order |
+| SIL function | A concrete `sil @symbol : $type { ... }` definition establishes symbol identity within that SIL file | Repeated definitions reject with both SIL lines and types. The derived function index refreshes on public array mutation and excludes duplicates. Typed-AST resolution uses exact symbols first; colliding source locations require structural compiler symbol roles and closure discriminators. Unknown roles remain candidates; ambiguous functions are never selected by order |
 | SIL debug scope | Numeric scope ID within one SIL document; an inherited scope keeps its own identity even when locations coincide | Duplicate IDs reject with both source records. `parent @name` supplies declaration location only for a concrete function definition. Debug-only names such as `__unknown_macro__` are not function identities; their locations remain available by scope ID |
+| SIL witness-table occurrences | SIL document and record line retain each occurrence; witness targets retain exact compiler symbols and module | Equal printed type/protocol names can denote distinct local declarations. Preserve every record, quarantine colliding type lookups before conditional/completeness filters, and never select a conformance by order |
 | SIL printed type and member aliases | Unique compiler-proven nominal/type aliases within the relevant module and source scope | `TypeEnvironment` excludes ambiguous private type summaries and fails when a required layout or dispatch cannot be proven; short names never grant a layout by themselves |
 | SIL source-module map | Explicit compiler `#fileID` to path mapping | A path mapped to conflicting modules rejects with the path and both module values; debug coordinates are provenance, not persisted identity |
 | Native Catalog and receipt keys | Validated versioned artifact identity, exact compiler/toolchain/SDK/target and canonical descriptor or TypeID | Snapshot/receipt validation precedes unique-key maps. Hash equality is useful only with the corresponding authenticated or validated record; runtime lookup by display name is not a fallback |
 | Compiler facts and caches | Exact toolchain, invocation, source/dependency content and transform identity; checkpoints also bind physical paths | `CachedAdapter` validates request/source uniqueness before maps, then confirms inputs again. Checkpoint hits are reparsed. Changing frontend identity interpretation changes the transform hash so old module receipts cannot bypass the new checks |
 | PBX objects and configurations | Object ID within the root `objects` dictionary; configuration name within its owning configuration list | Duplicate dictionary keys and repeated configuration names reject with their scope and object IDs. Nested `TargetAttributes` keys do not identify top-level target records |
 
-The current debug-scope change does not alter a shipped wire schema, nominal ID,
-or public symbol spelling. It changes the local transform identity and therefore
+These compiler-identity changes do not alter a shipped Shell/patch wire schema,
+nominal ID, or public symbol spelling. They change the local transform identity and therefore
 requires rebuilding affected cached Shell facts. Equal locations for the same
 real function remain valid. A placeholder-looking name that actually has a SIL
 function definition must still satisfy the function uniqueness rules.
@@ -42,3 +43,37 @@ explicit module compilation. That test exercises the configuration combination;
 it does not establish the minimal Swift program that emits `__unknown_macro__`.
 Replay preserves `-g`, `-gline-tables-only`, and `-gnone` in their captured order;
 argument-selection tests cover those levels independently.
+
+SIL declaration summaries inherit `private`/`fileprivate` extension access as a
+default for immediate members; an explicit member modifier overrides that
+default, while a private nominal owner still limits its children. Ambiguous
+private layouts and their descendants remain unavailable. Witness tables retain
+all same-spelled occurrences, including empty marker conformances. An ambiguous
+conforming type and its descendants cannot supply a layout, static witness, generic proof, or
+existential case through a printed-name lookup. Unrelated declarations remain
+available; exact witness-symbol membership is indexed per module. This does not
+claim support for lowering the ambiguous local types themselves.
+
+At colliding source coordinates, receipt analysis batches structural trees from
+the captured toolchain's `swift-demangle --expand --tree-only`. Explicit closures,
+autoclosures, ordinary functions, accessors, and witness thunks remain distinct
+roles. AST closure discriminators further constrain a match. Unknown roles and
+remaining same-role collisions fail closed with each symbol, ABI, role and
+location. No additional symbol-tree process is needed when locations are unique.
+
+A flat Objective-C runtime spelling, including its observed-module or `__C` /
+`__ObjC` qualification, is an ABI spelling only with exact reference/runtime
+evidence. It does not compete with an observed `NS_SWIFT_NAME` nested overlay.
+Nongeneric normalized and raw observations regroup by that runtime authority; contradictory
+runtime facts for one canonical identity still reject before normalization.
+Objective-C lightweight generic instantiations retain their type arguments despite
+runtime erasure. This does not equate arbitrary nested Swift spellings or distinct runtime classes.
+
+SIL inspection reports component-specific evidence independently. Only validated
+function definitions and debug scopes supply function-location facts for AST
+mapping; malformed type summaries or conformance records cannot supply type or
+operation facts. Conflicts in independent mappings are aggregated. These checks
+share the normal parser's implementation and never create a partial File.
+Diagnostic JSON separately migrates to schema 2 with optional `requestedStages`;
+legacy absence means full receipt scope. Selected passes qualify only their
+checks and dependencies, as specified in [the diagnosis guide](Large-Project-Integration.md#collect-independent-frontend-failures).

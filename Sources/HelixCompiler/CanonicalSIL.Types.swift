@@ -76,16 +76,36 @@ public struct TypeEnvironment: Sendable {
 
     private struct NominalHeader {
         var isFinal: Bool
-        var isFileScoped: Bool
+        var declaredAccess: String?
         var kind: String
         var name: String
         var conformances: [String]
         var requirements: String?
     }
 
-    private struct DefinitionInventory {
+    private struct DefinitionInventory: Sendable {
         var concrete: [Bytecode.LocalTypeKey: RawDefinition]
         var generic: [Bytecode.LocalTypeKey: RawGenericDefinition]
+    }
+
+    /// An opaque declaration summary can be checked before conformance or
+    /// function parsing succeeds. It does not authorize layouts by itself.
+    struct DeclarationSummary: Sendable {
+        private let inventory: DefinitionInventory
+        private let hasErrorBoundary: Bool
+
+        init(text: String) throws {
+            inventory = try TypeEnvironment.extractDefinitions(text)
+            hasErrorBoundary = text.contains("checked_cast_addr_br")
+                || text.contains("Result<") || TypeEnvironment.hasClosureErrorBoundary(in: text)
+        }
+
+        func environment(functions: [CanonicalSIL.Function],
+            conformances: CanonicalSIL.ProtocolConformance.Environment
+        ) throws -> TypeEnvironment {
+            try TypeEnvironment(inventory: inventory, hasErrorBoundary: hasErrorBoundary,
+                functions: functions, conformances: conformances)
+        }
     }
 
     private struct DefinitionParser {
@@ -96,6 +116,7 @@ public struct TypeEnvironment: Sendable {
             Bytecode.LocalTypeKey: RawGenericDefinition
         ] = [:]
         var fileScopes: [Bytecode.LocalTypeKey: Bool] = [:]
+        var declarationEvidence: [Bytecode.LocalTypeKey: [String]] = [:]
         var ambiguousNames = Set<Bytecode.LocalTypeKey>()
 
         // Canonical SIL starts with a declaration summary before function
@@ -144,7 +165,8 @@ public struct TypeEnvironment: Sendable {
 
         private mutating func scanScope(
             parentScope: String?,
-            stopsAtClosingBrace: Bool
+            stopsAtClosingBrace: Bool,
+            defaultFileScope: Bool = false
         ) throws {
             while index < lines.count {
                 let line = lines[index].trimmingCharacters(in: .whitespaces)
@@ -164,12 +186,15 @@ public struct TypeEnvironment: Sendable {
                         extended[0],
                         relativeTo: parentScope
                     )
+                    let fileScopedExtension = ["private", "fileprivate"].contains(
+                        TypeEnvironment.declaredAccess(in: line) ?? "")
                     index += 1
-                    try scanScope(parentScope: scope, stopsAtClosingBrace: true)
+                    try scanScope(parentScope: scope, stopsAtClosingBrace: true,
+                                  defaultFileScope: fileScopedExtension)
                     continue
                 }
                 if let header = try TypeEnvironment.nominalHeader(in: line) {
-                    try parseNominal(header, parentScope: parentScope)
+                    try parseNominal(header, parentScope: parentScope, defaultFileScope: defaultFileScope)
                     continue
                 }
                 if TypeEnvironment.braceDelta(in: line) > 0 {
@@ -187,7 +212,8 @@ public struct TypeEnvironment: Sendable {
 
         private mutating func parseNominal(
             _ header: NominalHeader,
-            parentScope: String?
+            parentScope: String?,
+            defaultFileScope: Bool = false
         ) throws {
             let shortName = header.name
             let declarationRequirements = header.requirements
@@ -208,18 +234,26 @@ public struct TypeEnvironment: Sendable {
                 relativeTo: parentScope
             )
             let key = Bytecode.LocalTypeKey(rawValue: name)
-            let isFileScoped = header.isFileScoped || parentScope.map {
+            // Extension access is a default for immediate members. An explicit
+            // member modifier overrides that default, unlike a private owner.
+            let isFileScoped = (header.declaredAccess.map { ["private", "fileprivate"].contains($0) }
+                ?? defaultFileScope) || parentScope.map {
                 fileScopes[.init(rawValue: $0)] == true
             } == true
+            let evidence = "SIL line \(index + 1): \(lines[index].trimmingCharacters(in: .whitespaces)); "
+                + "parent=\(parentScope ?? "<file>"), declaredAccess=\(header.declaredAccess ?? "implicit"), "
+                + "extensionDefaultFileScoped=\(defaultFileScope), effectiveFileScoped=\(isFileScoped)"
             if let existingScope = fileScopes[key] {
                 guard existingScope && isFileScoped else {
-                    throw CanonicalSIL.LoweringError.malformedSIL("duplicate nominal type \(name)")
+                    throw CanonicalSIL.LoweringError.malformedSIL(
+                        "duplicate nominal type \(name): \(declarationEvidence[key, default: []].joined(separator: "; ")); \(evidence)")
                 }
                 ambiguousNames.insert(key)
                 definitions.removeValue(forKey: key)
                 genericDefinitions.removeValue(forKey: key)
             }
             fileScopes[key] = isFileScoped
+            declarationEvidence[key, default: []].append(evidence)
             var fields: [RawField] = []
             var hasUnparsedInstanceStorage = false
             var cases: [RawEnumCase] = []
@@ -452,11 +486,18 @@ public struct TypeEnvironment: Sendable {
         protocolConformances: CanonicalSIL.ProtocolConformance.Environment?
             = nil
     ) throws {
-        let inventory = try Self.extractDefinitions(text)
-        rawDefinitions = inventory.concrete
-        rawGenericDefinitions = inventory.generic
-        self.protocolConformances = try protocolConformances
-            ?? CanonicalSIL.ProtocolConformance.Environment(text: text)
+        self = try DeclarationSummary(text: text).environment(functions: functions,
+            conformances: protocolConformances ?? CanonicalSIL.ProtocolConformance.Environment(text: text))
+    }
+
+    private init(inventory: DefinitionInventory, hasErrorBoundary: Bool,
+        functions: [CanonicalSIL.Function], conformances: CanonicalSIL.ProtocolConformance.Environment
+    ) throws {
+        self.protocolConformances = conformances
+        // A witness table can expose an erased local type name absent from the
+        // declaration summary. Do not reuse an unrelated same-spelled layout.
+        rawDefinitions = inventory.concrete.filter { !conformances.isAmbiguousType($0.key.rawValue) }
+        rawGenericDefinitions = inventory.generic.filter { !conformances.isAmbiguousType($0.key.rawValue) }
         factoryCandidates = functions
         structFactories = [:]
         classAllocators = [:]
@@ -468,9 +509,7 @@ public struct TypeEnvironment: Sendable {
         // Payload-free throws use the lightweight String error representation.
         // Typed storage is enabled only when SIL semantics, a local declaration,
         // or a closure boundary must preserve the Error existential identity.
-        requiresTypedErrors = text.contains("checked_cast_addr_br")
-            || text.contains("Result<")
-            || Self.hasClosureErrorBoundary(in: text)
+        requiresTypedErrors = hasErrorBoundary
             || rawDefinitions.values.contains(where: Self.hasStoredErrorPayload)
             || rawGenericDefinitions.values.contains(
                 where: Self.hasStoredErrorPayload
@@ -3059,15 +3098,16 @@ public struct TypeEnvironment: Sendable {
         }
         return .init(
             isFinal: !captures[0].isEmpty,
-            isFileScoped: line.range(
-                of: #"(?:^|\s)(?:private|fileprivate)\s"#,
-                options: .regularExpression
-            ) != nil,
+            declaredAccess: declaredAccess(in: line),
             kind: captures[1],
             name: name,
             conformances: conformances,
             requirements: requirements
         )
+    }
+
+    private static func declaredAccess(in line: String) -> String? {
+        captures(line, pattern: #"^(?:@[^\s]+\s+)*(public|internal|package|private|fileprivate)\s"#)?.first
     }
 
     private static let nominalHeaderPattern =

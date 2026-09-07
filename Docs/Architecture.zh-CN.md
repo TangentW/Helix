@@ -53,7 +53,7 @@ flowchart TB
 - Eligible 的 Shell 已有 struct/enum 使用已记录的逻辑值合同，而不是 Swift 私有 ABI layout。Archive 会记录精确的源码限定 identity、stored field 或 enum case、label 与顺序、递归 Bridge type、copyability、受支持的 conformance 事实，以及同时纳入 device hash 的确定性 layout fingerprint。构建阶段会在声明同一源码作用域生成 private 构造 hook，使 private storage 也能按 Swift 访问控制合法重建；生成的 Bridge 则经普通、有界的 value codec 流式编解码 field 与 case。Release 和 Patch 编译会分别从源码独立推导 shape，Verifier 只有在定义完全一致时，才允许 ordinary、`borrowing`、`consuming` 或 `mutating` value receiver 成为 root。同步 Entry 可以暴露恰好一个逻辑 `inout` 区域，包括可变 `self`。生成的 Bridge 会先快照该值，只在 HLVM invocation 内建立 address，再校验唯一且类型精确的 writeback；normal 与已声明 error continuation 提交写回，VM trap 不提交任何写回，Original route 使用同一结果合同。多个或 async `inout` 会因生成边界无法证明 alias identity 而 fail closed。反射、裸内存投影、运行时 metadata、VM address 与 Swift layout 假设都不会跨边界。
 - 工具链、SDK、target triple、编译参数、module 源文件集合与二进制身份把每个产物绑定到对应 Shell。
 - 版本 1 Shell 会预先声明纯 VM 的 String 与 Collection capability，即使 eligible 入口已记录的原生签名没有出现这些类型，后续 body-only patch 仍可使用可表示的局部文本与集合；Native type 与 import 仍严格受生成的 Shell 表面约束。精确原生类型名始终是权威 identity；从它派生的 module-relative 简写只有在唯一指向一个已记录的 identity 时才会安装，兄弟嵌套类型不会彼此覆盖。
-- canonical SIL 解析会把捕获 frontend 的 protocol witness table 收集为有界、确定且仅属于 Compiler 的证据，保留 conforming type pattern、protocol identity、条件 generic clause、associated type、继承 protocol、requirement ABI、精确 witness symbol 与 table 顺序。重复 conformance identity 或畸形 record 会在 inventory 阶段失败。由于 textual SIL 可能抹去源码参数标签，打印出的 requirement 与 ABI 都相同的多条 witness 仍会分别保留；后续 consumer 无法唯一解析时必须拒绝。只有声明、没有 target body 的 imported witness table 不构成 dispatch 证据，因此不会进入 inventory。无法识别的成员只会令对应 conformance 不可消费，不会让无关高级声明阻塞普通可达函数。这份 inventory 不把 Swift witness table 或 metadata 暴露给 HLBC，本身不直接执行 protocol dispatch；下述 closed concrete-specialization consumer 及后续 existential consumer 都只能使用其中精确且完整的记录。
+- canonical SIL 解析会把捕获 frontend 的 protocol witness table 收集为有界、确定且仅属于 Compiler 的证据，保留 conforming type pattern、protocol identity、条件 generic clause、associated type、继承 protocol、requirement ABI、精确 witness symbol 与 table 顺序。畸形 record 会在 inventory 阶段失败；同名 conformance 按 SIL header 行号分别保留，有歧义的 nominal 查找及其后代不能提供 dispatch 证据。由于 textual SIL 可能抹去源码参数标签，打印出的 requirement 与 ABI 都相同的多条 witness 仍会分别保留；后续 consumer 无法唯一解析时必须拒绝。只有声明、没有 target body 的 imported witness table 不构成 dispatch 证据，因此不会进入 inventory。无法识别的成员只会令对应 conformance 不可消费，不会让无关高级声明阻塞普通可达函数。这份 inventory 不把 Swift witness table 或 metadata 暴露给 HLBC，本身不直接执行 protocol dispatch；下述 closed concrete-specialization consumer 及后续 existential consumer 都只能使用其中精确且完整的记录。
 - 由具体 `apply`、`try_apply` 或 `partial_apply` 可达的语义 SIL 泛型 helper 会进入同一 image-function 图。Compiler 解析连续的外层 generic clause，并在替换完整 type token 前求解具体 conformance、same-type、superclass/`AnyObject` 与 dependent associated-type requirement；精确且完整的 frontend record 是权威证据，条件 conformance 只有在实例化后的 requirement 也能于同一闭合环境中递归证明时才可消费。每组参数都获得绑定原 Swift symbol 的确定 specialization identity，因此多种实例、受约束 extension method 与递归调用保持独立的静态 target。文件/module scope 的泛型 struct、enum 与 final class 只作为模板保存，并仅为可达的具体参数实例化字段、case、superclass projection 和 method。具体 opaque result 则依据 frontend entry 的精确结果 buffer，在普通单态化前消除 identity；它覆盖依赖外层泛型的 opaque 与保持顺序的多个 opaque 结果。HLBC 不携带 opaque identity、泛型 metadata 或 witness table。body 完全具体化后，closed protocol dispatch 再匹配精确 nominal、完整 requirement ABI 与唯一完整 witness record，把 `apply`、`try_apply`、`partial_apply` 归一为 frontend thunk；getter/setter、static、mutating、throwing、继承与默认实现链仍是普通 image call。未解析 archetype、pack、无法证明或递归的条件证据、缺失 target、歧义 requirement、隐式携带外层 archetype 的嵌套 nominal，以及 direct/indirect 混合的物理多结果或带多个间接 normal result 的 throwing call 会 fail closed。
 - 不可变的 protocol existential 通过同一份 inventory 建立独立的闭世界计划。Compiler 保留源码级 `any P` identity，包括 protocol composition、继承 requirement 与 `AnyObject` 约束；HLBC 只保存 VM-owned `Any` payload，以及“精确动态类型 → 具体 image function”的有界表。每个 case 都必须来自当前 module 内完整、非条件式的 conformance，并指向具体 witness thunk。Verifier 会校验表示类型唯一性、非 receiver ABI 一致性、receiver ownership、effect 与 concrete-specialization target；每个分发表或 cast 类型集合最多 4,096 项。HLVM 只做精确匹配，并按完整查找规模扣减 invocation fuel。由此可在不携带 Swift metadata 或运行时 witness table 的前提下支持不可变擦除与 opening、composition narrowing/widening、class-bound value、绑定 method、同步 throwing requirement，以及 checked/forced protocol cast。protocol existential identity 只是 image-local 的 Compiler 事实，因此 Indexer 与 lowerer 会拒绝 Swift protocol value 穿过 Shell 或普通 NativeImport。另行证明的 Objective-C `!foreign` protocol 擦除仍以已记录的原生 `AnyObject` reference 越界，不属于这里的 existential value。mutable existential opening 与 writeback 在 storage 模型能够保持 mutation 前继续 fail closed。
 - 经过验证的 debug metadata 把 HLBC 的 function/block/instruction 坐标映射到逻辑 Swift 文件、行、列。生产 artifact 会移除构建机绝对路径；trap 会补充精确 VM program counter 和固定的 generation。
@@ -165,6 +165,13 @@ Release 审计会扫描最终 bundle，而不是信任 target 名称。生产 Ru
 这类名字的消歧信息，因此重名布局及其子类型不进入结构化 HLBC codec，
 其他声明仍正常索引。
 
+SIL 声明摘要中的 `private`/`fileprivate extension` 为直接成员提供默认访问级别；
+成员的显式修饰符可覆盖这个默认值，但私有 nominal 父类型仍限制其子类型。存在歧义的
+私有布局及后代保持不可用。Witness table 保留每条同名记录，包括没有成员的 marker
+conformance；有歧义的类型及其后代不能通过打印名提供布局、静态 witness、泛型证明或
+existential 分支。其他声明仍可分析，精确 witness 符号按 module 建立成员索引。
+这不代表已支持降低这些有歧义的局部类型本身。
+
 `ShellBuildReceipt.NominalType` 在 schema 1 增加可选 `sourceFileLogicalID`。
 字段缺省时保持原始编码和 `HLX.NominalType.v1` 身份；文件私有 root 使用新增
 `HLX.NominalType.FileScoped.v2`，输入为模块、源码拼写和逻辑路径。修改正文或
@@ -182,12 +189,26 @@ Imported type 先建立 ABI/runtime 身份或编译器证明的精确 alias 集�
 不同限定模块、仅共享短名字的类型和不同 runtime class 不会因此合并。
 Catalog 的声明模块证据也能识别经由 reexport 使用的模块前缀。
 
+Objective-C 扁平 runtime 名及其已知 module、`__C` / `__ObjC` 限定形式，只有在
+reference/runtime 证据明确时才视为 ABI 拼写，不再与 `NS_SWIFT_NAME` 嵌套 overlay
+竞争。非泛型的已归一和原始观察按同一 runtime 权威重新分组；同一 canonical 身份的 runtime
+事实矛盾仍须先报错。Objective-C 轻量泛型在 runtime 擦除后仍保留类型参数区别。不同的嵌套 Swift 拼写或
+不同 runtime class 不能据此任意合并。
+
 身份冲突诊断列出每组不同的冲突事实，包括 Swift 拼写、imports、实测来源、runtime、
 表示和隔离规则，并选取一个确定的源文件示例。Typed AST 有位置时包含行列；重复的
 使用位置不会淹没冲突事实。这些位置仅用于诊断，不进入 nominal ID 派生。
 它们也不进入序列化的 compiler projection。
 Transform identity 同步更新，使旧本地 receipt/projection 失效；已有持久化 type ID
 派生规则和 archive schema 不变。
+
+### SIL 函数的编译器角色
+
+源码位置冲突时，receipt 分析批量调用捕获工具链的
+`swift-demangle --expand --tree-only`，区分显式 closure、autoclosure、普通函数、
+accessor 和 witness thunk；AST 闭包 discriminator 进一步约束匹配。未知角色和仍有
+歧义的同角色候选保持 fail closed，错误包含每个符号、ABI、角色及位置。没有位置冲突
+时，不额外启动 symbol-tree demangler。
 
 ### 可恢复的编译阶段
 
@@ -202,3 +223,14 @@ Transform identity 同步更新，使旧本地 receipt/projection 失效；已�
 function definition 支持；仅用于 debug 的 parent 保留为 scope 局部元数据。身份来源
 见[编译身份清单](Compiler-Identity.zh-CN.md)，诊断范围见
 [大型工程接入](Large-Project-Integration.zh-CN.md#一次收集独立的-frontend-问题)。
+
+`CanonicalSIL.Inspection` 分开验证原始函数定义、debug scope、源码模块映射、
+conformance 和 nominal 声明。函数位置依赖有效的定义与 scope；类型构建依赖有效的
+conformance 和声明清单。所有前置检查通过后才有完整 `CanonicalSIL.File`。正常解析
+共用这些组件并保留 fail-fast 行为；诊断保留独立检查和映射冲突。原始函数字符串行在
+构建较大的类型/conformance 表前释放，不向外提供部分有效的 File 或空环境替代品。
+
+诊断阶段选择使用共用的分析依赖图，跳过无关的编译重放和 Catalog 读取。局部通过仍需
+复核缓存输入，只保留完整验证的编译检查点，不发布模块 receipt。诊断 JSON schema 2
+增加 `requestedStages`，区分局部通过和完整 receipt 通过；旧 schema 1 中缺省的选择
+范围仍表示完整诊断。Shell/补丁 schema 保持不变。

@@ -62,7 +62,7 @@ struct Demangler {
         return result
     }
 
-    private func run(arguments: [String]) throws -> String {
+    func run(arguments: [String]) throws -> String {
         let resolvedCompiler = compilerURL.resolvingSymlinksInPath()
         let sibling = resolvedCompiler.deletingLastPathComponent()
             .appendingPathComponent("swift-demangle")

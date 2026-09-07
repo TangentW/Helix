@@ -64,8 +64,8 @@ struct ProtocolConformanceTests {
         })
     }
 
-    @Test("Malformed conformance evidence fails closed")
-    func rejectsMalformedEvidence() throws {
+    @Test("Printed conformance collisions retain every occurrence without supplying dispatch identity")
+    func retainsScopedCandidates() throws {
         let duplicateRecord = """
         sil_witness_table Value: Feature module Fixture {
           method #Feature.value: <Self where Self : Feature> (Self) -> () -> Int : @first
@@ -74,26 +74,48 @@ struct ProtocolConformanceTests {
           method #Feature.value: <Self where Self : Feature> (Self) -> () -> Int : @second
         }
         """
-        #expect(throws: CanonicalSIL.LoweringError.self) {
-            _ = try CanonicalSIL.ProtocolConformance.Environment(
-                text: duplicateRecord
-            )
-        }
+        let duplicates = try CanonicalSIL.ProtocolConformance.Environment(text: duplicateRecord)
+        #expect(duplicates.records.count == 2)
+        #expect(duplicates.records.map(\.sourceLine) == [1, 4])
+        #expect(duplicates.unambiguousRecords.isEmpty)
+        #expect(duplicates.specializedRecords(conformingType: "Value").isEmpty)
+        #expect(duplicates.isAmbiguousType("Fixture.Value"))
+        #expect(duplicates.ambiguityEvidence(for: "Value").joined().contains("first"))
+        #expect(duplicates.ambiguityEvidence(for: "Value").joined().contains("second"))
+        #expect(duplicates.containsWitnessTarget("first", moduleName: "Fixture"))
+        #expect(duplicates.containsWitnessTarget("second", moduleName: "Fixture"))
+        #expect(!duplicates.containsWitnessTarget("first", moduleName: "Other"))
 
         let ambiguousConditionalRecords = """
         sil_witness_table <Element where Element : Equatable> Box<Element>: Feature module Fixture {
           method #Feature.value: <Self where Self : Feature> (Self) -> () -> Int : @first
         }
-        sil_witness_table <Element where Element : Hashable> Box<Element>: Feature module Fixture {
+        sil_witness_table <T where T : Hashable> Fixture.Box<T>: Feature module Fixture {
           method #Feature.value: <Self where Self : Feature> (Self) -> () -> Int : @second
         }
         """
-        #expect(throws: CanonicalSIL.LoweringError.self) {
-            _ = try CanonicalSIL.ProtocolConformance.Environment(
-                text: ambiguousConditionalRecords
-            )
-        }
+        let conditional = try CanonicalSIL.ProtocolConformance.Environment(text: ambiguousConditionalRecords)
+        #expect(conditional.records.count == 2)
+        #expect(conditional.specializedRecords(conformingType: "Box<Int>").isEmpty)
+        #expect(conditional.isAmbiguousType("Fixture.Box<Int>"))
+    }
 
+    @Test("Malformed conformance evidence fails closed")
+    func rejectsMalformedEvidence() throws {
+        do {
+            _ = try CanonicalSIL.ProtocolConformance.Environment(text: """
+            sil_witness_table Value: Feature module Fixture {
+              associated_type Item: Int
+              associated_type Item: String
+            }
+            """)
+            Issue.record("Duplicate associated type was accepted")
+        } catch {
+            let message = String(describing: error)
+            #expect(message.contains("SIL line 1: sil_witness_table Value: Feature module Fixture"))
+            #expect(message.contains("SIL line 2: associated_type Item: Int"))
+            #expect(message.contains("SIL line 3: associated_type Item: String"))
+        }
         let missingTarget = """
         sil_witness_table Value: Feature module Fixture {
           method #Feature.value: <Self where Self : Feature> (Self) -> () -> Int
@@ -104,6 +126,97 @@ struct ProtocolConformanceTests {
                 text: missingTarget
             )
         }
+    }
+
+    @Test("Incomplete and marker candidates cannot disappear before identity checks")
+    func retainsIncompleteCandidates() throws {
+        let file = try CanonicalSIL.File(text: """
+        sil_stage canonical
+        struct Local {
+          @_hasStorage var value: Int { get set }
+          struct Child {
+          }
+        }
+        struct Safe {
+          @_hasStorage var value: Int { get set }
+        }
+        sil_witness_table Local: Feature module Fixture {
+          future_requirement #Feature.value: @future
+        }
+        sil_witness_table Local: Feature module Fixture {
+          method #Feature.value: <Self where Self : Feature> (Self) -> () -> Int : @value
+        }
+        sil_witness_table Local: Marker module Fixture {
+        }
+        sil_witness_table Empty: Marker module Fixture {
+        }
+        sil_witness_table Empty: Marker module Fixture {
+        }
+        sil_witness_table Safe: Feature module Fixture {
+          method #Feature.value: <Self where Self : Feature> (Self) -> () -> Int : @safe
+        }
+        sil_witness_table Local.Child: Feature module Fixture {
+        }
+        """)
+        let environment = file.protocolConformances
+        #expect(environment.records.count == 7)
+        #expect(environment.unambiguousRecords.map(\.conformingType) == ["Safe"])
+        #expect(environment.specializedRecords(conformingType: "Local", protocolName: "Marker").isEmpty)
+        let caller = CanonicalSIL.Function(mangledName: "$s7Fixture6calleryyF",
+            loweredType: "$@convention(thin) () -> ()", body: "")
+        let resolver = try CanonicalSIL.ProtocolExistential.Resolver(file: file, function: caller)
+        let identity = try #require(CanonicalSIL.ProtocolExistential.Identity(spelling: "any Feature"))
+        #expect(try resolver.conformers(to: identity).map(\.spelling) == ["Safe"])
+        #expect(throws: CanonicalSIL.LoweringError.self) { try file.typeEnvironment.resolve("Local") }
+        #expect(throws: CanonicalSIL.LoweringError.self) { try file.typeEnvironment.resolve("Local.Child") }
+        #expect(environment.isAmbiguousType("Fixture.Local<Int>.Child<Swift.String>"))
+        #expect(try file.typeEnvironment.resolve("Safe") == .local(.init(rawValue: "Safe")))
+        let clause = try CanonicalSIL.GenericSignature.standaloneClause("<T where T : Feature>")
+        do {
+            _ = try CanonicalSIL.GenericSignature.resolve(clause, bindings: ["T": "Local"],
+                conformances: environment, typeEnvironment: file.typeEnvironment)
+            Issue.record("Ambiguous conformance supplied a generic proof")
+        } catch {
+            let message = String(describing: error)
+            #expect(message.contains("ambiguous printed conformance identity"))
+            #expect(message.contains("SIL line 10"))
+            #expect(message.contains("future_requirement"))
+            #expect(message.contains("value"))
+        }
+    }
+
+    @Test("Real local conformers and fileprivate extension members do not block a module")
+    func realScopedDeclarations() throws {
+        let sil = try emitSIL(sources: ["""
+        public protocol Feature { func value() -> Int }
+        public enum Scope {}
+        fileprivate extension Scope {
+            class Nested { var storage = 1 }
+            struct Box<T> { let value: T }
+        }
+        public func first() -> Int {
+            struct Local: Feature { func value() -> Int { 1 } }
+            return Local().value()
+        }
+        public struct Safe { public var value: Int }
+        """, """
+        fileprivate extension Scope {
+            class Nested { var storage = "two" }
+            struct Box<T> { let value: [T] }
+        }
+        public func second() -> Int {
+            struct Local: Feature { func value() -> Int { 2 } }
+            return Local().value()
+        }
+        """])
+        let file = try CanonicalSIL.File(text: sil)
+        let locals = file.protocolConformances.records.filter { $0.conformingType == "Local" }
+        #expect(locals.count == 2)
+        #expect(Set(locals.flatMap(\.witnesses).compactMap(\.symbol)).count == 2)
+        #expect(file.protocolConformances.isAmbiguousType("Local"))
+        #expect(throws: CanonicalSIL.LoweringError.self) { try file.typeEnvironment.resolve("Scope.Nested") }
+        #expect(throws: CanonicalSIL.LoweringError.self) { try file.typeEnvironment.resolve("Scope.Box<Int>") }
+        #expect(try file.typeEnvironment.resolve("Safe") == .local(.init(rawValue: "Safe")))
     }
 
     @Test("Unavailable optional requirements remain explicit")
@@ -215,6 +328,10 @@ struct ProtocolConformanceTests {
     }
 
     private func emitSIL(_ source: String) throws -> String {
+        try emitSIL(sources: [source])
+    }
+
+    private func emitSIL(sources: [String]) throws -> String {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(
                 "helix-protocol-conformance-\(UUID().uuidString)",
@@ -225,13 +342,16 @@ struct ProtocolConformanceTests {
             withIntermediateDirectories: false
         )
         defer { try? FileManager.default.removeItem(at: directory) }
-        let sourceURL = directory.appendingPathComponent("Protocol.swift")
-        try Data((source + "\n").utf8).write(to: sourceURL)
+        let sourceURLs = try sources.enumerated().map { index, source in
+            let url = directory.appendingPathComponent("Protocol\(index).swift")
+            try Data((source + "\n").utf8).write(to: url)
+            return url
+        }
         return try SwiftFrontend.Driver().emitCanonicalSIL(
-            sourceFiles: [sourceURL],
+            sourceFiles: sourceURLs,
             moduleName: "HelixProtocolConformanceFixture",
             optimization: "-Onone",
-            additionalArguments: ["-parse-as-library"],
+            additionalArguments: ["-parse-as-library", "-g"],
             purpose: .semanticLowering
         )
     }

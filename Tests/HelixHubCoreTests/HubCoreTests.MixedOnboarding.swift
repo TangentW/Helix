@@ -129,6 +129,20 @@ struct MixedOnboarding {
         #expect(listing.status == 0, "\(listing.standardError)")
         try save("project-before.pbxproj", Data(original.utf8))
         try save("project-after.pbxproj", installedData)
+        let partialStart = DispatchTime.now().uptimeNanoseconds
+        let partial = await app.runAsync(["xcode", "post-compile", "--plan", sourceRoot.appendingPathComponent(".helix/xcode/HostPlan.json").path,
+            "--profile", "live", "--capture", capture.path, "--diagnose", "--stages", "source-nominals,imported-types", "--json"])
+        try save("selected-diagnosis.json", Data(partial.standardOutput.utf8))
+        observations.append(.init(operation: "selected-frontend-diagnosis", status: partial.exitCode,
+            milliseconds: (DispatchTime.now().uptimeNanoseconds - partialStart) / 1_000_000))
+        try save("observations.json", Core.CanonicalJSON.encode(observations))
+        try #require(partial.exitCode == 0, "\(partial.standardOutput)\n\(partial.standardError)")
+        let selectedReport = try JSONDecoder().decode(FrontendReceipt.DiagnosticReport.self, from: Data(partial.standardOutput.utf8))
+        #expect(selectedReport.requestedStages == [.importedTypes, .sourceNominals])
+        #expect(selectedReport.checks.allSatisfy { $0.status == .passed })
+        #expect(selectedReport.performance?.subprocesses.contains { $0.kind == .canonicalSIL } == false)
+        #expect(selectedReport.checks.contains { $0.stage == "xcode.catalog_availability" } == false)
+        #expect(selectedReport.checks.contains { $0.stage == "frontend.receipt" } == false)
         let start = DispatchTime.now().uptimeNanoseconds
         let diagnosed = await app.runAsync(["xcode", "post-compile", "--plan", sourceRoot.appendingPathComponent(".helix/xcode/HostPlan.json").path,
             "--profile", "live", "--capture", capture.path, "--diagnose", "--json"])
@@ -141,6 +155,12 @@ struct MixedOnboarding {
         let report = try JSONDecoder().decode(FrontendReceipt.DiagnosticReport.self, from: Data(diagnosed.standardOutput.utf8))
         #expect(report.passed)
         #expect(report.checks.contains { $0.stage == "frontend.receipt" && $0.status == .passed })
+        for prefix in ["frontend.identity_sil", "frontend.semantic_sil"] {
+            for component in ["conformances", "nominal_declarations", "function_locations", "ast_mapping"] {
+                #expect(report.checks.contains { $0.stage == prefix + "." + component && $0.status == .passed })
+            }
+        }
+        #expect(report.performance?.stages.contains { $0.name == "prepare.validate_environment" } == true)
         #expect(!(manager.subpaths(atPath: root.path) ?? []).contains { $0.hasSuffix("/ShellBuildReceipt.json") })
     }
 }

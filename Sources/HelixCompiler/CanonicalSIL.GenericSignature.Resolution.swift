@@ -303,6 +303,12 @@ extension CanonicalSIL.GenericSignature {
         }
         defer { visited.remove(key) }
 
+        if conformances.isAmbiguousType(concrete) {
+            throw ResolutionError.invalid(
+                "\(concrete) has ambiguous printed conformance identity for \(protocolName):\n  "
+                    + conformances.ambiguityEvidence(for: concrete).joined(separator: "\n  ")
+            )
+        }
         var proven: [Evidence] = []
         for match in conformances.specializedRecords(
             conformingType: concrete,

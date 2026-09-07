@@ -326,8 +326,9 @@ public struct Adapter: Sendable {
         }
         // Build location and symbol indexes once for this immutable SIL module.
         // Recreating them for every declaration makes large modules quadratic.
-        let silResolver = performance.measure("frontend.index_sil_functions") {
-            FrontendReceipt.SILFunctionResolver(file: silFile)
+        let silResolver = try performance.measure("frontend.index_sil_functions") {
+            try FrontendReceipt.SILFunctionResolver(file: silFile).resolvingCollisions(using: .init(
+                compilerURL: request.compilerURL, invocationObserver: performance.subprocessObserver))
         }
         var drafts: [Draft] = []
         try performance.measure("frontend.index_source_declarations") {

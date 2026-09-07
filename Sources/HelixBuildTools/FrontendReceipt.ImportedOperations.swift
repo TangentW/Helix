@@ -214,6 +214,7 @@ extension FrontendReceipt.Adapter {
         moduleName: String,
         demangled: [String: String],
         silFile: CanonicalSIL.File,
+        compilerURL: URL = URL(fileURLWithPath: "/usr/bin/swiftc"),
         performance: BuildPerformance.Recorder? = nil
     ) throws -> ImportedOperationSurface {
         func measure<Value>(
@@ -230,7 +231,8 @@ extension FrontendReceipt.Adapter {
         }
         var types: [ImportedNativeType] = []
         var operations: [ImportedOperation] = []
-        let silResolver = FrontendReceipt.SILFunctionResolver(file: silFile)
+        let silResolver = try FrontendReceipt.SILFunctionResolver(file: silFile).resolvingCollisions(using: .init(
+            compilerURL: compilerURL, invocationObserver: performance?.subprocessObserver))
 
         try measure("collect") {
         for document in documents {

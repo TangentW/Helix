@@ -802,13 +802,30 @@ extension FrontendReceipt.Adapter {
     private func normalizeImportedNominalIdentities(
         _ uses: [ImportedNativeType]
     ) throws -> [ImportedNativeType] {
-        let indicesByCanonicalName = Dictionary(grouping: uses.indices) {
-            uses[$0].canonicalName
+        let byCanonicalName = Dictionary(grouping: uses, by: \.canonicalName)
+        for name in byCanonicalName.keys.sorted() {
+            let records = byCanonicalName[name, default: []]
+            guard Set(records.compactMap(\.objectiveCRuntimeName)).count <= 1 else {
+                throw FrontendReceipt.ImportedNominalIdentity.conflict(
+                    "imported nominal \(name) has conflicting Objective-C runtime identities", uses: records)
+            }
+        }
+        // Runtime class identity remains authoritative after an earlier merge
+        // has selected a nested Swift canonical spelling. This also makes
+        // incremental merges of normalized and raw observations idempotent.
+        let indicesByABIName = Dictionary(grouping: uses.indices) {
+            let use = uses[$0]
+            // Objective-C lightweight generics erase their arguments at
+            // runtime. That class identity cannot merge Swift instantiations.
+            if use.canonicalName.contains("<") || use.swiftType.contains("<") {
+                return use.canonicalName
+            }
+            return use.objectiveCRuntimeName ?? use.canonicalName
         }
         var overlayByRuntime: [String: String] = [:]
         var normalized = uses
-        for runtimeName in indicesByCanonicalName.keys.sorted() {
-            guard let indices = indicesByCanonicalName[runtimeName] else {
+        for runtimeName in indicesByABIName.keys.sorted() {
+            guard let indices = indicesByABIName[runtimeName] else {
                 continue
             }
             let matchingUses = indices.map { uses[$0] }
@@ -854,7 +871,7 @@ extension FrontendReceipt.Adapter {
                 // not a nominal alias, so keep every runtime identity exact.
                 continue
             }
-            for index in indicesByCanonicalName[runtimeName] ?? [] {
+            for index in indicesByABIName[runtimeName] ?? [] {
                 normalized[index].aliases = Array(Set(
                     normalized[index].aliases
                         + [runtimeName, normalized[index].swiftType]

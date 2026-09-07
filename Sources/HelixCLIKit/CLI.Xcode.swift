@@ -477,10 +477,23 @@ func executeXcodePhase(_ arguments: [String]) async throws -> CLI.Result {
 
 func executeXcodePostCompile(_ arguments: [String]) async throws -> CLI.Result {
     if arguments == ["--help"] { return .init(exitCode: 0, standardOutput: Self.xcodePostCompileHelp) }
-    let options = try CLI.Arguments(arguments, valueOptions: ["plan", "profile", "capture"], flagOptions: ["diagnose", "json"])
+    let options = try CLI.Arguments(arguments, valueOptions: ["plan", "profile", "capture", "stages"], flagOptions: ["diagnose", "json"])
     try requireNoXcodePositionals(options, command: "xcode post-compile")
     guard !options.hasFlag("json") || options.hasFlag("diagnose") else {
         throw CLI.Error.usage("post-compile --json requires --diagnose")
+    }
+    let stageText = try options.value("stages")
+    guard stageText == nil || options.hasFlag("diagnose") else {
+        throw CLI.Error.usage("post-compile --stages requires --diagnose")
+    }
+    let diagnosticStages = try stageText.map { text in
+        try text.split(separator: ",", omittingEmptySubsequences: false).map { value in
+            guard let stage = FrontendReceipt.DiagnosticStage(rawValue: value.trimmingCharacters(in: .whitespaces)) else {
+                throw CLI.Error.usage("unknown diagnostic stage \(String(reflecting: value)); choose "
+                    + FrontendReceipt.DiagnosticStage.allCases.map(\.rawValue).joined(separator: ", "))
+            }
+            return stage
+        }
     }
     let context: XcodeIntegration.BuildContext
     do {
@@ -489,7 +502,7 @@ func executeXcodePostCompile(_ arguments: [String]) async throws -> CLI.Result {
             profileID: options.require("profile"), captureURL: files.resolve(options.require("capture")), environment: environment)
     } catch {
         if options.hasFlag("diagnose") {
-            return try formatXcodeDiagnosis(.failure(stage: "xcode.context", reason: String(describing: error)), json: options.hasFlag("json"))
+            return try formatXcodeDiagnosis(.failure(stage: "xcode.context", reason: String(describing: error), stages: diagnosticStages), json: options.hasFlag("json"))
         }
         if let error = error as? CLI.XcodePostCompileError { throw CLI.Error.input(error.description) }
         if let error = error as? BuildCapture.Error { throw CLI.Error.input(error.description) }
@@ -499,10 +512,10 @@ func executeXcodePostCompile(_ arguments: [String]) async throws -> CLI.Result {
     defer { phaseLock.unlock() }
     if options.hasFlag("diagnose") {
         do {
-            return try await performPrepareXcodeShell(context, performance: .init(), diagnosticJSON: options.hasFlag("json"))
+            return try await performPrepareXcodeShell(context, performance: .init(), diagnosticJSON: options.hasFlag("json"), diagnosticStages: diagnosticStages)
         } catch {
             if error is CancellationError { throw error }
-            return try formatXcodeDiagnosis(.failure(stage: "xcode.prepare_context", reason: String(describing: error)), json: options.hasFlag("json"))
+            return try formatXcodeDiagnosis(.failure(stage: "xcode.prepare_context", reason: String(describing: error), stages: diagnosticStages), json: options.hasFlag("json"))
         }
     }
     let prepared = try await prepareXcodeShell(context)
@@ -1316,7 +1329,8 @@ private func prepareXcodeShell(
 private func performPrepareXcodeShell(
     _ context: XcodeIntegration.BuildContext,
     performance: BuildPerformance.Recorder,
-    diagnosticJSON: Bool? = nil
+    diagnosticJSON: Bool? = nil,
+    diagnosticStages: [FrontendReceipt.DiagnosticStage]? = nil
 ) async throws -> CLI.Result {
     let manager = FileManager.default
     try performance.measure("prepare.validate_environment") {
@@ -1417,17 +1431,18 @@ private func performPrepareXcodeShell(
             ? .managedDevelopmentModule
             : .managedProductionModule
     if let diagnosticJSON {
-        let resolved: XcodeNativeAPICatalogResolution?
+        var resolved: XcodeNativeAPICatalogResolution?
         var catalogFailure: String?
-        do {
-            resolved = try await resolveXcodeNativeAPICatalogs(context: context, metadata: metadata,
-                importedModules: sourceImports.modules, compilerArguments: capture.analysisJob.arguments,
-                compilerInputs: compilerInputs, toolchain: toolchain, cache: buildCache, performance: performance,
-                cachedOnly: true)
-        } catch {
-            if error is CancellationError { throw error }
-            resolved = nil
-            catalogFailure = String(describing: error)
+        if diagnosticStages == nil || diagnosticStages!.contains(.catalogs) || diagnosticStages!.contains(.receipt) {
+            do {
+                resolved = try await resolveXcodeNativeAPICatalogs(context: context, metadata: metadata,
+                    importedModules: sourceImports.modules, compilerArguments: capture.analysisJob.arguments,
+                    compilerInputs: compilerInputs, toolchain: toolchain, cache: buildCache, performance: performance,
+                    cachedOnly: true)
+            } catch {
+                if error is CancellationError { throw error }
+                catalogFailure = String(describing: error)
+            }
         }
         let request = FrontendReceipt.Request(metadata: metadata, configuration: configuration,
             sources: capture.frontendSources, compilerURL: context.environment.compilerURL,
@@ -1435,11 +1450,13 @@ private func performPrepareXcodeShell(
         var report = try FrontendReceipt.CachedAdapter(cache: buildCache).diagnose(request,
             compilerCapture: capture.recordBytes, compilerArguments: capture.analysisJob.arguments,
             workingDirectory: context.environment.sourceRootURL, precomputedToolchain: toolchain,
-            precomputedCompilerInputs: compilerInputs, catalogFailure: catalogFailure)
+            precomputedCompilerInputs: compilerInputs, catalogFailure: catalogFailure, stages: diagnosticStages)
         if let resolved {
             report.checks.insert(.init(stage: "xcode.catalog_availability", status: .passed,
                 detail: "\(resolved.snapshots.count) cached module Catalog(s), \(resolved.prewarmRequests.count) missing, unresolved=\(resolved.unresolvedModules). Diagnosis reads cached Catalogs; normal Prepare manages prewarm."), at: 0)
         }
+        if let trace = report.performance { performance.merge(trace) }
+        report.performance = performance.trace()
         return try formatXcodeDiagnosis(report, json: diagnosticJSON)
     }
     if compilerInputs.isComplete {
@@ -3119,11 +3136,16 @@ generated integration uses automatic selection by default.
 """ + "\n"
 
 static let xcodePostCompileHelp = """
-Usage: helix xcode post-compile --plan HostPlan.json --profile ID --capture FILE [--diagnose [--json]]
+Usage: helix xcode post-compile --plan HostPlan.json --profile ID --capture FILE [--diagnose [--stages STAGE,STAGE] [--json]]
 
 --diagnose collects independent frontend failures, marks blocked checks, and
 validates the receipt pipeline without publishing a Shell, Bridge, or receipt.
-It reuses validated compiler checkpoints and reads existing Catalogs. Link,
+--stages runs only the requested checks and necessary dependencies: typed-ast,
+identity-sil, semantic-sil, source-nominals, imported-types, source-mappings,
+imported-operations, catalogs, receipt. A selected-check pass is not full receipt
+validation unless receipt is requested. JSON schema 2 records requestedStages.
+
+It reuses validated compiler checkpoints and reads needed existing Catalogs. Link,
 service registration, and runtime activation still require normal Build/Run.
 
 This internal command is invoked by the generated Swift compiler proxy after a

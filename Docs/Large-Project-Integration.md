@@ -187,6 +187,16 @@ AST analysis; captured module-loading inputs remain subject to replay validation
 Canonical SIL is read from a dedicated private output file because bridging-PCH
 driver jobs can write `-o -` SIL to stderr. Diagnostics are never parsed as SIL.
 
+Common source forms have the following identity boundaries. See the detailed
+[compiler identity inventory](Compiler-Identity.md) for authority and evidence.
+
+| Source form | Current behavior |
+| --- | --- |
+| Same-named protocol conformers local to different functions | Retain every witness-table occurrence; printed type/protocol names do not establish global uniqueness. Ambiguous types and descendants cannot supply layout, generic or dispatch facts |
+| Unmarked classes/structs in `private` / `fileprivate extension` | Inherit extension defaults, respecting explicit member access and private parent limits separately; ambiguous private layouts remain isolated |
+| Closures at one coordinate in `optional ?? { ... }()` | Compiler symbol roles distinguish autoclosures from explicit closures; closure discriminators further constrain matching. Remaining ambiguity reports all candidates |
+| `NS_SWIFT_NAME` nested classes and flat Clang names | Normalize using proven Objective-C runtime identity, preserve generic arguments, and do not equate unrelated nested types |
+
 ## Collect independent frontend failures
 
 Use the successful target's captured invocation to diagnose receipt generation:
@@ -197,37 +207,78 @@ helix xcode post-compile --plan .helix/xcode/HostPlan.json --profile live \
   --diagnose --json
 ```
 
-Omit `--json` for readable text. The report contains `passed`, a `checks` array
-with `passed`/`failed`/`blocked` statuses and evidence, eligibility diagnostics,
-and a performance trace when analysis starts. Exit zero means the checked
-frontend receipt analysis passed. Eligibility diagnostics describe individual
-declarations and do not by themselves mean the analysis failed.
+Omit `--json` for readable text with per-check elapsed time. The report contains
+`passed`, a `checks` array with `passed`/`failed`/`blocked` statuses and evidence,
+eligibility diagnostics, and a performance trace when analysis starts. Individual
+eligibility diagnostics do not by themselves mean the analysis failed.
+
+To investigate nominal discovery without replaying SIL or loading Catalogs:
+
+```sh
+helix xcode post-compile --plan .helix/xcode/HostPlan.json --profile live \
+  --capture /absolute/DerivedData/path/FrontendInvocation.hlxswiftc \
+  --diagnose --stages source-nominals,imported-types --json
+```
+
+`--stages` accepts comma-separated roots, includes their dependencies, and skips
+unselected branches. Empty or unknown selections are errors.
+
+| Selection | Work required |
+| --- | --- |
+| `typed-ast` | Request, source and toolchain validation; typed AST emission/parsing |
+| `identity-sil`, `semantic-sil` | The selected SIL replay and its component checks; no typed AST |
+| `source-nominals`, `imported-types` | Typed AST and type demangling; no SIL or Catalogs |
+| `source-mappings` | Typed AST, both SIL replays/component checks, and AST/SIL mapping |
+| `imported-operations` | Typed AST, type demangling and semantic SIL; no identity SIL or Catalogs |
+| `catalogs` | Typed AST imports, toolchain facts and available cached Catalog validation; no SIL |
+| `receipt` | Complete frontend receipt analysis and assembly |
+
+Diagnostic JSON now emits **schema 2**. Its optional `requestedStages` records a
+sorted, unique selection. A missing field (including schema 1 reports) means full
+scope. With a selection that omits `receipt`, `passed: true` and exit zero mean
+only that the selected checks and dependencies passed; they do not qualify a full
+receipt. Schema-aware consumers must recognize version 2 and inspect this scope.
+Omitting `--stages`, or selecting `receipt`, retains full frontend validation.
+This diagnostic format change does not change Shell or patch artifact schemas.
 
 Normal generation and diagnosis share the same dependency-aware analysis.
-Diagnosis aggregates independent request/source-file errors, runs typed AST and
-both SIL checks independently, then checks source nominals, imported types,
-operations and Catalog consistency wherever their prerequisites succeeded.
-Failed facts are never substituted as valid input; their consumers are marked
-blocked. Invalid capture/context prevents dependent compiler work. After these
-independent checks, final receipt assembly still stops at its first failure;
-this mode does not promise every possible violation from malformed input.
+Diagnosis aggregates independent request/source-file errors and compiler-stage
+failures. Within each SIL output, function definitions, debug scopes, source
+modules, conformance records and nominal declarations are checked independently.
+Validated definitions and debug scopes permit function-location binding and
+AST/SIL mapping even if unrelated conformance or layout checks fail. Mapping
+reports all independent declaration conflicts. Type-environment construction,
+imported operations and receipt assembly remain blocked when their facts are
+invalid; no empty replacement `CanonicalSIL.File` is created.
 
-Diagnosis reads existing validated Catalogs and reports missing production
+Component checks appear under `frontend.identity_sil.*` and
+`frontend.semantic_sil.*`, with elapsed time in the performance trace. The trace
+also includes CLI input preparation and required Catalog loading. Nested timing
+spans overlap; adding every stage duration is not total wall time. Invalid
+capture/context prevents compiler work. Final receipt assembly still stops at
+its first failure; diagnosis does not promise every violation from malformed input.
+
+Diagnosis reads needed existing validated Catalogs and reports missing production
 coverage without starting cold Catalog generation or background prewarm. It
 bypasses complete module-receipt cache hits so current checks run, but can reuse
-and retain individually validated compiler checkpoints. It does not publish a
-module receipt, Shell, Bridge, prepared state, or Hub reservation. Linking,
-service connection, and runtime activation require normal Build/Run.
+and retain individually validated compiler checkpoints. Partial SIL facts are
+never cached as a successful SIL stage. It does not publish a module receipt,
+Shell, Bridge, prepared state, or Hub reservation. Linking, service connection,
+and runtime activation require normal Build/Run.
 
 ## Mixed configuration regression
 
 [`Tests/Fixtures/MixedOnboarding`](../Tests/Fixtures/MixedOnboarding/README.md)
-contains a small real Xcode App with two `@TaskLocal` expansions, file-private
-types, qualified/unqualified SDK names, Foundation/UIKit/AVFoundation/Photos,
+contains a small real Xcode App with two `@TaskLocal` expansions, same-named local
+protocol conformers, classes/structs inheriting `fileprivate extension` access,
+`?? { ... }()` closures, and qualified/unqualified SDK names. It includes UIKit's
+nested `NS_SWIFT_NAME` reference `UIPencilInteraction.Tap` (iOS 17.5),
+Foundation/UIKit/AVFoundation/Photos,
 an Objective-C bridging header, C++ interop, `-g`, and explicit modules enabled
 in project settings. Its opt-in test performs a native Xcode compile/link,
 captures all five Swift files, installs twice, checks PBX syntax with `plutil`,
-loads the installed project with `xcodebuild -list`, and diagnoses the receipt.
+loads the installed project with `xcodebuild -list`, then runs selected nominal
+checks and full receipt diagnosis, including independent SIL and mapping checks.
 Driver probes record build status separately from capture availability.
 The direct `SystemFrameworkIntegration` test additionally invokes the compiler
 with `-explicit-module-build` and verifies emitted debug scopes.

@@ -417,6 +417,23 @@ struct Application {
         let invalid = await app.runAsync(["xcode", "post-compile", "--json"])
         #expect(invalid.exitCode != 0)
         #expect(invalid.standardError.contains("--diagnose"))
+        let selected = await app.runAsync(["xcode", "post-compile", "--plan", "MissingPlan.json",
+            "--profile", "live", "--capture", "MissingCapture", "--diagnose", "--json", "--stages", "source-nominals,imported-types"])
+        let scoped = try JSONDecoder().decode(FrontendReceipt.DiagnosticReport.self, from: Data(selected.standardOutput.utf8))
+        #expect(scoped.schemaVersion == 2)
+        #expect(scoped.requestedStages == [.importedTypes, .sourceNominals])
+        #expect(scoped.checks.contains { $0.stage == "frontend.receipt" } == false)
+        #expect(scoped.checks.contains { $0.stage == "frontend.discover_imported_types" && $0.status == .blocked })
+        let scopedHuman = await app.runAsync(["xcode", "post-compile", "--plan", "MissingPlan.json",
+            "--profile", "live", "--capture", "MissingCapture", "--diagnose", "--stages", "typed-ast"])
+        #expect(scopedHuman.standardOutput.contains("full receipt validation was not requested"))
+        for value in ["", "typed-ast,", "unknown"] {
+            let unknown = await app.runAsync(["xcode", "post-compile", "--diagnose", "--stages", value])
+            #expect(unknown.exitCode != 0)
+            #expect(unknown.standardError.contains("stage") || unknown.standardError.contains("value"))
+        }
+        let requiresDiagnosis = await app.runAsync(["xcode", "post-compile", "--stages", "typed-ast"])
+        #expect(requiresDiagnosis.standardError.contains("--stages requires --diagnose"))
     }
 
     @Test("Xcode prepare discovers all source entries and manages the Debug SDK surface")

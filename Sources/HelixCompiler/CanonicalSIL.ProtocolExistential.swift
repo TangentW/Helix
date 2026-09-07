@@ -651,7 +651,7 @@ extension CanonicalSIL.ProtocolExistential {
             self.moduleName = moduleName
             self.typeEnvironment = typeEnvironment ?? file.typeEnvironment
             recordsByConformingType = Dictionary(
-                grouping: file.protocolConformances.records.filter {
+                grouping: file.protocolConformances.unambiguousRecords.filter {
                     $0.moduleName == moduleName
                         && $0.genericClause == nil
                         && $0.isComplete

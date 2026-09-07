@@ -56,6 +56,29 @@ struct ImportedNominalIdentityTests {
         #expect(merged.first?.swiftType == "Foundation.Progress")
     }
 
+    @Test("Qualified flat Clang names are ABI evidence alongside a nested Swift overlay")
+    func mergesFlatAndNestedObjectiveCNames() throws {
+        let spellings = ["RuntimeNested", "Foundation.RuntimeNested", "__C.RuntimeNested",
+                         "Namespace.Nested", "Foundation.Namespace.Nested"]
+        let uses = spellings.enumerated().map {
+            type("RuntimeNested", swift: $0.element, source: "File\($0.offset).swift")
+        }
+        let adapter = FrontendReceipt.Adapter()
+        let merged = try adapter.mergeImportedNativeTypes(discoveredTypes: uses, operationTypes: [])
+        let value = try #require(merged.first)
+        #expect(merged.count == 1)
+        #expect(value.swiftType == "Foundation.Namespace.Nested")
+        #expect(value.objectiveCRuntimeName == "RuntimeNested")
+        #expect(Set(value.aliases + [value.swiftType]).isSuperset(of: spellings))
+        #expect(try adapter.mergeImportedNativeTypes(discoveredTypes: merged, operationTypes: uses) == merged)
+        #expect(try adapter.mergeImportedNativeTypes(discoveredTypes: [], operationTypes: uses.reversed()) == merged)
+        var unproven = uses
+        for index in unproven.indices { unproven[index].objectiveCRuntimeName = nil }
+        #expect(throws: FrontendReceipt.Error.self) {
+            try adapter.mergeImportedNativeTypes(discoveredTypes: unproven, operationTypes: [])
+        }
+    }
+
     @Test("Repeated use sites do not duplicate conflict facts")
     func boundsRepeatedDiagnostics() {
         let uses = (0..<1_000).map {
@@ -111,6 +134,36 @@ struct ImportedNominalIdentityTests {
             type("SecondRuntime", swift: "Foundation.Progress", source: "B.swift"),
         ], operationTypes: [])
         #expect(Set(merged.map(\.canonicalName)) == ["FirstRuntime", "SecondRuntime"])
+    }
+
+    @Test("Conflicting runtime facts cannot disappear when normalizing canonical groups")
+    func rejectsContradictoryRuntimes() {
+        var first = type("FirstRuntime", swift: "First.Nested", source: "First.swift")
+        var second = type("SecondRuntime", swift: "Second.Nested", source: "Second.swift")
+        first.canonicalName = "SharedCanonical"
+        second.canonicalName = "SharedCanonical"
+        do {
+            _ = try FrontendReceipt.Adapter().mergeImportedNativeTypes(discoveredTypes: [first, second], operationTypes: [])
+            Issue.record("Conflicting runtime identities were normalized away")
+        } catch {
+            let message = String(describing: error)
+            for fact in ["SharedCanonical", "FirstRuntime", "SecondRuntime", "First.swift", "Second.swift"] {
+                #expect(message.contains(fact))
+            }
+        }
+    }
+
+    @Test("An erased Objective-C runtime class does not equate lightweight generic instantiations")
+    func preservesObjectiveCGenericArguments() throws {
+        let uses = ["NSLayoutXAxisAnchor", "NSLayoutYAxisAnchor"].map { argument in
+            var use = type("NSLayoutAnchor", swift: "NSLayoutAnchor<\(argument)>", source: "Layout.swift")
+            use.canonicalName = use.swiftType
+            use.importedModules = ["UIKit"]
+            return use
+        }
+        let merged = try FrontendReceipt.Adapter().mergeImportedNativeTypes(discoveredTypes: uses, operationTypes: [])
+        #expect(Set(merged.map(\.canonicalName)) == Set(uses.map(\.canonicalName)))
+        #expect(merged.count == 2)
     }
 
     @Test("Declaring module conflicts include the compiler provenance")

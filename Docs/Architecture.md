@@ -147,8 +147,9 @@ Both workflows depend on stable, build-specific identities:
   tables as bounded, deterministic compiler-only evidence. It retains the
   conforming type pattern, protocol identity, conditional generic clause,
   associated-type and inherited-protocol evidence, requirement ABI, and exact
-  witness symbol and table order. Duplicate conformance identities or malformed
-  records fail during inventory. Multiple witness rows with the same printed
+  witness symbol, SIL header line, and table order. Malformed records fail during
+  inventory. Same-spelled conformance records remain distinct occurrences;
+  ambiguous nominal lookups and descendants cannot supply dispatch evidence. Multiple witness rows with the same printed
   requirement and ABI remain distinct because textual SIL can erase source
   argument labels; a later consumer must reject a lookup it cannot uniquely
   resolve. Imported witness-table declarations without target bodies are not
@@ -1013,6 +1014,16 @@ non-file-scoped duplicate declarations remain errors. Swift's textual SIL summar
 omits the discriminator for these names, so ambiguous layouts and their children
 are unavailable to structural HLBC codecs; unaffected declarations still index.
 
+SIL declaration summaries inherit `private`/`fileprivate` extension access as a
+default for immediate members; an explicit member modifier overrides that
+default, while a private nominal owner still limits its children. Ambiguous
+private layouts and their descendants remain unavailable. Witness tables retain
+all same-spelled occurrences, including empty marker conformances. An ambiguous
+conforming type and its descendants cannot supply a layout, static witness, generic proof, or
+existential case through a printed-name lookup. Unrelated declarations remain
+available; exact witness-symbol membership is indexed per module. This does not
+claim support for lowering the ambiguous local types themselves.
+
 `ShellBuildReceipt.NominalType` adds an optional `sourceFileLogicalID` in schema 1.
 Absent fields retain the exact prior encoding and `HLX.NominalType.v1` identity.
 Scoped roots use the additive `HLX.NominalType.FileScoped.v2` derivation over module,
@@ -1031,9 +1042,17 @@ an observed module-qualified spelling and its exact relative spelling, such as
 `Foundation.Progress` and `Progress`, before nested identity and merge consumers
 run. The observed qualified form is used for generated Swift; original spellings
 remain aliases. Only one proven module prefix may be removed for comparison;
-nested scopes and generic arguments remain significant. Distinct qualified
-modules, unrelated short aliases, and different runtime classes are not unified.
+nested scopes and generic arguments remain significant. Distinct qualified Swift
+overlays, unrelated short aliases, and different runtime classes are not unified.
 Catalog declaring-module evidence also recognizes reexported module prefixes.
+
+A flat Objective-C runtime spelling, including its observed-module or `__C` /
+`__ObjC` qualification, is an ABI spelling only with exact reference/runtime
+evidence. It does not compete with an observed `NS_SWIFT_NAME` nested overlay.
+Nongeneric normalized and raw observations regroup by that runtime authority; contradictory
+runtime facts for one canonical identity still reject before normalization.
+Objective-C lightweight generic instantiations retain their type arguments despite
+runtime erasure. This does not equate arbitrary nested Swift spellings or distinct runtime classes.
 
 Identity conflicts report all distinct conflicting facts with a deterministic
 source example, including Swift spelling, imports, measured provenance, runtime,
@@ -1042,6 +1061,15 @@ available. These locations are diagnostic evidence, not nominal ID components.
 They are excluded from serialized compiler projections.
 The transform identity is revised to discard older local receipts/projections;
 existing persisted type-ID derivations and archive schemas are unchanged.
+
+### Compiler symbol roles
+
+At colliding source coordinates, receipt analysis batches structural trees from
+the captured toolchain's `swift-demangle --expand --tree-only`. Explicit closures,
+autoclosures, ordinary functions, accessors, and witness thunks remain distinct
+roles. AST closure discriminators further constrain a match. Unknown roles and
+remaining same-role collisions fail closed with each symbol, ABI, role and
+location. No additional symbol-tree process is needed when locations are unique.
 
 ### Recoverable compiler stages
 
@@ -1060,3 +1088,19 @@ invalid facts, without publishing runtime artifacts or a complete module cache
 entry. SIL declaration identity requires an actual function definition; debug-only
 parents remain scope-local metadata. See the [identity authority inventory](Compiler-Identity.md)
 and [diagnosis boundaries](Large-Project-Integration.md#collect-independent-frontend-failures).
+
+`CanonicalSIL.Inspection` separates raw function definitions, debug scopes,
+source-module mappings, conformances and nominal declarations. Function locations
+require validated definitions/scopes; type construction requires validated
+conformance and declaration inventories. A complete `CanonicalSIL.File` exists
+only after all prerequisites succeed. Normal parsing uses the same components
+and keeps fail-fast behavior; diagnosis retains independent checks and mapping
+conflicts. Raw body lines are released before the larger type/conformance tables
+are assembled. No partially valid File or substitute empty environment escapes.
+
+Diagnostic stage selection uses the shared analysis graph to skip unrelated
+compiler replays and Catalog reads. A successful selected run still confirms
+cache inputs and retains only fully validated compiler checkpoints; it does not
+publish a module receipt. Diagnostic JSON schema 2 adds `requestedStages` so a
+partial pass cannot be mistaken for full receipt validation. Missing selection
+in legacy schema 1 reports retains full scope. Shell/patch schemas are unchanged.

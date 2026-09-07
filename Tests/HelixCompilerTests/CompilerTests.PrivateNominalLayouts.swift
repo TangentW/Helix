@@ -40,5 +40,56 @@ struct PrivateNominalLayouts {
             }
         }
     }
+
+    @Test("Extension defaults and owner visibility have distinct inheritance rules")
+    func extensionAccessDefaults() throws {
+        for access in ["private", "fileprivate"] {
+            let file = try CanonicalSIL.File(text: """
+            sil_stage canonical
+            public enum Scope {
+            }
+            \(access) extension Scope {
+              class Nested {
+                struct Child {
+                }
+              }
+            }
+            \(access) extension Scope {
+              class Nested {
+              }
+            }
+            extension Scope {
+              struct Safe {
+              }
+            }
+            """)
+            #expect(throws: CanonicalSIL.LoweringError.self) { try file.typeEnvironment.resolve("Scope.Nested") }
+            #expect(throws: CanonicalSIL.LoweringError.self) { try file.typeEnvironment.resolve("Scope.Nested.Child") }
+            #expect(try file.typeEnvironment.resolve("Scope.Safe") == .local(.init(rawValue: "Scope.Safe")))
+        }
+        for second in ["fileprivate extension Scope {\n  internal struct Key {",
+                       "extension Scope {\n  struct Key {"] {
+            do {
+                _ = try CanonicalSIL.File(text: """
+                sil_stage canonical
+                fileprivate extension Scope {
+                  struct Key {
+                  }
+                }
+                \(second)
+                  }
+                }
+                """)
+                Issue.record("Nonprivate duplicate was accepted")
+            } catch {
+                let message = String(describing: error)
+                #expect(message.contains("SIL line 3"))
+                #expect(message.contains("SIL line 7"))
+                #expect(message.contains("parent=Scope"))
+                #expect(message.contains("effectiveFileScoped=true"))
+                #expect(message.contains("effectiveFileScoped=false"))
+            }
+        }
+    }
 }
 }

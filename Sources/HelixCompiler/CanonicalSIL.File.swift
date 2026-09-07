@@ -186,43 +186,13 @@ public struct File: Sendable {
     private let sourceModuleByFile: [String: String]
 
     public init(text: String) throws {
-        let scopes = try CanonicalSIL.DebugMetadata.scopes(in: text)
-        let sourceModules = try CanonicalSIL.DebugMetadata.sourceModules(in: text)
-        let scopeLocations = Dictionary(
-            uniqueKeysWithValues: scopes.map { ($0.id, $0.location) }
-        )
-        var extractedFunctions = try Self.extractFunctions(text, scopeLocations: scopeLocations)
-        let definedSymbols = Set(extractedFunctions.map(\.mangledName))
-        var declarationScopes: [String: CanonicalSIL.DebugScope] = [:]
-        for scope in scopes {
-            // A debug parent spelling is not a declaration. In particular,
-            // __unknown_macro__ can name unrelated scopes in several files.
-            // Only a concrete SIL definition can give this map its identity.
-            guard let symbol = scope.parentSymbol, definedSymbols.contains(symbol) else { continue }
-            if let existing = declarationScopes[symbol], existing.location != scope.location {
-                throw CanonicalSIL.LoweringError.malformedSIL(
-                    "function @\(symbol) has conflicting declaration locations: "
-                    + "scope \(existing.id) at \(existing.location.file):\(existing.location.line):\(existing.location.column); "
-                    + "scope \(scope.id) at \(scope.location.file):\(scope.location.line):\(scope.location.column)"
-                )
-            }
-            declarationScopes[symbol] = scope
-        }
-        for index in extractedFunctions.indices {
-            extractedFunctions[index].declarationLocation = declarationScopes[
-                extractedFunctions[index].mangledName
-            ]?.location
-        }
-        let parsedFunctions = extractedFunctions.map(
-            CanonicalSIL.OpaqueResult.concretize
-        )
-        let parsedConformances = try CanonicalSIL.ProtocolConformance
-            .Environment(text: text)
-        let rawTypeEnvironment = try CanonicalSIL.TypeEnvironment(
-            text: text,
-            functions: parsedFunctions,
-            protocolConformances: parsedConformances
-        )
+        self = try CanonicalSIL.Inspection.parse(text, collectFailures: false).requireFile()
+    }
+
+    init(parsedFunctions: [CanonicalSIL.Function],
+        parsedConformances: CanonicalSIL.ProtocolConformance.Environment,
+        rawTypeEnvironment: CanonicalSIL.TypeEnvironment, sourceModules: [String: String]
+    ) throws {
         let dispatchInventory = CanonicalSIL.ProtocolConformance
             .StaticDispatch.Inventory(
             conformances: parsedConformances,
@@ -358,15 +328,41 @@ public struct File: Sendable {
         return false
     }
 
-    private static func extractFunctions(
-        _ text: String,
-        scopeLocations: [UInt32: Core.SourceLocation]
+    static func locateFunctions(_ definitions: [CanonicalSIL.FunctionDefinition],
+        scopes: [CanonicalSIL.DebugScope]
     ) throws -> [CanonicalSIL.Function] {
+        let scopeLocations = Dictionary(uniqueKeysWithValues: scopes.map { ($0.id, $0.location) })
+        var extractedFunctions = try definitions.map { try $0.function(scopeLocations: scopeLocations) }
+        let definedSymbols = Set(extractedFunctions.map(\.mangledName))
+        var declarationScopes: [String: CanonicalSIL.DebugScope] = [:]
+        for scope in scopes {
+            // A debug parent spelling is not a declaration. In particular,
+            // __unknown_macro__ can name unrelated scopes in several files.
+            // Only a concrete SIL definition can give this map its identity.
+            guard let symbol = scope.parentSymbol, definedSymbols.contains(symbol) else { continue }
+            if let existing = declarationScopes[symbol], existing.location != scope.location {
+                throw CanonicalSIL.LoweringError.malformedSIL(
+                    "function @\(symbol) has conflicting declaration locations: "
+                    + "scope \(existing.id) at \(existing.location.file):\(existing.location.line):\(existing.location.column); "
+                    + "scope \(scope.id) at \(scope.location.file):\(scope.location.line):\(scope.location.column)"
+                )
+            }
+            declarationScopes[symbol] = scope
+        }
+        for index in extractedFunctions.indices {
+            extractedFunctions[index].declarationLocation = declarationScopes[
+                extractedFunctions[index].mangledName
+            ]?.location
+        }
+        return extractedFunctions.map(CanonicalSIL.OpaqueResult.concretize)
+    }
+
+    static func extractFunctionDefinitions(_ text: String) throws -> [CanonicalSIL.FunctionDefinition] {
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         let headerRegex = try NSRegularExpression(
             pattern: #"^sil(?:(?:\s+\[[^\]]+\])|(?:\s+(?:public|public_external|hidden|shared|private|package|package_external|non_abi|public_non_abi|serialized)))*\s+@([^\s:]+)\s*:\s*\$(.+)\s*\{$"#
         )
-        var result: [CanonicalSIL.Function] = []
+        var result: [CanonicalSIL.FunctionDefinition] = []
         var definitionHeaders: [String: (line: Int, type: String)] = [:]
         var index = 0
         while index < lines.count {
@@ -419,30 +415,8 @@ public struct File: Sendable {
             guard index < lines.count else {
                 throw CanonicalSIL.LoweringError.malformedSIL("unterminated function @\(name)")
             }
-            var debugLineLocations: [CanonicalSIL.DebugLineLocation] = []
-            let normalizedBody = try bodyLines.enumerated().map { offset, rawLine in
-                let parsed = try CanonicalSIL.DebugMetadata.parse(
-                    rawLine,
-                    scopes: scopeLocations
-                )
-                if let location = parsed.location {
-                    debugLineLocations.append(
-                        .init(line: offset + 1, location: location)
-                    )
-                }
-                return parsed.instruction
-            }.joined(separator: "\n")
-            result.append(
-                .init(
-                    mangledName: name,
-                    loweredType: type,
-                    body: normalizedBody,
-                    isolation: isolation,
-                    declarationLocation: nil,
-                    debugLineLocations: debugLineLocations,
-                    isExternalDefinition: isExternalDefinition
-                )
-            )
+            result.append(.init(mangledName: name, loweredType: type, bodyLines: bodyLines,
+                isolation: isolation, isExternalDefinition: isExternalDefinition))
             index += 1
         }
         return result

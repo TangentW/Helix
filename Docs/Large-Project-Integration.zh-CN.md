@@ -153,6 +153,15 @@ explicit-module 调度不直接复制进 AST 分析；捕获到的 module-loadin
 Canonical SIL 改从单独的私有输出文件读取，因为包含 bridging PCH 的 driver job 可能把
 `-o -` 的 SIL 写到 stderr。诊断输出不会作为 SIL 解析。
 
+常见源码写法的身份边界如下；详细依据见[编译器身份清单](Compiler-Identity.zh-CN.md)。
+
+| 场景 | 当前行为 |
+| --- | --- |
+| 不同函数内的同名协议 conformer | 保留各条 witness table，不用类型/协议打印名做全局唯一断言；无法证明唯一性的类型及后代不提供布局、泛型或 dispatch 事实 |
+| `private` / `fileprivate extension` 内省略访问修饰符的 class/struct | 继承 extension 默认级别；显式成员修饰符与私有父类型限制分别处理，重名私有布局保持隔离 |
+| `optional ?? { ... }()` 的同位置闭包 | 用编译器符号角色区分 autoclosure 与显式闭包，再结合 discriminator；剩余歧义报告完整候选 |
+| `NS_SWIFT_NAME` 嵌套类与 Clang 扁平名称 | 以已证实的 Objective-C runtime 身份归一，保留泛型参数，不合并无关嵌套类型 |
+
 ## 一次收集独立的 frontend 问题
 
 用真实 target 成功编译后生成的捕获文件诊断 receipt：
@@ -163,29 +172,64 @@ helix xcode post-compile --plan .helix/xcode/HostPlan.json --profile live \
   --diagnose --json
 ```
 
-不加 `--json` 时输出可读文本。报告包含 `passed`、带 `passed`/`failed`/`blocked`
-状态和判定依据的 `checks`、声明资格诊断，以及分析启动后的性能 trace。退出码 0
-表示本次检查的 frontend receipt 分析通过；单个声明的资格诊断本身不代表分析失败。
+不加 `--json` 时输出可读文本和各检查耗时。报告包含 `passed`、带
+`passed`/`failed`/`blocked` 状态和判定依据的 `checks`、声明资格诊断，以及分析启动后
+的性能 trace。单个声明的资格诊断本身不代表分析失败。
 
-正常生成与诊断共用同一套有明确依赖关系的分析。诊断汇总独立的请求和源文件错误，
-分别运行 typed AST、identity SIL、semantic SIL，并在前置事实有效时继续检查源码
-nominal、imported type、operation 和 Catalog 一致性。失败事实不会被当作有效输入，
-依赖它的检查标为 blocked。捕获或上下文无效时无法继续编译。独立检查之后的最终
-receipt 组装仍在首个错误处停止；该模式不承诺从无效输入中枚举所有可能问题。
+仅排查 nominal 发现时，可跳过 SIL 重放和 Catalog 读取：
 
-诊断只读取已有且验证通过的 Catalog，报告缺失的生产覆盖，不启动冷编目或后台预热。
-它绕过完整模块 receipt 缓存，确保执行当前检查，但复用并保留逐阶段验证的 compiler
-checkpoint。不发布模块 receipt、Shell、Bridge、Prepare state 或 Hub reservation。
+```sh
+helix xcode post-compile --plan .helix/xcode/HostPlan.json --profile live \
+  --capture /absolute/DerivedData/path/FrontendInvocation.hlxswiftc \
+  --diagnose --stages source-nominals,imported-types --json
+```
+
+`--stages` 用逗号分隔检查入口，自动包含依赖，跳过未选择的分支；空列表和未知名称报错。
+
+| 选择项 | 所需工作 |
+| --- | --- |
+| `typed-ast` | 请求、源码、工具链校验及 typed AST 生成/解析 |
+| `identity-sil`、`semantic-sil` | 对应 SIL 重放及其组件检查，不生成 typed AST |
+| `source-nominals`、`imported-types` | Typed AST 和类型 demangling，不读取 SIL 或 Catalog |
+| `source-mappings` | Typed AST、两种 SIL 重放/组件检查及 AST/SIL 映射 |
+| `imported-operations` | Typed AST、类型 demangling 和 semantic SIL，不读取 identity SIL 或 Catalog |
+| `catalogs` | Typed AST imports、工具链事实和已有 Catalog 校验，不读取 SIL |
+| `receipt` | 完整 frontend receipt 分析与组装 |
+
+诊断 JSON 现在输出 **schema 2**，可选 `requestedStages` 记录去重、排序后的选择项。
+字段缺省（包括 schema 1 报告）表示完整范围。选择项不含 `receipt` 时，`passed: true`
+和退出码 0 只表示所选检查及依赖通过，不能代表完整 receipt 通过。读取报告的工具需识别
+版本 2 并检查范围。不传 `--stages` 或选择 `receipt` 时仍执行完整 frontend 验证。
+此次诊断格式迁移不改变 Shell 或补丁产物 schema。
+
+正常生成与诊断共用同一套有明确依赖关系的分析。诊断汇总独立的请求、源文件和编译
+阶段错误；每份 SIL 内的函数定义、debug scope、源码模块、conformance 和 nominal
+声明分别检查。函数定义和 debug scope 有效时，即使无关的 conformance 或布局失败，
+仍能绑定函数位置并检查 AST/SIL 映射，汇总独立声明的映射冲突。类型环境、imported
+operation 和 receipt 在依赖事实无效时保持 blocked，不构造空的替代 `CanonicalSIL.File`。
+
+组件检查名位于 `frontend.identity_sil.*`、`frontend.semantic_sil.*` 下，性能 trace
+包含各项耗时，以及 CLI 输入准备和所需的 Catalog 读取。嵌套计时互相重叠，不能把所有
+阶段时间相加当作总耗时。捕获或上下文无效时无法继续编译；最终 receipt 组装仍在首个
+错误处停止，该模式不承诺从无效输入中枚举所有可能问题。
+
+诊断只读取所需且已有、验证通过的 Catalog，报告缺失的生产覆盖，不启动冷编目或后台
+预热。它绕过完整模块 receipt 缓存，确保执行当前检查，但复用并保留逐阶段验证的
+compiler checkpoint。SIL 的局部有效事实不会作为整个 SIL 成功写入检查点。
+不发布模块 receipt、Shell、Bridge、Prepare state 或 Hub reservation。
 链接、服务连接及 runtime 激活仍须通过正常 Build/Run 验证。
 
 ## 混合配置回归
 
 [`Tests/Fixtures/MixedOnboarding`](../Tests/Fixtures/MixedOnboarding/README.md)
-是真实的小型 Xcode App，包含两个 `@TaskLocal` 展开、文件私有类型、带与不带 module
-前缀的 SDK 名称、Foundation/UIKit/AVFoundation/Photos、Objective-C bridging header、
+是真实的小型 Xcode App，包含两个 `@TaskLocal` 展开、同名局部协议 conformer、继承
+`fileprivate extension` 访问级别的 class/struct、`?? { ... }()` 闭包、带与不带 module
+前缀的 SDK 名称，以及 UIKit 的 `NS_SWIFT_NAME` 嵌套类型 `UIPencilInteraction.Tap`
+（iOS 17.5）。同时包含 Foundation/UIKit/AVFoundation/Photos、Objective-C bridging header、
 C++ interop、`-g`，并在工程设置中开启 explicit modules。可选集成测试实际编译链接，
 捕获全部 5 个 Swift 文件，连续安装两次，用 `plutil` 校验 PBX、用 `xcodebuild -list`
-读取安装后的工程，再执行 receipt 诊断。driver 探测分别记录构建结果与捕获是否存在。
+读取安装后的工程，再执行局部 nominal 检查和完整 receipt 诊断，核对 SIL 组件及
+AST/SIL 映射。driver 探测分别记录构建结果与捕获是否存在。
 直接编译的 `SystemFrameworkIntegration` 测试另外执行 `-explicit-module-build`，
 并核对输出确实包含 debug scope。
 

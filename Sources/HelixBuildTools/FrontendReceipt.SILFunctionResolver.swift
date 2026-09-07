@@ -13,22 +13,25 @@ struct SILFunctionResolver: Sendable {
         var column: Int
     }
 
-    let file: CanonicalSIL.File
     private let functionsByMangledName: [String: [CanonicalSIL.Function]]
     private let functionsByDeclarationLocation: [
         DeclarationLocationKey: [CanonicalSIL.Function]
     ]
+    private var symbolIdentities: [String: FrontendReceipt.SILSymbolIdentity] = [:]
 
     init(file: CanonicalSIL.File) {
-        self.file = file
+        self.init(functions: file.functions)
+    }
+
+    init(functions: [CanonicalSIL.Function]) {
         // Many functions share a source file. Resolve its symlinks once while
         // constructing this module-local, immutable location index.
         var canonicalPaths: [String: String] = [:]
         functionsByMangledName = Dictionary(
-            grouping: file.functions,
+            grouping: functions,
             by: \.mangledName
         )
-        functionsByDeclarationLocation = Dictionary(grouping: file.functions.compactMap {
+        functionsByDeclarationLocation = Dictionary(grouping: functions.compactMap {
             function -> (DeclarationLocationKey, CanonicalSIL.Function)? in
             guard let location = function.declarationLocation else { return nil }
             let path = canonicalPaths[location.file] ?? Self.canonicalPath(location.file)
@@ -42,6 +45,14 @@ struct SILFunctionResolver: Sendable {
                 function
             )
         }, by: \.0).mapValues { $0.map(\.1) }
+    }
+
+    func resolvingCollisions(using demangler: FrontendReceipt.Demangler) throws -> Self {
+        var result = self
+        let symbols = Set(functionsByDeclarationLocation.values.filter { $0.count > 1 }
+            .flatMap { $0.map(\.mangledName) })
+        result.symbolIdentities = try demangler.symbolIdentities(symbols)
+        return result
     }
 
     func function(
@@ -71,11 +82,12 @@ struct SILFunctionResolver: Sendable {
             line: location.line,
             column: location.column
         )
-        let matches = functionsByDeclarationLocation[key] ?? []
+        let candidates = functionsByDeclarationLocation[key] ?? []
+        let matches = disambiguate(candidates, item: item)
         guard matches.count <= 1 else {
             throw FrontendReceipt.Error.ambiguousSILFunction(
                 "\(astSymbol) at \(location.file):\(location.line):\(location.column)",
-                matches.map(\.mangledName).sorted()
+                candidates.map(evidence).sorted()
             )
         }
         return matches.first
@@ -97,14 +109,61 @@ struct SILFunctionResolver: Sendable {
             line: location.line,
             column: location.column
         )
-        let matches = functionsByDeclarationLocation[key] ?? []
+        let candidates = functionsByDeclarationLocation[key] ?? []
+        let matches = disambiguate(candidates, item: item)
         guard matches.count <= 1 else {
             throw FrontendReceipt.Error.ambiguousSILFunction(
-                "closure@\(location.file):\(location.line):\(location.column)",
-                matches.map(\.mangledName).sorted()
+                "closure@\(location.file):\(location.line):\(location.column), AST discriminator=\(item["discriminator"] ?? "unavailable")",
+                candidates.map(evidence).sorted()
             )
         }
         return matches.first
+    }
+
+    private func evidence(_ function: CanonicalSIL.Function) -> String {
+        "\(function.mangledName): \(function.loweredType), \(symbolIdentities[function.mangledName]?.evidence ?? "symbol tree unavailable"), location=\(String(describing: function.declarationLocation))"
+    }
+
+    private func disambiguate(
+        _ candidates: [CanonicalSIL.Function],
+        item: FrontendReceipt.TypedAST.Object
+    ) -> [CanonicalSIL.Function] {
+        guard candidates.count > 1 else { return candidates }
+        let expected: String?
+        switch item["_kind"] as? String {
+        case "closure_expr": expected = "ExplicitClosure"
+        case "func_decl": expected = "Function"
+        case "accessor_decl":
+            let accessors = [("get", "Getter"), ("set", "Setter"), ("_read", "ReadAccessor"),
+                             ("_modify", "ModifyAccessor"), ("willSet", "WillSet"), ("didSet", "DidSet")]
+            let kinds = accessors.filter { item[$0.0] as? Bool == true }.map(\.1)
+            expected = kinds.count == 1 ? kinds[0] : nil
+        default: expected = nil
+        }
+        guard let expected else { return candidates }
+        let discriminator = (item["discriminator"] as? String).flatMap(Int.init)
+        let knownRoles: Set<String> = ["Function", "Getter", "Setter", "ReadAccessor", "ModifyAccessor",
+            "WillSet", "DidSet", "ExplicitClosure", "ImplicitClosure", "ProtocolWitness",
+            "ReabstractionThunk", "ReabstractionThunkHelper", "CurryThunk", "DispatchThunk"]
+        let matches = candidates.filter { function in
+            guard let identity = symbolIdentities[function.mangledName],
+                  let kind = identity.kind, knownRoles.contains(kind) else {
+                // Unknown compiler roles cannot be discarded to manufacture a
+                // unique candidate. They remain in the fail-closed diagnostic.
+                return true
+            }
+            guard kind == expected else { return false }
+            if expected == "ExplicitClosure", let discriminator,
+               let actual = identity.discriminator { return actual == discriminator }
+            return true
+        }
+        if matches.count == 1, let selected = matches.first {
+            let identity = symbolIdentities[selected.mangledName]
+            guard identity?.kind == expected,
+                  expected != "ExplicitClosure" || discriminator == nil
+                    || identity?.discriminator == discriminator else { return candidates }
+        }
+        return matches
     }
 
     private func declarationLocation(

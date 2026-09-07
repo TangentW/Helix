@@ -17,6 +17,10 @@ extension CanonicalSIL.ProtocolConformance {
     }
 
     struct Record: Hashable, Sendable {
+        // A record occurrence is local to this SIL document. Printed type and
+        // protocol names are lookup hints, not declaration identity.
+        var sourceLine: Int
+        var header: String
         var conformingType: String
         var protocolName: String
         var moduleName: String
@@ -35,12 +39,14 @@ extension CanonicalSIL.ProtocolConformance {
         }
 
         var orderKey: String {
-            [conformingType, protocolName, genericClause ?? ""]
+            [moduleName, conformingType, protocolName, genericClause ?? ""]
                 .joined(separator: "\u{0}")
         }
 
-        var identityKey: String {
-            [conformingType, protocolName].joined(separator: "\u{0}")
+        var evidence: String {
+            "SIL line \(sourceLine): \(header); witnesses=\(witnesses.map { "#\($0.requirement): \($0.loweredType) -> \($0.symbol ?? "nil")" }); "
+                + "associatedTypes=\(associatedTypes.sorted { $0.key < $1.key }), associatedConformances=\(associatedConformances.sorted { $0.key < $1.key }), "
+                + "conditions=\(conditionalConformances), bases=\(baseProtocols), unsupported=\(unsupportedMembers)"
         }
     }
 
@@ -52,15 +58,63 @@ extension CanonicalSIL.ProtocolConformance {
         private static let maximumLineUTF8Count = 64 * 1_024
 
         let records: [Record]
+        let unambiguousRecords: [Record]
+        private let ambiguitiesByType: [String: [Record]]
+        private let witnessTargetsByModule: [String: Set<String>]
+
+        private struct TypeLookupKey: Hashable {
+            var module: String
+            var spelling: String
+        }
+
+        private struct ConformanceLookupKey: Hashable {
+            var type: TypeLookupKey
+            var protocolSpelling: String
+        }
+
+        private static func typeKey(_ record: Record) -> TypeLookupKey {
+            .init(module: record.moduleName,
+                  spelling: typeBase(relative(record.conformingType, to: record.moduleName)))
+        }
+
+        private static func typeBase(_ spelling: String) -> String {
+            let normalized = CanonicalSIL.SwiftTypeIdentity.normalized(spelling)
+            guard let components = try? CanonicalSIL.GenericSignature.splitTopLevel(
+                normalized, separator: ".") else { return normalized }
+            // Generic parameter spellings cannot disambiguate nominal scopes.
+            return components.map { String($0.prefix { $0 != "<" }) }.joined(separator: ".")
+        }
+
+        private static func typeScopes(_ spelling: String) -> [String] {
+            var components = typeBase(spelling).split(separator: ".").map(String.init)
+            var scopes: [String] = []
+            while !components.isEmpty {
+                scopes.append(components.joined(separator: "."))
+                components.removeLast()
+            }
+            return scopes
+        }
+
+        private static func relative(_ spelling: String, to module: String) -> String {
+            let normalized = CanonicalSIL.SwiftTypeIdentity.normalized(spelling)
+            return normalized.hasPrefix(module + ".")
+                ? String(normalized.dropFirst(module.count + 1)) : normalized
+        }
+
+        func isAmbiguousType(_ spelling: String) -> Bool {
+            Self.typeScopes(spelling).contains { ambiguitiesByType[$0] != nil }
+        }
+
+        func ambiguityEvidence(for spelling: String) -> [String] {
+            Set(Self.typeScopes(spelling).flatMap { ambiguitiesByType[$0, default: []] })
+                .sorted { $0.sourceLine < $1.sourceLine }.map(\.evidence)
+        }
 
         func containsWitnessTarget(
             _ symbol: String,
             moduleName: String
         ) -> Bool {
-            records.contains { record in
-                record.moduleName == moduleName
-                    && record.witnesses.contains { $0.symbol == symbol }
-            }
+            witnessTargetsByModule[moduleName]?.contains(symbol) == true
         }
 
         init(text: String) throws {
@@ -82,6 +136,7 @@ extension CanonicalSIL.ProtocolConformance {
                     throw Self.malformed("too many protocol conformance records")
                 }
                 tableCount += 1
+                let sourceLine = index + 1
                 let hasBody = line.hasSuffix("{")
                 let header = try Self.parseHeader(line, hasBody: hasBody)
                 index += 1
@@ -95,6 +150,7 @@ extension CanonicalSIL.ProtocolConformance {
                 var witnesses: [Witness] = []
                 var unsupportedMembers: [String] = []
                 var memberCount = 0
+                var memberOrigins: [String: String] = [:]
                 var terminated = false
                 while index < lines.count {
                     let member = lines[index]
@@ -117,46 +173,27 @@ extension CanonicalSIL.ProtocolConformance {
                             )
                         }
                     }
-                    if let pair = try Self.associatedType(in: member) {
-                        guard associatedTypes.updateValue(
-                            pair.value,
-                            forKey: pair.name
-                        ) == nil else {
-                            throw Self.malformed(
-                                "duplicate associated type \(pair.name) in "
-                                    + "\(header.conformingType): \(header.protocolName)"
-                            )
+                    // Keep both raw facts before rejecting a duplicate member.
+                    func register(_ key: String) throws {
+                        let fact = "SIL line \(index + 1): \(member)"
+                        if let previous = memberOrigins.updateValue(fact, forKey: key) {
+                            throw Self.malformed("duplicate \(key) in SIL line \(sourceLine): \(line); \(previous); \(fact)")
                         }
+                    }
+                    if let pair = try Self.associatedType(in: member) {
+                        try register("associated type " + pair.name)
+                        associatedTypes[pair.name] = pair.value
                     } else if let pair = try Self.associatedConformance(
                         in: member
                     ) {
-                        guard associatedConformances.updateValue(
-                            pair.value,
-                            forKey: pair.name
-                        ) == nil else {
-                            throw Self.malformed(
-                                "duplicate associated conformance \(pair.name) in "
-                                    + "\(header.conformingType): \(header.protocolName)"
-                            )
-                        }
+                        try register("associated conformance " + pair.name)
+                        associatedConformances[pair.name] = pair.value
                     } else if let name = try Self.baseProtocol(in: member) {
-                        guard baseProtocols.insert(name).inserted else {
-                            throw Self.malformed(
-                                "duplicate base protocol \(name) in "
-                                    + "\(header.conformingType): \(header.protocolName)"
-                            )
-                        }
+                        try register("base protocol " + name)
+                        baseProtocols.insert(name)
                     } else if let conformance = try Self
                         .conditionalConformance(in: member) {
-                        guard !conditionalConformances.contains(
-                            where: { $0.requirement == conformance.requirement }
-                        ) else {
-                            throw Self.malformed(
-                                "duplicate conditional conformance "
-                                    + "\(conformance.requirement) in "
-                                    + "\(header.conformingType): \(header.protocolName)"
-                            )
-                        }
+                        try register("conditional conformance " + conformance.requirement)
                         conditionalConformances.append(conformance)
                     } else if let witness = try Self.witness(in: member) {
                         // SILDeclRef text can erase argument labels. Consequently,
@@ -186,6 +223,8 @@ extension CanonicalSIL.ProtocolConformance {
                 }
                 parsed.append(
                     .init(
+                        sourceLine: sourceLine,
+                        header: line,
                         conformingType: header.conformingType,
                         protocolName: header.protocolName,
                         moduleName: header.moduleName,
@@ -199,11 +238,34 @@ extension CanonicalSIL.ProtocolConformance {
                     )
                 )
             }
-            let sorted = parsed.sorted { $0.orderKey < $1.orderKey }
-            guard Set(sorted.map(\.identityKey)).count == sorted.count else {
-                throw Self.malformed("duplicate protocol conformance record")
+            let sorted = parsed.sorted {
+                ($0.orderKey, $0.sourceLine) < ($1.orderKey, $1.sourceLine)
             }
             records = sorted
+            let groups = Dictionary(grouping: sorted) {
+                ConformanceLookupKey(type: Self.typeKey($0),
+                    protocolSpelling: Self.relative($0.protocolName, to: $0.moduleName))
+            }
+            let ambiguousTypeKeys = Set(groups.filter { $0.value.count > 1 }.keys.map(\.type))
+            func isAmbiguous(_ record: Record) -> Bool {
+                let key = Self.typeKey(record)
+                return Self.typeScopes(key.spelling).contains {
+                    ambiguousTypeKeys.contains(.init(module: key.module, spelling: $0))
+                }
+            }
+            // Filtering unsupported members or conditional clauses must not
+            // turn a name collision into a falsely unique dispatch target.
+            unambiguousRecords = sorted.filter { !isAmbiguous($0) }
+            ambiguitiesByType = sorted.filter(isAmbiguous)
+                .reduce(into: [:]) { result, record in
+                    let key = Self.typeKey(record)
+                    for spelling in [key.spelling, key.module + "." + key.spelling] {
+                        result[spelling, default: []].append(record)
+                    }
+                }
+            witnessTargetsByModule = sorted.reduce(into: [:]) { result, record in
+                result[record.moduleName, default: []].formUnion(record.witnesses.compactMap(\.symbol))
+            }
         }
 
         private struct Header {
