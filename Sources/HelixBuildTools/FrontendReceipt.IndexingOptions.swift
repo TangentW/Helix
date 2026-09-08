@@ -4,7 +4,8 @@ import HelixCompiler
 extension FrontendReceipt {
 public enum DeclarationFailurePolicy: String, Codable, Hashable, Sendable {
     case strict
-    /// Excludes a source declaration when its AST/SIL mapping cannot be proven.
+    /// Excludes a source declaration when its AST/SIL mapping cannot be proven,
+    /// or its entire source file when compiler-backed ownership is unavailable.
     /// Compiler, source, type, ABI and Catalog validation remain mandatory.
     case excludeUnresolved
 }

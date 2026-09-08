@@ -69,6 +69,7 @@ func executeXcode(_ arguments: [String]) throws -> CLI.Result {
     switch command {
     case "install": return try installXcodeProject(tail)
     case "uninstall": return try uninstallXcodeProject(tail)
+    case "exclusions": return try inspectXcodeExclusions(tail)
     case "inspect": return try inspectXcodeProjectTargets(tail)
     case "preflight":
         guard tail == ["--help"] else {
@@ -489,6 +490,68 @@ func executeXcodePreflight(_ arguments: [String]) async throws -> CLI.Result {
         "--capture", try options.require("capture"), "--diagnose", "--stages", try options.value("stages") ?? "inputs,typed-ast"]
     if options.hasFlag("json") { delegated.append("--json") }
     return try await executeXcodePostCompile(delegated)
+}
+
+func executeXcodeCatalogPrewarm(_ arguments: [String]) async throws -> CLI.Result {
+    if arguments == ["--help"] || arguments.contains("--job") {
+        return try prewarmXcodeCatalogs(arguments)
+    }
+    let options = try CLI.Arguments(arguments, valueOptions: ["plan", "profile", "capture", "max-modules"],
+        flagOptions: ["plan-only", "json"])
+    try requireNoXcodePositionals(options, command: "xcode catalog-prewarm")
+    guard !options.hasFlag("json") || options.hasFlag("plan-only") else {
+        throw CLI.Error.usage("capture-driven catalog-prewarm --json requires --plan-only")
+    }
+    let budget = try options.value("max-modules")
+    if let budget, Int(budget).map({ (1...256).contains($0) }) != true {
+        throw CLI.Error.usage("--max-modules must be an integer in 1...256")
+    }
+    let planURL = files.resolve(try options.require("plan"))
+    let captureURL = files.resolve(try options.require("capture"))
+    let context = try CLI.XcodePostCompileResolver().resolve(plan: loadHostPlan(at: planURL), planURL: planURL,
+        profileID: options.require("profile"), captureURL: captureURL, environment: environment, allowAttempt: true)
+    let capture = try capturedXcodeFeature(context, at: captureURL)
+    let metadata = try xcodeFrontendMetadata(context)
+    let imports = try FrontendReceipt.SourceImports.scan(sources: capture.frontendSources)
+    var inputs = BuildCache.CompilerInputs.capture(arguments: capture.analysisJob.arguments,
+        currentModuleName: context.feature.moduleName, workingDirectory: context.environment.sourceRootURL,
+        importedModules: Set(imports.modules))
+    inputs.isComplete = inputs.isComplete && imports.isComplete
+    if !imports.isComplete {
+        inputs.incompleteReasons = (inputs.incompleteReasons ?? []) + imports.incompleteSourcePaths.map {
+            "Source import scan is incomplete at \($0); check import syntax, literals/comments, and the 4096-module bound"
+        }
+    }
+    let cache = try xcodeBuildCacheStore() ?? BuildCache.Store(
+        rootURL: context.environment.profileOutputURL.appendingPathComponent(".BuildFacts", isDirectory: true))
+    let toolchain = try ReleaseCompiler.Driver().toolchainIdentity(compilerURL: context.environment.compilerURL)
+    let resolved = try await resolveXcodeNativeAPICatalogs(context: context, metadata: metadata,
+        importedModules: imports.modules, compilerArguments: capture.analysisJob.arguments,
+        compilerInputs: inputs, toolchain: toolchain, cache: cache, performance: .init(), cachedOnly: true)
+    let jobURL = try resolved.prewarmRequests.isEmpty ? nil : publishNativeAPICatalogPrewarmJob(
+        requests: resolved.prewarmRequests, cache: cache, workingDirectoryURL: context.environment.sourceRootURL,
+        planRequest: resolved.prewarmPlanRequest, outputDirectoryURL: context.environment.profileOutputURL)
+    let report = CLI.XcodeCatalogPlanReport(cachedModules: resolved.snapshots.map { $0.document.identity.moduleName },
+        pendingModules: resolved.prewarmRequests.map { $0.identity.moduleName }.sorted(),
+        unresolvedModules: resolved.unresolvedModules, unresolvedReasons: resolved.unresolvedReasons, jobPath: jobURL?.path)
+    if options.hasFlag("json") {
+        return .init(exitCode: report.unresolvedModules.isEmpty ? 0 : 1,
+            standardOutput: String(decoding: try Core.CanonicalJSON.encode(report), as: UTF8.self) + "\n")
+    }
+    var text = "Catalogs: \(report.cachedModules.count) cached, \(report.pendingModules.count) pending, \(report.unresolvedModules.count) unresolved\n"
+    if let jobURL { text += "Catalog job: \(jobURL.path)\n" }
+    if !report.unresolvedModules.isEmpty {
+        text += "Unresolved modules (first 20): \(report.unresolvedModules.prefix(20).joined(separator: ", ")). These are blocked fingerprints, not cache misses.\n"
+        let reasons = Set(report.unresolvedReasons.values.flatMap { $0 }).sorted()
+        text += reasons.prefix(8).map { "  \($0)\n" }.joined()
+        if reasons.count > 8 { text += "\(reasons.count - 8) more reasons; use --plan-only --json for the full report.\n" }
+    }
+    if let jobURL, !options.hasFlag("plan-only") {
+        var worker = ["--job", jobURL.path]
+        if let budget { worker += ["--max-modules", budget] }
+        text += try prewarmXcodeCatalogs(worker).standardOutput
+    }
+    return .init(exitCode: report.unresolvedModules.isEmpty ? 0 : 1, standardOutput: text)
 }
 
 func executeXcodePostCompile(_ arguments: [String]) async throws -> CLI.Result {
@@ -1084,6 +1147,15 @@ private func registerXcodeLiveSession(
     // build must refresh its context instead of creating a conflicting Shell.
     prepared.manifest.sessionBuildID = try DevSession.ShellIdentityFactory()
         .make(manifest: prepared.manifest).shellID.rawValue
+    let indexingDiagnostics = try JSONDecoder().decode([Core.Diagnostic].self, from: readRegularFile(
+        context.environment.shellOutputURL.appendingPathComponent("FrontendDiagnostics.json"),
+        maximumBytes: 64 * 1_024 * 1_024, label: "prepared frontend indexing diagnostics"))
+    let exclusions = indexingDiagnostics.filter { ["HLXIDX024", "HLXIDX025"].contains($0.code) }
+    guard exclusions.allSatisfy({ $0.location != nil }) else {
+        throw CLI.Error.input("prepared indexing exclusion has no source location; rebuild the Dev Shell")
+    }
+    try prepared.manifest.configureIndexing(context.indexingOptions,
+        excludedSourcePaths: Set(exclusions.compactMap { $0.location?.file }))
     try prepared.manifest.validate()
     let manifestURL = context.environment.profileOutputURL.appendingPathComponent(
         "DevBuildManifest.json"
@@ -1316,6 +1388,31 @@ private func capturedXcodeFeature(
     }
 }
 
+private func xcodeFrontendMetadata(_ context: XcodeIntegration.BuildContext) throws -> InterfaceArchive.ReleaseMetadata {
+    let minimumOS: Core.SemanticVersion
+    do {
+        minimumOS = try Core.SemanticVersion(
+            parsing: context.environment.minimumOS
+        )
+    } catch {
+        throw CLI.Error.input(
+            "invalid deployment target \(context.environment.minimumOS)"
+        )
+    }
+    let invocation = InterfaceArchive.FrontendInvocation(
+        moduleName: context.feature.moduleName,
+        targetTriple: context.environment.targetTriple,
+        sdkName: context.environment.sdkName,
+        sdkBuild: context.environment.sdkBuild,
+        optimization: context.environment.optimization,
+        semanticArguments: context.environment.semanticArguments
+    )
+    return try ShellBuild.MetadataFactory().make(.init(
+        bundleID: context.profile.bundleIdentifier, buildNumber: context.environment.buildNumber,
+        namespaceSeed: context.profile.namespaceSeed, minimumOS: minimumOS,
+        xcodeBuild: context.environment.xcodeBuild, frontendInvocation: invocation))
+}
+
 private func prepareXcodeShell(
     _ context: XcodeIntegration.BuildContext
 ) async throws -> CLI.Result {
@@ -1370,35 +1467,8 @@ private func performPrepareXcodeShell(
         arguments: capture.analysisJob.arguments,
         workingDirectory: context.environment.sourceRootURL
     ).joined()
-    let minimumOS: Core.SemanticVersion
-    do {
-        minimumOS = try Core.SemanticVersion(
-            parsing: context.environment.minimumOS
-        )
-    } catch {
-        throw CLI.Error.input(
-            "invalid deployment target \(context.environment.minimumOS)"
-        )
-    }
-    let invocation = InterfaceArchive.FrontendInvocation(
-        moduleName: context.feature.moduleName,
-        targetTriple: context.environment.targetTriple,
-        sdkName: context.environment.sdkName,
-        sdkBuild: context.environment.sdkBuild,
-        optimization: context.environment.optimization,
-        semanticArguments: context.environment.semanticArguments
-    )
     let metadata = try performance.measure("prepare.make_metadata") {
-        try ShellBuild.MetadataFactory().make(
-            .init(
-                bundleID: context.profile.bundleIdentifier,
-                buildNumber: context.environment.buildNumber,
-                namespaceSeed: context.profile.namespaceSeed,
-                minimumOS: minimumOS,
-                xcodeBuild: context.environment.xcodeBuild,
-                frontendInvocation: invocation
-            )
-        )
+        try xcodeFrontendMetadata(context)
     }
     if let diagnosticJSON, diagnosticStages.map(Set.init) == Set([FrontendReceipt.DiagnosticStage.inputs]) {
         let request = FrontendReceipt.Request(metadata: metadata, configuration: configuration,
@@ -1422,6 +1492,11 @@ private func performPrepareXcodeShell(
     }
     compilerInputs.isComplete = compilerInputs.isComplete
         && sourceImports.isComplete
+    if !sourceImports.isComplete {
+        compilerInputs.incompleteReasons = (compilerInputs.incompleteReasons ?? []) + sourceImports.incompleteSourcePaths.map {
+            "Source import scan is incomplete at \($0); check import syntax, literals/comments, and the 4096-module bound"
+        }
+    }
     performance.setCounter(
         "prepare.compiler_input_file_count",
         value: compilerInputs.fileCount
@@ -1479,8 +1554,11 @@ private func performPrepareXcodeShell(
             workingDirectory: context.environment.sourceRootURL, precomputedToolchain: toolchain,
             precomputedCompilerInputs: compilerInputs, catalogFailure: catalogFailure, stages: diagnosticStages)
         if let resolved {
+            let reasons = resolved.unresolvedReasons.keys.sorted().map {
+                "\($0): \((resolved.unresolvedReasons[$0] ?? []).joined(separator: "; "))"
+            }.joined(separator: "\n")
             report.checks.insert(.init(stage: "xcode.catalog_availability", status: .passed,
-                detail: "\(resolved.snapshots.count) cached module Catalog(s), \(resolved.prewarmRequests.count) missing, unresolved=\(resolved.unresolvedModules). Diagnosis reads cached Catalogs; normal Prepare manages prewarm."), at: 0)
+                detail: "\(resolved.snapshots.count) cached module Catalog(s), \(resolved.prewarmRequests.count) missing, unresolved=\(resolved.unresolvedModules). This check inventories availability, not API coverage. Use xcode catalog-prewarm --plan PATH --profile ID --capture PATH before Prepare to generate missing Catalogs.\n\(reasons)"), at: 0)
         }
         if let trace = report.performance { performance.merge(trace) }
         report.performance = performance.trace()
@@ -1524,7 +1602,7 @@ private func performPrepareXcodeShell(
                         + "\(context.environment.shellOutputURL.path)\n"
                         + "Functions: \(state.eligibleFunctionCount) eligible, "
                         + "\(state.rejectedFunctionCount) rejected\n"
-                        + xcodeExclusionSummary(count: Int(state.excludedDeclarationCount ?? 0), context: context),
+                        + xcodeExclusionSummary(count: Int(state.excludedDeclarationCount ?? 0), files: Int(state.excludedFileCount ?? 0), unowned: Int(state.unownedMappingCount ?? 0), context: context),
                     standardError: searchWarnings
                 )
             } else {
@@ -1561,7 +1639,7 @@ private func performPrepareXcodeShell(
                             + "\(context.environment.shellOutputURL.path)\n"
                             + "Functions: \(state.eligibleFunctionCount) eligible, "
                             + "\(state.rejectedFunctionCount) rejected\n"
-                            + xcodeExclusionSummary(count: Int(state.excludedDeclarationCount ?? 0), context: context),
+                            + xcodeExclusionSummary(count: Int(state.excludedDeclarationCount ?? 0), files: Int(state.excludedFileCount ?? 0), unowned: Int(state.unownedMappingCount ?? 0), context: context),
                         standardError: searchWarnings
                     )
                 }
@@ -1583,6 +1661,7 @@ private func performPrepareXcodeShell(
             "prepare.compiler_inputs_incomplete_count"
         )
     }
+    var catalogPrewarmStatus = ""
     let nativeAPICatalogs: XcodeNativeAPICatalogResolution?
     let indexed: FrontendReceipt.Output
     if let restoredFrontendOutput {
@@ -1600,6 +1679,30 @@ private func performPrepareXcodeShell(
             performance: performance
         )
         nativeAPICatalogs = resolved
+        if context.profile.workflow == .liveReload,
+           !resolved.prewarmRequests.isEmpty {
+            do {
+                try scheduleNativeAPICatalogPrewarm(
+                    requests: resolved.prewarmRequests,
+                    cache: buildCache,
+                    workingDirectoryURL: context.environment.sourceRootURL,
+                    planRequest: resolved.prewarmPlanRequest,
+                    outputDirectoryURL: context.environment.profileOutputURL
+                )
+                performance.incrementCounter(
+                    "prepare.catalog_prewarm_scheduled_count"
+                )
+                catalogPrewarmStatus = "Catalog prewarm: scheduled "
+                    + "\(resolved.prewarmRequests.count) module(s)\n"
+            } catch {
+                // A launcher failure must not suppress frontend validation or
+                // turn missing Catalogs into authoritative empty substitutes.
+                performance.incrementCounter(
+                    "prepare.catalog_prewarm_launch_failure_count"
+                )
+                catalogPrewarmStatus = "Catalog prewarm: skipped (\(error))\n"
+            }
+        }
         let receiptRequest = FrontendReceipt.Request(
             metadata: metadata,
             configuration: configuration,
@@ -1610,15 +1713,20 @@ private func performPrepareXcodeShell(
             callingSurfacePolicy: callingSurfacePolicy,
             indexing: context.indexingOptions
         )
-        indexed = try performance.measure("prepare.frontend_receipt") {
-            try FrontendReceipt.CachedAdapter(cache: buildCache).generate(
-                receiptRequest,
-                compilerCapture: capture.recordBytes,
-                compilerArguments: capture.analysisJob.arguments,
-                workingDirectory: context.environment.sourceRootURL,
-                precomputedToolchain: toolchain,
-                precomputedCompilerInputs: compilerInputs
-            )
+        do {
+            indexed = try performance.measure("prepare.frontend_receipt") {
+                try FrontendReceipt.CachedAdapter(cache: buildCache).generate(
+                    receiptRequest,
+                    compilerCapture: capture.recordBytes,
+                    compilerArguments: capture.analysisJob.arguments,
+                    workingDirectory: context.environment.sourceRootURL,
+                    precomputedToolchain: toolchain,
+                    precomputedCompilerInputs: compilerInputs
+                )
+            }
+        } catch {
+            if error is CancellationError { throw error }
+            throw CLI.Error.input(String(describing: error) + (catalogPrewarmStatus.isEmpty ? "" : "\n" + catalogPrewarmStatus))
         }
         performance.merge(indexed.performance)
     }
@@ -1777,6 +1885,8 @@ private func performPrepareXcodeShell(
                 nativeAPICatalogs?.prewarmRequests.isEmpty == false
         )
         state.excludedDeclarationCount = UInt32(clamping: indexed.excludedDeclarationCount)
+        state.excludedFileCount = UInt32(clamping: indexed.excludedFileCount)
+        state.unownedMappingCount = UInt32(clamping: indexed.unownedMappingCount)
         try performance.measure("prepare.publish_state") {
             try files.write(
                 try XcodeIntegration.PrepareStateCodec.encode(state),
@@ -1800,39 +1910,13 @@ private func performPrepareXcodeShell(
         "prepare.rejected_function_count",
         value: UInt64(materialized.report.rejectedFunctionCount)
     )
-    var catalogPrewarmStatus = ""
-    if context.profile.workflow == .liveReload,
-       let nativeAPICatalogs,
-       !nativeAPICatalogs.prewarmRequests.isEmpty {
-        do {
-            try scheduleNativeAPICatalogPrewarm(
-                requests: nativeAPICatalogs.prewarmRequests,
-                cache: buildCache,
-                workingDirectoryURL: context.environment.sourceRootURL,
-                planRequest: nativeAPICatalogs.prewarmPlanRequest,
-                outputDirectoryURL: context.environment.profileOutputURL
-            )
-            performance.incrementCounter(
-                "prepare.catalog_prewarm_scheduled_count"
-            )
-            catalogPrewarmStatus = "Catalog prewarm: scheduled "
-                + "\(nativeAPICatalogs.prewarmRequests.count) module(s)\n"
-        } catch {
-            // Prewarming is an optimization. The exact source-rooted fallback
-            // has already produced this development Shell successfully.
-            performance.incrementCounter(
-                "prepare.catalog_prewarm_launch_failure_count"
-            )
-            catalogPrewarmStatus = "Catalog prewarm: skipped (\(error))\n"
-        }
-    }
     return .init(
         exitCode: 0,
         standardOutput: "Prepared \(context.profile.id) Helix Shell at "
             + "\(context.environment.shellOutputURL.path)\n"
             + "Functions: \(materialized.report.eligibleFunctionCount) eligible, "
             + "\(materialized.report.rejectedFunctionCount) rejected\n"
-            + xcodeExclusionSummary(count: indexed.excludedDeclarationCount, context: context)
+            + xcodeExclusionSummary(count: indexed.excludedDeclarationCount, files: indexed.excludedFileCount, unowned: indexed.unownedMappingCount, context: context)
             + catalogPrewarmStatus,
         standardError: searchWarnings
     )

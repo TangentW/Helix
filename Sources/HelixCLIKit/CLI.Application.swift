@@ -105,9 +105,12 @@ public struct Application: Sendable {
     ) async -> CLI.Result {
         #if os(macOS)
         if arguments.first == "xcode",
-           ["phase", "post-compile", "preflight"].contains(arguments.dropFirst().first ?? "") {
+           ["phase", "post-compile", "preflight", "catalog-prewarm"].contains(arguments.dropFirst().first ?? "") {
             do {
                 let tail = Array(arguments.dropFirst(2))
+                if arguments.dropFirst().first == "catalog-prewarm" {
+                    return try await executeXcodeCatalogPrewarm(tail)
+                }
                 if arguments.dropFirst().first == "preflight" {
                     return try await executeXcodePreflight(tail)
                 }
@@ -690,6 +693,7 @@ Commands:
   inspect       List Xcode targets, configurations, and shared schemes
   install       Install a Host Plan into the Xcode project without the Hub GUI
   uninstall     Remove owned Xcode integration using its Host Plan or backup
+  exclusions    Query excluded declarations and files from frontend diagnostics
   generate      Generate deterministic xcconfig, file-list, and Scheme scripts
   validate      Validate the checked-in Host Plan and every referenced input
   doctor        Inspect the active Xcode build environment for one profile

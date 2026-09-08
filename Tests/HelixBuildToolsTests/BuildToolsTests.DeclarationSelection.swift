@@ -63,12 +63,64 @@ struct DeclarationSelectionTests {
             try FrontendReceipt.Adapter().analyzeSILSourceMappings(selection: &strict, sourcesByPhysicalPath: byPath,
                 functions: functions, compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc"), performance: .init(), stage: "strict SIL")
         }
-        // A closure without a compiler-backed source owner cannot be quarantined.
+        // Without a proven declaration owner, the entire validated source
+        // file is quarantined. Repeated SIL stages retain one entry per node.
         var unowned = try FrontendReceipt.DeclarationSelection(documents: [["filename": source.url.path, "items": [closure]]],
             sourcesByPhysicalPath: byPath, options: .init(failurePolicy: .excludeUnresolved))
-        #expect(throws: FrontendReceipt.Error.self) {
+        for stage in ["identity SIL", "semantic SIL"] {
             try FrontendReceipt.Adapter().analyzeSILSourceMappings(selection: &unowned, sourcesByPhysicalPath: byPath,
-                functions: functions, compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc"), performance: .init(), stage: "unowned SIL")
+                functions: functions, compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc"), performance: .init(), stage: stage)
+        }
+        #expect(unowned.excludedFilePaths == [source.logicalPath])
+        #expect(unowned.unownedExclusions.count == 1)
+        #expect(unowned.diagnostics.first?.code == "HLXIDX025")
+        #expect(unowned.diagnostics.first?.location?.file == source.logicalPath)
+        #expect(unowned.diagnostics.first?.notes.count == 2)
+        #expect(try FrontendReceipt.TypedAST.items(in: unowned.availableDocuments(sourcesByPhysicalPath: byPath)[0]).isEmpty)
+    }
+
+    @Test("Initializer ownership and file exclusions preserve imports, independent files and all failure sites")
+    func quarantinesUnownedFile() throws {
+        let data = Data("{}\n{}\n".utf8)
+        let first = FrontendReceipt.Adapter.SourceState(logicalPath: "Sources/First.swift",
+            url: URL(fileURLWithPath: "/tmp/First.swift"), contents: data, contentHash: .sha256(data))
+        var second = first
+        second.logicalPath = "Sources/Second.swift"
+        second.url = URL(fileURLWithPath: "/tmp/Second.swift")
+        let closure: FrontendReceipt.TypedAST.Object = ["_kind": "closure_expr", "range": ["start": 0, "end": 1]]
+        let initializer: FrontendReceipt.TypedAST.Object = ["_kind": "constructor_decl", "usr": "s:7Fixture5ValueVACycfc", "body": closure]
+        let moduleImport: FrontendReceipt.TypedAST.Object = ["_kind": "import_decl", "module_path": ["Foundation"]]
+        let documents: [FrontendReceipt.TypedAST.Object] = [
+            ["filename": first.url.path, "items": [moduleImport, closure, closure, initializer]],
+            ["filename": second.url.path, "items": [initializer]],
+        ]
+        let sources = [first.url.path: first, second.url.path: second]
+        var selection = try FrontendReceipt.DeclarationSelection(documents: documents, sourcesByPhysicalPath: sources,
+            options: .init(failurePolicy: .excludeUnresolved))
+        #expect(selection.members.filter { $0.declaration?.key.usr == "s:7Fixture5ValueVACycfc" }.count == 2)
+        for member in selection.members where member.declaration == nil { selection.exclude(member, reason: "ambiguous closure identity") }
+        #expect(selection.unownedExclusions.count == 2)
+        #expect(selection.excludedFilePaths == [first.logicalPath])
+        let available = try selection.availableDocuments(sourcesByPhysicalPath: sources)
+        let firstItems = try FrontendReceipt.TypedAST.items(in: available[0])
+        #expect(firstItems.count == 1 && (firstItems[0] as? FrontendReceipt.TypedAST.Object)?["_kind"] as? String == "import_decl")
+        #expect(try FrontendReceipt.TypedAST.items(in: available[1]).count == 1)
+    }
+
+    @Test("An unmatched directory scope gives bounded examples and actionable glob syntax")
+    func boundsScopeDiagnostics() throws {
+        let fixture = try makeInjectedFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        var request = fixture.request
+        request.indexing = .init(include: ["Sources"])
+        request.sources = (0..<2_551).map { .init(logicalPath: "Sources/File\($0).swift", url: fixture.root.appendingPathComponent("File\($0).swift")) }
+        do {
+            try FrontendReceipt.Adapter().validate(request)
+            Issue.record("Expected an unmatched scope")
+        } catch {
+            let text = String(describing: error)
+            #expect(text.contains("Sources/**") && text.contains("total=2551") && text.contains("omitted=2543"))
+            #expect(text.utf8.count < 2_000)
         }
     }
 
@@ -129,6 +181,28 @@ struct DeclarationSelectionTests {
         #expect(unmatched.checks.contains { $0.detail.contains("matches no captured source") })
     }
 
+    @Test("An unowned initializer closure publishes only independent-file roots and retains evidence on cache hits")
+    func publishesFileQuarantine() throws {
+        let fixture = try makeInjectedFixture(unowned: true)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        var request = fixture.request
+        #expect(throws: FrontendReceipt.Error.self) { try FrontendReceipt.Adapter().generate(request) }
+        request.indexing = .init(failurePolicy: .excludeUnresolved)
+        let cache = FrontendReceipt.CachedAdapter(cache: try .init(rootURL: fixture.root.appendingPathComponent("Cache")))
+        let output = try cache.generate(request, compilerCapture: Data("capture".utf8), workingDirectory: fixture.root)
+        try output.receipt.validate()
+        #expect(output.excludedFileCount == 1 && output.unownedMappingCount > 0)
+        #expect(output.receipt.sources.count == 2 && output.receipt.roots.count == 1)
+        #expect(output.receipt.roots[0].declarationMangledName.contains("4good"))
+        #expect(!output.receipt.nativeImportCandidates.flatMap(\.silMangledNames).contains { $0.contains("6broken") || $0.contains("5other") })
+        let hit = try cache.generate(request, compilerCapture: Data("capture".utf8), workingDirectory: fixture.root)
+        #expect(hit.diagnostics == output.diagnostics && hit.excludedFileCount == 1)
+        let report = try FrontendReceipt.Adapter().diagnose(request)
+        #expect(report.passed, "\(report.checks)")
+        #expect(report.checks.contains { $0.stage == "frontend.discover_imported_operations" && $0.status == .passed })
+        #expect(report.diagnostics.contains { $0.code == "HLXIDX025" && $0.location?.file == "Sources/Legacy/Bad.swift" })
+    }
+
     @Test("Host Plan v2 scopes are explicit, and v1 cannot silently carry new policy")
     func validatesOptionsAndMigration() throws {
         let defaults = try JSONDecoder().decode(FrontendReceipt.IndexingOptions.self, from: Data("{}".utf8))
@@ -158,12 +232,14 @@ struct DeclarationSelectionTests {
         #expect(try XcodeIntegration.PrepareStateCodec.decode(XcodeIntegration.PrepareStateCodec.encode(state)).excludedDeclarationCount == 3)
     }
 
-    private func makeInjectedFixture() throws -> (root: URL, request: FrontendReceipt.Request) {
+    private func makeInjectedFixture(unowned: Bool = false) throws -> (root: URL, request: FrontendReceipt.Request) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("helix-declaration-selection-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
         let bad = root.appendingPathComponent("Bad.swift")
         let good = root.appendingPathComponent("Good.swift")
-        try Data("public func broken(_ value: Int) -> Int { value }\n".utf8).write(to: bad)
+        let badText = unowned ? "public let broken: Int = { 3 }()\npublic func other(_ value: Int) -> Int { value + 2 }\n"
+            : "public func broken(_ value: Int) -> Int { value }\n"
+        try Data(badText.utf8).write(to: bad)
         try Data("public func good(_ value: Int) -> Int { value + 1 }\n".utf8).write(to: good)
         let frontend = SwiftFrontend.Driver()
         let sdk = try frontend.sdkIdentity(name: "iphonesimulator")
@@ -175,9 +251,9 @@ struct DeclarationSelectionTests {
                 sdkBuild: sdk.buildVersion, optimization: "-Onone", semanticArguments: ["-parse-as-library", "-g"]),
             transformPipelineHash: ShellBuild.transformPipelineHash, sourceBaselineHash: .sha256("computed"))
         let file = try CanonicalSIL.File(text: frontend.emitCanonicalSIL(sourceFiles: [bad, good], invocation: metadata.frontendInvocation))
-        let function = try #require(file.functions.first { $0.mangledName.contains("6broken") })
+        let function = try #require(file.functions.first { $0.mangledName.contains("6broken") && (!unowned || $0.mangledName.contains("fU")) })
         let location = try #require(function.declarationLocation)
-        try Core.CanonicalJSON.encode(["symbol": function.mangledName, "file": location.file,
+        try Core.CanonicalJSON.encode(["symbol": function.mangledName, "signature": function.loweredType, "file": location.file,
             "line": String(location.line), "column": String(location.column)]).write(to: root.appendingPathComponent("Injection.json"))
         // Change only the SIL identity facts after a real emission. Both alias
         // spellings are valid compiler symbols; no display-name demangler is mocked.
@@ -192,9 +268,9 @@ struct DeclarationSelectionTests {
         text = text.replace(config['symbol'], first)
         scope = max([int(x) for x in re.findall(r'^sil_scope (\d+)', text, re.M)] + [0]) + 1
         location = json.dumps(config['file']) + ':' + config['line'] + ':' + config['column']
-        signature = '$@convention(thin) (Int) -> Int'
+        signature = '$' + config['signature'].strip().lstrip('$')
         text += f'\nsil_scope {scope} {{ loc {location} parent @{second} : {signature} }}\n'
-        definition = f"sil hidden @{second} : {signature} {{\nbb0(%0 : $Int):\n  return %0 : $Int, scope {scope}\n}} // end sil function '{second}'\n"
+        definition = f"sil hidden @{second} : {signature} {{\nbb0:\n  unreachable, scope {scope}\n}} // end sil function '{second}'\n"
         text += definition
         if (root / 'corrupt').exists(): text += definition
         output.write_text(text)

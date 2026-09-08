@@ -30,7 +30,9 @@ struct MixedOnboarding {
         try manager.copyItem(at: repository.appendingPathComponent("Tests/Fixtures/MixedOnboarding"), to: sourceRoot)
         let project = sourceRoot.appendingPathComponent("MixedOnboarding.xcodeproj")
         let pbx = project.appendingPathComponent("project.pbxproj")
-        let original = try String(contentsOf: pbx, encoding: .utf8).replacingOccurrences(of: "\"../../..\"", with: "\"\(repository.path)\"")
+        let runtimePackagePath = ProcessInfo.processInfo.environment["HELIX_MIXED_RUNTIME_PACKAGE"] ?? repository.path
+        try #require(runtimePackagePath.hasPrefix("/") && manager.fileExists(atPath: runtimePackagePath + "/Package.swift"))
+        let original = try String(contentsOf: pbx, encoding: .utf8).replacingOccurrences(of: "\"../../..\"", with: "\"\(runtimePackagePath)\"")
         try Data(original.utf8).write(to: pbx)
         let reportPath = ProcessInfo.processInfo.environment["HELIX_MIXED_XCODE_REPORT_DIR"]
         try #require(reportPath == nil || reportPath?.hasPrefix("/") == true, "Report directory must be absolute")
@@ -54,22 +56,46 @@ struct MixedOnboarding {
         try manager.createDirectory(at: proxy.deletingLastPathComponent(), withIntermediateDirectories: false)
         try XcodeIntegration.CompilerCapture.proxyScript().write(to: proxy)
         try manager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: proxy.path)
-        func arguments(driver: String, derived: URL) -> [String] {
-            ["-project", project.path, "-scheme", "MixedApp", "-configuration", "Debug", "-sdk", "iphonesimulator",
+        func arguments(driver: String, derived: URL, probeDefaultLinkerArguments: Bool = false) throws -> [String] {
+            // Command-line overrides also affect package targets and erase
+            // Xcode's integrated-driver package-name handling. Scope this probe
+            // to the App configuration, as a real Helix installation does.
+            var document = try Hub.PBXProjectDocument(data: Data(contentsOf: pbx))
+            let configurationID = try document.configurationID(targetID: "B9F48C76A2828AF0D4500C2F", named: "Debug")
+            try document.updateObject(configurationID) { configuration in
+                var settings = configuration["buildSettings"]?.dictionary ?? [:]
+                settings["SWIFT_EXEC"] = .string(proxy.path)
+                settings["SWIFT_USE_INTEGRATED_DRIVER"] = .string(driver)
+                settings["SWIFT_ENABLE_COMPILE_CACHE"] = .string("YES")
+                if driver == "NO", !probeDefaultLinkerArguments {
+                    settings["SWIFT_GENERATE_ADDITIONAL_LINKER_ARGS"] = .string("NO")
+                } else {
+                    settings.removeValue(forKey: "SWIFT_GENERATE_ADDITIONAL_LINKER_ARGS")
+                }
+                configuration["buildSettings"] = .dictionary(settings)
+            }
+            try document.serialized().write(to: pbx)
+            return ["-project", project.path, "-scheme", "MixedApp", "-configuration", "Debug", "-sdk", "iphonesimulator",
              "-destination", "generic/platform=iOS Simulator", "-derivedDataPath", derived.path,
-             "ARCHS=arm64", "ONLY_ACTIVE_ARCH=YES", "CODE_SIGNING_ALLOWED=NO",
-             "SWIFT_EXEC=\(proxy.path)", "SWIFT_USE_INTEGRATED_DRIVER=\(driver)", "SWIFT_ENABLE_COMPILE_CACHE=YES"]
-                + (driver == "NO" ? ["SWIFT_GENERATE_ADDITIONAL_LINKER_ARGS=NO"] : []) + ["build"]
+             "ARCHS=arm64", "ONLY_ACTIVE_ARCH=YES", "CODE_SIGNING_ALLOWED=NO", "build"]
         }
         func captures(in derived: URL) -> [URL] {
             (manager.subpaths(atPath: derived.path) ?? []).filter { $0.hasSuffix("/" + XcodeIntegration.CompilerCapture.invocationFileName) }
                 .map { derived.appendingPathComponent($0) }
+                .filter { url in
+                    guard let data = try? Data(contentsOf: url),
+                          let record = try? BuildCapture.SwiftInvocationRecord.decode(data),
+                          let job = try? BuildCapture.FrontendJobNormalizer().normalize(record, workingDirectory: sourceRoot) else { return false }
+                    return job.moduleName == "MixedOnboarding"
+                }
         }
-        _ = try run("legacy-default-linker-options", arguments: arguments(driver: "NO", derived: root.appendingPathComponent("LegacyDefaultDerivedData"))
-            .filter { $0 != "SWIFT_GENERATE_ADDITIONAL_LINKER_ARGS=NO" })
+        let defaultDerived = root.appendingPathComponent("LegacyDefaultDerivedData")
+        _ = try run("legacy-default-linker-options", arguments: arguments(driver: "NO", derived: defaultDerived, probeDefaultLinkerArguments: true))
+        try manager.removeItem(at: defaultDerived)
         let legacy = root.appendingPathComponent("LegacyDerivedData")
         let compiled = try run("legacy-build", arguments: arguments(driver: "NO", derived: legacy))
         try #require(compiled.status == 0, "\(compiled.standardError)\n\(compiled.standardOutput.suffix(12_000))")
+        #expect(compiled.standardOutput.contains("HelixAppIntegration") && compiled.standardOutput.contains(runtimePackagePath))
         let capture = try #require(captures(in: legacy).first)
         let job = try BuildCapture.FrontendJobNormalizer().normalize(
             BuildCapture.SwiftInvocationRecord.decode(Data(contentsOf: capture)), workingDirectory: sourceRoot)
@@ -91,6 +117,7 @@ struct MixedOnboarding {
         }
         observations[observations.count - 1].captureFileCount = captures(in: integrated).count
         try save("observations.json", Core.CanonicalJSON.encode(observations))
+        try manager.removeItem(at: integrated)
         // A sibling real driver can satisfy XCBuild's tool lookup, but successful
         // compilation alone still does not establish Helix capture/hook support.
         let swift = try run("resolve-swift", executable: "/usr/bin/xcrun", arguments: ["--find", "swift"])
@@ -101,7 +128,9 @@ struct MixedOnboarding {
         _ = try run("integrated-with-sibling", arguments: arguments(driver: "YES", derived: sibling))
         observations[observations.count - 1].captureFileCount = captures(in: sibling).count
         try save("observations.json", Core.CanonicalJSON.encode(observations))
+        try manager.removeItem(at: sibling)
 
+        try Data(original.utf8).write(to: pbx)
         let parsed = try Hub.ProjectFileParser().parse(projectURL: project)
         let planned = try Hub.OnboardingPlanner().plan(.init(project: parsed, capabilities: .init([.liveReload]),
             profiles: [.init(id: "live", capability: .liveReload, applicationTargetName: "MixedApp", featureTargetName: "MixedApp",
@@ -139,10 +168,10 @@ struct MixedOnboarding {
         try #require(partial.exitCode == 0, "\(partial.standardOutput)\n\(partial.standardError)")
         let selectedReport = try JSONDecoder().decode(FrontendReceipt.DiagnosticReport.self, from: Data(partial.standardOutput.utf8))
         #expect(selectedReport.requestedStages == [.importedTypes, .sourceNominals])
-        #expect(selectedReport.checks.allSatisfy { $0.status == .passed })
+        #expect(selectedReport.checks.allSatisfy { $0.status == .passed || $0.status == .notRun })
         #expect(selectedReport.performance?.subprocesses.contains { $0.kind == .canonicalSIL } == false)
         #expect(selectedReport.checks.contains { $0.stage == "xcode.catalog_availability" } == false)
-        #expect(selectedReport.checks.contains { $0.stage == "frontend.receipt" } == false)
+        #expect(selectedReport.checks.contains { $0.stage == "frontend.receipt" && $0.status == .notRun })
         let start = DispatchTime.now().uptimeNanoseconds
         let diagnosed = await app.runAsync(["xcode", "post-compile", "--plan", sourceRoot.appendingPathComponent(".helix/xcode/HostPlan.json").path,
             "--profile", "live", "--capture", capture.path, "--diagnose", "--json"])

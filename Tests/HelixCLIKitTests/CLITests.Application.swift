@@ -16,6 +16,44 @@ enum CLITests {}
 extension CLITests {
 @Suite("CLI application")
 struct Application {
+    @Test("Human diagnosis bounds large stage failures while JSON retains every fact")
+    func boundsDiagnosticStageDetails() throws {
+        let detail = (0..<2_551).map { "Conflicting fact in Sources/File\($0).swift:1:1" }.joined(separator: "\n")
+        let report = FrontendReceipt.DiagnosticReport.failure(stage: "frontend.inputs", reason: detail)
+        let application = CLI.Application()
+        let human = try application.formatXcodeDiagnosis(report, json: false)
+        #expect(human.standardOutput.utf8.count < 8_000)
+        #expect(human.standardOutput.contains("--json") && human.standardOutput.contains("File0.swift"))
+        let json = try application.formatXcodeDiagnosis(report, json: true)
+        let decoded = try JSONDecoder().decode(FrontendReceipt.DiagnosticReport.self, from: Data(json.standardOutput.utf8))
+        #expect(decoded.checks.contains { $0.detail == detail })
+    }
+    @Test("Exclusion queries retain full JSON evidence and bound human output")
+    func indexingExclusionQueries() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let diagnostics = (0..<1_622).map { index in
+            Core.Diagnostic(code: "HLXIDX025", severity: .warning, message: "Unowned closure \(index)",
+                location: .init(file: "Sources/File\(index % 2).swift", line: index + 1, column: 1), notes: ["identity SIL conflict"])
+        } + [.init(code: "HLXIDX024", severity: .warning, message: "Excluded declaration", location: .init(file: "Sources/Other.swift", line: 2, column: 1))]
+        try Core.CanonicalJSON.encode(diagnostics).write(to: directory.appendingPathComponent("FrontendDiagnostics.json"))
+        let app = CLI.Application(currentDirectoryURL: directory)
+        let command = ["xcode", "exclusions", "--diagnostics", "FrontendDiagnostics.json"]
+        let human = app.run(command)
+        #expect(human.exitCode == 0 && human.standardOutput.contains("Showing 20 of 1623"))
+        #expect(human.standardOutput.utf8.count < 5_000)
+        let result = app.run(command + ["--json"])
+        let report = try JSONDecoder().decode(CLI.XcodeExclusionReport.self, from: Data(result.standardOutput.utf8))
+        #expect(report.declarationCount == 1 && report.fileCount == 2 && report.unownedMappingCount == 1_622)
+        #expect(report.diagnostics == diagnostics)
+        let scoped = app.run(command + ["--file", "Sources/File0.swift", "--json"])
+        let filtered = try JSONDecoder().decode(CLI.XcodeExclusionReport.self, from: Data(scoped.standardOutput.utf8))
+        #expect(filtered.declarationCount == 0 && filtered.fileCount == 1 && filtered.unownedMappingCount == 811)
+        #expect(app.run(command + ["unexpected"]).exitCode == 2)
+        try Data("not JSON".utf8).write(to: directory.appendingPathComponent("FrontendDiagnostics.json"))
+        #expect(app.run(command).exitCode != 0)
+    }
+
     @Test("Help and usage failures have stable exit semantics")
     func helpAndUsage() {
         let application = CLI.Application()
@@ -434,7 +472,7 @@ struct Application {
         let selected = await app.runAsync(["xcode", "post-compile", "--plan", "MissingPlan.json",
             "--profile", "live", "--capture", "MissingCapture", "--diagnose", "--json", "--stages", "source-nominals,imported-types"])
         let scoped = try JSONDecoder().decode(FrontendReceipt.DiagnosticReport.self, from: Data(selected.standardOutput.utf8))
-        #expect(scoped.schemaVersion == 2)
+        #expect(scoped.schemaVersion == 3)
         #expect(scoped.requestedStages == [.importedTypes, .sourceNominals])
         #expect(scoped.checks.contains { $0.stage == "frontend.receipt" } == false)
         #expect(scoped.checks.contains { $0.stage == "frontend.discover_imported_types" && $0.status == .blocked })

@@ -190,6 +190,25 @@ struct DevCompilationTests {
         })
     }
 
+    @Test("Deferred native surface discovery preserves the prepared indexing scope")
+    func keepsIndexingScopeInDeferredNativeSurface() throws {
+        let fixture = try Fixture.make(baseline: "public func transform(_ x: Int) -> Int { x + 1 }", platform: .iOSSimulator)
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let archive = try fixture.archive(nativeImports: [])
+        let receipt = try fixture.receipt(archive: archive, bindings: [])
+        var manifest = fixture.manifest
+        try manifest.configureIndexing(.init(include: ["Other/**"], failurePolicy: .excludeUnresolved), excludedSourcePaths: [])
+        let resolver = DevCompilation.NativeSurfaceResolver(manifest: manifest, receipt: receipt,
+            compilerURL: URL(fileURLWithPath: "/usr/bin/swiftc"),
+            cache: try BuildCache.Store(rootURL: fixture.directory.appendingPathComponent("ScopeCache")))
+        do {
+            _ = try resolver.resolve()
+            Issue.record("Deferred discovery must not expand an unmatched indexing scope to the full module")
+        } catch let FrontendReceipt.Error.invalidRequest(message) {
+            #expect(message.contains("Other/**"))
+        }
+    }
+
     @Test("A save may add an image-local helper without rebuilding the Dev Shell")
     func compilesNewPatchLocalFunction() async throws {
         let fixture = try Fixture.make()

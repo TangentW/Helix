@@ -38,13 +38,16 @@ public struct PlanRequest: Codable, Sendable {
 public struct BuildPlan: Sendable {
     public var requests: [NativeAPICatalog.BuildRequest]
     public var unresolvedModules: [String]
+    public var unresolvedReasons: [String: [String]]
 
     public init(
         requests: [NativeAPICatalog.BuildRequest],
-        unresolvedModules: [String]
+        unresolvedModules: [String],
+        unresolvedReasons: [String: [String]] = [:]
     ) {
         self.requests = requests
         self.unresolvedModules = unresolvedModules
+        self.unresolvedReasons = unresolvedReasons
     }
 }
 
@@ -90,7 +93,9 @@ public struct Planner: Sendable {
             excluding: request.metadata.frontendInvocation.moduleName
         )
         guard request.compilerInputs.isComplete else {
-            return .init(requests: [], unresolvedModules: modules)
+            let reasons = request.compilerInputs.incompleteReasons ?? ["Aggregate compiler input fingerprint is incomplete"]
+            return .init(requests: [], unresolvedModules: modules,
+                unresolvedReasons: Dictionary(uniqueKeysWithValues: modules.map { ($0, reasons) }))
         }
         let languageMode = try Self.swiftLanguageMode(
             in: request.metadata.frontendInvocation.semanticArguments
@@ -105,6 +110,7 @@ public struct Planner: Sendable {
         )
         var requests: [NativeAPICatalog.BuildRequest] = []
         var unresolved: [String] = []
+        var unresolvedReasons: [String: [String]] = [:]
         let directoryCache = BuildCache.CompilerInputs.DirectoryInventoryCache()
         for module in modules {
             let inputs = BuildCache.CompilerInputs.capture(
@@ -117,6 +123,7 @@ public struct Planner: Sendable {
             )
             guard inputs.isComplete else {
                 unresolved.append(module)
+                unresolvedReasons[module] = inputs.incompleteReasons ?? ["Module compiler input fingerprint is incomplete"]
                 continue
             }
             let isSystemModule = inputs.fileCount == 0
@@ -166,7 +173,8 @@ public struct Planner: Sendable {
             requests: requests.sorted {
                 $0.identity.moduleName < $1.identity.moduleName
             },
-            unresolvedModules: unresolved.sorted()
+            unresolvedModules: unresolved.sorted(),
+            unresolvedReasons: unresolvedReasons
         )
     }
 

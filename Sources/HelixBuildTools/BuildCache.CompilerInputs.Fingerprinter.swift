@@ -8,10 +8,16 @@ struct Fingerprinter {
     var fileCount: UInt64 = 0
     var byteCount: UInt64 = 0
     var isComplete: Bool
+    var incompleteReasons = Set<String>()
     private var seenResolvedFiles: [String: (byteCount: UInt64, hash: Core.Digest)] = [:]
 
     init(isComplete: Bool) {
         self.isComplete = isComplete
+    }
+
+    mutating func markIncomplete(_ reason: String) {
+        isComplete = false
+        incompleteReasons.insert(reason)
     }
 
     @discardableResult
@@ -74,13 +80,13 @@ struct Fingerprinter {
                 hasher.append("missing")
             } else {
                 hasher.append("unreadable")
-                isComplete = false
+                markIncomplete("Unreadable referenced compiler input: \(original.path)")
             }
             return
         }
         let resolved = original.resolvingSymlinksInPath().standardizedFileURL
         guard lstat(resolved.path, &information) == 0 else {
-            isComplete = false
+            markIncomplete("Unresolved referenced compiler input: \(original.path)")
             return
         }
         let excluded = excludedURL?.resolvingSymlinksInPath()
@@ -96,7 +102,7 @@ struct Fingerprinter {
             return
         }
         guard information.st_mode & S_IFMT == S_IFDIR else {
-            isComplete = false
+            markIncomplete("Unsupported referenced compiler input node: \(original.path)")
             return
         }
         let subpaths = try BuildCache.CompilerInputs.boundedSubpaths(
@@ -111,19 +117,19 @@ struct Fingerprinter {
             let child = resolved.appendingPathComponent(subpath)
             var childInformation = Darwin.stat()
             guard lstat(child.path, &childInformation) == 0 else {
-                isComplete = false
+                markIncomplete("Referenced compiler input disappeared or became unreadable: \(child.path)")
                 continue
             }
             if childInformation.st_mode & S_IFMT == S_IFLNK {
                 let target = child.resolvingSymlinksInPath().standardizedFileURL
                 guard lstat(target.path, &childInformation) == 0 else {
-                    isComplete = false
+                    markIncomplete("Unresolved referenced compiler input symlink: \(child.path)")
                     continue
                 }
                 guard childInformation.st_mode & S_IFMT == S_IFREG else {
                     // Avoid a cycle-prone second traversal through directory
                     // links. An uncached frontend remains authoritative.
-                    isComplete = false
+                    markIncomplete("Referenced compiler input symlink does not resolve to a regular file: \(child.path) -> \(target.path)")
                     continue
                 }
                 if target.path == excluded { continue }
@@ -139,7 +145,7 @@ struct Fingerprinter {
                 )
             }
             if fileCount > 100_000 || byteCount > 1_024 * 1_024 * 1_024 {
-                isComplete = false
+                markIncomplete("Compiler input budget exceeded at \(child.path): \(fileCount) files, \(byteCount) bytes")
                 return
             }
         }

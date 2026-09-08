@@ -1049,6 +1049,8 @@ Catalog declaring-module evidence also recognizes reexported module prefixes.
 
 Declaration discovery can be scoped by logical file and can exclude a proven
 source declaration when a consumed AST/SIL mapping is ambiguous or absent.
+Unowned mapping failures exclude the entire validated source file with explicit
+per-node diagnostics; initializers and deinitializers are recognized as owners.
 The compiler USR plus logical file owns the entire accessor/closure group; no
 candidate is guessed and partial body operations are rolled back. Global compiler,
 source, type, ABI and Catalog checks remain mandatory. Live Reload defaults to
@@ -1119,7 +1121,7 @@ are assembled. No partially valid File or substitute empty environment escapes.
 Diagnostic stage selection uses the shared analysis graph to skip unrelated
 compiler replays and Catalog reads. A successful selected run still confirms
 cache inputs and retains only fully validated compiler checkpoints; it does not
-publish a module receipt. Diagnostic JSON schema 2 adds `requestedStages` so a
+publish a module receipt. Diagnostic JSON schema 3 retains `requestedStages` and explicitly marks `not_run`; a
 partial pass cannot be mistaken for full receipt validation. Missing selection
 in legacy schema 1 reports retains full scope. Shell/patch schemas are unchanged.
 
@@ -1133,3 +1135,19 @@ prove full receipt or runtime support. See [preflight](Large-Project-Integration
 Semantic SIL is released after operation discovery; receipt assembly retains only the identity SIL needed for fingerprints.
 
 Host Plan schema 2 also supports an explicit runtime package revision or exact release version. Hub preserves it during reconfiguration; conflicting package authorities fail before writing. `helix xcode uninstall --project … --plan …` reuses transactional removal without the GUI. See [team integration](Large-Project-Integration.md#team-runtime-selection-and-removal) for pin defaults, ownership and backup requirements.
+
+Catalog bootstrap is a separate host operation over the canonical Host Plan,
+compiler capture, measured toolchain/SDK, source import inventory and dependency
+fingerprints. It can publish resumable jobs before a consumer receipt exists;
+normal Prepare also schedules misses before frontend analysis. Incomplete input
+facts remain explicit blockers, with provenance, rather than fabricated empty
+Catalogs. New remote runtime references use the published revision declared by
+`RuntimePackageRequirement.defaultRuntime`; existing references preserve their
+owner's choice. See [large-project integration](Large-Project-Integration.md).
+
+Host Dev Build Manifest schema 2 binds the effective indexing policy and excluded
+source IDs to the existing source baseline. The save pipeline rejects edited
+excluded files before compilation or transfer and retains the accepted baseline;
+deferred native discovery uses that same policy. This host migration preserves
+schema 1 decoding and does not alter runtime ABI or Dev Protocol wire formats.
+See [save guards and migration](Development-Live-Reload.md#saving-code-excluded-from-indexing).

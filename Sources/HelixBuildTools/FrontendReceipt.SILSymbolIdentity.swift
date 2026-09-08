@@ -19,10 +19,12 @@ struct SILSymbolIdentity: Sendable {
 
     private static let adapterAttributes: Set<String> = [
         "ObjCAttribute", "NonObjCAttribute", "MergedFunction",
+        "FunctionSignatureSpecialization",
     ]
     static let sourceRoles: Set<String> = [
         "Function", "Getter", "Setter", "ReadAccessor", "ModifyAccessor",
         "WillSet", "DidSet", "ExplicitClosure", "ImplicitClosure",
+        "Initializer",
     ]
     private static let adapterRoles: Set<String> = [
         "ProtocolWitness", "ReabstractionThunk", "ReabstractionThunkHelper",
@@ -77,7 +79,11 @@ struct SILSymbolIdentity: Sendable {
         let roots = children(of: 0)
         let attributes = roots.filter { adapterAttributes.contains(nodes[$0].kind) }
         let entities = roots.filter { !adapterAttributes.contains(nodes[$0].kind) }
-        guard entities.count == 1, attributes.allSatisfy({ children(of: $0).isEmpty }) else { return result }
+        // Signature-specialization attributes contain transformation parameters.
+        // They prove a generated variant, never a source-equivalent callable.
+        guard entities.count == 1, attributes.allSatisfy({
+            nodes[$0].kind == "FunctionSignatureSpecialization" || children(of: $0).isEmpty
+        }) else { return result }
         result.wrappers = attributes.map { nodes[$0].kind }
         var entity = entities[0]
         // Static is a declaration wrapper. Closure contexts may also contain

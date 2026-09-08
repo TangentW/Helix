@@ -456,3 +456,25 @@ fixture (280,761 bytes) measured 7.509 s explicit-module compilation, 30.155 s
 cold receipt and 0.944 s unchanged hit. Every source remained in the receipt;
 warm runs emitted no AST/SIL. These are current regression observations, not
 an isolated comparison with earlier runs whose source/configuration differs.
+
+## Imported alias normalization (round 6)
+
+A sampled cold Catalog regression spent time repeatedly scanning all imported
+nominal observations. Catalog alias matching now indexes each exact observed
+name and starts with the smallest candidate bucket, retaining every competing
+fact and the full subset/representation checks. Clang alias normalization
+indexes exact canonical names, and updates its index while names
+change so ordered alias-chain behavior is preserved. No identity is inferred
+from a short name alone.
+
+On the same macOS debug test executable configuration, a synthetic inventory
+of 8,000 observations (2,000 Catalog pairs plus 2,000 Clang pairs) produced the
+same 4,000 normalized types and exact canonical output hash before/after.
+Three measured merges had median 23.741 s before and 0.228 s after (about 104×).
+Input reversal and repeated merging also passed. This measures this merge only,
+not complete Prepare, cold Catalog generation, commercial-module integration,
+or save-to-active latency. The regression defaults to 128 groups in the suite;
+set `HELIX_ALIAS_TYPE_COUNT=2000` and `HELIX_ALIAS_REPORT=/absolute/path/report.json`
+with `--filter measuresAliasNormalization` to reproduce the larger measurement.
+Raw local evidence is kept outside the repository. Identity SIL and semantic SIL
+remain distinct compiler products; this optimization does not conflate them.

@@ -82,7 +82,7 @@ public struct ToolchainCapabilities: Codable, Hashable, Sendable {
 }
 
 public struct Document: Codable, Hashable, Sendable {
-    public static let currentSchemaVersion: UInt32 = 1
+    public static let currentSchemaVersion: UInt32 = 2
 
     public var schemaVersion: UInt32
     public var sessionBuildID: UUID
@@ -110,9 +110,10 @@ public struct Document: Codable, Hashable, Sendable {
     public var liveReloadIndexHash: Core.Digest
     public var dependencyGraphHash: Core.Digest
     public var toolchainCapabilities: DevBuildManifest.ToolchainCapabilities
+    public var indexingPolicy: DevBuildManifest.IndexingPolicy?
 
     public init(
-        schemaVersion: UInt32 = Self.currentSchemaVersion,
+        schemaVersion: UInt32 = 1,
         sessionBuildID: UUID,
         workspacePathHash: Core.Digest,
         scheme: String,
@@ -165,12 +166,18 @@ public struct Document: Codable, Hashable, Sendable {
         self.liveReloadIndexHash = liveReloadIndexHash
         self.dependencyGraphHash = dependencyGraphHash
         self.toolchainCapabilities = toolchainCapabilities
+        self.indexingPolicy = nil
     }
 
     public func validate() throws {
-        guard schemaVersion == Self.currentSchemaVersion else {
+        guard schemaVersion == 1 || schemaVersion == Self.currentSchemaVersion else {
             throw BuildCapture.Error.invalidManifest("unsupported schema \(schemaVersion)")
         }
+        guard (schemaVersion == 1 && indexingPolicy == nil)
+                || (schemaVersion == Self.currentSchemaVersion && indexingPolicy != nil) else {
+            throw BuildCapture.Error.invalidManifest("indexingPolicy requires Dev Build Manifest schema 2")
+        }
+        try indexingPolicy?.validate(sources: sourceFiles)
         guard !scheme.isEmpty, !configuration.isEmpty, !bundleID.isEmpty,
               !moduleName.isEmpty, !targetTriple.isEmpty, !architecture.isEmpty,
               !xcodeBuild.isEmpty, !swiftCompilerFingerprint.isEmpty, !sdkBuild.isEmpty
@@ -281,6 +288,7 @@ public struct Document: Codable, Hashable, Sendable {
         if frontendArguments != current.frontendArguments { changes.append(.frontendArguments) }
         if linkArguments != current.linkArguments { changes.append(.linkArguments) }
         if dependencyGraphHash != current.dependencyGraphHash { changes.append(.dependencies) }
+        if indexingPolicy != current.indexingPolicy { changes.append(.indexingPolicy) }
         if entitlementsHash != current.entitlementsHash { changes.append(.entitlements) }
         if executableUUID != current.executableUUID { changes.append(.executable) }
         if sourceFiles.map(\.logicalPath) != current.sourceFiles.map(\.logicalPath) {
@@ -328,6 +336,7 @@ public enum Change: String, Codable, Hashable, Sendable {
     case entitlements
     case executable
     case sourceMembership
+    case indexingPolicy
 }
 }
 

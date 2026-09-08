@@ -20,6 +20,8 @@ public struct Snapshot: Codable, Hashable, Sendable {
     public var byteCount: UInt64
     public var contentHash: Core.Digest
     public var isComplete: Bool
+    /// Diagnostic provenance only; absent from complete and legacy snapshots.
+    public var incompleteReasons: [String]?
 
     public init(
         schemaVersion: UInt16 = Self.currentSchemaVersion,
@@ -29,7 +31,8 @@ public struct Snapshot: Codable, Hashable, Sendable {
         fileCount: UInt64,
         byteCount: UInt64,
         contentHash: Core.Digest,
-        isComplete: Bool
+        isComplete: Bool,
+        incompleteReasons: [String]? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.importedModules = Array(Set(importedModules)).sorted()
@@ -39,6 +42,7 @@ public struct Snapshot: Codable, Hashable, Sendable {
         self.byteCount = byteCount
         self.contentHash = contentHash
         self.isComplete = isComplete
+        self.incompleteReasons = incompleteReasons.map { Array(Set($0)).sorted() }
     }
 }
 
@@ -70,12 +74,13 @@ static func capture(
         workingDirectory: workingDirectory
     )
     var fingerprint = Fingerprinter(isComplete: parsed.isComplete)
+    for reason in parsed.incompleteReasons { fingerprint.markIncomplete(reason) }
     var additionalExplicitPaths = Set<String>()
     let dependencyModules = importedModules.map {
         Set($0.compactMap(moduleRoot)).subtracting([currentModuleName])
     }
     if importedModules?.contains(where: { moduleRoot($0) == nil }) == true {
-        fingerprint.isComplete = false
+        fingerprint.markIncomplete("Invalid imported module names: \(importedModules!.filter { moduleRoot($0) == nil }.sorted())")
     }
     fingerprint.hasher.append(
         dependencyModules == nil ? "all-modules" : "selected-modules"
@@ -95,14 +100,14 @@ static func capture(
                 fingerprint.hasher.append("missing")
             } else {
                 fingerprint.hasher.append("unreadable")
-                fingerprint.isComplete = false
+                fingerprint.markIncomplete("Unreadable compiler input: \(original.path)")
             }
             continue
         }
         let resolved = original.resolvingSymlinksInPath().standardizedFileURL
         guard lstat(resolved.path, &information) == 0 else {
             fingerprint.hasher.append("unresolved")
-            fingerprint.isComplete = false
+            fingerprint.markIncomplete("Unresolved compiler input: \(original.path)")
             continue
         }
         if information.st_mode & S_IFMT == S_IFREG {
@@ -196,13 +201,13 @@ static func capture(
                 }
             } catch {
                 fingerprint.hasher.append("unstable-file")
-                fingerprint.isComplete = false
+                fingerprint.markIncomplete("\(original.path): \(error)")
             }
             continue
         }
         guard information.st_mode & S_IFMT == S_IFDIR else {
             fingerprint.hasher.append("unsupported-node")
-            fingerprint.isComplete = false
+            fingerprint.markIncomplete("Unsupported compiler input node: \(original.path)")
             continue
         }
         do {
@@ -222,7 +227,7 @@ static func capture(
                             )
                         }
                     } catch {
-                        fingerprint.isComplete = false
+                        fingerprint.markIncomplete("Module map \(child.path): \(error)")
                     }
                 }
                 for subpath in subpaths where importedModuleContainer(
@@ -241,7 +246,7 @@ static func capture(
                         // A module-directory link is valid compiler input, but
                         // FileManager does not traverse it. Disable reuse until
                         // the directory can be fingerprinted without cycles.
-                        fingerprint.isComplete = false
+                        fingerprint.markIncomplete("Module directory symlink is not fingerprinted: \(child.path) -> \(child.resolvingSymlinksInPath().path)")
                     }
                 }
             }
@@ -262,7 +267,7 @@ static func capture(
                 let child = resolved.appendingPathComponent(subpath)
                 var childInformation = Darwin.stat()
                 guard lstat(child.path, &childInformation) == 0 else {
-                    fingerprint.isComplete = false
+                    fingerprint.markIncomplete("Compiler input disappeared or became unreadable: \(child.path)")
                     continue
                 }
                 if childInformation.st_mode & S_IFMT == S_IFLNK {
@@ -270,7 +275,7 @@ static func capture(
                     guard lstat(target.path, &childInformation) == 0,
                           childInformation.st_mode & S_IFMT == S_IFREG
                     else {
-                        fingerprint.isComplete = false
+                        fingerprint.markIncomplete("Compiler interface symlink does not resolve to a regular file: \(child.path) -> \(target.path)")
                         continue
                     }
                     do {
@@ -279,7 +284,7 @@ static func capture(
                             logicalPath: "\(logicalRoot)/\(subpath)"
                         )
                     } catch {
-                        fingerprint.isComplete = false
+                        fingerprint.markIncomplete("\(child.path) -> \(target.path): \(error)")
                     }
                 } else if childInformation.st_mode & S_IFMT == S_IFREG {
                     do {
@@ -288,18 +293,18 @@ static func capture(
                             logicalPath: "\(logicalRoot)/\(subpath)"
                         )
                     } catch {
-                        fingerprint.isComplete = false
+                        fingerprint.markIncomplete("\(child.path): \(error)")
                     }
                 }
                 if fingerprint.fileCount > 100_000
                     || fingerprint.byteCount > 1_024 * 1_024 * 1_024 {
-                    fingerprint.isComplete = false
+                    fingerprint.markIncomplete("Compiler input budget exceeded at \(child.path): \(fingerprint.fileCount) files, \(fingerprint.byteCount) bytes")
                     break
                 }
             }
         } catch {
             fingerprint.hasher.append("directory-read-failed")
-            fingerprint.isComplete = false
+            fingerprint.markIncomplete("Compiler input directory \(resolved.path): \(error)")
         }
     }
 
@@ -313,7 +318,8 @@ static func capture(
         fileCount: fingerprint.fileCount,
         byteCount: fingerprint.byteCount,
         contentHash: fingerprint.hasher.finalize(),
-        isComplete: fingerprint.isComplete
+        isComplete: fingerprint.isComplete,
+        incompleteReasons: fingerprint.incompleteReasons.isEmpty ? nil : fingerprint.incompleteReasons.sorted()
     )
 }
 

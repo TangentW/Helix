@@ -214,7 +214,8 @@ partial-apply forwarder 和 Objective-C/C 适配属性不能替代 Swift 源码�
 命中不需要 symbol-tree 子进程。
 
 声明发现可按逻辑文件限定范围，并在被消费的 AST/SIL 映射有歧义或缺失时排除有明确
-源码归属的声明。编译器 USR 与逻辑文件绑定整组 accessor/closure，不猜测候选，已收集
+源码归属的声明；无法证明归属时，排除整个已验证源文件并记录每个失败节点，
+initializer/deinitializer 也作为闭包宿主。编译器 USR 与逻辑文件绑定整组 accessor/closure，不猜测候选，已收集
 的局部 body operation 会回滚。编译器、源码、类型、ABI、Catalog 的全局校验仍须通过。
 Live Reload 默认局部排除，Hot Patch/headless 默认严格，均可显式覆盖。策略进入
 receipt/Prepare 缓存 identity，范围外源码仍保留整模块失效权威。Host Plan v2 承载范围，
@@ -243,7 +244,7 @@ conformance 和声明清单。所有前置检查通过后才有完整 `Canonical
 构建较大的类型/conformance 表前释放，不向外提供部分有效的 File 或空环境替代品。
 
 诊断阶段选择使用共用的分析依赖图，跳过无关的编译重放和 Catalog 读取。局部通过仍需
-复核缓存输入，只保留完整验证的编译检查点，不发布模块 receipt。诊断 JSON schema 2
+复核缓存输入，只保留完整验证的编译检查点，不发布模块 receipt。诊断 JSON schema 3（含显式 `not_run` 状态）
 增加 `requestedStages`，区分局部通过和完整 receipt 通过；旧 schema 1 中缺省的选择
 范围仍表示完整诊断。Shell/补丁 schema 保持不变。
 
@@ -255,3 +256,15 @@ post-compile。仅输入预检不生成 AST/SIL，也不扫描依赖缓存；typ
 semantic SIL 在 operation 发现后即可释放；receipt 组装只保留计算指纹需要的 identity SIL。
 
 Host Plan schema 2 还支持显式 runtime package revision 或精确发布版本。Hub 重新配置时保留该字段，package authority 冲突会在写入前拒绝。`helix xcode uninstall --project … --plan …` 无需 GUI 即可复用事务卸载。版本缺省、ownership 和备份要求见[团队接入](Large-Project-Integration.zh-CN.md#团队-runtime-版本与卸载)。
+
+Catalog 自举是独立的宿主操作，输入为 canonical Host Plan、compiler capture、实测
+工具链/SDK、源码 import 清单和依赖指纹。消费模块 receipt 尚未生成时即可发布可续跑
+任务，普通 Prepare 也在 frontend 分析前安排 miss。不完整输入继续作为带出处的明确
+阻塞项，不伪造空 Catalog。新建远端 runtime 引用采用
+`RuntimePackageRequirement.defaultRuntime` 声明的已发布 revision，已有引用保留
+其所有者的选择。参见[大型工程接入](Large-Project-Integration.zh-CN.md)。
+
+宿主 Dev Build Manifest schema 2 将实际索引策略与被排除 source ID 绑定到已有源码
+基线；保存流程在编译/传输前拒绝被排除文件的修改，保留已接受基线，后续 Native
+能力发现沿用相同策略。该宿主迁移保留 schema 1 读取，不改变 runtime ABI 或 Dev
+Protocol 消息格式。见[保存保护与迁移](Development-Live-Reload.zh-CN.md#保存被排除的代码)。

@@ -206,6 +206,8 @@ extension FrontendReceipt.Adapter {
         try session.requireSuccess()
         guard session.includes("frontend.receipt") else { throw FrontendReceipt.DiagnosticSelectionComplete() }
         performance.setCounter("frontend.excluded_declaration_count", value: UInt64(selection!.exclusions.count))
+        performance.setCounter("frontend.excluded_file_count", value: UInt64(selection!.excludedFilePaths.count))
+        performance.setCounter("frontend.unowned_mapping_count", value: UInt64(selection!.unownedExclusions.count))
         return .init(sourceStates: states!, toolchain: toolchain!, documents: try selection!.availableDocuments(sourcesByPhysicalPath: byPath!), importedModules: ast!.modules,
                      demangled: demangled!, silFile: identitySIL.file!,
                      identityResolver: identitySIL.resolver!, selection: selection!, effectiveConfiguration: effectiveConfiguration!,

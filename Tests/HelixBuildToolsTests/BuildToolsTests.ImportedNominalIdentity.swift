@@ -1,3 +1,4 @@
+import Foundation
 import HelixCore
 import Testing
 @testable import HelixBuildTools
@@ -5,6 +6,77 @@ import Testing
 extension BuildToolsTests {
 @Suite("Imported nominal identity normalization")
 struct ImportedNominalIdentityTests {
+    @Test("NS-prefixed Swift modules and unproven flat names remain independent identities")
+    func preservesNSPrefixedModuleAuthority() throws {
+        for names in [["NSWidgets.Item", "Widgets.Item"], ["NSUnproven", "Unproven"],
+                      ["NSUnproven", "Unproven.Nested"]] {
+            let uses = names.map { name -> FrontendReceipt.Adapter.ImportedNativeType in
+                var value = FrontendReceipt.Adapter.ImportedNativeType(canonicalName: name,
+                    swiftType: name, kind: .value, aliases: [], representation: .opaqueValue,
+                    sourceFileLogicalID: "\(name).swift", importedModules: ["NSWidgets", "Widgets"], requiresMainActor: false)
+                value.nativeModuleName = name.hasPrefix("NS") ? "NSWidgets" : "Widgets"
+                return value
+            }
+            let merged = try FrontendReceipt.Adapter().mergeImportedNativeTypes(discoveredTypes: uses, operationTypes: [])
+            #expect(merged.map(\.canonicalName) == names.sorted())
+            #expect(merged.allSatisfy { $0.aliases.isEmpty })
+            let references = uses.map { value in
+                var reference = value
+                reference.kind = .reference
+                reference.representation = .reference
+                return reference
+            }
+            let mergedReferences = try FrontendReceipt.Adapter().mergeImportedNativeTypes(
+                discoveredTypes: references, operationTypes: [])
+            #expect(mergedReferences.map(\.canonicalName) == names.sorted())
+            #expect(mergedReferences.allSatisfy { $0.aliases.isEmpty })
+        }
+    }
+
+    @Test("A flat NS alias requires the same exact Objective-C runtime on both sides")
+    func mergesRuntimeProvenNSAlias() throws {
+        let runtime = type("NSProgress", swift: "NSProgress", source: "Runtime.swift")
+        var overlay = type("NSProgress", swift: "Progress", source: "Overlay.swift")
+        overlay.canonicalName = "Progress"
+        let adapter = FrontendReceipt.Adapter()
+        let merged = try adapter.mergeImportedNativeTypes(discoveredTypes: [runtime, overlay], operationTypes: [])
+        #expect(merged.count == 1)
+        #expect(merged.first?.objectiveCRuntimeName == "NSProgress")
+        #expect(try adapter.mergeImportedNativeTypes(discoveredTypes: [overlay, runtime], operationTypes: []) == merged)
+        #expect(try adapter.mergeImportedNativeTypes(discoveredTypes: merged, operationTypes: [runtime, overlay]) == merged)
+        overlay.objectiveCRuntimeName = "DifferentProgress"
+        let distinct = try adapter.mergeImportedNativeTypes(discoveredTypes: [runtime, overlay], operationTypes: [])
+        #expect(distinct.count == 2)
+        #expect(Set(distinct.compactMap(\.objectiveCRuntimeName)) == ["NSProgress", "DifferentProgress"])
+    }
+
+    @Test("Unbound archetypes cannot compete with nested Swift overlays or become aliases")
+    func excludesArchetypeObservations() throws {
+        let adapter = FrontendReceipt.Adapter()
+        let spellings = ["τ_0_0.Element", "Swift.Optional<τ_1_2.Element>", "Self.Element", "Container<τ_0_0>"]
+        for spelling in spellings {
+            #expect(adapter.importedNativeNominal(in: spelling) == nil)
+            #expect(adapter.importedNativeType(rawMangledType: "$sSo13RuntimeNestedCD", spelling: spelling,
+                source: .init(logicalPath: "Generic.swift", url: URL(fileURLWithPath: "/tmp/Generic.swift"), contents: Data(), contentHash: .sha256(Data())),
+                importedModules: ["Foundation"], requiresMainActor: false) == nil)
+        }
+        let uses = (["RuntimeNested", "Namespace.Nested"] + spellings).map {
+            type("RuntimeNested", swift: $0, source: "Generic.swift")
+        }
+        let merged = try adapter.mergeImportedNativeTypes(discoveredTypes: uses, operationTypes: [])
+        #expect(merged.count == 1 && merged.first?.swiftType == "Namespace.Nested")
+        #expect(merged.first?.objectiveCRuntimeName == "RuntimeNested")
+        #expect(merged.allSatisfy { !$0.aliases.contains { $0.contains("τ_") || $0.contains("Self") } })
+        #expect(try adapter.mergeImportedNativeTypes(discoveredTypes: uses.reversed(), operationTypes: []) == merged)
+        #expect(try adapter.mergeImportedNativeTypes(discoveredTypes: merged, operationTypes: uses) == merged)
+        #expect(FrontendReceipt.ImportedNominalIdentity.isConcreteSpelling("Namespace.myτ_0_0"))
+        var conflicting = type("OtherRuntime", swift: "τ_0_0.Element", source: "Conflict.swift")
+        conflicting.canonicalName = "RuntimeNested"
+        #expect(throws: FrontendReceipt.Error.self) {
+            try adapter.mergeImportedNativeTypes(discoveredTypes: uses, operationTypes: [conflicting])
+        }
+    }
+
     @Test("Qualified and relative Progress uses normalize across every merge and alias consumer")
     func mergesProgressSpellings() throws {
         let uses = ["NSProgress", "Foundation.Progress", "Progress"].enumerated().map {
@@ -189,6 +261,46 @@ struct ImportedNominalIdentityTests {
               aliases: [], representation: .reference, sourceFileLogicalID: source,
               importedModules: ["Foundation"], objectiveCRuntimeName: runtime,
               requiresMainActor: false)
+    }
+
+    @Test("Large independent Catalog and Clang alias sets preserve identity and input-order invariance")
+    func measuresAliasNormalization() throws {
+        let environment = ProcessInfo.processInfo.environment
+        let count = try #require(Int(environment["HELIX_ALIAS_TYPE_COUNT"] ?? "128"))
+        try #require((1...10_000).contains(count))
+        var uses: [FrontendReceipt.Adapter.ImportedNativeType] = []
+        for index in 0..<count {
+            var authority = FrontendReceipt.Adapter.ImportedNativeType(canonicalName: "Type\(index)",
+                swiftType: "Fixture.Type\(index)", kind: .value, aliases: ["Type\(index)", "Fixture.Type\(index)"],
+                representation: .opaqueValue, sourceFileLogicalID: "Catalog.swift", importedModules: ["Fixture"], requiresMainActor: false)
+            authority.nativeModuleName = "Fixture"
+            var observed = authority
+            observed.nativeModuleName = nil
+            observed.swiftType = "Type\(index)"
+            observed.aliases = []
+            uses += [authority, observed,
+                .init(canonicalName: "NSItem\(index)", swiftType: "NSItem\(index)", kind: .value,
+                    aliases: [], representation: .opaqueValue, sourceFileLogicalID: "ABI.swift", importedModules: ["Fixture"], requiresMainActor: false),
+                .init(canonicalName: "Item\(index)", swiftType: "Item\(index)", kind: .value,
+                    aliases: ["__C.NSItem\(index)"], representation: .opaqueValue, sourceFileLogicalID: "Overlay.swift", importedModules: ["Fixture"], requiresMainActor: false)]
+        }
+        let adapter = FrontendReceipt.Adapter()
+        var durations: [UInt64] = []
+        var merged: [FrontendReceipt.Adapter.ImportedNativeType] = []
+        for _ in 0..<3 {
+            let start = DispatchTime.now().uptimeNanoseconds
+            merged = try adapter.mergeImportedNativeTypes(discoveredTypes: uses, operationTypes: [])
+            durations.append((DispatchTime.now().uptimeNanoseconds - start) / 1_000)
+        }
+        #expect(merged.count == 2 * count)
+        #expect(try adapter.mergeImportedNativeTypes(discoveredTypes: uses.reversed(), operationTypes: []) == merged)
+        #expect(try adapter.mergeImportedNativeTypes(discoveredTypes: merged, operationTypes: uses) == merged)
+        if let path = environment["HELIX_ALIAS_REPORT"] {
+            try #require(path.hasPrefix("/"))
+            let data = try JSONSerialization.data(withJSONObject: ["independentTypePairs": count, "observations": uses.count,
+                "wallMicroseconds": durations, "outputHash": Core.Digest.sha256(try Core.CanonicalJSON.encode(merged)).hex], options: [.sortedKeys])
+            try data.write(to: URL(fileURLWithPath: path))
+        }
     }
 }
 }

@@ -18,6 +18,7 @@ struct ParsedArguments {
     var values: [Location]
     var isComplete: Bool
     var hasBridgingHeader: Bool
+    var incompleteReasons: [String]
 }
 
 static func parseArguments(
@@ -53,6 +54,7 @@ static func parseArguments(
         if seen.insert(location).inserted { result.append(location) }
     }
     var complete = true
+    var incompleteReasons: [String] = []
     var hasBridgingHeader = false
     var index = 0
     while index < arguments.count {
@@ -60,11 +62,14 @@ static func parseArguments(
         if pairedSearch.contains(argument) {
             guard index + 1 < arguments.count else {
                 complete = false
+                incompleteReasons.append("Missing compiler search-path argument after \(argument)")
                 break
             }
-            if let path = absolutePath(arguments[index + 1], in: workingDirectory),
-               !isToolchainOrSDKPath(path) {
-                append(.init(kind: .searchRoot, path: path))
+            if let path = absolutePath(arguments[index + 1], in: workingDirectory) {
+                if !isToolchainOrSDKPath(path) { append(.init(kind: .searchRoot, path: path)) }
+            } else {
+                complete = false
+                incompleteReasons.append("Invalid compiler search path after \(argument): \(arguments[index + 1].debugDescription)")
             }
             index += 2
             continue
@@ -72,15 +77,17 @@ static func parseArguments(
         if let kind = pairedInputs[argument] {
             guard index + 1 < arguments.count else {
                 complete = false
+                incompleteReasons.append("Missing compiler input argument after \(argument)")
                 break
             }
-            if let path = absolutePath(arguments[index + 1], in: workingDirectory),
-               !isToolchainOrSDKPath(path),
-               !belongsToCurrentModule(path, moduleName: currentModuleName) {
-                append(.init(kind: kind, path: path))
-                if kind == .bridgingHeaderInput {
-                    hasBridgingHeader = true
+            if let path = absolutePath(arguments[index + 1], in: workingDirectory) {
+                if !isToolchainOrSDKPath(path), !belongsToCurrentModule(path, moduleName: currentModuleName) {
+                    append(.init(kind: kind, path: path))
+                    if kind == .bridgingHeaderInput { hasBridgingHeader = true }
                 }
+            } else {
+                complete = false
+                incompleteReasons.append("Invalid compiler input path after \(argument): \(arguments[index + 1].debugDescription)")
             }
             index += 2
             continue
@@ -104,7 +111,8 @@ static func parseArguments(
     return .init(
         values: result,
         isComplete: complete,
-        hasBridgingHeader: hasBridgingHeader
+        hasBridgingHeader: hasBridgingHeader,
+        incompleteReasons: incompleteReasons
     )
 }
 

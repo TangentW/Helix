@@ -44,8 +44,8 @@ extension FrontendReceipt.Adapter {
             } catch {
                 guard FrontendReceipt.DeclarationSelection.isMappingFailure(error) else { throw error }
                 let evidence = "\(stage): \(error)"
-                if selection.failurePolicy == .excludeUnresolved, let declaration = member.declaration {
-                    selection.exclude(declaration, reason: evidence)
+                if selection.failurePolicy == .excludeUnresolved {
+                    selection.exclude(member, reason: evidence)
                 } else {
                     failures.insert(evidence)
                 }

@@ -96,6 +96,10 @@ public struct Output: Sendable {
     public var performance: BuildPerformance.Trace
 
     public var excludedDeclarationCount: Int { diagnostics.filter { $0.code == "HLXIDX024" }.count }
+    public var unownedMappingCount: Int { diagnostics.filter { $0.code == "HLXIDX025" }.count }
+    public var excludedFileCount: Int {
+        Set(diagnostics.filter { $0.code == "HLXIDX025" }.compactMap { $0.location?.file }).count
+    }
 
     public init(
         receipt: ShellBuildReceipt.Document,

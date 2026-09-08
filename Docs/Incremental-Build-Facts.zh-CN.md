@@ -14,7 +14,8 @@ specialization。任何缓存事实在使用前都要重新匹配当前语义输
 
 
 声明发现可按逻辑文件限定范围，并在被消费的 AST/SIL 映射有歧义或缺失时排除有明确
-源码归属的声明。编译器 USR 与逻辑文件绑定整组 accessor/closure，不猜测候选，已收集
+源码归属的声明；无法证明归属时，排除整个已验证源文件并记录每个失败节点，
+initializer/deinitializer 也作为闭包宿主。编译器 USR 与逻辑文件绑定整组 accessor/closure，不猜测候选，已收集
 的局部 body operation 会回滚。编译器、源码、类型、ABI、Catalog 的全局校验仍须通过。
 Live Reload 默认局部排除，Hot Patch/headless 默认严格，均可显式覆盖。策略进入
 receipt/Prepare 缓存 identity，范围外源码仍保留整模块失效权威。Host Plan v2 承载范围，
@@ -105,7 +106,8 @@ Catalog 命中时不会启动 Symbol Graph 或候选探针进程，但缓存中�
 
 Hot Patch 在发布生产能力基线前，会同步解析完整的可达 Catalog 闭包。Live Reload 则用
 非阻塞 shared lock 读取：条目不存在或正由其他 producer 生成时，Prepare 都不会等待，
-本次直接走权威源码根回退。Shell 成功后才发布仅当前用户可读的 canonical 预热任务。
+本次直接走权威源码根回退。在 frontend receipt 生成前发布仅当前用户可读的 canonical
+预热任务，因此后续 frontend 失败不会再阻断 Catalog 自举。
 utility worker 会重新确认任务仍匹配 compiler、SDK、plan 和 module input，再生成首批
 miss，并递归跟进引用到的 module。任务文件以原子方式发布到 `0700` 目录，权限为
 `0600`；读取使用 `O_NOFOLLOW`、大小上限和文件锁，重复 worker 不会破坏结果。
@@ -124,7 +126,7 @@ miss，并递归跟进引用到的 module。任务文件以原子方式发布到
 正常规则发布。诊断仅在所选检查需要时读取已有 Catalog，不执行冷编目或预热。
 `--stages` 跳过无关的编译重放，后续完整诊断可复用局部检查成功的中间产物；使用缓存
 的诊断在成功返回前仍复核输入。独立 SIL 检查可保留有效函数位置来诊断映射，但无效
-SIL 输出不能作为整个阶段成功写入检查点。JSON schema 2 记录选择范围，局部通过
+SIL 输出不能作为整个阶段成功写入检查点。JSON schema 3 记录选择范围和显式的 `not_run` 状态，局部通过
 不等于完整 receipt 通过；具体边界见
 [大型工程接入](Large-Project-Integration.zh-CN.md#一次收集独立的-frontend-问题)。
 
@@ -311,3 +313,12 @@ compiler proxy 现在在编译前保存 `FrontendAttempt.hlxswiftc`，供 `helix
 使用（默认 `inputs,typed-ast`）。只有成功编译才更新 `FrontendInvocation.hlxswiftc` 并运行
 post-compile。仅输入预检不生成 AST/SIL，也不扫描依赖缓存；typed 检查仍需要可用的编译
 依赖，局部检查通过不代表完整 receipt 或 runtime 支持。见[预检说明](Large-Project-Integration.zh-CN.md#成功构建前的预检)。
+
+Compiler input Snapshot schema 1 新增可选诊断字段 `incompleteReasons`，完整快照和旧
+快照均省略该字段，原有编码和 content hash 不变；不完整快照仍不能复用。Catalog
+规划按 unresolved 模块暴露这些原因。`prepare.catalog_miss_module_count` 只计真正
+待生成的缓存条目，前置条件阻塞仍计入 `prepare.catalog_unresolved_module_count`。
+import 扫描每次只持有一份源码，并保留每个失败逻辑路径。目录符号链接仍禁用缓存，
+不追随可能成环的目录树。私有 Catalog pipeline identity 因具体 nominal 过滤和
+Symbol Graph 工作目录传递而推进，公开 Catalog wire rules 与 runtime ABI 不变。
+参见[从 capture 自举](Large-Project-Integration.zh-CN.md#从-compiler-capture-自举-catalog)。

@@ -902,3 +902,52 @@ struct SourceImports {
     }
 }
 }
+
+extension BuildToolsTests {
+@Suite("Compiler input incompleteness provenance")
+struct CompilerInputDiagnostics {
+    @Test("Incomplete fingerprints name directory links and malformed arguments without changing complete snapshot bytes")
+    func reportsIncompleteFacts() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("helix-input-provenance-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("real-module", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
+        try Data("interface".utf8).write(to: target.appendingPathComponent("arm64.swiftinterface"))
+        let link = root.appendingPathComponent("External.swiftmodule")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+        let incomplete = BuildCache.CompilerInputs.capture(arguments: ["-I", root.path], currentModuleName: "Consumer",
+            workingDirectory: root, importedModules: ["External"])
+        #expect(!incomplete.isComplete)
+        #expect(incomplete.incompleteReasons?.contains { $0.contains(link.path) && $0.contains(target.path) } == true)
+        let roundtrip = try JSONDecoder().decode(BuildCache.CompilerInputs.Snapshot.self, from: Core.CanonicalJSON.encode(incomplete))
+        #expect(roundtrip == incomplete)
+        for arguments in [["-I"], ["-import-objc-header"], ["-I", ""], ["-fmodule-map-file", "\0"]] {
+            let invalid = BuildCache.CompilerInputs.capture(arguments: arguments, currentModuleName: "Consumer", workingDirectory: root)
+            #expect(!invalid.isComplete && invalid.incompleteReasons?.isEmpty == false)
+        }
+        let complete = BuildCache.CompilerInputs.capture(arguments: [], currentModuleName: "Consumer", workingDirectory: root)
+        let bytes = try Core.CanonicalJSON.encode(complete)
+        #expect(complete.isComplete && complete.incompleteReasons == nil)
+        #expect(!String(decoding: bytes, as: UTF8.self).contains("incompleteReasons"))
+        #expect(try Core.CanonicalJSON.encode(JSONDecoder().decode(BuildCache.CompilerInputs.Snapshot.self, from: bytes)) == bytes)
+    }
+
+    @Test("Streaming import discovery retains locatable independent source failures")
+    func reportsSourcePaths() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("helix-source-provenance-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var sources: [FrontendReceipt.Source] = []
+        for (name, content) in [("A.swift", "import Foundation\n/* unfinished"), ("B.swift", "import UIKit"), ("C.swift", "import Darwin\n\"unfinished")] {
+            let url = root.appendingPathComponent(name)
+            try Data(content.utf8).write(to: url)
+            sources.append(.init(logicalPath: name, url: url))
+        }
+        let result = try FrontendReceipt.SourceImports.scan(sources: sources)
+        #expect(!result.isComplete)
+        #expect(result.modules == ["Darwin", "Foundation", "UIKit"])
+        #expect(result.incompleteSourcePaths == ["A.swift", "C.swift"])
+    }
+}
+}

@@ -4,6 +4,20 @@ extension FrontendReceipt {
 /// Spelling equivalence is considered only inside an already proven ABI group.
 /// A shared suffix across different module-qualified names is never identity.
 enum ImportedNominalIdentity {
+    /// These compiler spellings describe an unbound type expression, not a
+    /// concrete nominal. Do not discard unrelated Unicode identifier tokens.
+    static func isConcreteSpelling(_ spelling: String) -> Bool {
+        if spelling.contains("@opened(") || spelling.contains("<<error type>>")
+            || spelling.contains("(unknown context at ") { return false }
+        let tokens = spelling.split { !$0.isLetter && !$0.isNumber && $0 != "_" }
+        return !tokens.contains { token in
+            if token == "Self" { return true }
+            guard token.hasPrefix("τ_") else { return false }
+            let indices = token.dropFirst(2).split(separator: "_", omittingEmptySubsequences: false)
+            return indices.count == 2 && indices.allSatisfy { !$0.isEmpty && $0.allSatisfy(\.isNumber) }
+        }
+    }
+
     static func overlaySpelling(
         canonicalName: String,
         uses: [Adapter.ImportedNativeType]

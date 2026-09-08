@@ -53,7 +53,8 @@ partial-apply forwarder 和 Objective-C/C 适配属性不能替代 Swift 源码�
 命中不需要 symbol-tree 子进程。
 
 声明发现可按逻辑文件限定范围，并在被消费的 AST/SIL 映射有歧义或缺失时排除有明确
-源码归属的声明。编译器 USR 与逻辑文件绑定整组 accessor/closure，不猜测候选，已收集
+源码归属的声明；无法证明归属时，排除整个已验证源文件并记录每个失败节点，
+initializer/deinitializer 也作为闭包宿主。编译器 USR 与逻辑文件绑定整组 accessor/closure，不猜测候选，已收集
 的局部 body operation 会回滚。编译器、源码、类型、ABI、Catalog 的全局校验仍须通过。
 Live Reload 默认局部排除，Hot Patch/headless 默认严格，均可显式覆盖。策略进入
 receipt/Prepare 缓存 identity，范围外源码仍保留整模块失效权威。Host Plan v2 承载范围，
@@ -70,10 +71,35 @@ reference/runtime 证据明确时才视为 ABI 拼写，不再与 `NS_SWIFT_NAME
 SIL 检查分别报告各组件的依据。AST 映射的函数位置只能来自通过校验的函数定义与
 scope；无效的类型摘要或 conformance 不提供类型及 operation 事实。独立映射冲突
 一起汇总，共用正常 parser 的实现，不构造部分有效的 File。诊断 JSON 单独迁移到
-schema 2，增加可选 `requestedStages`；旧报告字段缺省表示完整 receipt 范围。
+schema 3，显式列出 `not_run` 检查并保留可选 `requestedStages`；旧报告字段缺省表示完整 receipt 范围。
 局部通过只证明所选检查及其依赖通过，具体见[诊断指南](Large-Project-Integration.zh-CN.md#一次收集独立的-frontend-问题)。
 
 compiler proxy 现在在编译前保存 `FrontendAttempt.hlxswiftc`，供 `helix xcode preflight`
 使用（默认 `inputs,typed-ast`）。只有成功编译才更新 `FrontendInvocation.hlxswiftc` 并运行
 post-compile。仅输入预检不生成 AST/SIL，也不扫描依赖缓存；typed 检查仍需要可用的编译
 依赖，局部检查通过不代表完整 receipt 或 runtime 支持。见[预检说明](Large-Project-Integration.zh-CN.md#成功构建前的预检)。
+
+编译器 archetype（`τ_0_0.Element`、未替换的 `Self`、opened existential 和错误
+占位符）不能进入 imported nominal 或 alias 身份集合。上下文泛型拼写被移除时，
+独立证明的 Clang runtime 事实仍保留并校验，矛盾的 runtime 身份不会因此被隐藏。
+`NS` 前缀或共有的嵌套名称前缀不能证明 Clang alias。扁平 `NS` 重命名必须在两侧
+具有相同的精确 Objective-C runtime class 和 reference 表示，或具有编译器明确
+证明的 `__C.` alias。`NSWidgets.Item` 与 `Widgets.Item` 这类独立身份仍保持分离。
+
+## Frontend 身份权威清单
+
+以下清单记录本次复核的查找边界。候选索引可以加速检索，但不能证明实体相同；
+消费者必须保留冲突，直到对应权威证据完成消歧。
+
+| 键或观察值 | 权威及作用域 | 碰撞与非身份值处理 |
+| --- | --- | --- |
+| Source nominal USR | 已验证 module/source 清单中的 typed AST 编译器 USR | 同名类型按源码作用域保留；有歧义的布局和后代不能提供类型事实 |
+| SIL mangled symbol | 一次模块输出及一种 SIL purpose | 函数校验前保留重复候选；identity SIL 与 semantic SIL 是不同编译产物 |
+| 路径 + 行 + 列 | Debug metadata 查找位置，不是声明身份 | 使用实测角色、accessor/static 种类和闭包 discriminator 筛选；未知角色仍保留歧义 |
+| SIL scope 编号 | 单份 SIL 文档 | 拒绝冲突定义与环；不跨编译输出复用编号 |
+| 打印的 conformance 类型/协议名 | 模块内候选分组，不保证全局唯一 | 保留所有 witness-table 条目；歧义名称不能证明 dispatch/layout |
+| Imported Objective-C reference | 精确 Clang/runtime class 身份及 reference 表示 | 保留嵌套 Swift overlay 和所有 runtime 冲突；擦除后的 runtime class 不能合并不同泛型实例 |
+| Swift 类型/alias 拼写 | 具体 nominal 候选索引，由 runtime 或 Catalog 声明证据进一步约束 | 排除 archetype/opened/error 占位符；import 列表不能单独证明声明归属 |
+| Native operation | 编译器声明 USR 及已验证的 call/ABI projection | 上下文显示名和同后缀不能合并重载或 ABI 冲突 |
+| 模块 frontend 缓存 | Capture、工具链/依赖、invocation、源字节、Catalog 身份、配置和 indexing 策略 | 私有 key revision 3 使旧归一/排除结果失效；所有源码仍使整模块失效 |
+| 排除节点序号 | 一份已验证 AST 清单，仅用于诊断 | 不是声明或持久产物身份；无宿主失败按已验证源文件隔离 |

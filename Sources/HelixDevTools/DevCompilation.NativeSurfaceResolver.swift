@@ -48,12 +48,13 @@ public struct NativeSurfaceResolver: Sendable {
         let sdk = try frontend.sdkIdentity(
             name: receipt.metadata.frontendInvocation.sdkName
         )
-        let compilerInputs = BuildCache.CompilerInputs.capture(
+        var compilerInputs = BuildCache.CompilerInputs.capture(
             arguments: manifest.frontendArguments,
             currentModuleName: manifest.moduleName,
             workingDirectory: workingDirectory,
             importedModules: Set(imports.modules)
         )
+        compilerInputs.isComplete = compilerInputs.isComplete && imports.isComplete
         let snapshots = try cachedCatalogs(
             importedModules: imports.modules,
             compilerInputs: compilerInputs,
@@ -80,7 +81,8 @@ public struct NativeSurfaceResolver: Sendable {
                 compilerURL: compilerURL,
                 nativeImportCatalog: .empty,
                 nativeAPICatalogs: snapshots,
-                callingSurfacePolicy: .managedDevelopmentModule
+                callingSurfacePolicy: .managedDevelopmentModule,
+                indexing: manifest.indexingPolicy?.options ?? .init()
             ),
             compilerCapture: captureIdentity,
             compilerArguments: manifest.frontendArguments,

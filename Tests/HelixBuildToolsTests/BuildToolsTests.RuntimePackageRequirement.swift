@@ -13,7 +13,8 @@ struct RuntimePackageRequirementTests {
                 configurationName: "Debug", bundleIdentifier: "dev.example.app", namespaceSeed: "fixture", featureID: "app")])
         let legacy = try XcodeIntegration.HostPlanCodec.encode(plan)
         for requirement in [XcodeIntegration.RuntimePackageRequirement(kind: .revision, value: String(repeating: "a", count: 40)),
-                            .init(kind: .exactVersion, value: "1.2.3")] {
+                            .init(kind: .exactVersion, value: "1.2.3"),
+                            .init(kind: .branch, value: "main"), .init(kind: .branch, value: "release/1.2") ] {
             plan.runtimePackageRequirement = requirement
             let bytes = try XcodeIntegration.HostPlanCodec.encode(plan)
             #expect(try XcodeIntegration.HostPlanCodec.decode(bytes) == plan)
@@ -31,6 +32,13 @@ struct RuntimePackageRequirementTests {
         for value in ["", "v1.2.3", "1.2", "01.2.3", "1.2.3-beta", "1.2.3\n"] {
             #expect(throws: XcodeIntegration.Error.self) {
                 try XcodeIntegration.RuntimePackageRequirement(kind: .exactVersion, value: value).validate()
+            }
+        }
+        try XcodeIntegration.RuntimePackageRequirement.defaultRuntime.validate()
+        #expect(XcodeIntegration.RuntimePackageRequirement.defaultRuntime.kind == .revision)
+        for value in ["", "../main", "main..next", "-main", "main/", "a//b", ".main", "a.lock", "main\n", "main;echo", "@{1}", String(repeating: "a", count: 256)] {
+            #expect(throws: XcodeIntegration.Error.self) {
+                try XcodeIntegration.RuntimePackageRequirement(kind: .branch, value: value).validate()
             }
         }
     }

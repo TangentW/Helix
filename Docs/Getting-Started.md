@@ -198,6 +198,8 @@ API coverage.
 
 Declaration discovery can be scoped by logical file and can exclude a proven
 source declaration when a consumed AST/SIL mapping is ambiguous or absent.
+Unowned mapping failures exclude the entire validated source file with explicit
+per-node diagnostics; initializers and deinitializers are recognized as owners.
 The compiler USR plus logical file owns the entire accessor/closure group; no
 candidate is guessed and partial body operations are rolled back. Global compiler,
 source, type, ABI and Catalog checks remain mandatory. Live Reload defaults to
@@ -247,3 +249,14 @@ require available compiler dependencies, and selected-check success does not
 prove full receipt or runtime support. See [preflight](Large-Project-Integration.md#preflight-before-a-successful-build).
 
 Host Plan schema 2 also supports an explicit runtime package revision or exact release version. Hub preserves it during reconfiguration; conflicting package authorities fail before writing. `helix xcode uninstall --project … --plan …` reuses transactional removal without the GUI. See [team integration](Large-Project-Integration.md#team-runtime-selection-and-removal) for pin defaults, ownership and backup requirements.
+
+New remote runtime references default to a published full revision. Existing
+package references are preserved; following a branch requires an explicit
+schema 2 `runtimePackageRequirement`. If Prepare fails before Catalogs are
+available, use the [capture-driven prewarm commands](Large-Project-Integration.md#bootstrap-catalogs-from-a-compiler-capture)
+to plan or build them independently. Neither a successful preflight nor a
+populated Catalog cache proves Shell, Bridge, link, or runtime activation.
+
+After upgrading a partial-indexing installation, run a normal Build/Run to
+refresh its host manifest. New sessions explicitly report excluded file edits
+as requiring rebuild; see [saving excluded code](Development-Live-Reload.md#saving-code-excluded-from-indexing).

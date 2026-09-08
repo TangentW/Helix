@@ -34,7 +34,7 @@ enum Pipeline {
     /// decoding, but not on later candidate or Catalog rules.
     static let symbolGraphPipelineHash = Core.Digest.sha256(
         "Helix.NativeAPICatalog.SymbolGraphPipeline.v1:"
-            + "semantic-argument-projection:canonical-document-decoding"
+            + "semantic-argument-projection:canonical-document-decoding:explicit-working-directory"
     )
 
     /// Bump only when candidate nomination, generated probe source, compiler
@@ -56,7 +56,8 @@ enum Pipeline {
                 + "inherited-main-actor-symbol-graph-closure:"
                 + "compiler-inferred-main-actor-probes:"
                 + "line-bound-main-actor-diagnostics:"
-                + "compiler-wide-deprecation-filter"
+                + "compiler-wide-deprecation-filter:concrete-nominal-observations-v2:"
+                + "runtime-proven-ns-aliases-v3"
         )
         return hasher.finalize()
     }()

@@ -116,9 +116,9 @@ struct FrontendDiagnostics {
         let selected = try adapter.diagnose(fixture.request, compilerCapture: Data("capture".utf8),
             workingDirectory: fixture.root, catalogFailure: "An unselected Catalog must not be read", stages: stages)
         #expect(selected.passed, "\(selected.checks)")
-        #expect(selected.schemaVersion == 2)
+        #expect(selected.schemaVersion == 3)
         #expect(selected.requestedStages == [.importedTypes, .sourceNominals])
-        #expect(Set(selected.checks.map(\.stage)) == ["frontend.validate_request", "frontend.load_sources",
+        #expect(Set(selected.checks.filter { $0.status != .notRun }.map(\.stage)) == ["frontend.validate_request", "frontend.load_sources",
             "frontend.toolchain_identity", "frontend.typed_ast", "frontend.demangle_types",
             "frontend.discover_source_nominals", "frontend.discover_imported_types"])
         #expect(selected.performance?.subprocesses.contains { $0.kind == .canonicalSIL } == false)
@@ -213,7 +213,7 @@ struct FrontendDiagnostics {
         var current = FrontendReceipt.DiagnosticReport.failure(stage: "fixture", reason: "unavailable")
         current.requestedStages = [.typedAST]
         let roundtrip = try JSONDecoder().decode(FrontendReceipt.DiagnosticReport.self, from: Core.CanonicalJSON.encode(current))
-        #expect(roundtrip.schemaVersion == 2)
+        #expect(roundtrip.schemaVersion == 3)
         #expect(roundtrip.requestedStages == [.typedAST])
     }
 
@@ -225,7 +225,7 @@ struct FrontendDiagnostics {
         let report = try FrontendReceipt.Adapter().diagnose(fixture.request, stages: [stage])
         #expect(report.passed, "\(report.checks)")
         #expect(report.requestedStages == [stage])
-        #expect(report.checks.contains { $0.stage == "frontend.receipt" } == false)
+        #expect(report.checks.contains { $0.stage == "frontend.receipt" && $0.status == .notRun })
         for root in stage.roots { #expect(report.checks.contains { $0.stage == root && $0.status == .passed }) }
         if [.inputs, .typedAST, .catalogs].contains(stage) {
             #expect(report.performance?.subprocesses.contains { $0.kind == .canonicalSIL } == false)
@@ -243,7 +243,8 @@ struct FrontendDiagnostics {
         let adapter = FrontendReceipt.CachedAdapter(cache: try .init(rootURL: fixture.root.appendingPathComponent("InputCache")))
         let report = try adapter.diagnose(fixture.request, compilerCapture: Data(), stages: [.inputs])
         #expect(report.passed)
-        #expect(report.checks.count == 3)
+        #expect(report.checks.filter { $0.status == .passed }.count == 3)
+        #expect(report.checks.contains { $0.stage == "frontend.typed_ast" && $0.status == .notRun })
         #expect(report.performance?.subprocesses.allSatisfy { $0.kind != .typedAST && $0.kind != .canonicalSIL } == true)
         #expect(report.performance?.stages.contains { $0.name.contains("compiler_inputs") } == false)
         try FileManager.default.removeItem(at: fixture.request.sources[0].url)

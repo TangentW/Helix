@@ -15,6 +15,7 @@ enum ValidationError: Swift.Error, Equatable, Sendable {
 public struct Result: Equatable, Sendable {
     public var modules: [String]
     public var isComplete: Bool
+    public var incompleteSourcePaths: [String] = []
 
     public init(modules: [String], isComplete: Bool) {
         self.modules = Array(Set(modules)).sorted()
@@ -33,8 +34,8 @@ public struct Result: Equatable, Sendable {
 }
 
 public static func scan(sources: [FrontendReceipt.Source]) throws -> Result {
-    var contents: [Data] = []
-    contents.reserveCapacity(sources.count)
+    var result = Result(modules: [], isComplete: true)
+    var modules = Set<String>()
     for source in sources.sorted(by: { $0.logicalPath < $1.logicalPath }) {
         let url = source.url.resolvingSymlinksInPath().standardizedFileURL
         let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
@@ -54,9 +55,16 @@ public static func scan(sources: [FrontendReceipt.Source]) throws -> Result {
                 "source changed while reading or is not UTF-8: \(url.path)"
             )
         }
-        contents.append(data)
+        // Release each source buffer before reading the next large module file.
+        let scanned = scan(contents: [data])
+        modules.formUnion(scanned.modules)
+        if !scanned.isComplete || modules.count > 4_096 {
+            result.isComplete = false
+            result.incompleteSourcePaths.append(source.logicalPath)
+        }
     }
-    return scan(contents: contents)
+    result.modules = modules.sorted()
+    return result
 }
 
 static func scan(contents: [Data]) -> Result {

@@ -20,6 +20,9 @@ struct ScopedSILResolutionTests {
         #expect(getter.roots == ["Static"])
         let closure = "  kind=ExplicitClosure\n    kind=Function\n      kind=Number, index=77\n    kind=Number, index=2\n"
         #expect(try parse("kind=Global\n" + closure).discriminator == 2)
+        let specialized = try parse("kind=Global\n  kind=FunctionSignatureSpecialization\n    kind=SpecializationPassID, index=2\n" + closure)
+        #expect(specialized.kind == "ExplicitClosure" && specialized.isAdapter && specialized.discriminator == 2)
+        #expect(specialized.roots == ["FunctionSignatureSpecialization", "ExplicitClosure"])
         for attribute in ["ObjCAttribute", "NonObjCAttribute", "MergedFunction"] {
             let value = try parse("kind=Global\n  kind=\(attribute)\n" + closure)
             #expect(value.kind == "ExplicitClosure" && value.isAdapter && value.discriminator == 2)
@@ -291,8 +294,11 @@ struct ScopedSILResolutionTests {
             clang.swiftType = raw
             clang.canonicalName = "UIPencilInteractionTap"
             clang.aliases = []
-            let merged = try adapter.mergeImportedNativeTypes(discoveredTypes: types, operationTypes: [clang])
+            var generic = clang
+            generic.swiftType = "τ_0_0.Element"
+            let merged = try adapter.mergeImportedNativeTypes(discoveredTypes: types, operationTypes: [clang, generic])
             #expect(merged.filter { $0.objectiveCRuntimeName == "UIPencilInteractionTap" }.count == 1)
+            #expect(!merged.flatMap(\.aliases).contains("τ_0_0.Element"))
             let receipt = try adapter.generate(request)
             #expect(receipt.receipt.roots.count == 2)
         }

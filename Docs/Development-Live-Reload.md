@@ -934,6 +934,8 @@ with production HLBC.
 
 Declaration discovery can be scoped by logical file and can exclude a proven
 source declaration when a consumed AST/SIL mapping is ambiguous or absent.
+Unowned mapping failures exclude the entire validated source file with explicit
+per-node diagnostics; initializers and deinitializers are recognized as owners.
 The compiler USR plus logical file owns the entire accessor/closure group; no
 candidate is guessed and partial body operations are rolled back. Global compiler,
 source, type, ABI and Catalog checks remain mandatory. Live Reload defaults to
@@ -982,3 +984,30 @@ updates `FrontendInvocation.hlxswiftc` and invokes post-compile work. Input-only
 preflight does not emit AST/SIL or scan the dependency cache. Typed checks still
 require available compiler dependencies, and selected-check success does not
 prove full receipt or runtime support. See [preflight](Large-Project-Integration.md#preflight-before-a-successful-build).
+
+## Saving code excluded from indexing
+
+New Xcode live registrations preserve the effective indexing options and the
+source IDs named by `HLXIDX024`/`HLXIDX025` diagnostics in the host Dev Build
+Manifest. Files outside the configured indexing scope are included as well.
+When a save changes one of these files, the host returns rebuild-required
+`HLXLR209` before compiling or transferring a patch. The diagnostic crosses the
+existing authenticated channel. It reports the count and a bounded path sample;
+`helix xcode exclusions` and the manifest retain the full inventory. The accepted
+source baseline is not advanced: repeated saves keep warning, and reverting an
+unapplied edit is a no-op. Unexcluded files continue through normal activation.
+
+The guard is deliberately file-wide even when only one declaration was excluded.
+Other declarations in that file can remain indexed in the Shell, but editing
+the file requires normal Build/Run. Old AST offsets alone cannot prove that an
+edit stayed outside an excluded declaration. Deferred native capability discovery
+uses the same saved indexing scope and failure policy as Prepare.
+
+This is an explicit **host Dev Build Manifest schema 2** migration. Schema 2
+requires `indexingPolicy` (options plus sorted unique excluded source IDs),
+validated against the manifest's source inventory. Schema 1 cannot carry this
+field; it remains readable and preserves its original encoding. The existing
+initializer continues to produce schema 1, and `configureIndexing` opts
+nondefault policy/evidence into schema 2. Older hosts reject schema 2. Rebuild
+old partial-indexing sessions to obtain this protection. HLXI, runtime ABI and
+Dev Protocol message formats are unchanged.

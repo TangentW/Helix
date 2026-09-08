@@ -18,6 +18,8 @@ override; the normal owner-local location is
 
 Declaration discovery can be scoped by logical file and can exclude a proven
 source declaration when a consumed AST/SIL mapping is ambiguous or absent.
+Unowned mapping failures exclude the entire validated source file with explicit
+per-node diagnostics; initializers and deinitializers are recognized as owners.
 The compiler USR plus logical file owns the entire accessor/closure group; no
 candidate is guessed and partial body operations are rolled back. Global compiler,
 source, type, ABI and Catalog checks remain mandatory. Live Reload defaults to
@@ -144,7 +146,8 @@ Hot Patch synchronously resolves the complete reachable Catalog closure before
 publishing a production capability baseline. Live Reload uses a nonblocking
 shared-lock read: a missing entry or an entry currently being produced does not
 stall Prepare. The current build uses the authoritative source-rooted fallback
-and publishes an owner-private canonical prewarm job after the Shell succeeds.
+and publishes an owner-private canonical prewarm job before frontend receipt
+generation, so a later frontend failure does not prevent Catalog bootstrap.
 A utility worker verifies that the job still matches the captured compiler,
 SDK, plan, and module inputs, then builds the initial misses and recursively
 follows referenced modules. The job file is atomically published with mode
@@ -172,8 +175,8 @@ excluded. `--stages` skips unrelated compiler replays, and selected checks can
 reuse their successful intermediates in a later full run. Input confirmation
 still precedes a successful cached diagnostic result. Independent SIL inspection
 can retain validated function locations for diagnostic mapping, but a malformed
-SIL output never becomes a successful whole-stage checkpoint. JSON schema 2
-records the selected scope; a partial pass is not a full receipt pass. See the
+SIL output never becomes a successful whole-stage checkpoint. JSON schema 3
+records the selected scope and explicitly marks unexecuted checks as `not_run`; a partial pass is not a full receipt pass. See the
 [diagnosis scope](Large-Project-Integration.md#collect-independent-frontend-failures).
 
 Every cached value is decoded and semantically validated by its consumer:
@@ -412,3 +415,15 @@ updates `FrontendInvocation.hlxswiftc` and invokes post-compile work. Input-only
 preflight does not emit AST/SIL or scan the dependency cache. Typed checks still
 require available compiler dependencies, and selected-check success does not
 prove full receipt or runtime support. See [preflight](Large-Project-Integration.md#preflight-before-a-successful-build).
+
+Compiler input Snapshot schema 1 gains optional `incompleteReasons` provenance.
+Complete and legacy snapshots omit it, preserving their encoding and content
+hash; incomplete snapshots remain ineligible for reuse. Catalog plans expose
+these reasons per unresolved module. `prepare.catalog_miss_module_count` now
+counts actual pending cache entries only; blocked modules remain in
+`prepare.catalog_unresolved_module_count`. Source import discovery streams one
+source at a time and records each incomplete logical path. Directory symlinks
+remain uncached rather than following potentially cyclic trees. The private
+Catalog pipeline identity advances for concrete nominal filtering and explicit
+Symbol Graph working-directory propagation; public Catalog wire rules and
+runtime ABI are unchanged. See [capture bootstrap](Large-Project-Integration.md#bootstrap-catalogs-from-a-compiler-capture).

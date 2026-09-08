@@ -1042,3 +1042,10 @@ by the source index. Declaration USRs and logical file scope keep them distinct.
 Their ambiguous textual SIL layouts cannot cross a structural HLBC boundary;
 this limitation does not block indexing unrelated methods in the same module.
 See [file-scoped identity compatibility](Architecture.md#file-scoped-source-identities).
+
+For newly registered partial-indexing sessions, edits to files excluded by
+mapping diagnostics or indexing scope return host diagnostic `HLXLR209` and
+require normal Build/Run. The guard is file-wide, including files that still
+contain other indexed functions. Host Dev Build Manifest schema 2 carries this
+policy; old schema 1 sessions must be rebuilt to gain it. This does not expand
+the set of supported compiler mappings or native ABIs.

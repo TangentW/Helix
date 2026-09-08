@@ -177,6 +177,7 @@ extension SwiftFrontend.Driver {
         let output = try SwiftFrontend.Driver(
             compilerURL: tool.executable,
             environment: environment,
+            defaultWorkingDirectoryURL: defaultWorkingDirectoryURL,
             invocationObserver: invocationObserver
         ).run(arguments: arguments)
         guard output.terminationStatus == 0 else {

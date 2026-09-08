@@ -124,7 +124,8 @@ HLBC 仍不是“在设备上执行任意 Swift”。无法证明的 ABI、运�
 ## 可选诊断
 
 声明发现可按逻辑文件限定范围，并在被消费的 AST/SIL 映射有歧义或缺失时排除有明确
-源码归属的声明。编译器 USR 与逻辑文件绑定整组 accessor/closure，不猜测候选，已收集
+源码归属的声明；无法证明归属时，排除整个已验证源文件并记录每个失败节点，
+initializer/deinitializer 也作为闭包宿主。编译器 USR 与逻辑文件绑定整组 accessor/closure，不猜测候选，已收集
 的局部 body operation 会回滚。编译器、源码、类型、ABI、Catalog 的全局校验仍须通过。
 Live Reload 默认局部排除，Hot Patch/headless 默认严格，均可显式覆盖。策略进入
 receipt/Prepare 缓存 identity，范围外源码仍保留整模块失效权威。Host Plan v2 承载范围，
@@ -165,3 +166,12 @@ post-compile。仅输入预检不生成 AST/SIL，也不扫描依赖缓存；typ
 依赖，局部检查通过不代表完整 receipt 或 runtime 支持。见[预检说明](Large-Project-Integration.zh-CN.md#成功构建前的预检)。
 
 Host Plan schema 2 还支持显式 runtime package revision 或精确发布版本。Hub 重新配置时保留该字段，package authority 冲突会在写入前拒绝。`helix xcode uninstall --project … --plan …` 无需 GUI 即可复用事务卸载。版本缺省、ownership 和备份要求见[团队接入](Large-Project-Integration.zh-CN.md#团队-runtime-版本与卸载)。
+
+新建远端 runtime 引用默认固定到已发布的完整 revision；已有 package 引用继续保留，
+跟随分支需要 schema 2 的显式 `runtimePackageRequirement`。Prepare 在 Catalog 就绪前
+失败时，可用[从 capture 自举 Catalog](Large-Project-Integration.zh-CN.md#从-compiler-capture-自举-catalog)
+中的命令独立规划或生成。预检通过或 Catalog 缓存就绪均不等于 Shell、Bridge、链接或
+runtime 激活通过。
+
+升级局部索引接入后，正常 Build/Run 一次以刷新宿主 manifest。新 session 会明确提示
+被排除文件的修改需要重新构建，见[保存被排除的代码](Development-Live-Reload.zh-CN.md#保存被排除的代码)。

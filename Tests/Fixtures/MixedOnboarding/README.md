@@ -39,7 +39,7 @@ complete capture is insufficient for Helix. The direct compiler test
 `SystemFrameworkIntegration` independently exercises `-explicit-module-build`.
 
 When a report directory is provided, logs, timing observations, captured
-arguments, before/after PBX files, and both schema 2 diagnostic reports are saved there. Temporary
+arguments, before/after PBX files, and both schema 3 diagnostic reports are saved there. Temporary
 build outputs are deleted. This test does not run the installed App, generate a
 complete production Catalog closure, or qualify device runtime activation.
 The CLI/Hub tests cover generated phases and publication separately. Compiler
@@ -57,3 +57,11 @@ Finally it runs CLI uninstall using the authoring plan backup, checks that the
 original user package linkage survives, validates the removed project with
 `plutil` and `xcodebuild -list`, restores the deliberate source error and runs a
 real build again. The external report includes uninstall JSON, PBX and build logs.
+
+The fixture also exercises a static initializer closure and a generic
+`Collection.Element` observation that is called with the nested UIKit
+`UIPencilInteraction.Tap` type. These supplement direct and qualified Tap uses;
+compiler archetype spellings must not become concrete imported type identities.
+The opt-in test accepts `HELIX_MIXED_RUNTIME_PACKAGE=/absolute/package/path` to
+validate current tooling with an archived published runtime commit. This is a
+local package build with explicit HelixAppIntegration linkage, not remote SwiftPM resolution or generated Shell/Bridge activation evidence. The capture inventory selects the App module explicitly even when package targets also produce captures.

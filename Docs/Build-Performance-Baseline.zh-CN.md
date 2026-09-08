@@ -385,3 +385,19 @@ swift test --scratch-path .build/validation --no-parallel --filter SystemFramewo
 （280,761 字节）explicit-module 编译 7.509 秒、冷 receipt 30.155 秒、不变命中
 0.944 秒。每份源码仍包含在 receipt 中，热命中不发射 AST/SIL。这些是当前回归观测，
 并非与此前源码/配置不同的运行进行隔离性能对比。
+
+## 导入类型别名归一化（第六轮）
+
+冷 Catalog 回归采样显示，导入 nominal 合并反复扫描全量观察记录。Catalog 别名匹配
+改为按每个精确名称建索引，从最小候选集合开始，仍保留所有竞争事实，并执行完整的
+别名包含关系和表示校验。Clang 别名归一化为精确 canonical name 建索引；名称
+改变时同步更新索引，保留按顺序处理别名链的原有语义。不会仅凭短名称推断身份。
+
+同一 macOS debug 测试配置下，8,000 条合成观察记录（2,000 组 Catalog 对和 2,000 组
+Clang 对）在改动前后均产出相同的 4,000 个类型，canonical 输出 hash 完全一致。
+三次合并的中位耗时从 23.741 秒降至 0.228 秒，约 104 倍。输入逆序和重复合并同样通过。
+这是该合并步骤的测量，不是整个 Prepare、冷 Catalog、商业工程或 save-to-active
+的提速结论。普通回归默认 128 组；设置 `HELIX_ALIAS_TYPE_COUNT=2000` 和
+`HELIX_ALIAS_REPORT=/absolute/path/report.json`，配合
+`--filter measuresAliasNormalization` 可重跑较大基准。原始本地证据不放入仓库。
+Identity SIL 与 semantic SIL 仍是用途不同的 compiler 产物，本次优化不混用两者。

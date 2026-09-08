@@ -1,9 +1,10 @@
 import Foundation
+import HelixCompiler
 import HelixCore
 
 extension FrontendReceipt {
 public struct DiagnosticCheck: Codable, Hashable, Sendable {
-    public enum Status: String, Codable, Sendable { case passed, failed, blocked }
+    public enum Status: String, Codable, Sendable { case passed, failed, blocked, notRun = "not_run" }
     public var stage: String
     public var status: Status
     public var detail: String
@@ -16,9 +17,10 @@ public struct DiagnosticCheck: Codable, Hashable, Sendable {
 }
 
 public struct DiagnosticReport: Codable, Sendable {
+    // Schema 3 explicitly lists unexecuted checks with the not_run status.
     // Schema 2 distinguishes selected checks from full receipt validation.
     // Schema 1 decodes with a nil selection, preserving its full-scope meaning.
-    public var schemaVersion: UInt16 = 2
+    public var schemaVersion: UInt16 = 3
     public var passed: Bool
     public var checks: [DiagnosticCheck]
     public var diagnostics: [Core.Diagnostic]
@@ -112,7 +114,22 @@ final class DiagnosticSession {
         } else if output != nil {
             record("frontend.receipt", status: .passed)
         }
-        return .init(passed: (output != nil || selectedComplete) && !checks.isEmpty && checks.allSatisfy { $0.status == .passed },
+        let passed = (output != nil || selectedComplete) && !checks.isEmpty && checks.allSatisfy { $0.status == .passed }
+        if collectFailures {
+            var known = Set(DiagnosticPlan.dependencies.keys)
+            for prefix in ["frontend.identity_sil", "frontend.semantic_sil"] {
+                known.formUnion(CanonicalSIL.Inspection.Component.allCases.map { prefix + "." + $0.rawValue })
+            }
+            for stage in known.sorted() where statuses[stage] == nil {
+                let selected = includes(stage) || ["frontend.identity_sil", "frontend.semantic_sil"].contains {
+                    includes($0) && stage.hasPrefix($0 + ".") && !stage.hasSuffix(".ast_mapping")
+                }
+                record(stage, status: .notRun, detail: selected
+                    ? "Analysis stopped before this check; no result is available"
+                    : "Not requested by the selected diagnostic stages")
+            }
+        }
+        return .init(passed: passed,
                      checks: checks, diagnostics: output?.diagnostics ?? indexingDiagnostics, performance: performance.trace(), requestedStages: requestedStages)
     }
 }

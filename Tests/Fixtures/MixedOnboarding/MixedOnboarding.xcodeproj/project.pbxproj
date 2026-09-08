@@ -5,6 +5,15 @@
 	};
 	objectVersion = "60";
 	objects = {
+		F60000000000000000000001 = {
+			isa = "XCSwiftPackageProductDependency";
+			package = "9DF5040983A9EB6D518F8DBE";
+			productName = "HelixAppIntegration";
+		};
+		F60000000000000000000002 = {
+			isa = "PBXBuildFile";
+			productRef = "F60000000000000000000001";
+		};
 		98EDD35F41572799B2741474 = {
 			isa = "PBXFileReference";
 			lastKnownFileType = "sourcecode.swift";
@@ -117,6 +126,7 @@
 			isa = "PBXFrameworksBuildPhase";
 			buildActionMask = "2147483647";
 			files = (
+				"F60000000000000000000002",
 			);
 			runOnlyForDeploymentPostprocessing = "0";
 		};
@@ -250,6 +260,9 @@
 			dependencies = (
 			);
 			name = "MixedApp";
+			packageProductDependencies = (
+				"F60000000000000000000001",
+			);
 			productName = "MixedApp";
 			productReference = "87817DB8A53E4BAF4B7A2322";
 			productType = "com.apple.product-type.application";

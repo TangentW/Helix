@@ -14,7 +14,8 @@ public struct CachedAdapter: Sendable {
     }
 
     private struct Key: Codable, Sendable {
-        var schemaVersion: UInt16 = 1
+        // Private cache revision: exclusions and authority-scoped nominal aliases.
+        var schemaVersion: UInt16 = 3
         var compilerCaptureSHA256: Core.Digest
         var toolchain: ReleaseCompiler.ToolchainIdentity
         var compilerInputs: BuildCache.CompilerInputs.Snapshot

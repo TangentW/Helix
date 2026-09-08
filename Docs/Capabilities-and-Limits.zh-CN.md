@@ -179,3 +179,8 @@ Swift Package 的平台下限为 macOS 14 与 iOS 15。补丁绑定一个 finali
 不同 extension 文件中的同名文件私有 nominal 可以完成源码索引，USR 和逻辑
 文件作用域将它们区分开。存在歧义的文本 SIL 布局不能跨结构化 HLBC 边界，
 但不阻塞同模块其他方法的索引。兼容规则见[文件作用域身份](Architecture.zh-CN.md#文件作用域的源码类型身份)。
+
+新注册的局部索引 session 修改被映射诊断或索引范围排除的文件时，会返回宿主诊断
+`HLXLR209`，要求正常 Build/Run。保护范围为整个文件，包括其中仍有其他已索引函数
+的情况。宿主 Dev Build Manifest schema 2 保存该策略；旧 schema 1 session 需要
+重新构建后获得保护。这不扩大支持的 compiler 映射或 native ABI 范围。

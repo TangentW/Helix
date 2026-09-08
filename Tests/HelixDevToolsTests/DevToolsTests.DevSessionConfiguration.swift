@@ -12,6 +12,18 @@ import Testing
 extension DevToolsTests {
 @Suite("Dev Session configuration")
 struct DevSessionConfiguration {
+    @Test("Schema 2 indexing evidence survives loading a complete prepared host context")
+    func loadsIndexingEvidence() throws {
+        let fixture = try DaemonFixture()
+        defer { fixture.remove() }
+        var manifest = fixture.manifest
+        let path = try #require(manifest.sourceFiles.first?.logicalPath)
+        try manifest.configureIndexing(.init(failurePolicy: .excludeUnresolved), excludedSourcePaths: [path])
+        try Core.CanonicalJSON.encode(manifest).write(to: fixture.manifestURL)
+        let prepared = try DevSession.PreparedConfiguration.load(configurationURL: fixture.configurationURL)
+        #expect(prepared.manifest.indexingPolicy == manifest.indexingPolicy)
+        #expect(prepared.manifest.schemaVersion == 2)
+    }
     @Test("Configuration rejects unknown fields and resolves paths from its own directory")
     func strictConfiguration() throws {
         let fixture = try DaemonFixture()

@@ -804,10 +804,15 @@ struct PBXIntegration {
         guard candidates.count <= 1 else {
             throw Hub.Error.integrationConflict("runtime package authority is ambiguous for target \(targetID), HostPlan.runtimePackageRequirement=\(String(describing: requirement)): \(evidence(candidates))")
         }
-        let requested: Hub.OpenStep.Value? = requirement.map { value in
-            .dictionary(["kind": .string(value.kind.rawValue),
-                value.kind == .revision ? "revision" : "version": .string(value.value)])
+        func packageRequirement(_ value: XcodeIntegration.RuntimePackageRequirement) -> Hub.OpenStep.Value {
+            let key: String = switch value.kind {
+            case .revision: "revision"
+            case .exactVersion: "version"
+            case .branch: "branch"
+            }
+            return .dictionary(["kind": .string(value.kind.rawValue), key: .string(value.value)])
         }
+        let requested = requirement.map(packageRequirement)
         let ownedID = identifier(component: "runtime-package")
         if let existing = candidates.first {
             if let requested {
@@ -829,7 +834,7 @@ struct PBXIntegration {
         }
         try document.addObject(ownedID, isa: "XCRemoteSwiftPackageReference", fields: [
             "repositoryURL": .string(Self.runtimeRepositoryURL),
-            "requirement": requested ?? .dictionary(["branch": .string("main"), "kind": .string("branch")]),
+            "requirement": requested ?? packageRequirement(.defaultRuntime),
         ])
         try document.updateObject(document.projectObjectID) { project in
             var references = project["packageReferences"]?.array?.compactMap(\.string) ?? []

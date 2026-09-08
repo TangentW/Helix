@@ -162,6 +162,7 @@ Canonical SIL 改从单独的私有输出文件读取，因为包含 bridging PC
 | `optional ?? { ... }()` 的同位置闭包 | 用编译器符号角色区分 autoclosure 与显式闭包，再结合 discriminator；剩余歧义报告完整候选 |
 | private static SDK overlay 属性 | 根据 `Static`/getter 结构证据匹配 AST `CoreFoundation.CGFloat` 与 SIL `CoreGraphics.CGFloat`，不误选共用坐标的 addressor |
 | C callback 与 reabstraction thunk | 根据编译器适配属性和 thunk 角色排除生成入口；未知形态保留完整冲突证据 |
+| 泛型 archetype（如 `τ_0_0.Element`） | 在进入 nominal 与 alias 候选集合前排除；独立证明的 Clang runtime 事实仍保留并校验 |
 | `NS_SWIFT_NAME` 嵌套类与 Clang 扁平名称 | 以已证实的 Objective-C runtime 身份归一，保留泛型参数，不合并无关嵌套类型 |
 
 ## 声明范围与局部排除
@@ -175,8 +176,10 @@ Catalog 事实。
 外层函数拥有其闭包和局部函数，属性/下标拥有其 accessor。排除身份绑定编译器声明
 USR 与逻辑源码路径，同时保留位置和全部候选证据。函数体发现遇到内部映射失败时，
 回滚此前收集的 operation；属性生成按整组 accessor 回滚。未被消费的合成 backing
-声明不属于源码入口候选，实际消费者仍须验证 SIL。没有可信源码归属、源码集合不符、
-SIL 损坏，以及类型、ABI 或 Catalog 冲突仍会阻止发布。
+声明不属于源码入口候选，实际消费者仍须验证 SIL。initializer/deinitializer 也作为其闭包的
+宿主。映射失败且无法证明声明归属时，保守地排除其整个已验证源文件，并逐项记录失败；
+不会凭位置猜测宿主或单独保留可能依赖该闭包的调用者。源码集合不符、SIL 损坏，以及
+类型、ABI 或 Catalog 冲突仍会阻止发布。
 
 首次可先限定较小范围：把 Host Plan 升为 schema 2，在 feature 中加入 `indexing`，
 然后重新执行 `xcode install`：
@@ -196,13 +199,20 @@ SIL 损坏，以及类型、ABI 或 Catalog 冲突仍会阻止发布。
 
 模式匹配捕获到的逻辑源码路径，沿用 patch configuration 的 `*`、`**`、`?` 规则。
 显式提供 options 对象但省略字段时，默认值是 `include: ["**"]`、`exclude: []`、
-`failurePolicy: "strict"`。没有任何捕获源码匹配时，在 compiler replay 前拒绝。
+`failurePolicy: "strict"`。目录树使用 `Sources/**`，目录名 `Sources` 仅按完整路径匹配。
+没有任何捕获源码匹配时，在 compiler replay 前拒绝，给出 glob 语法、总数及至多 8 个
+源码路径示例，不输出整个源码清单。
 所有捕获源码仍参与编译、源码/依赖 hash、nominal 和 imported-type 事实验证。
 范围只缩小 Helix 的声明和源码 operation 发现，不代表整模块 Swift emission 会更便宜，
 也不会屏蔽全局冲突或移除显式 Catalog 的权威能力。
 
 `HLXIDX024` 会把每个排除声明及完整原因写入 `FrontendDiagnostics.json` 和诊断报告。
-CLI 会显示排除数量与诊断路径，未变化的 Prepare 快路径也保留这些信息。模块 receipt
+`HLXIDX025` 记录无宿主映射失败及其导致的整文件排除；同一 AST 节点在两个 SIL 阶段
+的原因合并，不把源码位置或诊断节点序号当成声明身份。CLI 显示声明数、文件数和无宿主
+失败数，未变化的 Prepare 快路径也保留这些信息。可运行
+`helix xcode exclusions --diagnostics /path/FrontendDiagnostics.json --file Sources/Feature.swift --json`
+查询完整证据；省略 `--file` 查看全部。文本最多显示 20 项，JSON 保留完整列表。
+这是构建期覆盖清单，不代表已在设备激活。模块 receipt
 和 Prepare identity 包含 indexing 配置，切换策略或范围不会错误复用结果；修改范围外
 源码仍会使整模块编译事实失效。原始 compiler checkpoint 只有在全部编译输入一致时，
 才可跨策略变更复用。
@@ -210,7 +220,8 @@ CLI 会显示排除数量与诊断路径，未变化的 Prepare 快路径也保�
 不带 indexing 或 runtime package 配置的 Host Plan schema 1 继续可读，并保持原 canonical bytes 的往返。
 indexing 配置要求 schema 2，让旧工具明确拒绝，而不是忽略范围。新建计划默认 schema 2。
 原有公开 request/feature initializer 继续保留，新 overload 是增量 API。receipt 和设备
-wire format 不变。PrepareState schema 1 增加可选的信息字段 `excludedDeclarationCount`；
+wire format 不变。PrepareState schema 1 保留可选的信息字段 `excludedDeclarationCount`，并增加
+`excludedFileCount`、`unownedMappingCount`；
 旧文件缺省表示没有这项历史计数，复用仍由独立的 input hash 控制。
 
 ## 一次收集独立的 frontend 问题
@@ -249,10 +260,11 @@ helix xcode post-compile --plan .helix/xcode/HostPlan.json --profile live \
 | `catalogs` | Typed AST imports、工具链事实和已有 Catalog 校验，不读取 SIL |
 | `receipt` | 完整 frontend receipt 分析与组装 |
 
-诊断 JSON 现在输出 **schema 2**，可选 `requestedStages` 记录去重、排序后的选择项。
+诊断 JSON 现在输出 **schema 3**，可选 `requestedStages` 记录去重、排序后的选择项。
 字段缺省（包括 schema 1 报告）表示完整范围。选择项不含 `receipt` 时，`passed: true`
 和退出码 0 只表示所选检查及依赖通过，不能代表完整 receipt 通过。读取报告的工具需识别
-版本 2 并检查范围。不传 `--stages` 或选择 `receipt` 时仍执行完整 frontend 验证。
+版本 3 并检查范围。新增 `not_run` 明确标记未选择或尚未执行的检查，
+与依赖失败导致的 `blocked` 区分；不能把错误未出现当成该阶段通过。schema 1/2 仍可读取。不传 `--stages` 或选择 `receipt` 时仍执行完整 frontend 验证。
 此次诊断格式迁移不改变 Shell 或补丁产物 schema。
 
 正常生成与诊断共用同一套有明确依赖关系的分析。诊断汇总独立的请求、源文件和编译
@@ -388,11 +400,16 @@ Host Plan schema 2 可在顶层设置 `runtimePackageRequirement`：
 安装器复用已经匹配的远端引用，允许更新 Helix 自己创建的引用；用户自有引用与显式
 pin 冲突、显式远端 pin 遇到本地包，或出现多个 runtime package authority 时，在发布
 工程改动前拒绝，并列出 package ID、仓库/路径及 requirement。Hub 读取、编辑和重新
-应用时保留该字段。schema 1 不允许携带此字段，旧计划字节及缺省行为保持兼容。
+应用时保留该字段。schema 1 不允许携带此字段，旧计划字节仍可读取。
 
-缺省保留现有 package requirement；不存在可复用引用时，兼容缺省仍为 canonical
-仓库的 `main` 分支，不虚构已发布的默认 tag。团队计划应显式固定经过验证的 revision
-或版本，并继续按正常流程把 Xcode package resolution 文件纳入版本控制。
+缺省保留现有 package requirement；**新建远端引用**时固定到已发布的 runtime revision
+`df420536312358631c1278d6b3b274e2fda64ddd`，由
+`XcodeIntegration.RuntimePackageRequirement.defaultRuntime` 声明。旧计划新建引用时
+也采用该默认值，已有分支引用和本地包不会被自动改写。推进默认基线需要同时验证
+runtime 兼容性和 package 接入。需要跟随分支时，在 schema 2 中显式设置
+`{"kind":"branch","value":"main"}`。旧工具会拒绝新增的 branch 枚举值，
+revision/exactVersion 计划仍保持源码兼容。团队仍可显式固定自己验证的 revision 或版本，
+并按正常流程把 Xcode package resolution 文件纳入版本控制。
 
 无需 Hub GUI 即可卸载：
 
@@ -416,3 +433,41 @@ Catalog、recipe 或私钥。ownership 清单损坏时仍禁止扩大删除范�
 非阻塞 advisory lock。同一工程上的其他 Helix 操作会在修改前拒绝，不同工程互不影响。
 目录锁不受 PBX 文件原子替换影响，也不生成额外 lock 文件。它只协调 Helix 操作，
 不协调未持有该锁的外部编辑器或 Git 命令。
+
+## 从 compiler capture 自举 Catalog
+
+创建 Catalog 任务不再要求 Prepare 成功。Xcode 已构建外部依赖并留下 compiler capture 后：
+
+```sh
+helix xcode catalog-prewarm --plan .helix/xcode/HostPlan.json --profile live \
+  --capture /absolute/path/to/Helix/FrontendAttempt.hlxswiftc --plan-only --json
+helix xcode catalog-prewarm --plan .helix/xcode/HostPlan.json --profile live \
+  --capture /absolute/path/to/Helix/FrontendAttempt.hlxswiftc --max-modules 1
+```
+
+支持位于原始 DerivedData 路径的 `FrontendAttempt.hlxswiftc` 和
+`FrontendInvocation.hlxswiftc`。规划只扫描源码 import 并验证捕获的 compiler、SDK、
+依赖指纹，不运行消费模块的 AST/SIL，不生成 Shell，不注册 live session。第一条命令
+写入私有可续跑任务，返回 schema 1 JSON：`cachedModules`、`pendingModules`、
+`unresolvedModules`、`unresolvedReasons`、`jobPath`。`--json` 必须搭配 `--plan-only`。
+省略 `--plan-only` 时在前台执行冷生成，沿用 `--job` 的 1...256 模块预算，缓存命中不占
+冷生成预算。续跑不要求终端位于工程目录，compiler 与 Symbol Graph 子进程使用任务
+中验证过的工作目录。依赖字节改变后必须重新规划，旧任务会被拒绝。
+
+`unresolvedModules` 表示指纹前置条件不完整，不是缓存 miss。原因会包含具体源码或
+输入路径，例如 import 扫描失败、尚不支持指纹采集的目录符号链接、文件不可读/不稳定、
+遍历超限。修正原因后再试，不通过放宽验证来填充缓存。人类输出最多显示 20 个模块和
+8 个不同原因，JSON 保留完整原因；存在 unresolved 时退出码为 1。普通 Prepare 会在
+frontend 生成前安排可生成的 miss，预热失败不会授权发布不完整的生产能力面。
+冷生成仍有成本，这个入口让团队可以独立安排它，不代表消除了成本。缓存仍遵循已有的
+用户本地共享规则；从其他机器复制未经验证的任务不是团队缓存协议。
+
+新的 live 注册还会[保护被排除文件的保存](Development-Live-Reload.zh-CN.md#保存被排除的代码)。
+包含 unresolved 声明或位于索引范围以外的文件，修改后要求正常 Build/Run，即使文件中
+仍有其他已索引函数。重复修改不会悄悄变成“无语义变化”。完整阶段失败证据仍保留在
+诊断 JSON 中；终端每个 check 的 detail 最多显示 4 KiB。
+
+compiler proxy 与 driver 设置应只作用于接入的 target/configuration。全局设置
+`xcodebuild SWIFT_USE_INTEGRATED_DRIVER=NO` 还会影响 package target；Xcode 26.6
+夹具在该设置下复现了 package-access 声明缺少 `-package-name` 的错误。混合工程探针
+已改为只覆盖 App 的设置，保留依赖包正常的 driver 行为。

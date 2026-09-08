@@ -1601,6 +1601,30 @@ struct ProjectInstallationTests {
         #expect(try Data(contentsOf: projectFile) == ambiguousBytes)
     }
 
+    @Test("New remote runtime references are pinned while existing references and explicit branches are preserved")
+    func defaultsToPublishedRuntime() throws {
+        let root = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let projectURL = root.appendingPathComponent("Example.xcodeproj")
+        let projectFile = projectURL.appendingPathComponent("project.pbxproj")
+        let project = try Hub.ProjectFileParser().parse(projectURL: projectURL)
+        var onboarding = try Hub.OnboardingPlanner().plan(.init(project: project, capabilities: .init([.liveReload]),
+            profiles: [.init(id: "live", capability: .liveReload, applicationTargetName: "LiveApp",
+                featureTargetName: "LiveFeature", featureModuleName: "LiveFeature", schemeName: "Live",
+                configurationName: "Debug", bundleIdentifier: "dev.example.live", namespaceSeed: "default-pin")]))
+        let installer = Hub.ProjectInstaller()
+        _ = try installer.install(onboarding)
+        var text = try String(contentsOf: projectFile, encoding: .utf8)
+        #expect(text.contains(XcodeIntegration.RuntimePackageRequirement.defaultRuntime.value))
+        onboarding.hostPlan.runtimePackageRequirement = .init(kind: .branch, value: "main")
+        _ = try installer.install(onboarding)
+        text = try String(contentsOf: projectFile, encoding: .utf8)
+        #expect(text.contains("branch = main") && !text.contains(XcodeIntegration.RuntimePackageRequirement.defaultRuntime.value))
+        onboarding.hostPlan.runtimePackageRequirement = nil
+        _ = try installer.install(onboarding)
+        #expect(try String(contentsOf: projectFile, encoding: .utf8) == text)
+    }
+
     @Test("Headless uninstall validates the applied plan and preserves source, private keys and developer files")
     func uninstallsThroughCLI() throws {
         let root = try fixture()

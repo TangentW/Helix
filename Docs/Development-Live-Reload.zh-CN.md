@@ -258,7 +258,8 @@ Tuple label 同样只属于编译期结构：frontend 若用 Array 或 Dictionar
 ## 调试与诊断
 
 声明发现可按逻辑文件限定范围，并在被消费的 AST/SIL 映射有歧义或缺失时排除有明确
-源码归属的声明。编译器 USR 与逻辑文件绑定整组 accessor/closure，不猜测候选，已收集
+源码归属的声明；无法证明归属时，排除整个已验证源文件并记录每个失败节点，
+initializer/deinitializer 也作为闭包宿主。编译器 USR 与逻辑文件绑定整组 accessor/closure，不猜测候选，已收集
 的局部 body operation 会回滚。编译器、源码、类型、ABI、Catalog 的全局校验仍须通过。
 Live Reload 默认局部排除，Hot Patch/headless 默认严格，均可显式覆盖。策略进入
 receipt/Prepare 缓存 identity，范围外源码仍保留整模块失效权威。Host Plan v2 承载范围，
@@ -285,3 +286,23 @@ compiler proxy 现在在编译前保存 `FrontendAttempt.hlxswiftc`，供 `helix
 使用（默认 `inputs,typed-ast`）。只有成功编译才更新 `FrontendInvocation.hlxswiftc` 并运行
 post-compile。仅输入预检不生成 AST/SIL，也不扫描依赖缓存；typed 检查仍需要可用的编译
 依赖，局部检查通过不代表完整 receipt 或 runtime 支持。见[预检说明](Large-Project-Integration.zh-CN.md#成功构建前的预检)。
+
+## 保存被排除的代码
+
+新的 Xcode live 注册会把实际 indexing options，以及 `HLXIDX024`/`HLXIDX025` 诊断
+对应的 source ID 保存到宿主 Dev Build Manifest；配置索引范围以外的文件也纳入保护。
+保存修改触及这些文件时，宿主在编译和传输补丁之前返回 `HLXLR209`，明确要求正常
+Build/Run。诊断通过已有认证通道到达 App，显示数量和有界路径样例；
+`helix xcode exclusions` 与 manifest 保留完整清单。不会推进已接受的源码基线，重复
+保存仍提示，撤回尚未应用的修改则保持 no-op。未排除文件继续正常激活。
+
+即使只排除一个声明，保存保护也保守到整个文件。该文件的其他声明仍可进入 Shell
+索引，但修改文件需要正常 Build/Run；不能仅靠旧 AST offset 证明编辑没有触及被排除
+声明。后续首次使用 Native API 时的能力发现也沿用 Prepare 的索引范围和失败策略。
+
+这是显式的**宿主 Dev Build Manifest schema 2** 迁移：schema 2 必须携带
+`indexingPolicy`（options 与排序去重的 excluded source ID），并与 manifest 源码清单
+核验。schema 1 不允许携带此字段，仍可读取且保持原有编码。已有 initializer 继续生成
+schema 1，`configureIndexing` 将非默认策略/排除证据显式升级为 schema 2。旧宿主会
+拒绝 schema 2。已有局部索引 session 需要重新 Build/Run 才获得该保护；HLXI、runtime
+ABI 和 Dev Protocol 消息格式不变。

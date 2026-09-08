@@ -1,4 +1,5 @@
 import Foundation
+import HelixBuildTools
 import HelixCompiler
 import HelixCore
 import HelixDevProtocol
@@ -855,15 +856,82 @@ struct Tooling {
         }
     }
 
+    @Test("Excluded saves require rebuild before compilation, including repeats, while reverts remain harmless")
+    func excludedSavesRequireRebuild() async throws {
+        let directory = try temporaryDirectory("helix-excluded-save")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fixture = try PipelineFixture(directory: directory)
+        var manifest = fixture.manifest
+        try manifest.configureIndexing(.init(failurePolicy: .excludeUnresolved), excludedSourcePaths: ["Sources/Screen.swift"])
+        let pipeline = try DevSession.Pipeline(identity: fixture.identity, manifest: manifest, reloadIndex: fixture.index,
+            snapshotter: .init(stabilityDelayNanoseconds: 0, maximumAttempts: 2),
+            builder: { _ in .noSemanticChange }, sender: { _ in throw CancellationError() })
+        let unchanged = await pipeline.submit(changedPaths: [fixture.sourceURL.path])
+        guard case .noSemanticChange = unchanged else { Issue.record("Unchanged excluded source must remain a no-op"); return }
+        try fixture.write("func render() { print(2) }\n")
+        for _ in 0..<2 {
+            let result = await pipeline.submit(changedPaths: [fixture.sourceURL.path])
+            guard case let .rebuildRequired(diagnostic) = result else { Issue.record("Excluded edit must require rebuild"); return }
+            #expect(diagnostic.code == "HLXLR209")
+            #expect(diagnostic.message.contains("Sources/Screen.swift"))
+            #expect(diagnostic.nextAction.contains("Build/Run"))
+            try diagnostic.validate()
+        }
+        try fixture.write(String(decoding: fixture.baseline, as: UTF8.self))
+        guard case .noSemanticChange = await pipeline.submit(changedPaths: [fixture.sourceURL.path]) else {
+            Issue.record("Reverting an unapplied excluded edit must leave the installed baseline intact"); return
+        }
+    }
+
+    @Test("Host indexing policy migrates explicitly and rejects stale or incomplete source authority")
+    func migratesManifestIndexingPolicy() throws {
+        let directory = try temporaryDirectory("helix-indexing-manifest")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fixture = try PipelineFixture(directory: directory)
+        var manifest = fixture.manifest
+        let legacy = try Core.CanonicalJSON.encode(manifest)
+        #expect(manifest.schemaVersion == 1 && !String(decoding: legacy, as: UTF8.self).contains("indexingPolicy"))
+        try manifest.configureIndexing(.init(), excludedSourcePaths: [])
+        #expect(try Core.CanonicalJSON.encode(manifest) == legacy)
+        let options = FrontendReceipt.IndexingOptions(include: ["Other/**"], failurePolicy: .excludeUnresolved)
+        try manifest.configureIndexing(options, excludedSourcePaths: [])
+        #expect(manifest.schemaVersion == 2 && manifest.indexingPolicy?.options == options)
+        #expect(manifest.indexingPolicy?.excludedSourceIDs == [fixture.sourceID])
+        let bytes = try Core.CanonicalJSON.encode(manifest)
+        let decoded = try JSONDecoder().decode(DevBuildManifest.Document.self, from: bytes)
+        try decoded.validate()
+        #expect(try Core.CanonicalJSON.encode(decoded) == bytes)
+        #expect(fixture.manifest.staleness(comparedWith: manifest).contains(.indexingPolicy))
+        manifest.schemaVersion = 1
+        #expect(throws: BuildCapture.Error.self) { try manifest.validate() }
+        manifest = decoded
+        manifest.indexingPolicy?.excludedSourceIDs = []
+        #expect(throws: BuildCapture.Error.self) { try manifest.validate() }
+        manifest = decoded
+        manifest.indexingPolicy?.excludedSourceIDs = [.derive(logicalPath: "Unknown.swift")]
+        #expect(throws: BuildCapture.Error.self) { try manifest.validate() }
+        manifest = decoded
+        manifest.indexingPolicy?.excludedSourceIDs += [fixture.sourceID]
+        #expect(throws: BuildCapture.Error.self) { try manifest.validate() }
+        #expect(throws: BuildCapture.Error.self) {
+            try manifest.configureIndexing(.init(), excludedSourcePaths: ["Unknown.swift"])
+        }
+        #expect(throws: BuildCapture.Error.self) {
+            try manifest.configureIndexing(.init(), excludedSourcePaths: ["Sources/Screen.swift"])
+        }
+    }
+
     @Test("The save pipeline activates changes and emits a baseline-restored generation")
     func savePipelineAndBaselineRestore() async throws {
         let directory = try temporaryDirectory("helix-save-pipeline")
         defer { try? FileManager.default.removeItem(at: directory) }
         let fixture = try PipelineFixture(directory: directory)
+        var manifest = fixture.manifest
+        try manifest.configureIndexing(.init(failurePolicy: .excludeUnresolved), excludedSourcePaths: [])
         let recorder = ArtifactRecorder()
         let pipeline = try DevSession.Pipeline(
             identity: fixture.identity,
-            manifest: fixture.manifest,
+            manifest: manifest,
             reloadIndex: fixture.index,
             snapshotter: .init(stabilityDelayNanoseconds: 0, maximumAttempts: 2),
             builder: { request in

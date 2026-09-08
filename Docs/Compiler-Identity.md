@@ -69,6 +69,8 @@ exact USR matches require no symbol-tree subprocess.
 
 Declaration discovery can be scoped by logical file and can exclude a proven
 source declaration when a consumed AST/SIL mapping is ambiguous or absent.
+Unowned mapping failures exclude the entire validated source file with explicit
+per-node diagnostics; initializers and deinitializers are recognized as owners.
 The compiler USR plus logical file owns the entire accessor/closure group; no
 candidate is guessed and partial body operations are rolled back. Global compiler,
 source, type, ABI and Catalog checks remain mandatory. Live Reload defaults to
@@ -92,7 +94,8 @@ function definitions and debug scopes supply function-location facts for AST
 mapping; malformed type summaries or conformance records cannot supply type or
 operation facts. Conflicts in independent mappings are aggregated. These checks
 share the normal parser's implementation and never create a partial File.
-Diagnostic JSON separately migrates to schema 2 with optional `requestedStages`;
+Diagnostic JSON separately migrates to schema 3 with explicit `not_run` checks
+and optional `requestedStages`;
 legacy absence means full receipt scope. Selected passes qualify only their
 checks and dependencies, as specified in [the diagnosis guide](Large-Project-Integration.md#collect-independent-frontend-failures).
 
@@ -102,3 +105,31 @@ updates `FrontendInvocation.hlxswiftc` and invokes post-compile work. Input-only
 preflight does not emit AST/SIL or scan the dependency cache. Typed checks still
 require available compiler dependencies, and selected-check success does not
 prove full receipt or runtime support. See [preflight](Large-Project-Integration.md#preflight-before-a-successful-build).
+
+Compiler archetypes (`τ_0_0.Element`, unbound `Self`, opened existentials and
+error placeholders) cannot enter imported nominal or alias identity sets. Exact
+Clang runtime facts remain independently validated even when a contextual generic
+spelling is discarded; contradictory runtime identities still fail closed.
+An `NS` prefix or a shared nested-name prefix does not establish a Clang alias.
+Flat `NS` renames require the same exact Objective-C runtime class and reference
+representation on both sides, or an explicit compiler-proven `__C.` alias.
+Independent names such as `NSWidgets.Item` and `Widgets.Item` remain distinct.
+
+## Frontend identity authority inventory
+
+The following inventory records the reviewed lookup boundaries. Candidate indexes
+may accelerate a search without proving equality; their consumers must retain
+conflicts until the named authority resolves them.
+
+| Key or observation | Authority and scope | Collision / non-identity handling |
+| --- | --- | --- |
+| Source nominal USR | Typed AST compiler USR within the validated module/source inventory | Same printed names remain separate by source scope; ambiguous layouts and descendants cannot supply type facts |
+| SIL mangled symbol | One emitted module and one SIL purpose | Keep duplicate candidates until function validation; identity and semantic SIL outputs are distinct compiler products |
+| Source path + line + column | Debug metadata lookup, not declaration identity | Filter by measured symbol role, accessor/static kind and closure discriminator; unknown roles retain ambiguity |
+| SIL scope number | One SIL document | Reject conflicting scope definitions and cycles; never reuse numbers across compiler outputs |
+| Printed conformance type/protocol | Module-local candidate grouping, not globally unique | Keep every witness-table occurrence and exclude ambiguous name-based dispatch/layout proofs |
+| Imported Objective-C reference | Exact Clang/runtime class identity and reference representation | Preserve nested Swift overlays and all conflicting runtime facts; erased runtime class alone cannot equate generic instantiations |
+| Swift type/alias spelling | Concrete nominal candidate index, refined by exact runtime or Catalog declaration evidence | Exclude archetypes/opened/error placeholders; observed import modules alone do not prove declaration ownership |
+| Native operation | Compiler declaration USR plus validated call/ABI projection | Contextual display names and matching suffixes do not collapse overloads or ABI conflicts |
+| Module frontend cache | Compiler capture, toolchain/dependencies, invocation, source bytes, Catalog identities, configuration and indexing policy | Private key revision 3 invalidates older normalization/exclusion results; all sources still invalidate the module |
+| Exclusion node ordinal | One validated AST inventory, diagnostics only | Does not name a declaration or a persistent artifact; an unowned failure quarantines the validated source file |

@@ -287,6 +287,7 @@ extension FrontendReceipt.Adapter {
     }
 
     func importedNativeNominal(in raw: String) -> String? {
+        guard FrontendReceipt.ImportedNominalIdentity.isConcreteSpelling(raw) else { return nil }
         var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         while value.hasSuffix("?") { value.removeLast() }
         for prefix in ["Swift.Optional<", "Optional<"]
@@ -368,7 +369,7 @@ extension FrontendReceipt.Adapter {
             normalizeExplicitAliasIdentities(
                 normalizeClangTypealiasIdentities(
                     normalizeCatalogAliasIdentities(
-                        discoveredTypes + operationTypes
+                        concreteImportedNominalUses(discoveredTypes + operationTypes)
                     )
                 )
             )
@@ -508,6 +509,29 @@ extension FrontendReceipt.Adapter {
         }.sorted { $0.canonicalName < $1.canonicalName }
     }
 
+    private func concreteImportedNominalUses(_ uses: [ImportedNativeType]) throws -> [ImportedNativeType] {
+        try uses.compactMap { original in
+            // A stale/intermediate generic spelling must not enter alias or
+            // canonical-name groups. Preserve independently proven Clang ABI
+            // evidence, including contradictory runtime facts for validation.
+            var use = original
+            if let runtime = use.objectiveCRuntimeName {
+                guard Core.NativeCall.isCanonicalObjectiveCRuntimeClassName(runtime), use.kind == .reference else {
+                    throw FrontendReceipt.ImportedNominalIdentity.conflict(
+                        "invalid Objective-C runtime evidence before generic-spelling filtering", uses: [use])
+                }
+            }
+            if !FrontendReceipt.ImportedNominalIdentity.isConcreteSpelling(use.swiftType) {
+                guard let runtime = use.objectiveCRuntimeName,
+                      use.kind == .reference, use.representation == .reference else { return nil }
+                use.swiftType = runtime
+            }
+            guard FrontendReceipt.ImportedNominalIdentity.isConcreteSpelling(use.canonicalName) else { return nil }
+            use.aliases.removeAll { !FrontendReceipt.ImportedNominalIdentity.isConcreteSpelling($0) }
+            return use
+        }
+    }
+
     /// A module Catalog sees a nominal in its declaring compiler context and
     /// therefore normally publishes more aliases than a consumer AST. Let one
     /// unique Catalog superset canonicalize the weaker source observation;
@@ -520,6 +544,14 @@ extension FrontendReceipt.Adapter {
 
         func names(of type: ImportedNativeType) -> Set<String> {
             Set([type.canonicalName, type.swiftType] + type.aliases)
+        }
+
+        let authorityNames = authorities.map(names)
+        var authoritiesByName: [String: [Int]] = [:]
+        for index in authorities.indices {
+            for name in authorityNames[index] {
+                authoritiesByName[name, default: []].append(index)
+            }
         }
 
         func hasCompatibleValueRepresentation(
@@ -551,7 +583,13 @@ extension FrontendReceipt.Adapter {
         return uses.map { use in
             guard use.nativeModuleName == nil else { return use }
             let observedNames = names(of: use)
-            let candidates = authorities.filter { authority in
+            // Every candidate must contain every observed name. Start with the
+            // smallest exact-name bucket, retaining duplicate/conflicting facts.
+            let anchor = observedNames.min {
+                (authoritiesByName[$0]?.count ?? 0, $0) < (authoritiesByName[$1]?.count ?? 0, $1)
+            }
+            let candidates = (anchor.flatMap { authoritiesByName[$0] } ?? []).filter { index in
+                let authority = authorities[index]
                 let hasMatchingRepresentation =
                     (authority.kind == use.kind
                         && authority.representation == use.representation
@@ -577,14 +615,15 @@ extension FrontendReceipt.Adapter {
                     && (use.objectiveCModuleName == nil
                         || authority.objectiveCModuleName
                             == use.objectiveCModuleName)
-                    && names(of: authority).isSuperset(of: observedNames)
+                    && authorityNames[index].isSuperset(of: observedNames)
             }
-            guard candidates.count == 1, let authority = candidates.first
+            guard candidates.count == 1, let authorityIndex = candidates.first
             else { return use }
+            let authority = authorities[authorityIndex]
             var normalized = use
             normalized.canonicalName = authority.canonicalName
             normalized.swiftType = authority.swiftType
-            normalized.aliases = Array(observedNames.union(names(of: authority)))
+            normalized.aliases = Array(observedNames.union(authorityNames[authorityIndex]))
                 .sorted()
             normalized.kind = authority.kind
             if !hasCompatibleValueRepresentation(use, authority) {
@@ -753,38 +792,37 @@ extension FrontendReceipt.Adapter {
         }
         let runtimeUses = Dictionary(grouping: uses, by: \.canonicalName)
         for (runtimeName, records) in runtimeUses
-        where runtimeName.hasPrefix("NS") && runtimeName.count > 2 {
+        where runtimeName.hasPrefix("NS") && runtimeName.count > 2
+            && !runtimeName.contains(".") && !runtimeName.contains("<") {
             let overlayName = String(runtimeName.dropFirst(2))
-            let runtimeRepresentations = Set(records.map(\.representation))
-            let exactOverlay = uses.filter { $0.canonicalName == overlayName }
-            if !exactOverlay.isEmpty {
-                let overlayRepresentations = Set(exactOverlay.map(\.representation))
-                if !runtimeRepresentations.isDisjoint(with: overlayRepresentations) {
-                    overlaysByRuntime[runtimeName, default: []].insert(overlayName)
-                }
-            } else if uses.contains(where: {
-                runtimeRepresentations.contains($0.representation)
-                    && ($0.canonicalName.hasPrefix(overlayName + ".")
-                        || $0.swiftType.hasPrefix(overlayName + "."))
-            }) {
-                overlaysByRuntime[runtimeName, default: []].insert(overlayName)
-            }
+            let exactOverlay = runtimeUses[overlayName] ?? []
+            // The NS prefix only nominates a candidate. Equality requires
+            // exact runtime-class evidence on both sides; nested name prefixes
+            // and matching representations cannot prove a parent identity.
+            guard !exactOverlay.isEmpty,
+                  (records + exactOverlay).allSatisfy({
+                      $0.kind == .reference && $0.representation == .reference
+                          && $0.objectiveCRuntimeName == runtimeName
+                  })
+            else { continue }
+            overlaysByRuntime[runtimeName, default: []].insert(overlayName)
         }
 
         var normalized = uses
+        var indicesByCurrentName = Dictionary(grouping: uses.indices) { uses[$0].canonicalName }
         for runtimeName in overlaysByRuntime.keys.sorted() {
             guard let overlayNames = overlaysByRuntime[runtimeName],
                   !overlayNames.isEmpty
             else { continue }
             guard overlayNames.count == 1, let overlayName = overlayNames.first
             else { continue }
-            let overlaySwiftTypes = Set(uses.compactMap { use in
-                use.canonicalName == overlayName ? use.swiftType : nil
-            })
+            let overlaySwiftTypes = Set((runtimeUses[overlayName] ?? []).map(\.swiftType))
             let overlaySwiftType = overlaySwiftTypes.count == 1
                 ? overlaySwiftTypes.first! : overlayName
-            for index in normalized.indices
-            where normalized[index].canonicalName == runtimeName {
+            // Update the index as names change so ordered alias chains retain
+            // the same semantics as scanning the current normalized inventory.
+            let indices = indicesByCurrentName.removeValue(forKey: runtimeName) ?? []
+            for index in indices {
                 normalized[index].aliases = Array(Set(
                     normalized[index].aliases
                         + [runtimeName, normalized[index].swiftType]
@@ -792,6 +830,7 @@ extension FrontendReceipt.Adapter {
                 normalized[index].canonicalName = overlayName
                 normalized[index].swiftType = overlaySwiftType
             }
+            indicesByCurrentName[overlayName, default: []].append(contentsOf: indices)
         }
         return normalized
     }

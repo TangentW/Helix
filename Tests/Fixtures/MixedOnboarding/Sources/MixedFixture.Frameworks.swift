@@ -5,6 +5,11 @@ import Photos
 import CoreGraphics
 
 extension MixedFixture {
+    static let initialized: Int = { 11 }()
+    static func first<C: Collection>(_ values: C) -> C.Element? { values.first }
+    @MainActor static func firstTap(_ values: [UIKit.UIPencilInteraction.Tap]) -> UIPencilInteraction.Tap? {
+        first(values)
+    }
     static func progress(_ value: Progress) -> Int64 { value.completedUnitCount }
     @MainActor static func frameworks(_ image: UIImage, _ player: AVPlayer, _ asset: PHAsset) -> Int {
         _ = image

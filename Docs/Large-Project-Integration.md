@@ -197,6 +197,7 @@ Common source forms have the following identity boundaries. See the detailed
 | Closures at one coordinate in `optional ?? { ... }()` | Compiler symbol roles distinguish autoclosures from explicit closures; closure discriminators further constrain matching. Remaining ambiguity reports all candidates |
 | Private static SDK overlay properties | Structural `Static`/getter evidence distinguishes a `CoreFoundation.CGFloat` AST USR from the `CoreGraphics.CGFloat` SIL getter without selecting a shared-coordinate addressor |
 | C callback and reabstraction thunks | Compiler adapter attributes and thunk roles exclude generated entries; unknown shapes retain all conflict evidence |
+| Generic archetypes such as `τ_0_0.Element` | Excluded before nominal/alias grouping; independently proven Clang runtime facts remain available and validated |
 | `NS_SWIFT_NAME` nested classes and flat Clang names | Normalize using proven Objective-C runtime identity, preserve generic arguments, and do not equate unrelated nested types |
 
 ## Declaration scope and local rejection
@@ -214,8 +215,12 @@ source file, with source location and every rejected candidate retained as evide
 Body discovery rolls back operations collected before a nested mapping failure;
 property generation rolls back the entire accessor group. Unconsumed synthesized
 backing declarations are not source entry candidates; their consumers still require
-SIL evidence. A failure without a proven source owner, invalid source membership,
-malformed SIL, or a conflicting type/ABI/Catalog remains fatal.
+SIL evidence. Initializers/deinitializers also own their nested closures. A mapping
+failure without proven declaration ownership conservatively excludes its entire
+validated source file, recording each failure. Coordinates never select an owner,
+and callers that may depend on that closure are not retained from that file.
+Invalid source membership, malformed SIL, or conflicting type/ABI/Catalog facts
+remain fatal.
 
 For a smaller initial scope, use Host Plan schema 2 and add `indexing` to the
 feature, then reapply `xcode install`:
@@ -242,8 +247,18 @@ and imported-type facts. Scope narrows Helix declaration and source-operation
 discovery; it does not promise cheaper whole-module Swift emission, suppress global
 conflicts, or remove explicitly supplied Catalog authority.
 
+Use `Sources/**` for a directory tree; `Sources` matches only that complete path.
+An unmatched scope reports glob syntax, the total source count and at most eight
+source-path examples before compiler replay.
+
 `HLXIDX024` records each excluded declaration and its complete reasons in
-`FrontendDiagnostics.json` and the diagnostic report. The CLI reports the excluded
+`FrontendDiagnostics.json` and the diagnostic report. `HLXIDX025` records each
+unowned mapping failure and the resulting whole-file exclusion. Reasons from both
+SIL stages merge for each AST inventory node; neither coordinates nor diagnostic
+node ordinals are declaration identities. Query the complete build-time list with
+`helix xcode exclusions --diagnostics /path/FrontendDiagnostics.json --file Sources/Feature.swift --json`;
+omit `--file` for all entries. Text displays at most 20 entries; JSON retains full
+evidence. This describes build-time coverage, not device activation. The CLI reports the excluded
 count and diagnostic path, including unchanged Prepare hits. Module-receipt and
 Prepare identities include the indexing options; changing policy or scope cannot
 reuse a result with different authority. A change to an excluded source still
@@ -255,7 +270,8 @@ original canonical bytes. Indexing options require schema 2, so older tools reje
 the plan instead of silently ignoring its scope. New plans use schema 2. Existing
 public request/feature initializers remain available; indexed overloads are additive.
 The receipt and device wire formats are unchanged. PrepareState schema 1 adds an
-optional informational `excludedDeclarationCount`; omission means a legacy count
+optional informational `excludedDeclarationCount`, `excludedFileCount` and
+`unownedMappingCount`; omission means a legacy count
 is unavailable, while independently bound input hashes still control reuse.
 
 ## Collect independent frontend failures
@@ -296,11 +312,14 @@ unselected branches. Empty or unknown selections are errors.
 | `catalogs` | Typed AST imports, toolchain facts and available cached Catalog validation; no SIL |
 | `receipt` | Complete frontend receipt analysis and assembly |
 
-Diagnostic JSON now emits **schema 2**. Its optional `requestedStages` records a
+Diagnostic JSON now emits **schema 3**. Its optional `requestedStages` records a
 sorted, unique selection. A missing field (including schema 1 reports) means full
 scope. With a selection that omits `receipt`, `passed: true` and exit zero mean
 only that the selected checks and dependencies passed; they do not qualify a full
-receipt. Schema-aware consumers must recognize version 2 and inspect this scope.
+receipt. Schema-aware consumers must recognize version 3 and inspect this scope. `not_run` explicitly
+marks unselected or unexecuted checks, separately from failed dependencies marked
+`blocked`. Absence of an error is not evidence of a passed check. Schema 1/2 reports
+remain readable.
 Omitting `--stages`, or selecting `receipt`, retains full frontend validation.
 This diagnostic format change does not change Shell or patch artifact schemas.
 
@@ -471,13 +490,19 @@ Helix-owned reference. A conflicting user-owned reference, local package under
 an explicit remote pin, or multiple runtime package authorities rejects before
 publication and includes package IDs, repository/path and requirement facts.
 Hub preserves the requirement through load, edit and reapply. Schema 1 plans
-cannot carry this field; their old bytes and defaults remain compatible.
+cannot carry this field; their old bytes remain readable.
 
-Omitting the field preserves an existing package requirement. If no reference
-exists, the compatibility default remains the canonical repository's `main`
-branch. A released default tag is not invented. Team plans should specify their
-qualified revision/version explicitly and retain their normal Xcode package
-resolution file in version control.
+Omitting the field preserves an existing package requirement. A **new remote
+reference** uses the published runtime revision
+`df420536312358631c1278d6b3b274e2fda64ddd`, declared by
+`XcodeIntegration.RuntimePackageRequirement.defaultRuntime`. This behavior also
+applies to legacy plans that create a new reference; it does not silently repin
+an existing branch or override a local package. The baseline must be advanced
+deliberately with runtime compatibility and package tests. To track a branch,
+explicitly use `{"kind":"branch","value":"main"}` in schema 2. Older tools
+reject this new enum case; revision/exactVersion plans remain source compatible.
+Team plans can select their qualified revision/version explicitly and should
+retain Xcode's package resolution file in version control.
 
 Remove an installation without the Hub GUI:
 
@@ -508,3 +533,52 @@ Competing Helix operations on the same project reject before mutation; different
 projects remain independent. Locking the directory survives atomic PBX file
 replacement and creates no generated lock artifact. This coordinates Helix
 operations, not external editors or Git commands that do not take the lock.
+
+## Bootstrap Catalogs from a compiler capture
+
+A successful Prepare is no longer required to create a Catalog job. After Xcode
+has built the external dependencies and captured a compiler invocation, run:
+
+```sh
+helix xcode catalog-prewarm --plan .helix/xcode/HostPlan.json --profile live \
+  --capture /absolute/path/to/Helix/FrontendAttempt.hlxswiftc --plan-only --json
+helix xcode catalog-prewarm --plan .helix/xcode/HostPlan.json --profile live \
+  --capture /absolute/path/to/Helix/FrontendAttempt.hlxswiftc --max-modules 1
+```
+
+Both `FrontendAttempt.hlxswiftc` and `FrontendInvocation.hlxswiftc` are accepted
+at their original DerivedData location. Planning reads sources for imports and
+validates the captured compiler, SDK and dependency fingerprints; it does not
+run the consumer's AST/SIL, create a Shell, or register a live session. The first
+command writes a private resumable job and returns schema 1 JSON containing
+`cachedModules`, `pendingModules`, `unresolvedModules`, `unresolvedReasons`, and
+`jobPath`. `--json` requires `--plan-only`. Without `--plan-only`, cold generation
+runs in the foreground with the same 1...256 module budget as `--job`. Cache hits
+do not consume that budget. Jobs can be resumed from any current directory;
+compiler and Symbol Graph processes use the job's validated working directory.
+Changing dependency bytes invalidates the job and requires a fresh plan.
+
+`unresolvedModules` means a fingerprint prerequisite is incomplete, not a cache
+miss. Reasons include malformed source imports, unsupported directory symlinks,
+unreadable/unstable files and traversal limits, with source/input paths. Fix the
+reported prerequisite before retrying; Helix does not waive it to populate the
+cache. Human output samples at most 20 modules and eight distinct reasons; JSON
+retains all reasons. Planning exits 1 if any modules remain unresolved. Normal
+Prepare schedules available misses before frontend generation; prewarm failure
+does not authorize a partial production capability surface. Cold compilation
+still costs time, and this path makes it independently schedulable rather than
+eliminating that cost. Existing owner-local cache sharing rules still apply;
+copying an unverified job from another machine is not a team-cache protocol.
+
+New live registrations also [guard excluded file saves](Development-Live-Reload.md#saving-code-excluded-from-indexing).
+A file containing an unresolved declaration or lying outside the configured
+indexing scope requires normal Build/Run when edited, even if that file still
+contains other indexed functions. Repeated edits cannot silently become
+“no semantic change.” Full stage failure details remain available in diagnosis
+JSON; terminal output limits each check's detail to 4 KiB.
+
+Keep compiler-proxy and driver settings on the opted-in target/configuration.
+Global `xcodebuild SWIFT_USE_INTEGRATED_DRIVER=NO` overrides also affect package
+targets; the Xcode 26.6 fixture reproduced missing `-package-name` diagnostics in
+package-access declarations under that setup. The mixed fixture now scopes these
+probes to the App, preserving dependency packages' normal driver settings.

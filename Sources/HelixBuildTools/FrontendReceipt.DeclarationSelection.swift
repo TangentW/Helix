@@ -17,9 +17,33 @@ struct DeclarationSelection {
     }
 
     struct Member {
+        // An ordinal identifies one node in this validated AST inventory only.
+        // It is diagnostic provenance, never a persisted declaration identity.
+        var ordinal: Int
         var declaration: Declaration?
         var item: TypedAST.Object
         var source: Adapter.SourceState
+    }
+
+    struct UnownedKey: Hashable {
+        var logicalPath: String
+        var ordinal: Int
+    }
+
+    struct UnownedExclusion {
+        var member: Member
+        var reasons: Set<String>
+
+        var diagnostic: Core.Diagnostic {
+            var location = Adapter().sourceRange(in: member.item).flatMap {
+                member.source.sourceLocation(atUTF8Offset: $0.start)
+            } ?? .init(file: member.source.logicalPath, line: 1, column: 1)
+            location.file = member.source.logicalPath
+            let kind = member.item["_kind"] as? String ?? "item"
+            return .init(code: "HLXIDX025", severity: .warning,
+                message: "Excluded source file \(member.source.logicalPath): AST/SIL identity for unowned \(kind) at AST node \(member.ordinal) is unresolved; no Shell entry or source NativeImport is emitted for this file",
+                location: location, notes: reasons.sorted())
+        }
     }
 
     struct Exclusion: Sendable {
@@ -36,6 +60,8 @@ struct DeclarationSelection {
     let documents: [TypedAST.Object]
     let members: [Member]
     private(set) var exclusions: [Key: Exclusion] = [:]
+    private(set) var unownedExclusions: [UnownedKey: UnownedExclusion] = [:]
+    var excludedFilePaths: Set<String> { Set(unownedExclusions.keys.map(\.logicalPath)) }
     let failurePolicy: DeclarationFailurePolicy
 
     init(documents: [TypedAST.Object], sourcesByPhysicalPath: [String: Adapter.SourceState],
@@ -59,11 +85,12 @@ struct DeclarationSelection {
                     guard let item = value as? TypedAST.Object else { continue }
                     let kind = item["_kind"] as? String
                     var declaration = parent
-                    if parent == nil, ["func_decl", "var_decl", "subscript_decl"].contains(kind),
+                    if parent == nil, ["func_decl", "var_decl", "subscript_decl", "constructor_decl", "destructor_decl"].contains(kind),
                        let usr = item["usr"] as? String, usr.hasPrefix("s:") {
                         let key = Key(logicalPath: source.logicalPath, usr: usr)
                         let offset = Adapter().sourceRange(in: item)?.start
-                        let location = offset.flatMap { $0 >= 0 && $0 < source.contents.count ? source.sourceLocation(atUTF8Offset: $0) : nil }
+                        var location = offset.flatMap { $0 >= 0 && $0 < source.contents.count ? source.sourceLocation(atUTF8Offset: $0) : nil }
+                        location?.file = source.logicalPath
                         if let existing = declarations[key] {
                             throw FrontendReceipt.Error.malformedAST("duplicate source declaration USR \(usr) in \(source.logicalPath): \(String(describing: existing.location)) and \(String(describing: location))")
                         }
@@ -74,7 +101,7 @@ struct DeclarationSelection {
                     // Synthesized backing declarations are not source roots.
                     // Their consumers still resolve exact SIL facts on demand.
                     if declaration?.isImplicit != true, ["func_decl", "accessor_decl", "closure_expr"].contains(kind) {
-                        members.append(.init(declaration: declaration, item: item, source: source))
+                        members.append(.init(ordinal: members.count, declaration: declaration, item: item, source: source))
                     }
                     for key in item.keys.sorted() where key != "decl" {
                         let child = item[key]!
@@ -100,7 +127,8 @@ struct DeclarationSelection {
     static func declaration(in item: TypedAST.Object, source: Adapter.SourceState) -> Declaration? {
         guard let usr = item["usr"] as? String, usr.hasPrefix("s:") else { return nil }
         let offset = Adapter().sourceRange(in: item)?.start
-        let location = offset.flatMap { $0 >= 0 && $0 < source.contents.count ? source.sourceLocation(atUTF8Offset: $0) : nil }
+        var location = offset.flatMap { $0 >= 0 && $0 < source.contents.count ? source.sourceLocation(atUTF8Offset: $0) : nil }
+        location?.file = source.logicalPath
         return .init(key: .init(logicalPath: source.logicalPath, usr: usr), location: location,
             isImplicit: item["implicit"] as? Bool == true)
     }
@@ -117,15 +145,29 @@ struct DeclarationSelection {
         exclusions[declaration.key] = value
     }
 
+    mutating func exclude(_ member: Member, reason: String) {
+        if let declaration = member.declaration {
+            exclude(declaration, reason: reason)
+        } else {
+            // Without compiler-backed ownership, quarantining only a closure
+            // could retain a caller whose lowered body still depends on it.
+            let key = UnownedKey(logicalPath: member.source.logicalPath, ordinal: member.ordinal)
+            var value = unownedExclusions[key] ?? .init(member: member, reasons: [])
+            value.reasons.insert(reason)
+            unownedExclusions[key] = value
+        }
+    }
+
     var diagnostics: [Core.Diagnostic] {
-        exclusions.values.map(\.diagnostic).sorted {
+        (exclusions.values.map(\.diagnostic) + unownedExclusions.values.map(\.diagnostic)).sorted {
             ($0.location?.file ?? "", $0.location?.line ?? 0, $0.message)
                 < ($1.location?.file ?? "", $1.location?.line ?? 0, $1.message)
         }
     }
 
     func availableDocuments(sourcesByPhysicalPath: [String: Adapter.SourceState]) throws -> [TypedAST.Object] {
-        guard !exclusions.isEmpty else { return documents }
+        guard !exclusions.isEmpty || !unownedExclusions.isEmpty else { return documents }
+        let excludedFiles = excludedFilePaths
         func filter(_ items: [Any], logicalPath: String) -> [Any] {
             items.compactMap { value in
                 guard var item = value as? TypedAST.Object else { return value }
@@ -139,7 +181,10 @@ struct DeclarationSelection {
                   let source = sourcesByPhysicalPath[URL(fileURLWithPath: filename).resolvingSymlinksInPath().standardizedFileURL.path]
             else { throw FrontendReceipt.Error.malformedAST("declaration filtering document is outside the validated source set") }
             var result = document
-            result["items"] = filter(try TypedAST.items(in: document), logicalPath: source.logicalPath)
+            let items = try TypedAST.items(in: document)
+            result["items"] = excludedFiles.contains(source.logicalPath)
+                ? items.filter { ($0 as? TypedAST.Object)?["_kind"] as? String == "import_decl" }
+                : filter(items, logicalPath: source.logicalPath)
             return result
         }
     }

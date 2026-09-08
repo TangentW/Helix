@@ -6,6 +6,15 @@ import HelixCore
 import HelixInterface
 
 extension CLI {
+public struct XcodeCatalogPlanReport: Codable, Sendable {
+    public var schemaVersion: UInt16 = 1
+    public var cachedModules: [String]
+    public var pendingModules: [String]
+    public var unresolvedModules: [String]
+    public var unresolvedReasons: [String: [String]]
+    public var jobPath: String?
+}
+
 enum CatalogPrewarmProcess {
     static func launch(
         executableURL: URL,
@@ -73,6 +82,7 @@ extension CLI.Application {
         var prewarmRequests: [NativeAPICatalog.BuildRequest]
         var prewarmPlanRequest: NativeAPICatalog.PlanRequest
         var unresolvedModules: [String]
+        var unresolvedReasons: [String: [String]]
     }
 
     func resolveXcodeNativeAPICatalogs(
@@ -102,6 +112,7 @@ extension CLI.Application {
         ))
         var processedModules = Set<String>()
         var unresolvedModules = Set<String>()
+        var unresolvedReasons: [String: [String]] = [:]
         var cacheHits: UInt64 = 0
         var generated: UInt64 = 0
         var entryCount: UInt64 = 0
@@ -125,6 +136,9 @@ extension CLI.Application {
                 return try NativeAPICatalog.Planner().plan(planRequest)
             }
             unresolvedModules.formUnion(plan.unresolvedModules)
+            for (module, reasons) in plan.unresolvedReasons {
+                unresolvedReasons[module] = Array(Set((unresolvedReasons[module] ?? []) + reasons)).sorted()
+            }
             let pending = plan.requests.filter {
                 !processedModules.contains($0.identity.moduleName)
             }.sorted {
@@ -217,7 +231,7 @@ extension CLI.Application {
         )
         performance.setCounter(
             "prepare.catalog_miss_module_count",
-            value: UInt64(prewarmRequests.count + unresolved.count)
+            value: UInt64(prewarmRequests.count)
         )
         performance.setCounter(
             "prepare.catalog_entry_count",
@@ -228,7 +242,8 @@ extension CLI.Application {
             snapshots: snapshots,
             prewarmRequests: prewarmRequests,
             prewarmPlanRequest: planRequest,
-            unresolvedModules: unresolved
+            unresolvedModules: unresolved,
+            unresolvedReasons: unresolvedReasons
         )
     }
 
@@ -240,6 +255,17 @@ extension CLI.Application {
         outputDirectoryURL: URL
     ) throws {
         guard !requests.isEmpty else { return }
+        let jobURL = try publishNativeAPICatalogPrewarmJob(requests: requests, cache: cache,
+            workingDirectoryURL: workingDirectoryURL, planRequest: planRequest, outputDirectoryURL: outputDirectoryURL)
+        let logURL = jobURL.deletingPathExtension().appendingPathExtension("log")
+        try catalogPrewarmLauncher(executableURL, jobURL, logURL, workingDirectoryURL)
+    }
+
+    func publishNativeAPICatalogPrewarmJob(
+        requests: [NativeAPICatalog.BuildRequest], cache: BuildCache.Store,
+        workingDirectoryURL: URL, planRequest: NativeAPICatalog.PlanRequest,
+        outputDirectoryURL: URL
+    ) throws -> URL {
         let job = NativeAPICatalog.PrewarmJob(
             cacheRootURL: cache.rootURL,
             workingDirectoryURL: workingDirectoryURL,
@@ -258,13 +284,7 @@ extension CLI.Application {
         try preparePrivateCatalogDirectory(directory)
         let jobURL = directory.appendingPathComponent("\(identifier).json")
         try publishPrivateCatalogJob(data, to: jobURL)
-        let logURL = directory.appendingPathComponent("\(identifier).log")
-        try catalogPrewarmLauncher(
-            executableURL,
-            jobURL,
-            logURL,
-            workingDirectoryURL
-        )
+        return jobURL
     }
 
     func prewarmXcodeCatalogs(
@@ -273,10 +293,17 @@ extension CLI.Application {
         if arguments == ["--help"] {
             return .init(exitCode: 0, standardOutput: """
             Usage: helix xcode catalog-prewarm --job <path> [--max-modules <1...256>]
-            Run from the captured project working directory. A module limit pauses
+               or: helix xcode catalog-prewarm --plan <path> --profile <id> --capture <path>
+                     [--plan-only] [--max-modules <1...256>] [--json]
+
+            Capture mode accepts FrontendAttempt.hlxswiftc and needs no successful
+            Prepare, AST or SIL. --plan-only publishes a private resumable job and
+            reads existing Catalogs without cold generation. JSON is for plan-only.
+            All compiler work uses the captured project working directory.
+            A module limit pauses
             after that many cache misses; rerun the same job to resume. Completed
             modules are reused and do not consume the limit. Changed build inputs
-            require a new Prepare job. The job is retired only after completion.
+            require a new capture-driven job. The job is retired only after completion.
 
             """)
         }
@@ -339,14 +366,8 @@ extension CLI.Application {
         defer { _ = flock(descriptor, LOCK_UN) }
         let data = try handle.readToEnd() ?? Data()
         let job = try NativeAPICatalog.PrewarmJobCodec.decode(data)
-        guard job.workingDirectoryPath
-                == URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                    .standardizedFileURL.path
-        else {
-            throw CLI.Error.input(
-                "Catalog prewarm worker started in the wrong working directory"
-            )
-        }
+        // Every planner, input snapshot and compiler request uses the validated
+        // job directory explicitly. Never mutate this process's global cwd.
         let cache = try BuildCache.Store(
             rootURL: URL(fileURLWithPath: job.cacheRootPath)
         )
@@ -354,7 +375,7 @@ extension CLI.Application {
             .toolchainIdentity(compilerURL: job.planRequest.compilerURL)
         guard currentToolchain == job.planRequest.toolchain else {
             throw CLI.Error.input(
-                "Catalog prewarm compiler changed after Prepare"
+                "Catalog prewarm compiler changed since job creation"
             )
         }
         let frontend = SwiftFrontend.Driver(
@@ -368,7 +389,7 @@ extension CLI.Application {
         )
         guard currentSDK == job.planRequest.sdk else {
             throw CLI.Error.input(
-                "Catalog prewarm SDK changed after Prepare"
+                "Catalog prewarm SDK changed since job creation"
             )
         }
         let currentCompilerInputs = BuildCache.CompilerInputs.capture(
@@ -382,7 +403,7 @@ extension CLI.Application {
         )
         guard currentCompilerInputs == job.planRequest.compilerInputs else {
             throw CLI.Error.input(
-                "Catalog prewarm compiler inputs changed after Prepare"
+                "Catalog prewarm compiler inputs changed since job creation"
             )
         }
         let builder = NativeAPICatalog.Builder(cache: cache)
@@ -454,6 +475,11 @@ extension CLI.Application {
             pending = followup.requests.filter {
                 !processedModules.contains($0.identity.moduleName)
             }
+        }
+        guard initialPlan.unresolvedModules.isEmpty else {
+            throw CLI.Error.input("Catalog prewarm completed available modules but remains blocked for: "
+                + initialPlan.unresolvedModules.joined(separator: ", ")
+                + ". Replan with --plan-only --json for fingerprint reasons.")
         }
         do {
             try FileManager.default.removeItem(at: jobURL)

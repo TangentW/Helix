@@ -211,6 +211,22 @@ public actor Pipeline {
                 try await baseline.markAccepted(snapshot)
                 return await complete(.noSemanticChange(revision))
             }
+            let excludedIDs = Set(manifest.indexingPolicy?.excludedSourceIDs ?? [])
+                .intersection(classification.changedFiles)
+            if !excludedIDs.isEmpty {
+                let paths = manifest.sourceFiles.filter { excludedIDs.contains($0.id) }.map(\.logicalPath).sorted()
+                let sample = paths.prefix(8).joined(separator: ", ")
+                let examples = String(decoding: sample.utf8.prefix(8 * 1_024), as: UTF8.self)
+                // Do not advance the accepted baseline: repeated saves must
+                // continue to warn until the edit is rebuilt or reverted.
+                return await complete(.rebuildRequired(diagnostic(
+                    code: "HLXLR209",
+                    message: "Saved changes touch \(paths.count) file(s) excluded from live indexing: \(examples)"
+                        + (paths.count > 8 || sample.utf8.count > 8 * 1_024 ? " (sample limited to 8 paths / 8192 bytes)" : ""),
+                    revision: revision,
+                    nextAction: "Build/Run the App normally. Files containing unresolved declarations are conservatively excluded from live saves; inspect FrontendDiagnostics.json or helix xcode exclusions."
+                )))
+            }
             let changedSourceIDs = Set(snapshot.files.map(\.id))
             let candidateFunctions = candidateFunctions(for: changedSourceIDs)
             let reason: LiveReload.Reason = Set(classification.changedFiles)

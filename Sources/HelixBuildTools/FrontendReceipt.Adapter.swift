@@ -651,6 +651,8 @@ public struct Adapter: Sendable {
             value: UInt64(receipt.declarations.count)
         )
         performance.setCounter("frontend.excluded_declaration_count", value: UInt64(selection.exclusions.count))
+        performance.setCounter("frontend.excluded_file_count", value: UInt64(selection.excludedFilePaths.count))
+        performance.setCounter("frontend.unowned_mapping_count", value: UInt64(selection.unownedExclusions.count))
         performance.setCounter(
             "frontend.root_count",
             value: UInt64(receipt.roots.count)
@@ -684,7 +686,8 @@ public struct Adapter: Sendable {
         check("indexing") { try request.indexing?.validate() }
         if request.sources.isEmpty { failures.append("source set is empty") }
         if let indexing = request.indexing, !request.sources.contains(where: { indexing.includes(logicalPath: $0.logicalPath) }) {
-            failures.append("indexing scope matches no captured source: include=\(indexing.include), exclude=\(indexing.exclude), sources=\(request.sources.map(\.logicalPath).sorted())")
+            let paths = request.sources.map(\.logicalPath).sorted()
+            failures.append("indexing scope matches no captured source: include=\(indexing.include), exclude=\(indexing.exclude). Patterns match source-root-relative paths; use Sources/** for a directory tree, * for one path component, or an exact file path. Captured sources: total=\(paths.count), sample=\(Array(paths.prefix(8))), omitted=\(max(0, paths.count - 8))")
         }
         let logical = Dictionary(grouping: request.sources, by: \.logicalPath)
         for path in logical.keys.sorted() where logical[path]!.count > 1 {
