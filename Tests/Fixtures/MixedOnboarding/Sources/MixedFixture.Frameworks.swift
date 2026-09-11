@@ -3,8 +3,24 @@ import UIKit
 import AVFoundation
 import Photos
 import CoreGraphics
+import CoreFoundation
+#if os(macOS)
+import AppKit
+#endif
 
 extension MixedFixture {
+    enum InputSource { case `import`, manual }
+    static func imported(_ source: InputSource) -> Bool {
+        switch source {
+        case .import: true
+        case .manual: false
+        }
+    }
+    static func box(_ page: CGPDFPage, _ box: CGPDFBox) -> CGRect { page.getBoxRect(box) }
+    static func metadata(_ context: CGContext, _ info: CFDictionary, _ data: CFData) {
+        context.beginPDFPage(info)
+        context.addDocumentMetadata(data)
+    }
     static let initialized: Int = { 11 }()
     static func first<C: Collection>(_ values: C) -> C.Element? { values.first }
     @MainActor static func firstTap(_ values: [UIKit.UIPencilInteraction.Tap]) -> UIPencilInteraction.Tap? {

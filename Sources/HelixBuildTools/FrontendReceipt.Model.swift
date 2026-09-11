@@ -123,6 +123,7 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
     case demanglingFailed(String)
     case missingSILFunction(String)
     case ambiguousSILFunction(String, [String])
+    case ambiguousForeignParameterMapping(String)
     case unsupportedDeclaration(String)
 
     public var description: String {
@@ -135,6 +136,8 @@ public enum Error: Swift.Error, Equatable, Sendable, CustomStringConvertible {
         case let .ambiguousSILFunction(name, matches):
             "typed AST function maps ambiguously to canonical SIL: \(name) -> "
                 + matches.joined(separator: ", ")
+        case let .ambiguousForeignParameterMapping(reason):
+            "cannot establish imported C member parameter mapping: \(reason)"
         case let .unsupportedDeclaration(reason): "unsupported indexed declaration: \(reason)"
         }
     }

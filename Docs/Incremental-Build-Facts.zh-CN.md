@@ -114,7 +114,7 @@ miss，并递归跟进引用到的 module。任务文件以原子方式发布到
 
 冷的全模块探测不会再对每个候选逐条查询文件缓存：外层 Catalog key 已经精确表示该
 模块，而每个公开 API 再开一次 lock、读一次 manifest 只会增加线性 I/O，不能带来有效
-复用。顶层每 256 条为一批，最多 4 个 worker；结果和错误按批次顺序 join，因此并发只
+复用。顶层每 256 条为一批，使用调用方分配的探针预算（默认 4，可配置 1...8）；CLI 将它与模块并发统筹；结果和错误按批次顺序 join，因此并发只
 改变耗时，不改变输出字节、诊断、指标或缓存身份。源码根扩展仍使用细粒度探针缓存，
 因为普通源码修改造成 module receipt miss 时，这些候选仍有实际复用价值。
 
@@ -297,9 +297,9 @@ Live Reload Prepare 成功后，私有任务与日志位于
 helix xcode catalog-prewarm --job "/absolute/path/to/job.json" --max-modules 1
 ```
 
-`--max-modules` 接受 1 到 256，限制单次新生成的模块数，已经验证的缓存命中不占额度。
-达到上限后成功退出并保留任务，再次运行同一命令会复用已经完成的模块；全部完成后
-才删除任务。中断 compiler probe 后，尚未完成的那个模块可能需要重新生成。并发 worker
+`--max-modules` 接受 1 到 256，限制单次冷模块尝试次数（含失败），已验证的缓存命中不占额度。
+达到上限且没有失败时成功退出，失败返回非零，均保留任务。再次运行会重新校验已完成模块，
+优先处理尚未尝试的模块，再重试上次失败；全部成功后才删除任务。中断 compiler probe 后，尚未完成的那个模块可能需要重新生成。并发 worker
 由任务文件锁协调，已有 worker 时新调用会提示任务正在运行。compiler、SDK 或模块
 输入发生变化后，需要重新 Prepare 生成任务。
 
@@ -310,7 +310,7 @@ helix xcode catalog-prewarm --job "/absolute/path/to/job.json" --max-modules 1
 数据乘以 import 数量，当成已经测得的大工程预热时间。
 
 compiler proxy 现在在编译前保存 `FrontendAttempt.hlxswiftc`，供 `helix xcode preflight`
-使用（默认 `inputs,typed-ast`）。只有成功编译才更新 `FrontendInvocation.hlxswiftc` 并运行
+使用（默认 `inputs,typed-ast,catalogs`）。只有成功编译才更新 `FrontendInvocation.hlxswiftc` 并运行
 post-compile。仅输入预检不生成 AST/SIL，也不扫描依赖缓存；typed 检查仍需要可用的编译
 依赖，局部检查通过不代表完整 receipt 或 runtime 支持。见[预检说明](Large-Project-Integration.zh-CN.md#成功构建前的预检)。
 
@@ -322,3 +322,9 @@ import 扫描每次只持有一份源码，并保留每个失败逻辑路径。�
 不追随可能成环的目录树。私有 Catalog pipeline identity 因具体 nominal 过滤和
 Symbol Graph 工作目录传递而推进，公开 Catalog wire rules 与 runtime ABI 不变。
 参见[从 capture 自举](Large-Project-Integration.zh-CN.md#从-compiler-capture-自举-catalog)。
+
+### Header map 与精确 foreign 事实
+
+Header map identity 枚举实际占用 bucket，并对每个引用 header 做内容指纹。Xcode 可能在替换映射时累计 `NumEntries`，因此不要求它等于占用数量。二次幂 bucket 数、bucket/string 边界、UTF-8 终止字符串与不区分 ASCII 大小写的唯一 key 继续校验；冲突提供 bucket/key/path 证据。`.import` 成员引用（含中间注释）不再提名模块。提供捕获的 target triple 后，精确的 `os(...)`、`!os(...)` 条件会排除确定不生效的分支；复杂或未知条件保留所有可能导入，并独立校验对编译器实际导入的覆盖。
+
+Clang typedef 识别要求完整、长度匹配的单一 nominal，拒绝嵌套、容器、函数拼写以及长度溢出。只有两份观察都证明相同 raw-representable representation 时，enum 观察才可细化 value fallback；reference/value 冲突继续报错。C 成员参数证据与投影 v2 更新 transform 和 compiler-probe pipeline identity，防止复用旧污染事实。

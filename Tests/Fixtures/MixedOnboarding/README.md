@@ -10,6 +10,15 @@ generic higher-order calls exercise generated adapter and reabstraction thunks.
 Its deployment target is
 iOS 17.5 for that mapped API. It also includes an Objective-C bridging header
 and a compiled Objective-C++ implementation.
+It also calls CoreGraphics C APIs imported as Swift members with `CGPDFBox`,
+`CFDictionary`, and `CFData` parameters, uses an enum's `.import` case, and keeps
+an inactive macOS `import AppKit` branch in its iOS source. The test fingerprints
+real Xcode-produced header maps from the captured command and saves their bytes
+and input snapshots with the external evidence. Reserved but absent header-map
+search roots are recorded separately; their later creation still invalidates
+the compiler-input fingerprint. Custom global actor rejection
+and inherited construction identity are covered by `LargeProjectCatalog` using
+separate compiler modules; they are not device actor-execution evidence.
 Debug enables debug information, C++ interop, and explicit modules in Xcode
 settings. It is a configuration regression, not a large-source benchmark.
 

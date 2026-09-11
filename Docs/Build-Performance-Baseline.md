@@ -254,8 +254,8 @@ candidate instead of aborting the module.
 The product conclusion is therefore explicit: full SDK Catalog generation is
 one-time background work keyed by SDK/module identity. Catalog-first Prepare
 must consume a validated hit or perform a small source-demanded query; it must
-never put this roughly 230-second scan back onto every local build. Schema, protocol,
-artifact, and product versions remain 1.
+never put this roughly 230-second scan back onto every local build. Those measurements used the then-current version-1 contracts. The current
+parameter-projection v2 extension is documented in [Native Calls](Native-Calls.md#c-member-argument-order-and-projection-compatibility).
 
 ## Final Hot Patch Release evidence
 
@@ -447,7 +447,7 @@ This isolates parser operations, excluding compiler emission, AST discovery,
 Catalog generation, Bridge compilation, transfer and activation. It is not a
 commercial-project cold-build or save-to-activation benchmark. Shared module
 facts still require complete compiler input invalidation; no per-file WMO cache
-or parallel frontend emission is implied.
+or concurrent identity/semantic SIL emission for one source module is implied.
 
 The existing 2,500-file integration benchmarks were also rerun on the same
 Swift/SDK pair. The scalar fixture (147,780 bytes) measured 9.240 s cold receipt,
@@ -478,3 +478,35 @@ set `HELIX_ALIAS_TYPE_COUNT=2000` and `HELIX_ALIAS_REPORT=/absolute/path/report.
 with `--filter measuresAliasNormalization` to reproduce the larger measurement.
 Raw local evidence is kept outside the repository. Identity SIL and semantic SIL
 remain distinct compiler products; this optimization does not conflate them.
+
+## SDK correctness and prewarm recheck (September 11, 2026)
+
+The opt-in SDK test uses a fresh Helix cache per module on Xcode 26.6 (17F113),
+Swift 6.3.3, iPhoneSimulator SDK 23F81a, `arm64-apple-ios15.0-simulator`, and Swift
+language mode 5. This host has 10 active CPUs and 16 GiB physical memory; the
+resource heuristic gives this single-module producer six probe workers.
+
+| Module | Candidates | Published entries | Cold Catalog | Warm read | Probe attempts | Cold / warm compiler-tool invocations |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| UIKit | 6,184 | 4,257 | 162.482 s | 1.833 s | 2,564 | 6,499 / 0 |
+| CoreGraphics | 627 | 226 | 16.592 s | 0.110 s | 283 | 773 / 0 |
+
+Both documents validate and replay identically from cache. UIKit assertions cover
+presentation, initialization, properties and callbacks. CoreGraphics now includes
+`CGPDFPage.getBoxRect(_:)` with exact module authority. Separate compiler tests
+check CF parameter identity, a C receiver in the middle, ambiguous receiver
+rejection, and parameter-projection v1/v2 compatibility. Subprocess traces count
+actual invocations across their grouped operation kinds; warm reads add none.
+
+These are one cold/warm pair per module, not percentiles. “Cold” means a fresh
+Helix content cache; OS and Xcode module caches were not cleared. The API surface
+and toolchain differ from historical runs above, so this is not a controlled
+speedup comparison or a prediction for 104 modules. Module-parallel scheduling,
+failed-module continuation and resume are tested separately with real small
+modules. No device activation or save-to-screen latency was measured.
+
+```sh
+HELIX_RUN_SDK_CATALOG_INTEGRATION=1 \
+HELIX_SDK_CATALOG_REPORT_DIR=/absolute/path/outside/the/repository \
+swift test --scratch-path .build/validation --no-parallel --filter buildsUIKitCatalogWhenRequested
+```

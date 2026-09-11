@@ -8,7 +8,8 @@ enum ImportedNominalIdentity {
     /// concrete nominal. Do not discard unrelated Unicode identifier tokens.
     static func isConcreteSpelling(_ spelling: String) -> Bool {
         if spelling.contains("@opened(") || spelling.contains("<<error type>>")
-            || spelling.contains("(unknown context at ") { return false }
+            || spelling.contains("(unknown context at ")
+            || spelling.contains("related decl '") { return false }
         let tokens = spelling.split { !$0.isLetter && !$0.isNumber && $0 != "_" }
         return !tokens.contains { token in
             if token == "Self" { return true }
@@ -85,7 +86,7 @@ enum ImportedNominalIdentity {
                 + "declaringModule=\(use.objectiveCModuleName ?? "unproven"), "
                 + "catalogModule=\(use.nativeModuleName ?? "none"), "
                 + "runtime=\(use.objectiveCRuntimeName ?? "unproven"), "
-                + "representation=\(use.kind.rawValue)/\(use.representation.rawValue), "
+                + "representation=\(use.kind.rawValue)/\(use.representation.rawValue)/\(use.representationEvidence.rawValue), "
                 + "MainActor=\(use.requiresMainActor)/\(use.isolationEvidence.rawValue), "
                 + "aliases=\(Array(Set(use.aliases)).sorted())"
             // Keep every distinct conflicting fact, with one deterministic

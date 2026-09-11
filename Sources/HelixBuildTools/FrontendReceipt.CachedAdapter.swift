@@ -127,7 +127,7 @@ public struct CachedAdapter: Sendable {
             )
         }
         let sourceImports = performance.measure("frontend_cache.scan_imports") {
-            FrontendReceipt.SourceImports.scan(contents: states.map(\.contents))
+            FrontendReceipt.SourceImports.scan(contents: states.map(\.contents), targetTriple: request.metadata.frontendInvocation.targetTriple)
         }
         let toolchain = try precomputedToolchain
             ?? performance.measure("frontend_cache.toolchain_identity") {

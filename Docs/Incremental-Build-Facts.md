@@ -157,7 +157,7 @@ locked so duplicate workers remain harmless.
 Cold whole-module probing deliberately bypasses the per-candidate filesystem
 cache: the enclosing Catalog key already names the exact module, while one
 lock/manifest lookup per public API would add linear I/O without useful reuse.
-Its independent 256-entry top-level batches use at most four workers. Results
+Its independent 256-entry top-level batches use the caller’s probe budget (default four, configurable from one to eight); the CLI coordinates it with module concurrency. Results
 and failures are joined in batch order, so concurrency changes elapsed time but
 not bytes, diagnostics, metrics, or cache identity. Source-rooted expansion
 continues to use the fine-grained probe cache because ordinary source edits can
@@ -393,10 +393,11 @@ interrupted job manually, run from its captured project working directory:
 helix xcode catalog-prewarm --job "/absolute/path/to/job.json" --max-modules 1
 ```
 
-`--max-modules` accepts 1 through 256 and limits newly generated modules per
-invocation. Verified cache hits do not consume the budget. A pause returns
-success and keeps the job; repeating the command resumes from completed module
-caches. Completion retires the job. Interrupting a compiler probe may require
+`--max-modules` accepts 1 through 256 and limits cold module attempts, including
+failures. Verified cache hits do not consume the budget. A pause without failures
+returns success and keeps the job; failures return nonzero. Repeating the command
+revalidates completed module caches and prioritizes unattempted modules before
+previous failures. Only complete success retires the job. Interrupting a compiler probe may require
 restarting that unfinished module. A concurrently running worker holds the job
 lock, and a second invocation reports that it is already running. Changed
 compiler, SDK, or module inputs require a fresh Prepare job.
@@ -410,7 +411,7 @@ depends on each module's actual API surface: multiplying UIKit's historical
 230-second measurement by the number of imports is not a measured estimate.
 
 The compiler proxy now retains `FrontendAttempt.hlxswiftc` before compilation
-for `helix xcode preflight` (default `inputs,typed-ast`). Only a successful compile
+for `helix xcode preflight` (default `inputs,typed-ast,catalogs`). Only a successful compile
 updates `FrontendInvocation.hlxswiftc` and invokes post-compile work. Input-only
 preflight does not emit AST/SIL or scan the dependency cache. Typed checks still
 require available compiler dependencies, and selected-check success does not
@@ -427,3 +428,9 @@ remain uncached rather than following potentially cyclic trees. The private
 Catalog pipeline identity advances for concrete nominal filtering and explicit
 Symbol Graph working-directory propagation; public Catalog wire rules and
 runtime ABI are unchanged. See [capture bootstrap](Large-Project-Integration.md#bootstrap-catalogs-from-a-compiler-capture).
+
+### Header maps and exact foreign facts
+
+Header-map identity enumerates occupied buckets and fingerprints every referenced header. `NumEntries` is not required to equal occupied buckets: Xcode can count replaced mappings. Power-of-two bucket count, bucket/string bounds, terminated UTF-8 strings and unique case-insensitive keys remain validated; conflicts report bucket/key/path evidence. Swift member references such as `.import` (including intervening comments) do not nominate modules. With a captured target triple, exact `os(...)` and `!os(...)` conditions exclude proven inactive branches. Complex or unknown conditions retain all possible imports; compiler-module coverage remains independently checked.
+
+Exact Clang typedef recognition validates the complete length-prefixed nominal and rejects nested/container/function spellings and overflowing lengths. An enum observation may refine a value fallback only when both observations prove the same raw-representable representation; reference/value conflicts remain errors. The transform and compiler-probe pipeline identities advance for corrected C member parameter evidence and projection v2, so old contaminated facts cannot be reused.

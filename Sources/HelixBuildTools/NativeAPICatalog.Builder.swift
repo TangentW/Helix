@@ -40,6 +40,7 @@ public struct BuildMetrics: Hashable, Sendable {
     public var probeCacheHitCount: UInt64
     public var probeCacheMissCount: UInt64
     public var probeAttemptCount: UInt64
+    public var rejectionReasons: [String] = []
 }
 
 public struct BuildOutput: Sendable {
@@ -67,6 +68,7 @@ public struct Builder: Sendable {
         var candidateCount: UInt64
         var entryCount: UInt64
         var unpublishedCandidateCount: UInt64
+        var rejectionReasons: [String] = []
     }
 
     private struct CachePayload: Codable, Sendable {
@@ -84,18 +86,24 @@ public struct Builder: Sendable {
 
     public var cache: BuildCache.Store
     public var invocationObserver: SwiftFrontend.InvocationObserver?
+    public var maximumProbeWorkers: Int
 
     public init(
         cache: BuildCache.Store,
-        invocationObserver: SwiftFrontend.InvocationObserver? = nil
+        invocationObserver: SwiftFrontend.InvocationObserver? = nil,
+        maximumProbeWorkers: Int = 4
     ) {
         self.cache = cache
         self.invocationObserver = invocationObserver
+        self.maximumProbeWorkers = maximumProbeWorkers
     }
 
     public func build(
         _ request: NativeAPICatalog.BuildRequest
     ) throws -> NativeAPICatalog.BuildOutput {
+        guard (1...8).contains(maximumProbeWorkers) else {
+            throw NativeAPICatalog.Error.invalid("probe worker budget must be in 1...8")
+        }
         let performance = BuildPerformance.Recorder()
         let prepared = try performance.measure(
             "native_api_catalog.prepare"
@@ -135,7 +143,8 @@ public struct Builder: Sendable {
                         invocation: prepared.invocation.execution,
                         cache: cache,
                         compilerFingerprint: prepared.toolchain.fingerprint,
-                        moduleInputHash: prepared.compilerInputHash
+                        moduleInputHash: prepared.compilerInputHash,
+                        maximumProbeWorkers: maximumProbeWorkers
                     )
                 }
                 let measuredProjection = NativeAPICatalog.CompilerProjection(
@@ -205,7 +214,8 @@ public struct Builder: Sendable {
                             ),
                             candidateCount: surface.metrics.candidateCount,
                             entryCount: UInt64(entries.count),
-                            unpublishedCandidateCount: unpublished
+                            unpublishedCandidateCount: unpublished,
+                            rejectionReasons: Array(Set(surface.metrics.rejectionReasons)).sorted()
                         )
                     ))
                 }
@@ -383,7 +393,8 @@ public struct Builder: Sendable {
                     surfaceMetrics?.symbolGraphCacheMissCount ?? 0,
                 probeCacheHitCount: surfaceMetrics?.probeCacheHitCount ?? 0,
                 probeCacheMissCount: surfaceMetrics?.probeCacheMissCount ?? 0,
-                probeAttemptCount: surfaceMetrics?.probeAttemptCount ?? 0
+                probeAttemptCount: surfaceMetrics?.probeAttemptCount ?? 0,
+                rejectionReasons: payload.metrics.rejectionReasons
             ),
             performance: performance
         )
@@ -573,6 +584,9 @@ public struct Builder: Sendable {
               payload.metrics.entryCount
                 == UInt64(payload.document.entries.count),
               payload.metrics.candidateCount >= payload.metrics.entryCount,
+              payload.metrics.rejectionReasons == Array(Set(payload.metrics.rejectionReasons)).sorted(),
+              payload.metrics.rejectionReasons.count <= 250_000,
+              payload.metrics.rejectionReasons.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 65_536 }),
               payload.metrics.unpublishedCandidateCount
                 == payload.metrics.candidateCount - payload.metrics.entryCount
         else {

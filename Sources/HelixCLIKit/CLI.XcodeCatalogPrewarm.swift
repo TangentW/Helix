@@ -101,9 +101,11 @@ extension CLI.Application {
             path: context.environment.sdkRootURL.standardizedFileURL.path,
             buildVersion: context.environment.sdkBuild
         )
+        let budget = NativeAPICatalog.WorkBudget()
         let builder = NativeAPICatalog.Builder(
             cache: cache,
-            invocationObserver: performance.subprocessObserver
+            invocationObserver: performance.subprocessObserver,
+            maximumProbeWorkers: budget.probesPerModule(concurrentModules: min(2, budget.moduleWorkers))
         )
         var snapshots: [NativeAPICatalog.Snapshot] = []
         var prewarmRequests: [NativeAPICatalog.BuildRequest] = []
@@ -147,7 +149,7 @@ extension CLI.Application {
             guard !pending.isEmpty else { break }
             var discoveredModules = Set<String>()
             let isLiveReload = cachedOnly || context.profile.workflow == .liveReload
-            let parallelism = isLiveReload ? 4 : 2
+            let parallelism = isLiveReload ? 4 : min(2, budget.moduleWorkers)
             var resolved: [(NativeAPICatalog.BuildRequest,
                             NativeAPICatalog.BuildOutput?)] = []
             for start in stride(from: 0, to: pending.count, by: parallelism) {
@@ -292,16 +294,16 @@ extension CLI.Application {
     ) throws -> CLI.Result {
         if arguments == ["--help"] {
             return .init(exitCode: 0, standardOutput: """
-            Usage: helix xcode catalog-prewarm --job <path> [--max-modules <1...256>]
+            Usage: helix xcode catalog-prewarm --job <path> [--max-modules <1...256>] [--jobs <1...8>] [--json]
                or: helix xcode catalog-prewarm --plan <path> --profile <id> --capture <path>
-                     [--plan-only] [--max-modules <1...256>] [--json]
+                     [--plan-only] [--max-modules <1...256>] [--jobs <1...8>] [--json]
 
             Capture mode accepts FrontendAttempt.hlxswiftc and needs no successful
             Prepare, AST or SIL. --plan-only publishes a private resumable job and
-            reads existing Catalogs without cold generation. JSON is for plan-only.
+            reads existing Catalogs without cold generation. JSON also reports worker outcomes.
             All compiler work uses the captured project working directory.
             A module limit pauses
-            after that many cache misses; rerun the same job to resume. Completed
+            after that many cold attempts (including failures); rerun the same job to resume. Completed
             modules are reused and do not consume the limit. Changed build inputs
             require a new capture-driven job. The job is retired only after completion.
 
@@ -309,8 +311,8 @@ extension CLI.Application {
         }
         let options = try CLI.Arguments(
             arguments,
-            valueOptions: ["job", "max-modules"],
-            flagOptions: []
+            valueOptions: ["job", "max-modules", "jobs"],
+            flagOptions: ["json"]
         )
         guard options.positionals.isEmpty else {
             throw CLI.Error.usage(
@@ -326,6 +328,14 @@ extension CLI.Application {
         } else {
             maximumModules = 256
         }
+        let requestedJobs: Int
+        if let value = try options.value("jobs") {
+            guard let count = Int(value), (1...8).contains(count) else {
+                throw CLI.Error.usage("--jobs must be an integer in 1...8")
+            }
+            requestedJobs = count
+        } else { requestedJobs = 4 }
+        let workBudget = NativeAPICatalog.WorkBudget(requestedModules: requestedJobs)
         let jobURL = files.resolve(try options.require("job"))
         let descriptor = Darwin.open(
             jobURL.path,
@@ -420,66 +430,136 @@ extension CLI.Application {
                 "Catalog prewarm requests no longer match their compiler inputs"
             )
         }
-        let initialRequestModules = Set(
-            job.requests.map { $0.identity.moduleName }
-        )
-        var processedModules = Set(
-            initialPlan.requests.map { $0.identity.moduleName }
-        ).subtracting(initialRequestModules)
-        var requestedModules = Set(try NativeAPICatalog.Planner.catalogModules(
-            job.planRequest.importedModules,
-            excluding: job.planRequest.metadata.frontendInvocation.moduleName
-        ))
-        var pending = job.requests
-        var completedCount = 0
-        var generatedCount = 0
-        while !pending.isEmpty {
-            var referencedModules = Set<String>()
-            for request in pending {
-                let output: NativeAPICatalog.BuildOutput
-                if let cached = try builder.cached(request) {
-                    output = cached
-                } else {
-                    guard generatedCount < maximumModules else {
-                        return .init(exitCode: 0, standardOutput:
-                            "Catalog prewarm paused: \(generatedCount) generated, "
-                            + "\(completedCount - generatedCount) cached; "
-                            + "rerun --job \(jobURL.path) to resume\n")
-                    }
-                    output = try builder.build(request)
-                    if output.metrics.cacheSource != .hit { generatedCount += 1 }
-                }
-                processedModules.insert(request.identity.moduleName)
-                completedCount += 1
-                referencedModules.formUnion(
-                    output.snapshot.referencedModules
-                )
-            }
-            let previousCount = requestedModules.count
-            requestedModules = Set(try NativeAPICatalog.Planner.catalogModules(
-                Array(requestedModules.union(referencedModules)),
-                excluding: job.planRequest.metadata.frontendInvocation.moduleName
-            ))
-            guard requestedModules.count != previousCount else { break }
-            var followupRequest = job.planRequest
-            followupRequest.importedModules = requestedModules.subtracting(processedModules).sorted()
-            let followup = try NativeAPICatalog.Planner().plan(
-                followupRequest
-            )
-            guard followup.unresolvedModules.isEmpty else {
-                throw CLI.Error.input(
-                    "Catalog prewarm cannot resolve referenced modules: "
-                        + followup.unresolvedModules.joined(separator: ", ")
-                )
-            }
-            pending = followup.requests.filter {
-                !processedModules.contains($0.identity.moduleName)
+        let reportDirectory = cache.rootURL.appendingPathComponent("PrewarmReports", isDirectory: true)
+        try preparePrivateCatalogDirectory(reportDirectory)
+        let jobDigest = Core.Digest.sha256(data)
+        let reportURL = reportDirectory.appendingPathComponent(jobDigest.hex + ".json")
+        var previouslyFailed = Set<String>()
+        if FileManager.default.fileExists(atPath: reportURL.path) {
+            let previousBytes = try readPrivateCatalogJob(reportURL, maximumBytes: 64 * 1_024 * 1_024)
+            // The report only prioritizes retries; corrupt diagnostic JSON
+            // must not invalidate compiler artifacts or prevent a fresh run.
+            if let previous = try? JSONDecoder().decode(CLI.CatalogPrewarmReport.self, from: previousBytes),
+               previous.schemaVersion == 1, previous.jobDigest == jobDigest {
+                previouslyFailed = Set(previous.modules.filter { $0.status == .failed }.map(\.name))
             }
         }
-        guard initialPlan.unresolvedModules.isEmpty else {
-            throw CLI.Error.input("Catalog prewarm completed available modules but remains blocked for: "
-                + initialPlan.unresolvedModules.joined(separator: ", ")
-                + ". Replan with --plan-only --json for fingerprint reasons.")
+        var records: [String: CLI.CatalogPrewarmReport.Module] = [:]
+        var unresolved = initialPlan.unresolvedReasons
+        for module in initialPlan.unresolvedModules {
+            unresolved[module] = unresolved[module] ?? ["Module fingerprint is unresolved"]
+            records[module] = .init(name: module, status: .unresolved,
+                failure: (unresolved[module] ?? ["Module fingerprint is unresolved"]).joined(separator: "; "))
+        }
+        var report = CLI.CatalogPrewarmReport(jobDigest: jobDigest,
+            startedAtMilliseconds: Int64(Date().timeIntervalSince1970 * 1_000), workBudget: workBudget, modules: [])
+        func saveReport() throws {
+            report.modules = records.values.sorted { $0.name < $1.name }
+            let bytes = try Core.CanonicalJSON.encode(report)
+            guard bytes.count <= 64 * 1_024 * 1_024 else { throw CLI.Error.input("Catalog prewarm report exceeds 64 MiB") }
+            try publishPrivateCatalogJob(bytes, to: reportURL, replacing: true)
+        }
+        func accept(_ request: NativeAPICatalog.BuildRequest, _ output: NativeAPICatalog.BuildOutput,
+                    duration: UInt64, referenced: inout Set<String>) {
+            records[request.identity.moduleName] = .init(name: request.identity.moduleName, output: output, duration: duration)
+            referenced.formUnion(output.snapshot.referencedModules)
+        }
+        var processedModules = Set<String>()
+        var requestedModules = Set(try NativeAPICatalog.Planner.catalogModules(
+            job.planRequest.importedModules,
+            excluding: job.planRequest.metadata.frontendInvocation.moduleName))
+        // Revalidate all current roots: a previously warm artifact may have
+        // been evicted after the immutable job was created.
+        var pending = initialPlan.requests
+        var attemptedMisses = 0
+        var generatedCount = 0
+        while !pending.isEmpty {
+            try Task.checkCancellation()
+            pending.sort {
+                let left = previouslyFailed.contains($0.identity.moduleName)
+                let right = previouslyFailed.contains($1.identity.moduleName)
+                return left == right ? $0.identity.moduleName < $1.identity.moduleName : !left
+            }
+            for request in pending { records[request.identity.moduleName] = .init(name: request.identity.moduleName, status: .pending) }
+            try saveReport()
+            var referencedModules = Set<String>()
+            for start in stride(from: 0, to: pending.count, by: workBudget.moduleWorkers) {
+                try Task.checkCancellation()
+                let wave = Array(pending[start..<min(start + workBudget.moduleWorkers, pending.count)])
+                var cold: [NativeAPICatalog.BuildRequest] = []
+                var readDurations: [String: UInt64] = [:]
+                // Reserve cold attempts in canonical order so a small module
+                // limit cannot select different work depending on thread timing.
+                for request in wave {
+                    let module = request.identity.moduleName
+                    let began = DispatchTime.now().uptimeNanoseconds
+                    do {
+                        if let cached = try builder.cached(request) {
+                            accept(request, cached, duration: (DispatchTime.now().uptimeNanoseconds - began) / 1_000,
+                                referenced: &referencedModules)
+                            processedModules.insert(module)
+                        } else if attemptedMisses < maximumModules {
+                            attemptedMisses += 1
+                            cold.append(request)
+                            readDurations[module] = (DispatchTime.now().uptimeNanoseconds - began) / 1_000
+                        } else { report.paused = true }
+                    } catch {
+                        if error is CancellationError { throw error }
+                        records[module] = .init(name: module, status: .failed,
+                            duration: (DispatchTime.now().uptimeNanoseconds - began) / 1_000,
+                            failure: "Cache read: \(error)")
+                        processedModules.insert(module)
+                    }
+                }
+                let waveBuilder = NativeAPICatalog.Builder(cache: cache,
+                    maximumProbeWorkers: workBudget.probesPerModule(concurrentModules: max(1, cold.count)))
+                let outcomes = CLI.CatalogPrewarmBatch.run(cold, build: waveBuilder.build)
+                for (request, outcome) in zip(cold, outcomes) {
+                    let module = request.identity.moduleName
+                    let duration = outcome.durationMicroseconds + (readDurations[module] ?? 0)
+                    if let output = outcome.output {
+                        accept(request, output, duration: duration, referenced: &referencedModules)
+                        if output.metrics.cacheSource != .hit { generatedCount += 1 }
+                    } else {
+                        records[module] = .init(name: module, status: .failed, duration: duration,
+                            failure: "Catalog build: " + (outcome.failure ?? "worker produced no result"))
+                    }
+                    processedModules.insert(module)
+                }
+                try saveReport()
+                if outcomes.contains(where: \.cancelled) { throw CancellationError() }
+            }
+            requestedModules = Set(try NativeAPICatalog.Planner.catalogModules(
+                Array(requestedModules.union(referencedModules)),
+                excluding: job.planRequest.metadata.frontendInvocation.moduleName))
+            var followupRequest = job.planRequest
+            followupRequest.importedModules = requestedModules.subtracting(processedModules).subtracting(unresolved.keys).sorted()
+            let followup = try NativeAPICatalog.Planner().plan(followupRequest)
+            for module in followup.unresolvedModules {
+                let reasons = followup.unresolvedReasons[module] ?? ["Module fingerprint is unresolved"]
+                unresolved[module] = reasons
+                records[module] = .init(name: module, status: .unresolved, failure: reasons.joined(separator: "; "))
+            }
+            pending = followup.requests.filter { !processedModules.contains($0.identity.moduleName) }
+            for request in pending { records[request.identity.moduleName] = .init(name: request.identity.moduleName, status: .pending) }
+            if report.paused { break }
+        }
+        let failures = records.values.filter { $0.status == .failed || $0.status == .unresolved }.sorted { $0.name < $1.name }
+        let completedCount = records.values.filter { $0.status == .cached || $0.status == .generated }.count
+        report.complete = !report.paused && failures.isEmpty
+        try saveReport()
+        let details = report.modules.map {
+            "\($0.name): \($0.status.rawValue), \($0.durationMicroseconds) us"
+                + ($0.failure.map { "; \($0)" } ?? "")
+        }.joined(separator: "\n") + "\nReport: \(reportURL.path)\n"
+        if !report.complete {
+            let summary = report.paused
+                ? "Catalog prewarm paused: \(generatedCount) generated, \(completedCount - generatedCount) cached; \(attemptedMisses) cold attempts"
+                : "Catalog prewarm incomplete: \(completedCount) completed, \(failures.count) failed or unresolved"
+            return .init(exitCode: failures.isEmpty ? 0 : 1,
+                standardOutput: options.hasFlag("json")
+                    ? String(decoding: try Core.CanonicalJSON.encode(report), as: UTF8.self) + "\n"
+                    : summary + "; rerun --job \(jobURL.path) to resume\n" + details)
         }
         do {
             try FileManager.default.removeItem(at: jobURL)
@@ -493,7 +573,9 @@ extension CLI.Application {
         }
         return .init(
             exitCode: 0,
-            standardOutput: "Prewarmed \(completedCount) Native API Catalog module(s)\n"
+            standardOutput: options.hasFlag("json")
+                ? String(decoding: try Core.CanonicalJSON.encode(report), as: UTF8.self) + "\n"
+                : "Prewarmed \(completedCount) Native API Catalog module(s)\n" + details
         )
     }
 
@@ -540,7 +622,8 @@ extension CLI.Application {
 
     private func publishPrivateCatalogJob(
         _ data: Data,
-        to url: URL
+        to url: URL,
+        replacing: Bool = false
     ) throws {
         let temporaryURL = url.deletingLastPathComponent().appendingPathComponent(
             ".\(url.lastPathComponent).\(UUID().uuidString).tmp"
@@ -584,6 +667,18 @@ extension CLI.Application {
                 "cannot sync Catalog prewarm job at \(temporaryURL.path)"
             )
         }
+        if replacing {
+            var existing = Darwin.stat()
+            if lstat(url.path, &existing) == 0 {
+                _ = try readPrivateCatalogJob(url, maximumBytes: 64 * 1_024 * 1_024)
+            } else if errno != ENOENT {
+                throw CLI.Error.input("cannot inspect Catalog prewarm report at \(url.path)")
+            }
+            guard Darwin.rename(temporaryURL.path, url.path) == 0 else {
+                throw CLI.Error.input("cannot publish Catalog prewarm report at \(url.path)")
+            }
+            return
+        }
         guard Darwin.link(temporaryURL.path, url.path) == 0 else {
             if errno == EEXIST {
                 let existing = try readPrivateCatalogJob(url)
@@ -600,7 +695,7 @@ extension CLI.Application {
         }
     }
 
-    private func readPrivateCatalogJob(_ url: URL) throws -> Data {
+    private func readPrivateCatalogJob(_ url: URL, maximumBytes: Int = NativeAPICatalog.PrewarmJobCodec.maximumDocumentBytes) throws -> Data {
         let descriptor = Darwin.open(
             url.path,
             O_RDONLY | O_CLOEXEC | O_NOFOLLOW
@@ -622,7 +717,7 @@ extension CLI.Application {
               information.st_mode & 0o177 == 0,
               information.st_size > 0,
               information.st_size
-                <= NativeAPICatalog.PrewarmJobCodec.maximumDocumentBytes
+                <= maximumBytes
         else {
             throw CLI.Error.input(
                 "Catalog prewarm job is not an owner-only bounded regular file"

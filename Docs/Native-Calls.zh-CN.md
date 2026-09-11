@@ -45,7 +45,7 @@ Typed AST 与 SIL 证据会进入和业务模块相同的原生调用分类器�
 只出现在参数或返回值里的原生类型也会保留在一份不对外暴露的 compiler projection
 中，避免后续绑定项目时因为它不在 owner 列表里而丢失。
 
-互相独立的候选每 256 条组成一批，最多由 4 个 worker 并行探测，结果仍按原始批次顺序
+互相独立的候选每 256 条组成一批，使用可配置的 1...8 个 worker（默认 4，CLI 与模块并发统筹），结果仍按原始批次顺序
 合并。失败递归拆分只发生在本批次，所有 worker join 后再合并指标，并确定性地返回最早
 批次的错误。多个逻辑 API 即使复用同一个泛型 SIL 实现，Catalog 仍会依据精确 owner、
 USR 与签名分别保存；反过来，由其他 Swift 模块声明的 protocol 默认实现或合成操作不会
@@ -165,3 +165,31 @@ Pack source 与 Pack object 是两层独立的内容寻址事实。source identi
 当前只认证 Simulator 与 macOS 的按需 Swift Adapter；物理 iOS 会明确拒绝并要求重新构建 App，直到开发签名与加载矩阵有独立证据。开发传输也不再接受裸 HLBC：即使没有 Adapter，仍使用版本 1 envelope。重连 identity 会报告精确的 `NativeCallKey` 到 `NativeImportID` 映射、已发布开发 `TypeID` 清单，以及已映射 Adapter 的资源总量。Hub 必须保留已经写进活动字节码的紧凑 ID，才能安全复用同一 session Registry，而不重复编译已经激活的 Adapter。协议边界会拒绝重复 Key、重复 ID、重复 type、非规范排序，以及没有活动 HLBC generation 却携带原生清单的身份。
 
 产品、协议、Catalog、Archive 和 Bytecode 版本全部保持为 1。
+
+### C 成员参数顺序与投影兼容
+
+C 函数导入为 Swift 成员后，SIL 保留原始 C 参数顺序，参见 [SE-0044](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0044-import-as-member.md)。适配器使用精确 SIL symbol、匹配的 `[clang Owner.member]` 声明与物理类型定位唯一 receiver，其他参数保留 C 声明顺序。receiver 的拼写不能用于普通参数。声明缺失、证据冲突或多个可能的 receiver 位置，在部分索引下形成可定位排除，在严格索引下报错；含多个 owner 同类型参数的 C 成员目前需要更强的编译器来源证据，不猜测位置。
+
+`NativeImportParameterProjection.argumentOrderVersion` 明确区分契约：缺省字段是 v1，仍要求选中索引升序；版本 2 允许一一对应的重排，包括 `[1, 0]` 与 `[0, 2, 1]`。索引边界、唯一性、完整覆盖与默认值编译器证据继续校验，未知版本拒绝。既有 v1 编码与 identity 不变，旧校验器会拒绝非升序 v2 投影。Shell 与 patch 工具需使用一致的投影语义，并在 transform/Catalog pipeline identity 更新后重建事实。这是参数投影契约的扩展，不代表新增设备 ABI 或全部 C API 覆盖。
+
+### 候选拒绝与布局证据
+
+新测量结果必须在写入缓存前匹配提名声明。继承的零参数构造不能把祖先 USR 归属到子类
+Catalog。拒绝原因保留预期身份、实测 owner/USR/签名和源码来源，其他独立候选继续处理。
+明确的自定义 actor 隔离、无效 `#selector` 编译诊断属于语义拒绝；未知编译器错误、崩溃、
+无效 Symbol Graph 和新产生的损坏事实仍然失败。拒绝探针不发布类型或操作事实，负缓存
+命中保留相同原因。已有损坏缓存仍须验证、隔离并重建，不能 catch 后继续发布。
+
+编译器的 `related decl` 显示占位符不是具体 nominal 名称；有独立证据的 Objective-C
+runtime 身份仍保留。Clang typedef 观察显式标记布局证据：只有唯一声明模块 Catalog
+包含完整观察别名集合及精确 Clang alias，才能细化其 opaque fallback，因此也适用于
+没有 Objective-C runtime class 的 CF 引用。真正的 nominal reference/value 冲突、多个
+竞争权威或歧义别名仍然拒绝。私有事实和拒绝 payload 的变化推进缓存 pipeline identity。
+
+Clang USR 不编码 Swift 模块名。已验证的 Catalog compiler projection 将精确声明到
+模块的映射传给 adapter 发布阶段，使 `CGPDFPage.getBoxRect(_:)` 等已测量 C 成员在
+需要 Swift adapter 时保留模块归属。仅有源码观察不会获得这项权威，也不能用未限定的
+显示名称补出模块身份。
+
+探针占位 TypeID 仅对应已验证的 canonical nominal。多个类型共享的短别名保持未解析，
+输入顺序不能选择类型；占位符不建立持久化声明身份。

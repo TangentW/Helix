@@ -35,7 +35,7 @@ public struct NativeSurfaceResolver: Sendable {
                 url: URL(fileURLWithPath: $0.absolutePath)
             )
         }.sorted { $0.logicalPath < $1.logicalPath }
-        let imports = try FrontendReceipt.SourceImports.scan(sources: sources)
+        let imports = try FrontendReceipt.SourceImports.scan(sources: sources, targetTriple: receipt.metadata.frontendInvocation.targetTriple)
         let workingDirectory = sources[0].url.deletingLastPathComponent()
             .standardizedFileURL
         let toolchain = try ReleaseCompiler.Driver().toolchainIdentity(

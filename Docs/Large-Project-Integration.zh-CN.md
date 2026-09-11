@@ -335,7 +335,7 @@ MiB/GiB 按 1,024 计算。
 | 显式扫描输入 | Module map 8 MiB、VFS overlay 16 MiB、bridging header/header map 64 MiB、其他显式编译器输入 512 MiB |
 | Planning inventory | 单次同步 plan 最多保留 250,000 个根/目录项记录，不跨调用保存目录清单 |
 | Catalog 闭包 | 含依赖扩展最多 256 模块 |
-| Native API Catalog | 每模块 250,000 entries、编码文档 128 MiB；每 producer 最多 4 个 frontend probe worker，每批 256 候选 |
+| Native API Catalog | 每模块 250,000 entries、编码文档 128 MiB；每 producer 可配置 1...8 个 frontend probe worker，与 CLI 模块并发统筹，每批 256 候选 |
 | 显式 NativeImport policy | 与模块 Catalog 不同：1,024 types、4,096 candidates、文档 8 MiB |
 | Host Plan | 128 features、256 profiles、文档 1 MiB |
 | Receipt/缓存 | Shell receipt 32 MiB、模块 frontend 缓存 payload 64 MiB、compiler checkpoint 每阶段 256 MiB；缓存 payload 超限时不存储 |
@@ -345,7 +345,7 @@ module cache 放进源码头文件目录下，会扩大扫描输入并可能禁�
 先检查 `frontend_cache.compiler_inputs_incomplete_count`。
 
 当前没有宿主进程 RSS 硬预算，也没有缓存磁盘总配额。AST/SIL 输出和解析结构会进入内存。
-4 workers 是每个 producer 的边界，不是整机信号量。失败 checkpoint 可能保留磁盘空间，
+CLI 按 CPU 和物理内存估算并统筹模块/探针 worker，但不是跨进程的整机信号量。失败 checkpoint 可能保留磁盘空间，
 重置私有缓存前应停止使用它的构建进程。真机原生激活、商业工程保存到屏幕延迟，以及其
 完整冷 Catalog 成本，仍须对应工程实测；宿主交叉编译不能证明这些路径。
 
@@ -365,7 +365,7 @@ helix xcode preflight --plan .helix/xcode/HostPlan.json --profile live \
   --stages inputs --json
 ```
 
-省略 `--stages` 执行 `inputs,typed-ast`；选择 `source-mappings` 可进一步检查 SIL
+省略 `--stages` 执行 `inputs,typed-ast,catalogs`：AST 之前检查编译器输入指纹，随后盘点模块和 Catalog 可用性。unresolved 模块带来源报错，pending 缓存明确列出，不代表 API 覆盖。显式 `--stages inputs` 保留轻量行为；选择 `source-mappings` 可进一步检查 SIL
 身份映射并汇总声明排除。`inputs` 校验所选 compiler/SDK、调用参数、源码集合及字节，
 不指纹化依赖缓存、不生成 AST/SIL。通过只代表输入检查成功，不代表类型检查或运行时
 覆盖。typed 检查仍需要生成的依赖模块、头文件和插件。Xcode 至少需要运行到 target
@@ -379,7 +379,7 @@ SIL 元数据扫描先按记录前缀筛选，再分配字符串和执行正则�
 扫描，未转义路径不再逐字节解码。scope 继承改为迭代遍历，并记忆没有位置的结果。
 两种 SIL 重用选定的 AST 成员清单进行有界符号分类。具体测量边界见
 [解析器对照](Build-Performance-Baseline.zh-CN.md#sil-调试元数据扫描)。完整模块编译输入
-仍参与失效判断，不声称支持按文件 WMO 复用或并行 Swift frontend 发射。
+仍参与失效判断，不声称支持按文件 WMO 复用或同一源码模块的 identity/semantic SIL 并行发射。
 
 ## 团队 runtime 版本与卸载
 
@@ -450,7 +450,7 @@ helix xcode catalog-prewarm --plan .helix/xcode/HostPlan.json --profile live \
 依赖指纹，不运行消费模块的 AST/SIL，不生成 Shell，不注册 live session。第一条命令
 写入私有可续跑任务，返回 schema 1 JSON：`cachedModules`、`pendingModules`、
 `unresolvedModules`、`unresolvedReasons`、`jobPath`。`--json` 必须搭配 `--plan-only`。
-省略 `--plan-only` 时在前台执行冷生成，沿用 `--job` 的 1...256 模块预算，缓存命中不占
+省略 `--plan-only` 时在前台执行冷生成，沿用 `--job` 的 1...256 次冷模块尝试预算，缓存命中不占
 冷生成预算。续跑不要求终端位于工程目录，compiler 与 Symbol Graph 子进程使用任务
 中验证过的工作目录。依赖字节改变后必须重新规划，旧任务会被拒绝。
 
@@ -471,3 +471,26 @@ compiler proxy 与 driver 设置应只作用于接入的 target/configuration。
 `xcodebuild SWIFT_USE_INTEGRATED_DRIVER=NO` 还会影响 package target；Xcode 26.6
 夹具在该设置下复现了 package-access 声明缺少 `-package-name` 的错误。混合工程探针
 已改为只覆盖 App 的设置，保留依赖包正常的 driver 行为。
+
+### 编译输入与 C 成员回归
+
+大型工程回归覆盖实际 Clang 对膨胀 header-map 计数的接受、import 关键字成员扫描、CoreGraphics/CoreFoundation 参数身份、receiver 位于中间的 C 成员、重复 receiver 类型歧义，以及投影版本兼容。这些是当前安装 SDK 下的编译器集成验证，不是商业 App 或设备激活验收。C 成员契约和保守排除详见 [Native Calls](Native-Calls.zh-CN.md#c-成员参数顺序与投影兼容)。
+
+## 预热预算与模块结果
+
+capture 驱动和 `--job` 执行均支持 `--jobs 1...8` 限制并发模块，默认 4。有效编译器预算
+同时受活跃 CPU 数、8 个 worker 上限及内存估算约束：预留 4 GiB 后每个 compiler 按
+2 GiB 估算，最少 1 个。每轮模块共享此预算分配探针 worker。它约束单次 CLI 调用，
+不限制所有 Helix 进程的总并发，也不是峰值 RSS 保证。
+
+单个模块失败后继续处理其他独立模块。worker 每轮将 schema 1 私有报告原子写入
+`<cache-root>/PrewarmReports/<job-SHA256>.json`，记录预算、完成/暂停状态、模块状态
+（`pending`、`cached`、`generated`、`failed`、`unresolved`）、耗时微秒、候选/entry/probe
+计数、缓存命中/未命中及拒绝/失败原因。`--job ... --json` 直接输出该报告。损坏的诊断
+JSON 可重建，符号链接或不安全权限仍拒绝。报告仅辅助重试排序，不构成 Catalog 权威。
+
+失败/unresolved 返回非零并保留任务，单纯预算暂停返回零并保留任务。下次优先处理
+尚未尝试的模块，再处理上次失败。已完成 artifact 重新校验，包括创建 job 时已经缓存
+的根模块；compiler/SDK/input 变化需新建任务。无效 Symbol Graph 不会变成伪造的空
+Catalog。依赖闭包仍限制 256 个模块；本轮不新增团队跨机器 Catalog 包，也不宣称完成
+商业工程或真机激活验收。

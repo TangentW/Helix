@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import HelixCompiler
 import HelixCore
 import Testing
 @testable import HelixBuildTools
@@ -650,6 +651,58 @@ struct BuildCacheStore {
         #expect(changed.contentHash != first.contentHash)
     }
 
+    @Test("Header map declared entry counts are hints; bucket and string bounds remain required")
+    func acceptsHeaderMapEntryHints() throws {
+        let root = URL(fileURLWithPath: "/tmp/helix-header-map-hints")
+        let original = headerMap(key: "Mapped.h", prefix: root.path + "/", suffix: "Mapped.h")
+        let expected = try BuildCache.CompilerInputs.ExternalReferences.headerMapManifest(original, relativeTo: root)
+        for count: UInt32 in [0, 2, 40, .max] {
+            var bytes = original
+            for offset in 0..<4 { bytes[12 + offset] = UInt8(truncatingIfNeeded: count >> (8 * offset)) }
+            let actual = try BuildCache.CompilerInputs.ExternalReferences.headerMapManifest(bytes, relativeTo: root)
+            #expect(actual.identityData == expected.identityData)
+            #expect(actual.references.map(\.path) == expected.references.map(\.path))
+        }
+        for length in [0, 23, 47, original.count - 1] {
+            #expect(throws: BuildCache.Error.self) {
+                try BuildCache.CompilerInputs.ExternalReferences.headerMapManifest(original.prefix(length), relativeTo: root)
+            }
+        }
+        for count: UInt32 in [0, 3, .max] {
+            var malformed = original
+            for offset in 0..<4 { malformed[16 + offset] = UInt8(truncatingIfNeeded: count >> (8 * offset)) }
+            #expect(throws: BuildCache.Error.self) {
+                try BuildCache.CompilerInputs.ExternalReferences.headerMapManifest(malformed, relativeTo: root)
+            }
+        }
+        var duplicate = original
+        duplicate.replaceSubrange(36..<48, with: original[24..<36])
+        #expect(throws: BuildCache.Error.self) {
+            try BuildCache.CompilerInputs.ExternalReferences.headerMapManifest(duplicate, relativeTo: root)
+        }
+    }
+
+    @Test("Clang consumes the same populated header-map buckets when NumEntries is inflated")
+    func clangAcceptsHeaderMapEntryHint() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("helix-clang-hmap-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("#define MAPPED_VALUE 42\n".utf8).write(to: root.appendingPathComponent("Mapped.h"))
+        try Data("#include <Mapped.h>\n_Static_assert(MAPPED_VALUE == 42, \"mapping\");\n".utf8).write(to: root.appendingPathComponent("input.c"))
+        var map = headerMap(key: "Mapped.h", prefix: root.path + "/", suffix: "Mapped.h")
+        // Clang's ASCII-lowercase sum * 13 puts Mapped.h in bucket 1 of 2.
+        map.replaceSubrange(36..<48, with: map[24..<36])
+        map.replaceSubrange(24..<36, with: Data(repeating: 0, count: 12))
+        map[12] = 40
+        let mapURL = root.appendingPathComponent("fixture.hmap")
+        try map.write(to: mapURL)
+        let parsed = try BuildCache.CompilerInputs.ExternalReferences.headerMapManifest(map, relativeTo: root)
+        #expect(parsed.references.count == 1)
+        let output = try SwiftFrontend.Driver(compilerURL: URL(fileURLWithPath: "/usr/bin/xcrun"))
+            .run(arguments: ["clang", "-fsyntax-only", "-I", mapURL.path, root.appendingPathComponent("input.c").path])
+        #expect(output.terminationStatus == 0, "\(output.standardError)")
+    }
+
     @Test("Path-bearing Clang manifests are portable without losing mappings")
     func fingerprintsPortableClangManifests() throws {
         let manager = FileManager.default
@@ -865,6 +918,19 @@ struct BuildCacheStore {
 extension BuildToolsTests {
 @Suite("Swift source import discovery")
 struct SourceImports {
+    @Test("Keyword member references are not import declarations")
+    func acceptsImportMembers() {
+        let result = FrontendReceipt.SourceImports.scan(contents: [Data("""
+        import Foundation
+        enum Source { case `import`, manual }
+        func check(_ value: Source) -> Bool { value == .import }
+        let other = Source /* comment */ . /* comment */ import
+        let escaped = Source.`import`
+        """.utf8)])
+        #expect(result.isComplete)
+        #expect(result.modules == ["Foundation"])
+    }
+
     @Test("Common import forms are found outside comments and literals")
     func scansCommonForms() {
         let source = [

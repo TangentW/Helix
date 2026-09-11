@@ -85,7 +85,8 @@ public struct Inspection: Sendable {
         }
         let file = try run(.file, dependencies: [.sourceModules, .functionLocations, .conformances, .typeEnvironment]) {
             try File(parsedFunctions: functions!, parsedConformances: conformances!,
-                rawTypeEnvironment: types!, sourceModules: modules!)
+                rawTypeEnvironment: types!, sourceModules: modules!,
+                clangMembers: ClangMember.inventory(in: text))
         }
         return .init(checks: checks, functions: functions, file: file)
     }

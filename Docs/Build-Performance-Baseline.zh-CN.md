@@ -222,7 +222,7 @@ MainActor 却不在自己的 Symbol Graph 行重复标注，历史 imported glob
 
 因此产品结论很明确：完整 SDK Catalog 只能按 SDK/模块身份做一次后台生成。Catalog-first
 Prepare 必须读取经过验证的命中，或只对源码当前需要的 API 做小范围查询，绝不能把这次
-约 230 秒扫描重新塞回每次本地构建。schema、协议、产物与产品版本全部继续保持 1。
+约 230 秒扫描重新塞回每次本地构建。这些测量对应当时的版本 1 契约；当前参数投影 v2 扩展见 [Native Calls](Native-Calls.zh-CN.md#c-成员参数顺序与投影兼容)。
 
 ## 最终 Hot Patch Release 证据
 
@@ -378,7 +378,7 @@ swift test --scratch-path .build/validation --no-parallel --filter SystemFramewo
 
 这些数据只隔离解析操作，不含编译器发射、AST 发现、Catalog 生成、Bridge 编译、传输
 或激活，不能作为商业工程冷构建或保存到生效延迟。模块共享事实仍按完整编译输入失效，
-不意味着按文件 WMO 缓存或并行 frontend 发射已实现。
+不意味着按文件 WMO 缓存或同一源码模块的 identity/semantic SIL 并行发射已实现。
 
 现有两组 2,500 文件集成基准也在同一 Swift/SDK 下重新运行。标量样板（147,780 字节）
 冷 receipt 9.240 秒、不变命中 0.804 秒、单个函数体修改后 9.256 秒。混合系统框架样板
@@ -401,3 +401,31 @@ Clang 对）在改动前后均产出相同的 4,000 个类型，canonical 输出
 `HELIX_ALIAS_REPORT=/absolute/path/report.json`，配合
 `--filter measuresAliasNormalization` 可重跑较大基准。原始本地证据不放入仓库。
 Identity SIL 与 semantic SIL 仍是用途不同的 compiler 产物，本次优化不混用两者。
+
+## SDK 正确性与预热复测（2026-09-11）
+
+opt-in SDK 测试为每个模块创建全新 Helix 缓存。环境为 Xcode 26.6（17F113）、Swift
+6.3.3、iPhoneSimulator SDK 23F81a、`arm64-apple-ios15.0-simulator`、Swift 语言模式
+5。本机有 10 个活跃 CPU、16 GiB 物理内存，资源估算为单模块 producer 分配 6 个探针
+worker。
+
+| 模块 | 候选数 | 发布 entries | 冷 Catalog | 暖读取 | 探针尝试 | 冷 / 暖编译器相关调用 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| UIKit | 6,184 | 4,257 | 162.482 s | 1.833 s | 2,564 | 6,499 / 0 |
+| CoreGraphics | 627 | 226 | 16.592 s | 0.110 s | 283 | 773 / 0 |
+
+两份文档均验证通过，暖缓存重放内容一致。UIKit 断言覆盖页面呈现、初始化、属性和回调；
+CoreGraphics 包含模块权威正确的 `CGPDFPage.getBoxRect(_:)`。独立编译器回归还检查
+CF 参数身份、C receiver 位于参数中间、歧义 receiver 拒绝及参数投影 v1/v2 兼容。
+子进程 trace 按操作类别汇总真实调用次数，暖读取没有新增调用。
+
+每个模块仅记录一组冷/暖数据，不是分位数。“冷”指新的 Helix 内容缓存，没有清空
+OS/Xcode 模块缓存。API 面和工具链与上面的历史测试不同，不能作为受控提速对照或推算
+104 模块工程耗时。跨模块并发、失败继续和续跑用真实小模块另行测试；未测真机激活或
+保存到页面刷新延迟。
+
+```sh
+HELIX_RUN_SDK_CATALOG_INTEGRATION=1 \
+HELIX_SDK_CATALOG_REPORT_DIR=/absolute/path/outside/the/repository \
+swift test --scratch-path .build/validation --no-parallel --filter buildsUIKitCatalogWhenRequested
+```

@@ -15,8 +15,8 @@ struct CatalogPrewarm {
         func record() { lock.withLock { value += 1 } }
         var count: Int { lock.withLock { value } }
     }
-    @Test("Module budget resumes through cache hits and rejects changed build inputs")
-    func resumesPrewarm() throws {
+    @Test("Module budget resumes through cache hits, failures and changed input checks", arguments: [(false, 1), (true, 1), (false, 2), (true, 2)])
+    func resumesPrewarm(withUnavailableModule: Bool, maximumModules: Int) throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("helix-prewarm-resume-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -26,6 +26,10 @@ struct CatalogPrewarm {
         let toolchain = try ReleaseCompiler.Driver().toolchainIdentity()
         let target = "arm64-apple-ios15.0-simulator"
         for module in ["WarmA", "WarmB"] {
+            if withUnavailableModule, module == "WarmA" {
+                try Data("invalid Swift module bytes".utf8).write(to: directory.appendingPathComponent("WarmA.swiftmodule"))
+                continue
+            }
             let source = directory.appendingPathComponent("\(module).swift")
             try Data("public func increment(_ value: Int) -> Int { value + 1 }\n".utf8).write(to: source)
             let output = try frontend.run(arguments: [
@@ -58,8 +62,36 @@ struct CatalogPrewarm {
         try NativeAPICatalog.PrewarmJobCodec.encode(job).write(to: jobURL)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: jobURL.path)
         let application = CLI.Application()
-        let command = ["--job", jobURL.path, "--max-modules", "1"]
+        let command = ["--job", jobURL.path, "--max-modules", String(maximumModules), "--jobs", "2"]
         let first = try application.prewarmXcodeCatalogs(command)
+        if maximumModules == 2 {
+            #expect(first.exitCode == (withUnavailableModule ? 1 : 0))
+            #expect(FileManager.default.fileExists(atPath: jobURL.path) == withUnavailableModule)
+            let builder = NativeAPICatalog.Builder(cache: cache)
+            #expect((try builder.cached(plan.requests[0]) == nil) == withUnavailableModule)
+            #expect(try builder.cached(plan.requests[1]) != nil)
+            let reportURL = cache.rootURL.appendingPathComponent("PrewarmReports")
+                .appendingPathComponent(Core.Digest.sha256(try NativeAPICatalog.PrewarmJobCodec.encode(job)).hex + ".json")
+            let report = try JSONDecoder().decode(CLI.CatalogPrewarmReport.self, from: Data(contentsOf: reportURL))
+            #expect(!report.paused && report.complete == !withUnavailableModule)
+            #expect(report.modules.map(\.name) == ["WarmA", "WarmB"])
+            #expect(report.modules.map(\.status) == [withUnavailableModule ? .failed : .generated, .generated])
+            #expect(report.workBudget.moduleWorkers <= 2)
+            return
+        }
+        if withUnavailableModule {
+            #expect(first.exitCode == 1 && first.standardOutput.contains("WarmA: failed"))
+            #expect(FileManager.default.fileExists(atPath: jobURL.path))
+            let second = try application.prewarmXcodeCatalogs(command + ["--json"])
+            let progress = try JSONDecoder().decode(CLI.CatalogPrewarmReport.self, from: Data(second.standardOutput.utf8))
+            #expect(progress.paused && !progress.complete)
+            #expect(progress.modules.first { $0.name == "WarmB" }?.status == .generated)
+            let builder = NativeAPICatalog.Builder(cache: cache)
+            #expect(try builder.cached(plan.requests.first { $0.identity.moduleName == "WarmA" }!) == nil)
+            #expect(try builder.cached(plan.requests.first { $0.identity.moduleName == "WarmB" }!) != nil)
+            #expect(FileManager.default.fileExists(atPath: jobURL.path))
+            return
+        }
         #expect(first.standardOutput.contains("paused: 1 generated"))
         #expect(FileManager.default.fileExists(atPath: jobURL.path))
         let builder = NativeAPICatalog.Builder(cache: cache)
@@ -71,10 +103,30 @@ struct CatalogPrewarm {
         #expect(throws: CLI.Error.self) { try application.prewarmXcodeCatalogs(command) }
         #expect(FileManager.default.fileExists(atPath: jobURL.path))
         try original.write(to: moduleURL)
+        let reportURL = cache.rootURL.appendingPathComponent("PrewarmReports")
+            .appendingPathComponent(Core.Digest.sha256(try Data(contentsOf: jobURL)).hex + ".json")
+        let progress = try JSONDecoder().decode(CLI.CatalogPrewarmReport.self, from: Data(contentsOf: reportURL))
+        #expect(progress.paused && !progress.complete)
+        #expect(progress.modules.map(\.status) == [.generated, .pending])
+        let originalReport = try Data(contentsOf: reportURL)
+        let outside = directory.appendingPathComponent("unrelated.json")
+        try Data("do not replace".utf8).write(to: outside)
+        try FileManager.default.removeItem(at: reportURL)
+        try FileManager.default.createSymbolicLink(at: reportURL, withDestinationURL: outside)
+        #expect(throws: CLI.Error.self) { try application.prewarmXcodeCatalogs(command) }
+        #expect(try Data(contentsOf: outside) == Data("do not replace".utf8))
+        #expect(FileManager.default.fileExists(atPath: jobURL.path))
+        try FileManager.default.removeItem(at: reportURL)
+        try originalReport.write(to: reportURL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: reportURL.path)
+        try Data("broken diagnostic JSON".utf8).write(to: reportURL)
         let second = try application.prewarmXcodeCatalogs(command)
         #expect(second.standardOutput.contains("Prewarmed 2"))
         #expect(!FileManager.default.fileExists(atPath: jobURL.path))
         #expect(try builder.cached(plan.requests[1]) != nil)
+        let completed = try JSONDecoder().decode(CLI.CatalogPrewarmReport.self, from: Data(contentsOf: reportURL))
+        #expect(completed.complete && completed.modules.map(\.status) == [.cached, .generated])
+        #expect(completed.modules.allSatisfy { $0.durationMicroseconds > 0 })
     }
 
     @Test("A failed compile capture can bootstrap Catalogs without Prepare or frontend success")
@@ -144,6 +196,11 @@ struct CatalogPrewarm {
         let blockedReport = try JSONDecoder().decode(CLI.XcodeCatalogPlanReport.self, from: Data(blocked.standardOutput.utf8))
         #expect(blockedReport.unresolvedModules == ["WarmA"] && blockedReport.jobPath == nil)
         #expect(blockedReport.unresolvedReasons["WarmA"]?.contains { $0.contains("Consumer.swift") } == true)
+        let preflight = await application.runAsync(["xcode", "preflight", "--plan", planURL.path,
+            "--profile", "live", "--capture", captureURL.path, "--json"])
+        let inputFailure = try JSONDecoder().decode(FrontendReceipt.DiagnosticReport.self, from: Data(preflight.standardOutput.utf8))
+        #expect(!inputFailure.passed && inputFailure.checks.contains { $0.stage == "xcode.compiler_inputs" && $0.status == .failed })
+        #expect(!inputFailure.checks.contains { $0.stage == "frontend.typed_ast" && $0.status == .passed })
     }
 
     @Test("Prewarm limits are bounded and documented")
@@ -152,6 +209,11 @@ struct CatalogPrewarm {
         for value in ["0", "257", "-1", "unknown"] {
             #expect(throws: CLI.Error.self) {
                 try application.prewarmXcodeCatalogs(["--job", "/missing.json", "--max-modules", value])
+            }
+        }
+        for value in ["0", "9", "-1", "unknown"] {
+            #expect(throws: CLI.Error.self) {
+                try application.prewarmXcodeCatalogs(["--job", "/missing.json", "--jobs", value])
             }
         }
         #expect(try application.prewarmXcodeCatalogs(["--help"]).standardOutput.contains("--max-modules"))

@@ -90,7 +90,8 @@ a deterministic Adapter ID derived from the stable call key. Signature-only
 native types are retained in an opaque compiler projection so later project
 binding does not lose a type that was absent from the owner list.
 
-Independent 256-candidate probe batches run with at most four workers and are
+Independent 256-candidate probe batches use a configurable one-to-eight worker
+budget (default four; coordinated across modules by the CLI) and are
 merged in original batch order. Recursive failure isolation remains local to
 one batch, metrics are combined after all workers join, and the earliest batch
 error is reported deterministically. A shared generic SIL implementation does
@@ -428,3 +429,40 @@ types, noncanonical ordering, or native inventory without an active HLBC
 generation are rejected at the protocol boundary.
 
 All product, protocol, catalog, archive, and bytecode versions remain 1.
+
+### C member argument order and projection compatibility
+
+C functions imported as Swift members keep their original C parameter order in SIL (see [SE-0044](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0044-import-as-member.md)). The adapter uses the exact SIL symbol, matching `[clang Owner.member]` declaration and physical type to locate a unique receiver slot; it retains the order of the remaining C arguments. It never assigns a receiver spelling to an unrelated argument. Missing or conflicting declarations, or multiple possible receiver slots, produce a locatable mapping exclusion under partial indexing and an error under strict indexing. Repeated owner-typed C arguments currently require stronger compiler provenance and are not guessed.
+
+`NativeImportParameterProjection.argumentOrderVersion` names the explicit migration: an absent field is v1 and still requires ascending selected indices; version 2 permits a one-to-one permutation, including `[1, 0]` and `[0, 2, 1]`. Slot bounds, uniqueness, complete coverage and compiler-proven defaults remain mandatory. Unknown versions are rejected. Existing v1 encoding and identity remain unchanged; old validators reject nonascending v2 projections. New Shell/patch tooling must use matching projection semantics and regenerate build facts after the transform/Catalog pipeline identity change. This is a parameter-projection contract extension, not a claim of new device ABI or complete C API coverage.
+
+### Candidate rejection and layout evidence
+
+Fresh measurements must match the nominated declaration before becoming cache
+payloads. Inherited zero-argument construction cannot assign an ancestor's USR
+to a subclass Catalog. The rejected candidate retains its expected identity,
+measured owner/USR/signature and source provenance; unrelated candidates proceed.
+Known custom-actor isolation and invalid `#selector` diagnostics are semantic
+rejections. Unknown compiler errors, crashes, invalid Symbol Graphs and corrupt
+fresh facts remain failures. Rejected probes publish no type or operation facts;
+negative cache hits retain the same reason. Corrupt existing cache entries still
+undergo validation and quarantine/rebuild, never catch-and-continue publication.
+
+Compiler `related decl` display placeholders are not concrete nominal names.
+Independently proven Objective-C runtime identity is retained where available.
+Clang typedef observations carry explicit layout-evidence provenance: their
+opaque fallback can be refined by exactly one declaring Catalog containing the
+complete observed alias set and exact Clang alias. This also covers CF references
+without an Objective-C runtime class. An actual nominal reference/value conflict,
+competing authorities, or ambiguous aliases still reject. Cache pipeline identity
+advances for these private facts and rejection payloads.
+
+Clang USRs do not encode a Swift module. A validated Catalog compiler projection
+passes its exact declaration-to-module map into adapter publication, so a
+measured C member such as `CGPDFPage.getBoxRect(_:)` can retain module ownership
+when its ABI requires a Swift adapter. Source-only observations receive no such
+authority; an unqualified display name never supplies the missing module.
+
+Probe placeholder TypeIDs are scoped to validated canonical nominals. Shared
+short aliases remain unresolved; input order cannot choose a nominal. These
+placeholders never establish persisted declaration identity.

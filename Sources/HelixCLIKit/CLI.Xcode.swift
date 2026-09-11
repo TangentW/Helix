@@ -487,7 +487,7 @@ func executeXcodePreflight(_ arguments: [String]) async throws -> CLI.Result {
     let options = try CLI.Arguments(arguments, valueOptions: ["plan", "profile", "capture", "stages"], flagOptions: ["json"])
     try requireNoXcodePositionals(options, command: "xcode preflight")
     var delegated = ["--plan", try options.require("plan"), "--profile", try options.require("profile"),
-        "--capture", try options.require("capture"), "--diagnose", "--stages", try options.value("stages") ?? "inputs,typed-ast"]
+        "--capture", try options.require("capture"), "--diagnose", "--stages", try options.value("stages") ?? "inputs,typed-ast,catalogs"]
     if options.hasFlag("json") { delegated.append("--json") }
     return try await executeXcodePostCompile(delegated)
 }
@@ -496,11 +496,15 @@ func executeXcodeCatalogPrewarm(_ arguments: [String]) async throws -> CLI.Resul
     if arguments == ["--help"] || arguments.contains("--job") {
         return try prewarmXcodeCatalogs(arguments)
     }
-    let options = try CLI.Arguments(arguments, valueOptions: ["plan", "profile", "capture", "max-modules"],
+    let options = try CLI.Arguments(arguments, valueOptions: ["plan", "profile", "capture", "max-modules", "jobs"],
         flagOptions: ["plan-only", "json"])
     try requireNoXcodePositionals(options, command: "xcode catalog-prewarm")
     guard !options.hasFlag("json") || options.hasFlag("plan-only") else {
         throw CLI.Error.usage("capture-driven catalog-prewarm --json requires --plan-only")
+    }
+    let jobs = try options.value("jobs")
+    if let jobs, Int(jobs).map({ (1...8).contains($0) }) != true {
+        throw CLI.Error.usage("--jobs must be an integer in 1...8")
     }
     let budget = try options.value("max-modules")
     if let budget, Int(budget).map({ (1...256).contains($0) }) != true {
@@ -512,7 +516,7 @@ func executeXcodeCatalogPrewarm(_ arguments: [String]) async throws -> CLI.Resul
         profileID: options.require("profile"), captureURL: captureURL, environment: environment, allowAttempt: true)
     let capture = try capturedXcodeFeature(context, at: captureURL)
     let metadata = try xcodeFrontendMetadata(context)
-    let imports = try FrontendReceipt.SourceImports.scan(sources: capture.frontendSources)
+    let imports = try FrontendReceipt.SourceImports.scan(sources: capture.frontendSources, targetTriple: context.environment.targetTriple)
     var inputs = BuildCache.CompilerInputs.capture(arguments: capture.analysisJob.arguments,
         currentModuleName: context.feature.moduleName, workingDirectory: context.environment.sourceRootURL,
         importedModules: Set(imports.modules))
@@ -549,7 +553,10 @@ func executeXcodeCatalogPrewarm(_ arguments: [String]) async throws -> CLI.Resul
     if let jobURL, !options.hasFlag("plan-only") {
         var worker = ["--job", jobURL.path]
         if let budget { worker += ["--max-modules", budget] }
-        text += try prewarmXcodeCatalogs(worker).standardOutput
+        if let jobs { worker += ["--jobs", jobs] }
+        let result = try prewarmXcodeCatalogs(worker)
+        text += result.standardOutput
+        if result.exitCode != 0 { return .init(exitCode: result.exitCode, standardOutput: text) }
     }
     return .init(exitCode: report.unresolvedModules.isEmpty ? 0 : 1, standardOutput: text)
 }
@@ -1480,7 +1487,7 @@ private func performPrepareXcodeShell(
         return try formatXcodeDiagnosis(report, json: diagnosticJSON)
     }
     let sourceImports = try performance.measure("prepare.scan_imports") {
-        try FrontendReceipt.SourceImports.scan(sources: capture.frontendSources)
+        try FrontendReceipt.SourceImports.scan(sources: capture.frontendSources, targetTriple: context.environment.targetTriple)
     }
     var compilerInputs = performance.measure("prepare.compiler_inputs") {
         BuildCache.CompilerInputs.capture(
@@ -1496,6 +1503,12 @@ private func performPrepareXcodeShell(
         compilerInputs.incompleteReasons = (compilerInputs.incompleteReasons ?? []) + sourceImports.incompleteSourcePaths.map {
             "Source import scan is incomplete at \($0); check import syntax, literals/comments, and the 4096-module bound"
         }
+    }
+    if let diagnosticJSON, !compilerInputs.isComplete {
+        let reasons = (compilerInputs.incompleteReasons ?? ["Compiler input fingerprint is incomplete"]).joined(separator: "\n")
+        var report = FrontendReceipt.DiagnosticReport.failure(stage: "xcode.compiler_inputs", reason: reasons, stages: diagnosticStages)
+        report.performance = performance.trace()
+        return try formatXcodeDiagnosis(report, json: diagnosticJSON)
     }
     performance.setCounter(
         "prepare.compiler_input_file_count",
@@ -1557,9 +1570,12 @@ private func performPrepareXcodeShell(
             let reasons = resolved.unresolvedReasons.keys.sorted().map {
                 "\($0): \((resolved.unresolvedReasons[$0] ?? []).joined(separator: "; "))"
             }.joined(separator: "\n")
-            report.checks.insert(.init(stage: "xcode.catalog_availability", status: .passed,
+            report.checks.insert(.init(stage: "xcode.catalog_availability", status: resolved.unresolvedModules.isEmpty ? .passed : .failed,
                 detail: "\(resolved.snapshots.count) cached module Catalog(s), \(resolved.prewarmRequests.count) missing, unresolved=\(resolved.unresolvedModules). This check inventories availability, not API coverage. Use xcode catalog-prewarm --plan PATH --profile ID --capture PATH before Prepare to generate missing Catalogs.\n\(reasons)"), at: 0)
         }
+        report.checks.insert(.init(stage: "xcode.compiler_inputs", status: .passed,
+            detail: "Import scan and \(compilerInputs.fileCount) compiler input files have complete fingerprints."), at: 0)
+        if report.checks.contains(where: { $0.status == .failed || $0.status == .blocked }) { report.passed = false }
         if let trace = report.performance { performance.merge(trace) }
         report.performance = performance.trace()
         return try formatXcodeDiagnosis(report, json: diagnosticJSON)
@@ -3255,8 +3271,10 @@ static let xcodePreflightHelp = """
 Usage: helix xcode preflight --plan HostPlan.json --profile ID --capture FILE [--stages STAGE,STAGE] [--json]
 
 Accepts FrontendAttempt.hlxswiftc recorded before compilation, or a successful
-FrontendInvocation.hlxswiftc. Defaults to inputs,typed-ast; --stages inputs only
+FrontendInvocation.hlxswiftc. Defaults to inputs,typed-ast,catalogs; --stages inputs only
 validates the invocation, source inventory and toolchain without AST/SIL emission.
+The default also validates import scanning, header/module fingerprints and Catalog
+availability. Unresolved modules fail; a cache miss is reported as pending work.
 Typed checks still require available generated modules, headers and plugins.
 This command reports selected checks and never publishes a Shell or Bridge.
 """ + "\n"
@@ -3269,7 +3287,7 @@ validates the receipt pipeline without publishing a Shell, Bridge, or receipt.
 --stages runs only the requested checks and necessary dependencies: inputs, typed-ast,
 identity-sil, semantic-sil, source-nominals, imported-types, source-mappings,
 imported-operations, catalogs, receipt. A selected-check pass is not full receipt
-validation unless receipt is requested. JSON schema 2 records requestedStages.
+validation unless receipt is requested. JSON schema 3 records requestedStages and skipped checks.
 
 It reuses validated compiler checkpoints and reads needed existing Catalogs. Link,
 service registration, and runtime activation still require normal Build/Run.

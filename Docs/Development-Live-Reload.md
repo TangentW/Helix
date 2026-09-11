@@ -979,7 +979,7 @@ let environment = DevRuntime.LiveReloadEnvironment(
 ```
 
 The compiler proxy now retains `FrontendAttempt.hlxswiftc` before compilation
-for `helix xcode preflight` (default `inputs,typed-ast`). Only a successful compile
+for `helix xcode preflight` (default `inputs,typed-ast,catalogs`). Only a successful compile
 updates `FrontendInvocation.hlxswiftc` and invokes post-compile work. Input-only
 preflight does not emit AST/SIL or scan the dependency cache. Typed checks still
 require available compiler dependencies, and selected-check success does not

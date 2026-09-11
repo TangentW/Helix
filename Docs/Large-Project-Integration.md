@@ -408,7 +408,7 @@ below them fits memory or compiles quickly. MiB/GiB use powers of 1,024.
 | Explicit scan inputs | Module map 8 MiB, VFS overlay 16 MiB, bridging header/header map 64 MiB, other explicit compiler inputs 512 MiB |
 | Planning inventory | At most 250,000 retained root/entry records within one synchronous plan; no persistent directory listing cache |
 | Catalog closure | 256 modules, including dependency expansion |
-| Native API Catalog | 250,000 entries and 128 MiB encoded document per module; at most four frontend probe workers per producer, in batches of 256 candidates |
+| Native API Catalog | 250,000 entries and 128 MiB encoded document per module; one-to-eight frontend probe workers per producer, coordinated with CLI module workers, in batches of 256 candidates |
 | Explicit NativeImport policy | Separate from module Catalogs: 1,024 types, 4,096 candidates, 8 MiB document |
 | Host Plan | 128 features, 256 profiles, 1 MiB document |
 | Receipt/cache | Shell receipt 32 MiB; module frontend cache payload 64 MiB; compiler checkpoint 256 MiB per stage; oversized cache payloads bypass storage |
@@ -420,8 +420,9 @@ set and can disable reuse. Inspect `frontend_cache.compiler_inputs_incomplete_co
 before interpreting a repeated build as a cache performance result.
 
 There is no hard host-process RSS budget or aggregate cache disk quota. AST/SIL
-outputs and parsed structures are materialized in memory. Four workers is a
-per-producer bound, not a machine-wide semaphore. Remaining failed checkpoints
+outputs and parsed structures are materialized in memory. The CLI coordinates
+module and probe workers using CPU and physical-memory estimates; it is not a
+cross-process machine-wide semaphore. Remaining failed checkpoints
 can retain disk space; stop users of a private cache before resetting it.
 Physical-device native activation, the commercial project's save-to-screen
 latency, and its complete cold Catalog cost still need corresponding project
@@ -445,7 +446,10 @@ helix xcode preflight --plan .helix/xcode/HostPlan.json --profile live \
   --stages inputs --json
 ```
 
-Omitting `--stages` runs `inputs,typed-ast`. Use `source-mappings` to include SIL
+Omitting `--stages` runs `inputs,typed-ast,catalogs`. The default checks fingerprint
+compiler inputs before AST work, then inventory module/Catalog availability.
+Unresolved modules fail with provenance; pending cache entries are reported and
+do not claim API coverage. Explicit `--stages inputs` retains the lightweight behavior. Use `source-mappings` to include SIL
 identity diagnosis and declaration exclusions. `inputs` validates the selected
 compiler/SDK, invocation, source inventory and source bytes; it does not
 fingerprint the dependency cache or emit AST/SIL. A pass is not type-check or
@@ -465,7 +469,7 @@ inheritance uses iterative traversal and memoizes absent locations. Both SIL
 purposes reuse the selected AST member inventory for bounded symbol classification.
 See [the measured parser comparison](Build-Performance-Baseline.md#sil-debug-metadata-scanning)
 for its limited measurement scope. Whole-module compiler input invalidation
-remains required; per-file WMO reuse and parallel Swift frontend emission are
+remains required; per-file WMO reuse and concurrent identity/semantic SIL emission for one source module are
 not claimed.
 
 ## Team runtime selection and removal
@@ -553,7 +557,7 @@ run the consumer's AST/SIL, create a Shell, or register a live session. The firs
 command writes a private resumable job and returns schema 1 JSON containing
 `cachedModules`, `pendingModules`, `unresolvedModules`, `unresolvedReasons`, and
 `jobPath`. `--json` requires `--plan-only`. Without `--plan-only`, cold generation
-runs in the foreground with the same 1...256 module budget as `--job`. Cache hits
+runs in the foreground with the same 1...256 cold-attempt budget as `--job`. Cache hits
 do not consume that budget. Jobs can be resumed from any current directory;
 compiler and Symbol Graph processes use the job's validated working directory.
 Changing dependency bytes invalidates the job and requires a fresh plan.
@@ -582,3 +586,32 @@ Global `xcodebuild SWIFT_USE_INTEGRATED_DRIVER=NO` overrides also affect package
 targets; the Xcode 26.6 fixture reproduced missing `-package-name` diagnostics in
 package-access declarations under that setup. The mixed fixture now scopes these
 probes to the App, preserving dependency packages' normal driver settings.
+
+### Compiler input and C-member regressions
+
+The large-project regression suite checks inflated Xcode header-map counts against real Clang, keyword member import scanning, CoreGraphics/CoreFoundation parameter identity, C import-as-member with a middle receiver, ambiguous repeated receiver types, and projection version compatibility. These are compiler integration checks on the installed SDK, not commercial-app or device activation acceptance. The C member contract and conservative exclusions are detailed in [Native Calls](Native-Calls.md#c-member-argument-order-and-projection-compatibility).
+
+## Bounded prewarm and module outcomes
+
+Use `--jobs 1...8` in capture-driven or `--job` execution to cap concurrent
+modules (default four). The effective compiler budget is capped by active CPUs,
+eight workers, and a heuristic reserving 4 GiB then allowing 2 GiB per compiler,
+with a minimum of one. Each wave shares that budget between its modules' probe
+workers. It controls one CLI invocation, not all Helix processes or peak RSS.
+
+A failed module no longer aborts independent modules. The worker saves a private,
+atomically replaced schema 1 report at
+`<cache-root>/PrewarmReports/<job-SHA256>.json` after each wave. It records the
+budget, completion/pause state, module status (`pending`, `cached`, `generated`,
+`failed`, `unresolved`), elapsed microseconds, candidate/entry/probe counts, cache
+hits/misses, and rejection/failure reasons. `--job ... --json` emits that report.
+Malformed diagnostic JSON is rebuilt; symlinks or unsafe file permissions are
+rejected. Reports are advisory retry state, never Catalog authority.
+
+Failed/unresolved runs return nonzero and retain the job; a budget-only pause
+returns zero and retains it. Previously failed modules follow unattempted work
+on the next run. Completed artifacts are revalidated, including roots that were
+already cached when the job was created. Compiler/SDK/input changes require a
+fresh job. An invalid Symbol Graph never becomes a fabricated empty Catalog.
+Closure discovery remains bounded at 256 modules; team-portable Catalog bundles
+and commercial-project/device activation qualification are not added here.

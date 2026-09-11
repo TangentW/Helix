@@ -305,6 +305,7 @@ extension FrontendReceipt.Adapter {
         moduleName: String,
         nativeTypes: [String: Core.TypeID],
         sourceTypeNames: Set<String> = [],
+        declaringModulesByUSR: [String: String] = [:],
         requiredSourceFileLogicalIDs: Set<String> = []
     ) throws -> [NativeImportDiscovery.Declaration] {
         try canonicalizePhysicalOperations(operations).compactMap {
@@ -442,6 +443,11 @@ extension FrontendReceipt.Adapter {
             let catalogModuleName = operation.catalogEntry.flatMap { entry in
                 entry.descriptor.target.backend == .swiftAdapter
                     ? entry.descriptor.target.module : nil
+            } ?? operation.declarationUSR.flatMap { usr in
+                // A Clang USR has no Swift module component. A validated
+                // module projection can still prove its exact declaration
+                // owner, including C members that require a Swift adapter.
+                usr.hasPrefix("c:") ? declaringModulesByUSR[usr] : nil
             }
             let nativeModuleName = operation.c?.moduleName
                 ?? operation.objectiveC?.moduleName
@@ -1245,6 +1251,7 @@ extension FrontendReceipt.Adapter {
                 importedModules: importedModules,
                 moduleName: moduleName,
                 demangled: demangled,
+                clangMembers: silResolver.clangMembers,
                 callbackActorBindings: callbackActorBindings,
                 types: &types,
                 operations: &operations
@@ -1640,6 +1647,7 @@ extension FrontendReceipt.Adapter {
         importedModules: [String],
         moduleName: String,
         demangled: [String: String],
+        clangMembers: [String: [CanonicalSIL.ClangMember]],
         callbackActorBindings: [CallbackActorBinding],
         types: inout [ImportedNativeType],
         operations: inout [ImportedOperation]
@@ -1801,14 +1809,41 @@ extension FrontendReceipt.Adapter {
                 allowsGlobalFunction: dispatch == .globalFunction
             ) else { return }
             call = foreign
-            let physicalParameters = physicalParameterSpellings(
-                in: foreign.loweredType
-            ).filter { !isPhysicalMetatypeParameter($0) }
-            let alignedPhysicalParameters = alignForeignParameters(
-                physicalParameters,
-                logicalCount: parameterTypes.count,
-                dispatch: dispatch
-            )
+        }
+        let physicalParameters = physicalParameterSpellings(in: call.loweredType)
+            .filter { !isPhysicalMetatypeParameter($0) }
+        let formalPhysicalIndices: [Int]
+        if dispatch == .instanceMethod, call.loweredType.hasPrefix("@convention(c)") {
+            let members = clangMembers[call.symbol] ?? []
+            let matchingMembers = members.filter { $0.loweredType == call.loweredType && $0.member == baseName }
+            let contexts = Set(matchingMembers.map(\.owner))
+            let receivers = physicalParameters.indices.filter { index in
+                contexts.contains(importedPhysicalNominalSpelling(physicalParameters[index]) ?? "")
+            }
+            guard matchingMembers.count == members.count,
+                  contexts.count == 1, receivers.count == 1,
+                  physicalParameters.count == formalParameterTypes.count + 1,
+                  let receiverIndex = receivers.first, let physicalOwner = contexts.first
+            else {
+                let evidence = members.map { "SIL:\($0.silLine) [clang \($0.owner).\($0.member)] \($0.loweredType)" }.joined(separator: "; ")
+                throw FrontendReceipt.Error.ambiguousForeignParameterMapping(
+                    "\(source.logicalPath) \(usr) / \(call.symbol); logical=\(parameterTypes); physical=\(physicalParameters); receiver slots=\(receivers); declarations=\(evidence)")
+            }
+            // Clang preserves the original C argument order. Import-as-member
+            // removes self from that list; it does not move self to the SIL tail.
+            formalPhysicalIndices = physicalParameters.indices.filter { $0 != receiverIndex } + [receiverIndex]
+            ownerType = physicalOwner
+        } else {
+            formalPhysicalIndices = Array(formalParameterTypes.indices)
+                + (dispatch == .instanceMethod ? [physicalParameters.count - 1] : [])
+        }
+        let logicalFormalIndices = explicitParameterIndices
+            + (dispatch == .instanceMethod ? [formalParameterTypes.count] : [])
+        guard logicalFormalIndices.allSatisfy(formalPhysicalIndices.indices.contains) else { return }
+        let physicalParameterIndices = logicalFormalIndices.map { formalPhysicalIndices[$0] }
+        guard physicalParameterIndices.allSatisfy(physicalParameters.indices.contains) else { return }
+        if usr.hasPrefix("c:") {
+            let alignedPhysicalParameters = physicalParameterIndices.map { physicalParameters[$0] }
             parameterTypes = parameterTypes.enumerated().map { index, logical in
                 guard alignedPhysicalParameters.indices.contains(index) else {
                     return logical
@@ -1826,7 +1861,7 @@ extension FrontendReceipt.Adapter {
                     physicalSpelling: physical
                 )
             }
-            if let physicalResult = physicalResultSpelling(in: foreign.loweredType) {
+            if let physicalResult = physicalResultSpelling(in: call.loweredType) {
                 resultType = objcLogicalType(
                     resultType,
                     physicalSpelling: physicalResult
@@ -1846,16 +1881,6 @@ extension FrontendReceipt.Adapter {
             } else if dispatch == .initializer {
                 resultType = ownerType
             }
-        }
-        let physicalParameters = physicalParameterSpellings(
-            in: call.loweredType
-        ).filter { !isPhysicalMetatypeParameter($0) }
-        var physicalParameterIndices = explicitParameterIndices
-        if dispatch == .instanceMethod {
-            guard let receiverIndex = physicalParameters.indices.last else {
-                return
-            }
-            physicalParameterIndices.append(receiverIndex)
         }
         guard physicalParameters.count >= formalParameterTypes.count,
               physicalParameterIndices.allSatisfy(physicalParameters.indices.contains),
@@ -1964,9 +1989,10 @@ extension FrontendReceipt.Adapter {
                         guard parameterTypes.indices.contains(offset) else {
                             return nil
                         }
-                        if physicalParameters.indices.contains(index) {
+                        if formalPhysicalIndices.indices.contains(index),
+                           physicalParameters.indices.contains(formalPhysicalIndices[index]) {
                             if let physicalSpelling = importedPhysicalNominalSpelling(
-                                physicalParameters[index]
+                                physicalParameters[formalPhysicalIndices[index]]
                             ) {
                                 return physicalSpelling
                             }
@@ -2077,28 +2103,6 @@ extension FrontendReceipt.Adapter {
                 witnessFunctions: [function.mangledName]
             )
         )
-    }
-
-    private func alignForeignParameters(
-        _ physical: [String],
-        logicalCount: Int,
-        dispatch: NativeImportDiscovery.Dispatch
-    ) -> [String] {
-        guard logicalCount > 0 else { return [] }
-        switch dispatch {
-        case .instanceMethod:
-            let explicitCount = logicalCount - 1
-            guard physical.count >= logicalCount, let receiver = physical.last else {
-                return Array(physical.prefix(logicalCount))
-            }
-            // Objective-C error bridging inserts NSError** before the receiver.
-            return Array(physical.prefix(explicitCount)) + [receiver]
-        case .globalFunction, .initializer, .staticMethod, .nativeUpcast,
-             .anyObjectBridge,
-             .staticGetter, .staticSetter, .instanceGetter, .instanceSetter,
-             .instanceValueSetter:
-            return Array(physical.prefix(logicalCount))
-        }
     }
 
     private func objectiveCMethodEvidence(

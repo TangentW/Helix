@@ -6,6 +6,18 @@ import Testing
 extension BuildToolsTests {
 @Suite("Imported nominal identity normalization")
 struct ImportedNominalIdentityTests {
+    @Test("Probe placeholder aliases remain ambiguous across distinct canonical authorities")
+    func preservesAmbiguousProbeAliases() {
+        let first = type("FirstRuntime", swift: "First.Nested", source: "First.swift")
+        var second = type("SecondRuntime", swift: "Second.Nested", source: "Second.swift")
+        var sharedFirst = first
+        sharedFirst.aliases = ["Nested"]
+        second.aliases = ["Nested"]
+        let lookup = FrontendReceipt.ManagedNativeSurface.placeholderNativeTypes([sharedFirst, second])
+        #expect(lookup["Nested"] == nil)
+        #expect(lookup["FirstRuntime"] != lookup["SecondRuntime"])
+        #expect(lookup == FrontendReceipt.ManagedNativeSurface.placeholderNativeTypes([second, sharedFirst]))
+    }
     @Test("NS-prefixed Swift modules and unproven flat names remain independent identities")
     func preservesNSPrefixedModuleAuthority() throws {
         for names in [["NSWidgets.Item", "Widgets.Item"], ["NSUnproven", "Unproven"],
@@ -53,7 +65,8 @@ struct ImportedNominalIdentityTests {
     @Test("Unbound archetypes cannot compete with nested Swift overlays or become aliases")
     func excludesArchetypeObservations() throws {
         let adapter = FrontendReceipt.Adapter()
-        let spellings = ["τ_0_0.Element", "Swift.Optional<τ_1_2.Element>", "Self.Element", "Container<τ_0_0>"]
+        let spellings = ["τ_0_0.Element", "Swift.Optional<τ_1_2.Element>", "Self.Element", "Container<τ_0_0>",
+                         "__C_Synthesized.related decl 'e' for UIGuidedAccessErrorCode"]
         for spelling in spellings {
             #expect(adapter.importedNativeNominal(in: spelling) == nil)
             #expect(adapter.importedNativeType(rawMangledType: "$sSo13RuntimeNestedCD", spelling: spelling,
@@ -74,6 +87,35 @@ struct ImportedNominalIdentityTests {
         conflicting.canonicalName = "RuntimeNested"
         #expect(throws: FrontendReceipt.Error.self) {
             try adapter.mergeImportedNativeTypes(discoveredTypes: uses, operationTypes: [conflicting])
+        }
+    }
+
+    @Test("Only a unique declaring Catalog can refine an opaque Clang typedef layout")
+    func refinesClangTypedefLayout() throws {
+        let adapter = FrontendReceipt.Adapter()
+        var fallback = FrontendReceipt.Adapter.ImportedNativeType(canonicalName: "CGColorSpaceRef",
+            swiftType: "CGColorSpaceRef", kind: .value, aliases: ["__C.CGColorSpaceRef"], representation: .opaqueValue,
+            representationEvidence: .clangTypealias, sourceFileLogicalID: "Use.swift",
+            importedModules: ["CoreGraphics"], requiresMainActor: false)
+        let authority = FrontendReceipt.Adapter.ImportedNativeType(canonicalName: "CoreGraphics.CGColorSpace",
+            swiftType: "CoreGraphics.CGColorSpace", kind: .reference,
+            aliases: ["CGColorSpace", "CGColorSpaceRef", "__C.CGColorSpaceRef"], representation: .reference,
+            sourceFileLogicalID: "NativeAPICatalog/CoreGraphics.swift", importedModules: ["CoreGraphics"],
+            nativeModuleName: "CoreGraphics", objectiveCModuleName: "CoreGraphics", requiresMainActor: false)
+        let merged = try adapter.mergeImportedNativeTypes(discoveredTypes: [authority], operationTypes: [fallback])
+        #expect(merged.count == 1 && merged[0].representation == .reference && merged[0].representationEvidence == .nominal)
+        #expect(try adapter.mergeImportedNativeTypes(discoveredTypes: [fallback], operationTypes: [authority]) == merged)
+        #expect(try adapter.mergeImportedNativeTypes(discoveredTypes: merged, operationTypes: [fallback]) == merged)
+        fallback.representationEvidence = .nominal
+        #expect(throws: FrontendReceipt.Error.self) {
+            try adapter.mergeImportedNativeTypes(discoveredTypes: [authority], operationTypes: [fallback])
+        }
+        fallback.representationEvidence = .clangTypealias
+        var conflict = authority
+        conflict.kind = .value
+        conflict.representation = .opaqueValue
+        #expect(throws: FrontendReceipt.Error.self) {
+            try adapter.mergeImportedNativeTypes(discoveredTypes: [authority, conflict], operationTypes: [fallback])
         }
     }
 

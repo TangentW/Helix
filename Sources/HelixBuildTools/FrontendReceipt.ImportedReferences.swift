@@ -18,11 +18,18 @@ extension FrontendReceipt.Adapter {
             case opaqueValue
         }
 
+        enum RepresentationEvidence: String, Codable, Hashable, Sendable {
+            case nominal
+            /// Clang typedef mangling preserves identity but erases its layout.
+            case clangTypealias
+        }
+
         var canonicalName: String
         var swiftType: String
         var kind: InterfaceArchive.TypeKind
         var aliases: [String]
         var representation: Representation
+        var representationEvidence: RepresentationEvidence = .nominal
         var sourceFileLogicalID: String
         var importedModules: [String]
         /// External module that owns reusable compiler-visible TypeOps. Nil
@@ -42,6 +49,7 @@ extension FrontendReceipt.Adapter {
 
         private enum CodingKeys: String, CodingKey {
             case canonicalName, swiftType, kind, aliases, representation
+            case representationEvidence
             case sourceFileLogicalID, importedModules, nativeModuleName
             case objectiveCModuleName, objectiveCRuntimeName
             case requiresMainActor, isolationEvidence
@@ -236,6 +244,7 @@ extension FrontendReceipt.Adapter {
             kind: kind,
             aliases: clangTypealias.map { ["__C.\($0)"] } ?? [],
             representation: representation,
+            representationEvidence: clangTypealias == nil ? .nominal : .clangTypealias,
             source: source,
             importedModules: importedModules,
             objectiveCRuntimeName: representation == .reference
@@ -283,7 +292,8 @@ extension FrontendReceipt.Adapter {
         guard value.hasPrefix("$s"), value.hasSuffix("D") else { return false }
         value.removeLast()
         while value.hasSuffix("Sg") { value.removeLast(2) }
-        return value.hasPrefix("$sSo") && value.hasSuffix("a")
+        return value.hasSuffix("a")
+            && Self.objectiveCNominalIdentity(inMangledType: rawMangledType) != nil
     }
 
     func importedNativeNominal(in raw: String) -> String? {
@@ -328,6 +338,7 @@ extension FrontendReceipt.Adapter {
         kind: InterfaceArchive.TypeKind,
         aliases: [String] = [],
         representation: ImportedNativeType.Representation,
+        representationEvidence: ImportedNativeType.RepresentationEvidence = .nominal,
         source: SourceState,
         importedModules: [String],
         objectiveCRuntimeName: String? = nil,
@@ -339,6 +350,7 @@ extension FrontendReceipt.Adapter {
             kind: kind,
             aliases: aliases,
             representation: representation,
+            representationEvidence: representationEvidence,
             sourceFileLogicalID: source.logicalPath,
             importedModules: importedModules,
             objectiveCRuntimeName: objectiveCRuntimeName,
@@ -437,6 +449,7 @@ extension FrontendReceipt.Adapter {
                    use.representation == .rawRepresentable {
                     existing.kind = use.kind
                     existing.representation = .rawRepresentable
+                    existing.representationEvidence = use.representationEvidence
                     existing.requiresMainActor = use.requiresMainActor
                     existing.isolationEvidence = use.isolationEvidence
                 } else if existing.representation == .rawRepresentable,
@@ -444,6 +457,13 @@ extension FrontendReceipt.Adapter {
                     // Explicit enum/OptionSet evidence is more precise than
                     // the fallback opaque-value classification, including its
                     // actor-neutral value semantics.
+                } else if existing.representation == .rawRepresentable,
+                          use.representation == .rawRepresentable,
+                          Set([existing.kind, use.kind]) == Set([.value, .enumeration]) {
+                    // A direct enum observation refines the value fallback;
+                    // it cannot turn a reference or an unrelated layout into an enum.
+                    existing.kind = .enumeration
+                    try mergeImportedIsolation(into: &existing, from: use)
                 } else if existing.kind != use.kind
                             || existing.representation != use.representation {
                     throw FrontendReceipt.ImportedNominalIdentity.conflict(
@@ -453,6 +473,9 @@ extension FrontendReceipt.Adapter {
                     )
                 } else {
                     try mergeImportedIsolation(into: &existing, from: use)
+                }
+                if use.representationEvidence == .nominal {
+                    existing.representationEvidence = .nominal
                 }
                 existing.importedModules = Array(Set(
                     existing.importedModules + use.importedModules
@@ -526,7 +549,10 @@ extension FrontendReceipt.Adapter {
                       use.kind == .reference, use.representation == .reference else { return nil }
                 use.swiftType = runtime
             }
-            guard FrontendReceipt.ImportedNominalIdentity.isConcreteSpelling(use.canonicalName) else { return nil }
+            if !FrontendReceipt.ImportedNominalIdentity.isConcreteSpelling(use.canonicalName) {
+                guard let runtime = use.objectiveCRuntimeName else { return nil }
+                use.canonicalName = runtime
+            }
             use.aliases.removeAll { !FrontendReceipt.ImportedNominalIdentity.isConcreteSpelling($0) }
             return use
         }
@@ -610,8 +636,18 @@ extension FrontendReceipt.Adapter {
                             observedNames,
                             authority: authority
                         )
+                // A typedef's opaque box is a layout fallback, not evidence
+                // contradicting the uniquely measured declaring module. Keep
+                // every observed alias and require an exact Clang alias match.
+                let resolvesClangTypealiasLayout =
+                    use.representationEvidence == .clangTypealias
+                        && use.kind == .value && use.representation == .opaqueValue
+                        && use.objectiveCRuntimeName == nil
+                        && authority.representationEvidence == .nominal
+                        && authority.objectiveCModuleName != nil
+                        && use.aliases.contains { $0.hasPrefix("__C.") && authorityNames[index].contains($0) }
                 return (hasMatchingRepresentation
-                        || correctsWeakObjectiveCReference)
+                        || correctsWeakObjectiveCReference || resolvesClangTypealiasLayout)
                     && (use.objectiveCModuleName == nil
                         || authority.objectiveCModuleName
                             == use.objectiveCModuleName)
@@ -626,6 +662,7 @@ extension FrontendReceipt.Adapter {
             normalized.aliases = Array(observedNames.union(authorityNames[authorityIndex]))
                 .sorted()
             normalized.kind = authority.kind
+            normalized.representationEvidence = authority.representationEvidence
             if !hasCompatibleValueRepresentation(use, authority) {
                 normalized.representation = authority.representation
             }
@@ -972,6 +1009,7 @@ extension FrontendReceipt.Adapter {
                 kind: .value,
                 aliases: ["__C.\(runtimeName)"],
                 representation: .opaqueValue,
+                representationEvidence: .clangTypealias,
                 source: source,
                 importedModules: importedModules,
                 requiresMainActor: false
@@ -1005,7 +1043,7 @@ extension FrontendReceipt.Adapter {
                   as: UTF8.self
               )),
               length > 0,
-              cursor + length + 1 == bytes.count,
+              length == bytes.count - cursor - 1,
               [
                   UInt8(ascii: "C"), UInt8(ascii: "V"),
                   UInt8(ascii: "O"), UInt8(ascii: "a"),
@@ -1046,7 +1084,8 @@ extension FrontendReceipt.Adapter {
                       as: UTF8.self
                   )),
                   length > 0,
-                  cursor + length + terminatorBytes.count <= bytes.count,
+                  length <= bytes.count - cursor,
+                  terminatorBytes.count <= bytes.count - cursor - length,
                   bytes[(cursor + length)..<(cursor + length
                     + terminatorBytes.count)].elementsEqual(terminatorBytes)
             else {

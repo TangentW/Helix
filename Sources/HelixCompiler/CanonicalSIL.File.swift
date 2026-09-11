@@ -180,6 +180,7 @@ public struct File: Sendable {
     }
     private var uniqueFunctionIndices: [String: Int] = [:]
     public var typeEnvironment: CanonicalSIL.TypeEnvironment
+    public let clangMembers: [String: [CanonicalSIL.ClangMember]]
     let protocolConformances: CanonicalSIL.ProtocolConformance.Environment
     private let protocolDispatchInventory: CanonicalSIL.ProtocolConformance
         .StaticDispatch.Inventory
@@ -191,7 +192,8 @@ public struct File: Sendable {
 
     init(parsedFunctions: [CanonicalSIL.Function],
         parsedConformances: CanonicalSIL.ProtocolConformance.Environment,
-        rawTypeEnvironment: CanonicalSIL.TypeEnvironment, sourceModules: [String: String]
+        rawTypeEnvironment: CanonicalSIL.TypeEnvironment, sourceModules: [String: String],
+        clangMembers: [String: [CanonicalSIL.ClangMember]] = [:]
     ) throws {
         let dispatchInventory = CanonicalSIL.ProtocolConformance
             .StaticDispatch.Inventory(
@@ -210,6 +212,7 @@ public struct File: Sendable {
         protocolConformances = parsedConformances
         protocolDispatchInventory = dispatchInventory
         sourceModuleByFile = sourceModules
+        self.clangMembers = clangMembers
         uniqueFunctionIndices = Self.indexFunctions(functions)
     }
 

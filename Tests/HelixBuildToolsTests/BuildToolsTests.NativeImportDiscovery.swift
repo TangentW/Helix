@@ -1492,15 +1492,22 @@ struct NativeImportDiscoveryTests {
             compilerFingerprint: "overload-test-compiler",
             compilerInputHash: .sha256("overload-test-compiler-inputs")
         )
+        // The merged compiler facts may refine an unqualified source alias.
+        // Both overloads must use the same uniquely proven nominal spelling.
+        let owners = FrontendReceipt.ImportedTypeIndex(types: first.importedTypes)
+            .matching(spellings: ["\(moduleName).Overloaded"])
+        try #require(owners.count == 1)
+        let owner = owners[0].swiftType
         let overloads = first.operations.filter {
-            $0.ownerType == "Overloaded"
+            $0.ownerType == owner
                 && $0.baseName == "transform"
                 && $0.argumentLabels == ["_"]
         }
         #expect(overloads.count == 2)
+        #expect(Set(overloads.compactMap(\.declarationUSR)).count == 2)
         #expect(Set(overloads.map(\.parameterSwiftTypes)) == Set([
-            ["Swift.Int", "Overloaded"],
-            ["Swift.String", "Overloaded"],
+            ["Swift.Int", owner],
+            ["Swift.String", owner],
         ]))
         #expect(reused.operations == first.operations)
         #expect(reused.metrics.probeCacheHitCount == reused.metrics.candidateCount)

@@ -119,7 +119,7 @@ struct DeclarationSelection {
     static func isMappingFailure(_ error: Swift.Error) -> Bool {
         guard let error = error as? FrontendReceipt.Error else { return false }
         switch error {
-        case .ambiguousSILFunction, .missingSILFunction: return true
+        case .ambiguousSILFunction, .missingSILFunction, .ambiguousForeignParameterMapping: return true
         default: return false
         }
     }

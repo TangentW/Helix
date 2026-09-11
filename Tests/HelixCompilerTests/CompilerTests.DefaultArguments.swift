@@ -10,6 +10,38 @@ import Testing
 extension CompilerTests {
 @Suite("Default argument lowering")
 struct DefaultArguments {
+    @Test("Versioned C member projection reorders native apply values")
+    func lowersPermutedNativeArguments() throws {
+        let symbol = "$s7Fixture6memberyySi_SitF"
+        let projection = InterfaceArchive.NativeImportParameterProjection(physicalParameterCount: 2, logicalParameterIndices: [1, 0])
+        let requirement = try nativeRequirement(id: .init(rawValue: 0), canonicalCallee: "Fixture.member(_:_:)",
+            signature: .init(parameters: ["Swift.Int", "Swift.Int"], result: "Swift.Void"),
+            effects: .init(), contract: .bounded(kind: .globalFunction, domain: .application, access: .pure,
+                maximumDurationMicroseconds: 500, allowsMainThread: true),
+            physicalParameterTypes: ["Swift.Int", "Swift.Int"], physicalArgumentSources: [.argument(1), .argument(0)])
+        let calls = try CanonicalSIL.DirectCallTable([.init(mangledName: symbol,
+            parameterTypes: [.int64, .int64], parameterProjection: projection, resultType: .void, target: .nativeImport(requirement))])
+        let type = "@convention(c) (Swift.Int, Swift.Int) -> ()"
+        let function = CanonicalSIL.Function(mangledName: "$s7Fixture4rootyySi_SitF",
+            loweredType: "@convention(thin) (Swift.Int, Swift.Int) -> ()", body: """
+            bb0(%0 : $Swift.Int, %1 : $Swift.Int):
+              %2 = function_ref @\(symbol) : $\(type)
+              %3 = apply %2(%0, %1) : $\(type)
+              %4 = tuple ()
+              return %4
+            """)
+        let lowered = try CanonicalSIL.Lowerer().lower(function, displayName: "root", directCalls: calls)
+        let arguments = lowered.blocks.flatMap(\.instructions).compactMap { instruction -> [Bytecode.Register]? in
+            guard case let .nativeApply(_, _, arguments) = instruction else { return nil }
+            return arguments
+        }
+        #expect(arguments.map { $0.map(\.rawValue) } == [[1, 0]])
+        #expect(throws: CanonicalSIL.LoweringError.self) {
+            try CanonicalSIL.DirectCallTable([.init(mangledName: symbol, parameterTypes: [.int64, .int64],
+                parameterProjection: projection, resultType: .void, target: .function(.init(rawValue: 0)))])
+        }
+    }
+
     @Test("One physical native symbol selects default-argument variants per call")
     func selectsPhysicalSymbolVariants() throws {
         let symbol = "$s7Fixture6invokeyySi_SitF"

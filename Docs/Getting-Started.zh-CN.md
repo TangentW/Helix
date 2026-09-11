@@ -161,7 +161,7 @@ swift run helix xcode doctor \
 继续阅读[总体架构](Architecture.zh-CN.md)、[开发期热重载](Development-Live-Reload.zh-CN.md)和[生产热补丁](Production-Hot-Patching.zh-CN.md)。
 
 compiler proxy 现在在编译前保存 `FrontendAttempt.hlxswiftc`，供 `helix xcode preflight`
-使用（默认 `inputs,typed-ast`）。只有成功编译才更新 `FrontendInvocation.hlxswiftc` 并运行
+使用（默认 `inputs,typed-ast,catalogs`）。只有成功编译才更新 `FrontendInvocation.hlxswiftc` 并运行
 post-compile。仅输入预检不生成 AST/SIL，也不扫描依赖缓存；typed 检查仍需要可用的编译
 依赖，局部检查通过不代表完整 receipt 或 runtime 支持。见[预检说明](Large-Project-Integration.zh-CN.md#成功构建前的预检)。
 

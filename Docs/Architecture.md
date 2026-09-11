@@ -314,7 +314,10 @@ Both workflows depend on stable, build-specific identities:
   If source syntax omits SDK defaults, HLXI records a checked physical-to-logical
   parameter projection: lowering proves each erased SIL value came from that
   declaration's default generator or an exact typed `Optional.none`, and the
-  generated Swift call supplies the default normally. A closure value records
+  generated Swift call supplies the default normally. The explicitly versioned
+  v2 projection also supports compiler-proven C member argument permutations
+  (see [Native Calls](Native-Calls.md#c-member-argument-order-and-projection-compatibility));
+  absent-version projections keep their original ordering rule. A closure value records
   only its exact Swift callable ABI: parameter shape and ownership, result,
   throwing behavior, global actor, and async behavior. Allocation and external
   side-effect authority remain properties of the concrete closure body;
@@ -1126,7 +1129,7 @@ partial pass cannot be mistaken for full receipt validation. Missing selection
 in legacy schema 1 reports retains full scope. Shell/patch schemas are unchanged.
 
 The compiler proxy now retains `FrontendAttempt.hlxswiftc` before compilation
-for `helix xcode preflight` (default `inputs,typed-ast`). Only a successful compile
+for `helix xcode preflight` (default `inputs,typed-ast,catalogs`). Only a successful compile
 updates `FrontendInvocation.hlxswiftc` and invokes post-compile work. Input-only
 preflight does not emit AST/SIL or scan the dependency cache. Typed checks still
 require available compiler dependencies, and selected-check success does not
@@ -1151,3 +1154,11 @@ excluded files before compilation or transfer and retains the accepted baseline;
 deferred native discovery uses that same policy. This host migration preserves
 schema 1 decoding and does not alter runtime ABI or Dev Protocol wire formats.
 See [save guards and migration](Development-Live-Reload.md#saving-code-excluded-from-indexing).
+
+Catalog generation validates each measured candidate before cache publication.
+Deterministic unsupported candidates retain rejection provenance; compiler or
+module failures remain failures. Prewarm records module outcomes and continues
+independent work under a shared module/probe execution budget. Neither advisory
+progress reports nor compiler display placeholders may establish declaration
+identity. See [module outcomes](Large-Project-Integration.md#bounded-prewarm-and-module-outcomes)
+and [layout evidence](Native-Calls.md#candidate-rejection-and-layout-evidence).

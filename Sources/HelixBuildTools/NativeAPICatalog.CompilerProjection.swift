@@ -608,7 +608,8 @@ extension NativeAPICatalog.Projector {
                 .makeImportedOperationDeclarations(
                     [operation],
                     moduleName: invocation.moduleName,
-                    nativeTypes: nativeTypes
+                    nativeTypes: nativeTypes,
+                    declaringModulesByUSR: projection.modulesByDeclarationUSR
                 )
             declarations += projected
             for declaration in projected {

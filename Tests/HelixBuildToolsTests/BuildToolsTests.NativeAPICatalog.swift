@@ -1832,13 +1832,14 @@ struct NativeAPICatalogTests {
         #expect(surface.metrics.rejectedSingletonCount > 0)
     }
 
-    @Test("System SDK Catalog covers representative UIKit first uses")
-    func buildsUIKitCatalogWhenRequested() throws {
+    @Test("System SDK Catalog covers UIKit and CoreGraphics first uses", arguments: ["UIKit", "CoreGraphics"])
+    func buildsUIKitCatalogWhenRequested(moduleName: String) throws {
         guard ProcessInfo.processInfo.environment[
             "HELIX_RUN_SDK_CATALOG_INTEGRATION"
         ] == "1" else { return }
+        if let selected = ProcessInfo.processInfo.environment["HELIX_SDK_CATALOG_MODULE"], selected != moduleName { return }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "helix-uikit-catalog-\(UUID().uuidString)",
+            "helix-\(moduleName)-catalog-\(UUID().uuidString)",
             isDirectory: true
         )
         try FileManager.default.createDirectory(
@@ -1861,14 +1862,16 @@ struct NativeAPICatalogTests {
             targetTriple: target,
             minimumDeployment: .init(15),
             swiftLanguageMode: "5",
-            moduleName: "UIKit",
-            moduleContentHash: .sha256("UIKit:\(sdk.buildVersion)"),
+            moduleName: moduleName,
+            moduleContentHash: .sha256("\(moduleName):\(sdk.buildVersion)"),
             moduleSearchPathHash: .sha256("system-sdk"),
-            dependencyGraphHash: .sha256("UIKit-system-dependencies")
+            dependencyGraphHash: .sha256("\(moduleName)-system-dependencies")
         )
-        let output = try NativeAPICatalog.Builder(cache: .init(
-            rootURL: directory.appendingPathComponent("Cache")
-        )).build(.init(
+        let invocations = BuildPerformance.Recorder()
+        let builder = try NativeAPICatalog.Builder(cache: .init(rootURL: directory.appendingPathComponent("Cache")),
+            invocationObserver: invocations.subprocessObserver,
+            maximumProbeWorkers: NativeAPICatalog.WorkBudget().compilerWorkers)
+        let request = NativeAPICatalog.BuildRequest(
             identity: identity,
             frontendInvocation: .init(
                 moduleName: "UIKitCatalogConsumer",
@@ -1879,10 +1882,23 @@ struct NativeAPICatalogTests {
                 semanticArguments: ["-parse-as-library"]
             ),
             compilerURL: compilerURL,
-            precomputedToolchain: toolchain
-        ))
-
-        #expect(output.metrics.candidateCount > 1_000)
+            precomputedToolchain: toolchain,
+            precomputedSDK: sdk
+        )
+        let started = DispatchTime.now().uptimeNanoseconds
+        let output = try builder.build(request)
+        let coldMicroseconds = (DispatchTime.now().uptimeNanoseconds - started) / 1_000
+        let coldInvocationCount = invocations.trace().subprocesses.reduce(UInt64(0)) { $0 + $1.invocationCount }
+        #expect(coldInvocationCount > 0)
+        let warmStarted = DispatchTime.now().uptimeNanoseconds
+        let warm = try builder.build(request)
+        let warmMicroseconds = (DispatchTime.now().uptimeNanoseconds - warmStarted) / 1_000
+        #expect(warm.metrics.cacheSource == .hit && warm.metrics.probeAttemptCount == 0)
+        let warmInvocationCount = invocations.trace().subprocesses.reduce(UInt64(0)) { $0 + $1.invocationCount } - coldInvocationCount
+        #expect(warmInvocationCount == 0)
+        #expect(warm.snapshot.document == output.snapshot.document)
+        #expect(output.metrics.candidateCount > (moduleName == "UIKit" ? 1_000 : 100))
+        if moduleName == "UIKit" {
         #expect(output.snapshot.document.entries.contains {
             $0.descriptor.target.backend == .objectiveCMessage
                 && $0.descriptor.target.owner == "UIViewController"
@@ -1911,7 +1927,26 @@ struct NativeAPICatalogTests {
                 && $0.descriptor.target.owner == "UIView"
                 && $0.descriptor.canonicalCallee.contains("animate")
         })
+        } else {
+            #expect(output.snapshot.document.entries.contains { $0.swiftNames.contains { $0.contains("getBoxRect") } })
+        }
         try output.snapshot.document.validate()
+        if let path = ProcessInfo.processInfo.environment["HELIX_SDK_CATALOG_REPORT_DIR"], path.hasPrefix("/") {
+            let destination = URL(fileURLWithPath: path)
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+            try NativeAPICatalog.Codec.encode(output.snapshot.document).write(to: destination.appendingPathComponent(moduleName + ".catalog.json"))
+            try Core.CanonicalJSON.encode(output.performance).write(to: destination.appendingPathComponent(moduleName + ".performance.json"))
+            try Core.CanonicalJSON.encode(invocations.trace()).write(to: destination.appendingPathComponent(moduleName + ".subprocesses.json"))
+            let measurement: [String: Any] = ["module": moduleName, "sdkBuild": sdk.buildVersion,
+                "compiler": toolchain.fingerprint, "target": target, "coldMicroseconds": coldMicroseconds,
+                "warmMicroseconds": warmMicroseconds, "candidates": output.metrics.candidateCount,
+                "entries": output.metrics.entryCount, "probeAttempts": output.metrics.probeAttemptCount,
+                "rejectionReasons": output.metrics.rejectionReasons, "probeWorkers": builder.maximumProbeWorkers,
+                "coldFrontendInvocations": coldInvocationCount,
+                "warmFrontendInvocations": warmInvocationCount]
+            try JSONSerialization.data(withJSONObject: measurement, options: [.sortedKeys, .prettyPrinted])
+                .write(to: destination.appendingPathComponent(moduleName + ".measurement.json"))
+        }
     }
 
     private func swiftEntry() throws -> NativeAPICatalog.Entry {

@@ -66,6 +66,10 @@ public struct NativeImportDefaultArgument: Codable, Hashable, Sendable {
 /// defaults; the generated Swift invoker intentionally exposes only the
 /// source arguments represented by the frozen logical call variant.
 public struct NativeImportParameterProjection: Codable, Hashable, Sendable {
+    /// Absent means the shipped order-preserving v1 projection. Version 2
+    /// additionally permits a bijective permutation of the selected slots.
+    /// Older readers reject permutations under their v1 validation rules.
+    public var argumentOrderVersion: UInt16?
     public var physicalParameterCount: UInt16
     public var logicalParameterIndices: [UInt16]
     public var defaultArguments: [InterfaceArchive.NativeImportDefaultArgument]
@@ -77,6 +81,7 @@ public struct NativeImportParameterProjection: Codable, Hashable, Sendable {
     ) {
         self.physicalParameterCount = physicalParameterCount
         self.logicalParameterIndices = logicalParameterIndices
+        argumentOrderVersion = logicalParameterIndices == logicalParameterIndices.sorted() ? nil : 2
         self.defaultArguments = defaultArguments.sorted {
             $0.physicalParameterIndex < $1.physicalParameterIndex
         }
@@ -98,7 +103,8 @@ public struct NativeImportParameterProjection: Codable, Hashable, Sendable {
         let omitted = omittedPhysicalParameterIndices
         guard logicalParameterIndices.count == logicalParameterCount,
               Set(logicalParameterIndices).count == logicalParameterIndices.count,
-              logicalParameterIndices == logicalParameterIndices.sorted(),
+              (argumentOrderVersion == nil && logicalParameterIndices == logicalParameterIndices.sorted()
+                || argumentOrderVersion == 2),
               logicalParameterIndices.allSatisfy({ $0 < physicalParameterCount }),
               defaultArguments.map(\.physicalParameterIndex) == omitted,
               defaultArguments.allSatisfy(\.isValid)

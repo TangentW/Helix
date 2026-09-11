@@ -57,7 +57,8 @@ enum Pipeline {
                 + "compiler-inferred-main-actor-probes:"
                 + "line-bound-main-actor-diagnostics:"
                 + "compiler-wide-deprecation-filter:concrete-nominal-observations-v2:"
-                + "runtime-proven-ns-aliases-v3"
+                + "runtime-proven-ns-aliases-v3:exact-clang-nominals:"
+                + "clang-member-physical-argument-order-v2:measured-candidate-rejections-v2:actor-selector-rejections:merged-probe-aliases:target-os-imports:clang-typedef-layout-evidence:related-decl-filter:unique-probe-aliases:clang-constructor-usr-boundary"
         )
         return hasher.finalize()
     }()
@@ -89,7 +90,7 @@ enum Pipeline {
                 + "published-operation-entry-index:"
                 + "published-native-capability-projection:"
                 + "declaration-missing-objective-c-implementation-lookup:"
-                + "vm-native-operation-precedence:binary-cache-payload"
+                + "vm-native-operation-precedence:binary-cache-payload:clang-declaration-module-adapters"
         )
         return hasher.finalize()
     }()

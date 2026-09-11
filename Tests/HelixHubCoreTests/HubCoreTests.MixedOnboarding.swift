@@ -105,6 +105,30 @@ struct MixedOnboarding {
         observations[observations.count - 1].captureSourceCount = job.sourcePaths.count
         observations[observations.count - 1].captureFileCount = captures(in: legacy).count
         try save("captured-arguments.json", Core.CanonicalJSON.encode(job.arguments))
+        let sourceImports = try FrontendReceipt.SourceImports.scan(sources: job.sourcePaths.map {
+            .init(logicalPath: URL(fileURLWithPath: $0).lastPathComponent, url: URL(fileURLWithPath: $0))
+        }, targetTriple: job.targetTriple)
+        #expect(sourceImports.isComplete && !sourceImports.modules.contains("AppKit"))
+        #expect(sourceImports.modules.contains("CoreGraphics") && !sourceImports.modules.contains("true"))
+        let inputs = BuildCache.CompilerInputs.capture(arguments: job.arguments, currentModuleName: job.moduleName,
+            workingDirectory: sourceRoot, importedModules: Set(sourceImports.modules))
+        try save("compiler-inputs.json", Core.CanonicalJSON.encode(inputs))
+        #expect(inputs.isComplete, "\(inputs.incompleteReasons ?? [])")
+        // Use normalized roots: Xcode also forwards concatenated -I/path.hmap.
+        let headerMapRoots = inputs.searchRoots.filter { $0.hasSuffix(".hmap") }
+        // Missing search roots are valid compiler inputs and still affect the
+        // fingerprint if Xcode creates them later; only existing maps have bytes.
+        let headerMaps = headerMapRoots.filter { manager.fileExists(atPath: $0) }.map { URL(fileURLWithPath: $0) }
+        try save("missing-header-map-search-roots.json", Core.CanonicalJSON.encode(
+            headerMapRoots.filter { !manager.fileExists(atPath: $0) }))
+        #expect(!headerMaps.isEmpty)
+        for (index, headerMap) in headerMaps.enumerated() {
+            let snapshot = BuildCache.CompilerInputs.capture(arguments: ["-I", headerMap.path],
+                currentModuleName: job.moduleName, workingDirectory: sourceRoot, importedModules: [])
+            #expect(snapshot.isComplete && snapshot.fileCount > 0, "\(headerMap.path): \(snapshot.incompleteReasons ?? [])")
+            try save("xcode-header-map-\(index).hmap", Data(contentsOf: headerMap))
+            try save("xcode-header-map-\(index).json", Core.CanonicalJSON.encode(snapshot))
+        }
 
         // Probe the integrated mode as evidence, without treating discovery-only
         // proxy calls as proof of a complete target capture or post-compile hook.

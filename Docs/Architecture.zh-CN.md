@@ -249,7 +249,7 @@ conformance 和声明清单。所有前置检查通过后才有完整 `Canonical
 范围仍表示完整诊断。Shell/补丁 schema 保持不变。
 
 compiler proxy 现在在编译前保存 `FrontendAttempt.hlxswiftc`，供 `helix xcode preflight`
-使用（默认 `inputs,typed-ast`）。只有成功编译才更新 `FrontendInvocation.hlxswiftc` 并运行
+使用（默认 `inputs,typed-ast,catalogs`）。只有成功编译才更新 `FrontendInvocation.hlxswiftc` 并运行
 post-compile。仅输入预检不生成 AST/SIL，也不扫描依赖缓存；typed 检查仍需要可用的编译
 依赖，局部检查通过不代表完整 receipt 或 runtime 支持。见[预检说明](Large-Project-Integration.zh-CN.md#成功构建前的预检)。
 
@@ -268,3 +268,10 @@ Catalog 自举是独立的宿主操作，输入为 canonical Host Plan、compile
 基线；保存流程在编译/传输前拒绝被排除文件的修改，保留已接受基线，后续 Native
 能力发现沿用相同策略。该宿主迁移保留 schema 1 读取，不改变 runtime ABI 或 Dev
 Protocol 消息格式。见[保存保护与迁移](Development-Live-Reload.zh-CN.md#保存被排除的代码)。
+
+C import-as-member 参数顺序使用明确的参数投影 v2；缺省版本维持既有保序规则。迁移、证据要求与排除边界见 [Native Calls](Native-Calls.zh-CN.md#c-成员参数顺序与投影兼容)。
+
+Catalog 生成在缓存发布前逐项验证实测候选。确定不支持的候选保留拒绝来源，编译器或
+模块故障仍是失败。预热在共同模块/探针预算下记录模块结果并继续独立工作；进度报告
+和编译器显示占位符都不能建立声明身份。参见[模块结果](Large-Project-Integration.zh-CN.md#预热预算与模块结果)
+及[布局证据](Native-Calls.zh-CN.md#候选拒绝与布局证据)。

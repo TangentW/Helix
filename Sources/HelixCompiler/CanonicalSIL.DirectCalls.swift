@@ -189,10 +189,10 @@ public struct DirectCallTable: Sendable {
                     "direct-call @\(value.mangledName) has an invalid physical parameter projection"
                 )
             }
-            if !value.parameterProjection.omittedPhysicalParameterIndices.isEmpty {
+            if value.parameterProjection != .identity(parameterCount: value.parameterTypes.count) {
                 guard case .nativeImport = value.target else {
                     throw CanonicalSIL.LoweringError.invalidCallTable(
-                        "non-NativeImport @\(value.mangledName) omits physical parameters"
+                        "non-NativeImport @\(value.mangledName) changes physical parameter order or count"
                     )
                 }
             }

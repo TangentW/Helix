@@ -19,9 +19,11 @@ struct SILFunctionResolver: Sendable {
     ]
     private var symbolIdentities: [String: FrontendReceipt.SILSymbolIdentity] = [:]
     private var demangler: FrontendReceipt.Demangler?
+    private(set) var clangMembers: [String: [CanonicalSIL.ClangMember]] = [:]
 
     init(file: CanonicalSIL.File) {
         self.init(functions: file.functions)
+        clangMembers = file.clangMembers
     }
 
     init(functions: [CanonicalSIL.Function]) {

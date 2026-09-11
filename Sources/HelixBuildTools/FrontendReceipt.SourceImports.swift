@@ -34,6 +34,12 @@ public struct Result: Equatable, Sendable {
 }
 
 public static func scan(sources: [FrontendReceipt.Source]) throws -> Result {
+    try scan(sources: sources, targetTriple: nil)
+}
+
+/// Only exact os(...) conditions are evaluated. Unknown conditions retain all
+/// possible imports, and compiler-module coverage remains independently checked.
+public static func scan(sources: [FrontendReceipt.Source], targetTriple: String?) throws -> Result {
     var result = Result(modules: [], isComplete: true)
     var modules = Set<String>()
     for source in sources.sorted(by: { $0.logicalPath < $1.logicalPath }) {
@@ -56,7 +62,7 @@ public static func scan(sources: [FrontendReceipt.Source]) throws -> Result {
             )
         }
         // Release each source buffer before reading the next large module file.
-        let scanned = scan(contents: [data])
+        let scanned = scan(contents: [data], targetTriple: targetTriple)
         modules.formUnion(scanned.modules)
         if !scanned.isComplete || modules.count > 4_096 {
             result.isComplete = false
@@ -67,15 +73,54 @@ public static func scan(sources: [FrontendReceipt.Source]) throws -> Result {
     return result
 }
 
-static func scan(contents: [Data]) -> Result {
+static func scan(contents: [Data], targetTriple: String? = nil) -> Result {
     var modules = Set<String>()
     var complete = true
     for contents in contents {
         var lexer = Lexer(bytes: Array(contents))
+        var previous: Token?
+        var frames: [ConditionalFrame] = []
+        var active = true
         while let token = lexer.next() {
+            defer { previous = token }
+            if case .punctuation(0x23) = token {
+                var lookahead = lexer
+                if case let .identifier(directive, false) = lookahead.next(),
+                   ["if", "elseif", "else", "endif"].contains(directive) {
+                    lexer = lookahead
+                    let end = lexer.bytes[lexer.index...].firstIndex(of: 10) ?? lexer.bytes.count
+                    let expression = String(decoding: lexer.bytes[lexer.index..<end], as: UTF8.self)
+                    var following = Lexer(bytes: lexer.bytes, index: end)
+                    let continues: Bool
+                    if case let .punctuation(byte) = following.next(), byte == 38 || byte == 124 {
+                        continues = true
+                    } else { continues = false }
+                    let condition: Condition = continues ? .unknown : osCondition(expression, targetTriple: targetTriple)
+                    if directive == "if" {
+                        guard frames.count < 256 else { complete = false; break }
+                        frames.append(.init(parentActive: active, seen: condition))
+                        active = active && condition != .no
+                    } else if directive == "endif", let frame = frames.popLast() {
+                        active = frame.parentActive
+                    } else if !frames.isEmpty, directive == "elseif" || directive == "else" {
+                        let index = frames.count - 1
+                        if frames[index].hasElse { complete = false }
+                        let remaining = frames[index].seen.negated
+                        let branch = directive == "else" ? remaining : remaining.and(condition)
+                        active = frames[index].parentActive && branch != .no
+                        frames[index].seen = directive == "else" ? .yes : frames[index].seen.or(condition)
+                        frames[index].hasElse = directive == "else"
+                    } else { complete = false }
+                    continue
+                }
+            }
+            guard active else { continue }
             guard case let .identifier(value, escaped) = token,
                   value == "import", !escaped
             else { continue }
+            // A keyword can be an unescaped member after a period; imports
+            // cannot begin there. Comments and whitespace do not change it.
+            if case .punctuation(0x2E) = previous { continue }
             guard var next = lexer.next() else {
                 complete = false
                 break
@@ -91,9 +136,8 @@ static func scan(contents: [Data]) -> Result {
             guard case let .identifier(module, _) = next,
                   isModuleIdentifier(module)
             else {
-                // `import` may legally be used as an argument label when
-                // escaped only. An unescaped non-declaration is invalid Swift,
-                // so refusing the cache is safer than guessing.
+                // An unrecognized declaration keeps the scan incomplete;
+                // only compiler-proven lexical contexts may be skipped.
                 complete = false
                 continue
             }
@@ -103,9 +147,42 @@ static func scan(contents: [Data]) -> Result {
                 break
             }
         }
-        complete = complete && lexer.isComplete
+        complete = complete && lexer.isComplete && frames.isEmpty
     }
     return .init(modules: Array(modules), isComplete: complete)
+}
+
+private enum Condition {
+    case yes, no, unknown
+    var negated: Self { self == .yes ? .no : self == .no ? .yes : .unknown }
+    func or(_ other: Self) -> Self { self == .yes || other == .yes ? .yes : self == .no && other == .no ? .no : .unknown }
+    func and(_ other: Self) -> Self { negated.or(other.negated).negated }
+}
+
+private struct ConditionalFrame {
+    var parentActive: Bool
+    var seen: Condition
+    var hasElse = false
+}
+
+private static func osCondition(_ raw: String, targetTriple: String?) -> Condition {
+    guard let targetTriple else { return .unknown }
+    let parts = targetTriple.split(separator: "-")
+    guard parts.count >= 3 else { return .unknown }
+    let platform = String(parts[2]).lowercased()
+    let names = [("macos", "macOS"), ("darwin", "macOS"), ("ios", "iOS"), ("tvos", "tvOS"),
+                 ("watchos", "watchOS"), ("xros", "visionOS"), ("linux", "Linux"), ("windows", "Windows")]
+    guard let os = names.first(where: { platform.hasPrefix($0.0) })?.1 else { return .unknown }
+    var expression = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let comment = expression.range(of: "//") { expression = String(expression[..<comment.lowerBound]) }
+    expression = expression.filter { !$0.isWhitespace }
+    let inverted = expression.hasPrefix("!")
+    if inverted { expression.removeFirst() }
+    guard expression.hasPrefix("os("), expression.hasSuffix(")") else { return .unknown }
+    let requested = String(expression.dropFirst(3).dropLast())
+    guard names.contains(where: { $0.1 == requested }) else { return .unknown }
+    let result: Condition = requested == os ? .yes : .no
+    return inverted ? result.negated : result
 }
 
 private static let declarationKinds: Set<String> = [

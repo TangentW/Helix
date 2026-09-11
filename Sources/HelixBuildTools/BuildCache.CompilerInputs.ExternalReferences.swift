@@ -87,9 +87,8 @@ static func headerMapManifest(
           readUInt32(bytes, at: 0) == 0x686D_6170,
           readUInt16(bytes, at: 4) == 1,
           let stringsOffset = Int(exactly: readUInt32(bytes, at: 8)),
-          let entryCount = Int(exactly: readUInt32(bytes, at: 12)),
           let bucketCount = Int(exactly: readUInt32(bytes, at: 16)),
-          entryCount <= bucketCount,
+          bucketCount > 0, bucketCount & (bucketCount - 1) == 0,
           bucketCount <= 1_000_000,
           stringsOffset >= 24,
           stringsOffset <= bytes.count,
@@ -107,13 +106,13 @@ static func headerMapManifest(
         else { throw BuildCache.Error.io("header map string is invalid") }
         return value
     }
-    var mappings: [(key: String, path: String)] = []
-    var populatedBuckets = 0
+    var mappings: [(key: String, path: String, bucket: Int)] = []
+    // Clang looks up occupied buckets; Xcode's NumEntries can count replaced
+    // keys. It is a capacity hint, not a checksum of the serialized mappings.
     for bucket in 0..<bucketCount {
         let offset = 24 + bucket * 12
         let keyOffset = readUInt32(bytes, at: offset)
         guard keyOffset != 0 else { continue }
-        populatedBuckets += 1
         let key = try string(at: keyOffset)
         let prefix = try string(at: readUInt32(bytes, at: offset + 4))
         let suffix = try string(at: readUInt32(bytes, at: offset + 8))
@@ -123,13 +122,16 @@ static func headerMapManifest(
         ) else {
             throw BuildCache.Error.io("header map value path is invalid")
         }
-        mappings.append((key, absolute))
+        mappings.append((key, absolute, bucket))
     }
     mappings.sort { ($0.key, $0.path) < ($1.key, $1.path) }
-    guard populatedBuckets == entryCount,
-          Set(mappings.map(\.key)).count == mappings.count
-    else {
-        throw BuildCache.Error.io("header map entry count is invalid")
+    let collisions = Dictionary(grouping: mappings, by: { mapping in
+        // HeaderMap lookup folds ASCII case, as Clang's hash does.
+        String(decoding: mapping.key.utf8.map { (65...90).contains($0) ? $0 + 32 : $0 }, as: UTF8.self)
+    }).values.filter { $0.count > 1 }.sorted { $0[0].key < $1[0].key }
+    guard collisions.isEmpty else {
+        let evidence = collisions.flatMap { $0 }.map { "bucket[\($0.bucket)] \($0.key)=\($0.path)" }.joined(separator: "; ")
+        throw BuildCache.Error.io("header map contains duplicate keys: \(evidence)")
     }
     let identity: [[String: String]] = mappings.map {
         [
